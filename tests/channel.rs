@@ -45,7 +45,7 @@ fn pair(a: Option<usize>, b: Option<usize>) -> Pair {
 /// would, the Pipe Stream ID removed; returns how many moved.
 fn move_channel(from: &mut SessionCore, to: &mut SessionCore, now: std::time::Instant) -> usize {
     let mut out = Vec::new();
-    assert!(from.poll_channel(P0, &mut out), "channel live");
+    assert!(from.poll_channel(P0, &mut out, now), "channel live");
     for d in &out {
         let (id, frame) = channel::split(d).expect("Pipe Stream ID");
         assert_eq!(id, ID);
@@ -60,14 +60,17 @@ fn negotiated_datagrams_go_on_the_channel() {
     assert!(p.a.features().carrier_datagrams && p.b.features().carrier_datagrams);
     assert!(p.a.local_parameters().zmux_carrier_datagrams);
     let records = p.a.stats().records_sent;
-    p.a.send_datagram(Bytes::from_static(b"hello"), true)
+    p.a.send_datagram(Bytes::from_static(b"hello"), true, p.now)
         .unwrap();
     // Not in a record: the pipe has nothing to write for it.
     assert!(!p.a.wants_write(P0));
     let now = p.now;
     let before = p.b.stats().records_received;
     assert_eq!(move_channel(&mut p.a, &mut p.b, now), 1);
-    assert_eq!(p.b.recv_datagram().unwrap().as_deref(), Some(&b"hello"[..]));
+    assert_eq!(
+        p.b.recv_datagram(p.now).unwrap().as_deref(),
+        Some(&b"hello"[..])
+    );
     p.pump();
     assert_eq!(p.a.stats().records_sent, records, "no record");
     assert_eq!(p.b.stats().records_received, before);
@@ -85,19 +88,30 @@ fn records_without_a_negotiated_channel() {
     let mut p = pair(Some(MAX), None);
     assert!(!p.b.local_parameters().zmux_carrier_datagrams);
     assert!(!p.a.features().carrier_datagrams);
-    p.a.send_datagram(Bytes::from_static(b"x"), true).unwrap();
+    p.a.send_datagram(Bytes::from_static(b"x"), true, p.now)
+        .unwrap();
     let mut out = Vec::new();
-    assert!(!p.a.poll_channel(P0, &mut out), "the channel's task ends");
+    assert!(
+        !p.a.poll_channel(P0, &mut out, p.now),
+        "the channel's task ends"
+    );
     assert_eq!(out, Vec::<bytes::Bytes>::new());
     p.pump();
-    assert_eq!(p.b.recv_datagram().unwrap().as_deref(), Some(&b"x"[..]));
+    assert_eq!(
+        p.b.recv_datagram(p.now).unwrap().as_deref(),
+        Some(&b"x"[..])
+    );
     assert_eq!(p.a.stats().datagrams_sent_channel, 0);
     // No channel at all on this end.
     let mut p = pair(None, Some(MAX));
     assert!(!p.b.features().carrier_datagrams);
-    p.b.send_datagram(Bytes::from_static(b"y"), true).unwrap();
+    p.b.send_datagram(Bytes::from_static(b"y"), true, p.now)
+        .unwrap();
     p.pump();
-    assert_eq!(p.a.recv_datagram().unwrap().as_deref(), Some(&b"y"[..]));
+    assert_eq!(
+        p.a.recv_datagram(p.now).unwrap().as_deref(),
+        Some(&b"y"[..])
+    );
     // Without datagrams the parameter is never sent.
     let mut p = Pair::attached(Config::default(), Config::default());
     p.a.set_pipe_channel(P0, Some(ID), MAX);
@@ -108,14 +122,16 @@ fn records_without_a_negotiated_channel() {
 fn the_choice_is_per_frame() {
     let mut p = pair(Some(100), Some(100));
     // Pipe Stream ID 4 (1 byte), type (1), Flow 0 (1): 97 payload bytes fit.
-    p.a.send_datagram(Bytes::from(vec![1u8; 97]), true).unwrap();
-    p.a.send_datagram(Bytes::from(vec![2u8; 98]), true).unwrap();
+    p.a.send_datagram(Bytes::from(vec![1u8; 97]), true, p.now)
+        .unwrap();
+    p.a.send_datagram(Bytes::from(vec![2u8; 98]), true, p.now)
+        .unwrap();
     let now = p.now;
     assert_eq!(move_channel(&mut p.a, &mut p.b, now), 1);
     assert!(p.a.wants_write(P0), "the larger one goes in a record");
     p.pump();
     let mut got = Vec::new();
-    while let Some(d) = p.b.recv_datagram().unwrap() {
+    while let Some(d) = p.b.recv_datagram(p.now).unwrap() {
         got.push(d.len());
     }
     got.sort_unstable();
@@ -124,10 +140,14 @@ fn the_choice_is_per_frame() {
     assert_eq!(p.a.stats().datagrams_sent, 2);
     // A channel that takes nothing now (0): records.
     p.a.set_pipe_channel(P0, Some(ID), 0);
-    p.a.send_datagram(Bytes::from_static(b"z"), true).unwrap();
+    p.a.send_datagram(Bytes::from_static(b"z"), true, p.now)
+        .unwrap();
     assert!(p.a.wants_write(P0));
     p.pump();
-    assert_eq!(p.b.recv_datagram().unwrap().as_deref(), Some(&b"z"[..]));
+    assert_eq!(
+        p.b.recv_datagram(p.now).unwrap().as_deref(),
+        Some(&b"z"[..])
+    );
 }
 
 /// A shaper that changes nothing.
@@ -143,20 +163,20 @@ impl Shaper for Plain {
 fn shaped_pipes_keep_datagrams_in_records() {
     let mut p = pair(Some(MAX), Some(MAX));
     assert!(p.a.set_pipe_shaper(P0, Some(Box::new(Plain))));
-    p.a.send_datagram(Bytes::from_static(b"shaped"), true)
+    p.a.send_datagram(Bytes::from_static(b"shaped"), true, p.now)
         .unwrap();
     let mut out = Vec::new();
-    assert!(p.a.poll_channel(P0, &mut out));
+    assert!(p.a.poll_channel(P0, &mut out, p.now));
     assert_eq!(out, Vec::<bytes::Bytes>::new());
     assert!(p.a.wants_write(P0));
     p.pump();
     assert_eq!(
-        p.b.recv_datagram().unwrap().as_deref(),
+        p.b.recv_datagram(p.now).unwrap().as_deref(),
         Some(&b"shaped"[..])
     );
     // Unshaped again: the channel.
     assert!(p.a.set_pipe_shaper(P0, None));
-    p.a.send_datagram(Bytes::from_static(b"plain"), true)
+    p.a.send_datagram(Bytes::from_static(b"plain"), true, p.now)
         .unwrap();
     let now = p.now;
     assert_eq!(move_channel(&mut p.a, &mut p.b, now), 1);
@@ -166,10 +186,11 @@ fn shaped_pipes_keep_datagrams_in_records() {
 fn failed_channel_sends_count_as_dropped() {
     let mut p = pair(Some(MAX), Some(MAX));
     for _ in 0..3 {
-        p.a.send_datagram(Bytes::from_static(b"d"), true).unwrap();
+        p.a.send_datagram(Bytes::from_static(b"d"), true, p.now)
+            .unwrap();
     }
     let mut out = Vec::new();
-    assert!(p.a.poll_channel(P0, &mut out));
+    assert!(p.a.poll_channel(P0, &mut out, p.now));
     assert_eq!(out.len(), 3);
     p.a.channel_send_failed(2);
     let s = p.a.stats();
@@ -189,7 +210,7 @@ fn received_channel_datagrams_that_name_no_pipe_or_session_are_dropped() {
     let mut q = pair(None, Some(MAX));
     q.b.receive_channel_datagram(P0, &frame, now);
     assert_eq!(q.b.stats().datagrams_dropped_recv, 1);
-    assert_eq!(q.b.recv_datagram().unwrap(), None);
+    assert_eq!(q.b.recv_datagram(q.now).unwrap(), None);
     assert_eq!(q.b.state(), State::Active);
 }
 
@@ -234,7 +255,7 @@ fn channel_datagrams_are_not_records() {
         p.a.handle_timeout(now);
         p.b.handle_timeout(now);
         if p.a
-            .send_datagram(Bytes::from_static(b"tick"), true)
+            .send_datagram(Bytes::from_static(b"tick"), true, p.now)
             .is_err()
         {
             // The sender timed out first: neither do its own channel
@@ -242,7 +263,10 @@ fn channel_datagrams_are_not_records() {
             break;
         }
         move_channel(&mut p.a, &mut p.b, now);
-        assert_eq!(p.b.recv_datagram().unwrap().as_deref(), Some(&b"tick"[..]));
+        assert_eq!(
+            p.b.recv_datagram(p.now).unwrap().as_deref(),
+            Some(&b"tick"[..])
+        );
     }
     p.b.handle_timeout(start + Duration::from_secs(6));
     assert!(matches!(
@@ -257,9 +281,9 @@ fn a_stream_datagram_that_overtakes_the_opening_frame_is_held_until_it_opens() {
     for i in 0..5u8 {
         let k = p.a.open(Dir::Bidi).unwrap();
         p.a.write(k, &[i]).unwrap();
-        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true)
+        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true, p.now)
             .unwrap();
-        p.a.send_stream_datagram(k, 2, Bytes::from(vec![i, i]), true)
+        p.a.send_stream_datagram(k, 2, Bytes::from(vec![i, i]), true, p.now)
             .unwrap();
         // The channel first: the opening frame is still to be written.
         let now = p.now;
@@ -268,11 +292,11 @@ fn a_stream_datagram_that_overtakes_the_opening_frame_is_held_until_it_opens() {
         p.pump();
         let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
         assert_eq!(
-            p.b.recv_stream_datagram(s).unwrap(),
+            p.b.recv_stream_datagram(s, p.now).unwrap(),
             Some((0, Bytes::from(vec![i])))
         );
         assert_eq!(
-            p.b.recv_stream_datagram(s).unwrap(),
+            p.b.recv_stream_datagram(s, p.now).unwrap(),
             Some((2, Bytes::from(vec![i, i]))),
             "in arrival order"
         );
@@ -288,7 +312,7 @@ fn held_datagrams_expire_after_one_smoothed_rtt() {
     let mut p = pair(Some(MAX), Some(MAX));
     let k = p.a.open(Dir::Bidi).unwrap();
     p.a.write(k, b"o").unwrap();
-    p.a.send_stream_datagram(k, 0, Bytes::from_static(b"late"), true)
+    p.a.send_stream_datagram(k, 0, Bytes::from_static(b"late"), true, p.now)
         .unwrap();
     let now = p.now;
     move_channel(&mut p.a, &mut p.b, now);
@@ -305,7 +329,7 @@ fn held_datagrams_expire_after_one_smoothed_rtt() {
     );
     p.pump();
     let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
-    assert_eq!(p.b.recv_stream_datagram(s).unwrap(), None);
+    assert_eq!(p.b.recv_stream_datagram(s, p.now).unwrap(), None);
 }
 
 #[test]
@@ -323,7 +347,7 @@ fn held_datagrams_count_in_the_session_bytes_and_go_first() {
     for _ in 0..40 {
         let k = p.a.open(Dir::Bidi).unwrap();
         p.a.write(k, b"o").unwrap();
-        p.a.send_stream_datagram(k, 0, Bytes::from(vec![7u8; 60_000]), true)
+        p.a.send_stream_datagram(k, 0, Bytes::from(vec![7u8; 60_000]), true, p.now)
             .unwrap();
         move_channel(&mut p.a, &mut p.b, now);
         keys.push(k);
@@ -333,7 +357,7 @@ fn held_datagrams_count_in_the_session_bytes_and_go_first() {
     p.pump();
     let mut delivered = 0;
     while let Some(s) = p.b.accept(Dir::Bidi).unwrap() {
-        if p.b.recv_stream_datagram(s).unwrap().is_some() {
+        if p.b.recv_stream_datagram(s, p.now).unwrap().is_some() {
             delivered += 1;
         }
     }
@@ -347,12 +371,12 @@ fn held_datagrams_for_streams_in_records_too() {
     let mut p = Pair::new(dgram_config(), dgram_config());
     let k = p.a.open(Dir::Bidi).unwrap();
     p.a.write(k, b"o").unwrap();
-    p.a.send_stream_datagram(k, 0, Bytes::from_static(b"d"), true)
+    p.a.send_stream_datagram(k, 0, Bytes::from_static(b"d"), true, p.now)
         .unwrap();
     p.pump();
     let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
     assert_eq!(
-        p.b.recv_stream_datagram(s).unwrap(),
+        p.b.recv_stream_datagram(s, p.now).unwrap(),
         Some((0, Bytes::from_static(b"d")))
     );
     assert_eq!(p.b.stats().datagrams_dropped_recv, 0);
@@ -372,7 +396,8 @@ fn tiny_held_datagrams_are_bounded_by_their_entry_cost() {
     let k = p.a.open(Dir::Bidi).unwrap();
     p.a.write(k, b"o").unwrap();
     for _ in 0..20_000 {
-        p.a.send_stream_datagram(k, 0, Bytes::new(), true).unwrap();
+        p.a.send_stream_datagram(k, 0, Bytes::new(), true, p.now)
+            .unwrap();
         move_channel(&mut p.a, &mut p.b, now);
     }
     assert_eq!(p.b.stats().datagrams_dropped_recv, 20_000 - 16_384);
@@ -385,7 +410,7 @@ fn held_datagrams_expire_in_arrival_order() {
     for i in 0..3u8 {
         let k = p.a.open(Dir::Bidi).unwrap();
         p.a.write(k, b"o").unwrap();
-        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true)
+        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true, p.now)
             .unwrap();
         move_channel(&mut p.a, &mut p.b, now);
     }
@@ -393,4 +418,39 @@ fn held_datagrams_expire_in_arrival_order() {
     let due = p.b.poll_timeout().expect("a deadline");
     p.b.handle_timeout(due);
     assert_eq!(p.b.stats().datagrams_dropped_recv, 3);
+}
+
+/// `path_datagram_size` is what fits one channel datagram: a datagram of
+/// it goes on the channel, one byte more in a record; a smaller channel
+/// lowers it and `DatagramPathChanged` reports it.
+#[test]
+fn the_path_datagram_size_fits_one_channel_datagram() {
+    use zmux::proto::session::CoreEvent;
+    let mut p = pair(Some(MAX), Some(MAX));
+    let max = p.a.max_datagram_size().expect("datagrams");
+    let path = p.a.path_datagram_size().expect("datagrams");
+    // Pipe Stream ID 4 (1 byte), type (1), Flow 0 (1).
+    assert_eq!(path, MAX - 3);
+    assert!(path < max);
+    p.a.send_datagram(Bytes::from(vec![1u8; path]), true, p.now)
+        .unwrap();
+    let now = p.now;
+    assert_eq!(move_channel(&mut p.a, &mut p.b, now), 1, "on the channel");
+    p.a.send_datagram(Bytes::from(vec![2u8; path + 1]), true, p.now)
+        .unwrap();
+    assert_eq!(move_channel(&mut p.a, &mut p.b, now), 0, "in a record");
+    p.pump();
+    assert_eq!(p.a.stats().datagrams_sent_channel, 1);
+    p.a.set_pipe_channel(P0, Some(ID), MAX - 400);
+    let events: Vec<_> = std::iter::from_fn(|| p.a.poll_event()).collect();
+    assert!(
+        events.contains(&CoreEvent::DatagramPathChanged {
+            size: Some(path - 400)
+        }),
+        "{events:?}"
+    );
+    assert_eq!(p.a.path_datagram_size(), Some(path - 400));
+    // A session without a channel: the records' bound.
+    let q = pair(None, None);
+    assert_eq!(q.a.path_datagram_size(), q.a.max_datagram_size());
 }

@@ -1,7 +1,7 @@
 //! Application commands: opening and accepting streams, reading and
 //! writing, termination, priorities, datagrams and pings.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -13,7 +13,9 @@ use super::stream::{
 };
 use super::streams::Stopped;
 use super::tp::TpValues;
-use super::{DatagramError, OpenError, SessionCore, SessionError, StreamError, di, dir_of_index};
+use super::{
+    CoreEvent, DatagramError, OpenError, SessionCore, SessionError, StreamError, di, dir_of_index,
+};
 use crate::proto::frame::{Dir, Priority};
 use crate::proto::meter::Count;
 use crate::proto::payload::{AppTlvs, GreaseTlv, WirePreamble};
@@ -90,7 +92,7 @@ impl SessionCore {
     /// Opens a stream of a type. Opening reserves stream-count credit, so
     /// the stream's identifier is always below the peer's limit; nothing is
     /// sent until the first write or [`SessionCore::stream_id`]. Fails with [`OpenError::Blocked`]
-    /// without credit; the driver waits for [`super::CoreEvent::StreamsAvailable`] and tries again.
+    /// without credit; the driver waits for [`CoreEvent::StreamsAvailable`] and tries again.
     /// Before establishment the peer's limits are unknown: the stream is created
     /// and its data waits for the peer's parameters (and for credit).
     pub fn open(&mut self, dir: Dir) -> Result<StreamKey, OpenError> {
@@ -131,7 +133,7 @@ impl SessionCore {
     }
 
     /// The next peer stream of a type, in identifier order, or `None` when
-    /// none is ready (wait for [`super::CoreEvent::StreamOpened`]).
+    /// none is ready (wait for [`CoreEvent::StreamOpened`]).
     pub fn accept(&mut self, dir: Dir) -> Result<Option<StreamKey>, SessionError> {
         if let Some(e) = self.lost() {
             return Err(e);
@@ -167,7 +169,7 @@ impl SessionCore {
     /// What the receiving part has for the application, without taking
     /// it: `Ok(Some(n))` with `n` bytes readable now, `Ok(Some(0))` once the
     /// stream ended cleanly and everything was read, `Ok(None)` while
-    /// nothing is available (wait for [`super::CoreEvent::StreamReadable`]), or
+    /// nothing is available (wait for [`CoreEvent::StreamReadable`]), or
     /// the error a read would report.
     pub fn readable_len(&self, key: StreamKey) -> Result<Option<usize>, StreamError> {
         Ok(match self.readable(key)? {
@@ -265,7 +267,7 @@ impl SessionCore {
 
     /// Room for new data on the stream's sending part, as
     /// [`SessionCore::write`] takes it, or the outcome that ended it; with
-    /// no room, registers for [`super::CoreEvent::StreamWritable`] once
+    /// no room, registers for [`CoreEvent::StreamWritable`] once
     /// there is some or the part ends, as a write that took nothing does.
     pub fn poll_write_room(&mut self, key: StreamKey) -> Result<u64, StreamError> {
         let room = self.write_room(key)?;
@@ -310,7 +312,7 @@ impl SessionCore {
         })
     }
 
-    /// Registers for [`super::CoreEvent::StreamWritable`] once a wait for
+    /// Registers for [`CoreEvent::StreamWritable`] once a wait for
     /// `min` bytes of send capacity is over ([`SendCapacity::reaches`]), or
     /// the part ended. The part is woken only then, not on every change of
     /// credit, so that a caller that wants a chunk's worth costs one
@@ -363,7 +365,7 @@ impl SessionCore {
     }
 
     /// Writes as much of `data` as the send buffers take and returns the
-    /// count; 0 means wait for [`super::CoreEvent::StreamWritable`].
+    /// count; 0 means wait for [`CoreEvent::StreamWritable`].
     pub fn write(&mut self, key: StreamKey, data: &[u8]) -> Result<usize, StreamError> {
         let room = self.write_room(key)?;
         let n = usize_sat(room.min(data.len() as u64));
@@ -407,7 +409,7 @@ impl SessionCore {
 
     /// Whether every byte written to the sending part has been passed to a
     /// carrier (none is unsent); if not, registers for
-    /// [`super::CoreEvent::StreamWritable`] once that is so or the part ends.
+    /// [`CoreEvent::StreamWritable`] once that is so or the part ends.
     pub fn data_sent(&mut self, key: StreamKey) -> Result<bool, StreamError> {
         if self.writable_part(key)?.buf.is_empty() {
             return Ok(true);
@@ -470,7 +472,7 @@ impl SessionCore {
     /// Whether the stream's opening frame and every byte written were passed
     /// to a carrier (nothing is left to pass of a reset part), or are queued
     /// in the held first flight, which leaves with them; if not,
-    /// registers for [`super::CoreEvent::StreamWritable`] once that is so or
+    /// registers for [`CoreEvent::StreamWritable`] once that is so or
     /// the part ends.
     ///
     /// A `STOP_SENDING` that arrives once the opening frame and every byte
@@ -661,7 +663,7 @@ impl SessionCore {
             self.streams.drop_unsent(unsent);
             let d = di(dir);
             if self.streams.unreserve_local(d) {
-                self.push_event(super::CoreEvent::StreamsAvailable(dir_of_index(d)));
+                self.push_event(CoreEvent::StreamsAvailable(dir_of_index(d)));
             }
             self.unschedule(key);
             self.wake_send_waiters();
@@ -774,7 +776,7 @@ impl SessionCore {
     /// Reads into `buf`. Returns `Some((n, fin))` with `fin` set when the
     /// stream ended cleanly and everything was read (`n` may then be 0),
     /// or `None` when nothing is available yet (wait for
-    /// [`super::CoreEvent::StreamReadable`]). Data below a peer's Reliable Size
+    /// [`CoreEvent::StreamReadable`]). Data below a peer's Reliable Size
     /// is read before the reset is reported.
     pub fn read(
         &mut self,
@@ -1423,7 +1425,13 @@ impl SessionCore {
     /// is dropped and counted (`datagrams_dropped_limit`) once the checks
     /// that fail the call passed. Returns whether the datagram was queued:
     /// the caller then charges the limiter, after releasing the lock.
-    pub fn send_datagram(&mut self, data: Bytes, allowed: bool) -> Result<bool, DatagramError> {
+    pub fn send_datagram(
+        &mut self,
+        data: Bytes,
+        allowed: bool,
+        now: Instant,
+    ) -> Result<bool, DatagramError> {
+        self.tick(now);
         if let Some(e) = self.lost() {
             return Err(DatagramError::SessionLost(e));
         }
@@ -1462,7 +1470,9 @@ impl SessionCore {
         context: u64,
         data: Bytes,
         allowed: bool,
+        now: Instant,
     ) -> Result<bool, DatagramError> {
+        self.tick(now);
         if let Some(e) = self.lost() {
             return Err(DatagramError::SessionLost(e));
         }
@@ -1549,11 +1559,14 @@ impl SessionCore {
         else {
             return;
         };
+        let now = self.now;
         for (flow, data) in early {
             // The send limiter passed them when they were queued.
             let sent = match flow {
-                None => self.send_datagram(data, true).is_ok(),
-                Some((key, context)) => self.send_stream_datagram(key, context, data, true).is_ok(),
+                None => self.send_datagram(data, true, now).is_ok(),
+                Some((key, context)) => self
+                    .send_stream_datagram(key, context, data, true, now)
+                    .is_ok(),
             };
             if !sent {
                 self.stats.datagrams_dropped_send += 1;
@@ -1566,12 +1579,49 @@ impl SessionCore {
             self.dgram_mut().send.pop_front();
             self.stats.datagrams_dropped_send += 1;
         }
-        self.dgram_mut().send.push_back((flow, data));
+        let at = self.now;
+        self.dgram_mut()
+            .send
+            .push_back(super::OutDatagram { flow, data, at });
         self.channel_kick();
     }
 
+    /// Removes the queued datagram `i`, which leaves the send queue; the
+    /// queue's delay bound ends when it empties.
+    pub(super) fn take_send_datagram(&mut self, i: usize) -> Option<Bytes> {
+        let send_queue = self.config.datagram_send_queue;
+        let d = self.dgram_mut();
+        let was_full = d.send.len() >= send_queue;
+        let o = d.send.remove(i)?;
+        if d.send.is_empty() {
+            d.send_codel.idle();
+        }
+        if was_full {
+            self.events.push_back(CoreEvent::DatagramsUnblocked);
+        }
+        Some(o.data)
+    }
+
+    /// Decides on the queued datagram `i`, about to leave the send queue
+    /// ([`super::Config::datagram_queue_delay`]): `true` drops it, removed
+    /// and counted.
+    pub(super) fn send_delay_drop(&mut self, i: usize) -> bool {
+        let (target, now) = (self.config.datagram_queue_delay, self.now);
+        let d = self.dgram_mut();
+        let Some(at) = d.send.get(i).map(|o| o.at) else {
+            return false;
+        };
+        let alone = d.send.len() == i + 1;
+        if !d.send_codel.drop(at, now, target, alone) {
+            return false;
+        }
+        let _ = self.take_send_datagram(i);
+        self.stats.datagrams_dropped_send += 1;
+        true
+    }
+
     /// Whether the datagram send queue is full (a waiting sender waits for
-    /// [`super::CoreEvent::DatagramsUnblocked`]).
+    /// [`CoreEvent::DatagramsUnblocked`]).
     pub fn datagram_queue_full(&self) -> bool {
         self.dgram().send.len() >= self.config.datagram_send_queue
     }
@@ -1620,9 +1670,32 @@ impl SessionCore {
         refused
     }
 
-    /// The next session datagram.
-    pub fn recv_datagram(&mut self) -> Result<Option<Bytes>, SessionError> {
-        match self.dgram.as_deref_mut().and_then(|d| d.recv.pop_front()) {
+    /// The next session datagram at `now`. Datagrams queued longer than
+    /// [`super::Config::datagram_queue_delay`] allows are dropped on the
+    /// way (CoDel), counted.
+    pub fn recv_datagram(&mut self, now: Instant) -> Result<Option<Bytes>, SessionError> {
+        self.tick(now);
+        let (target, now) = (self.config.datagram_queue_delay, self.now);
+        let mut dropped = 0;
+        let mut next = None;
+        if let Some(d) = self.dgram.as_deref_mut() {
+            while let Some((data, at)) = d.recv.pop_front() {
+                if d.recv_codel.drop(at, now, target, d.recv.is_empty()) {
+                    super::debit(&mut d.recv_bytes, data.len());
+                    dropped += 1;
+                    continue;
+                }
+                next = Some(data);
+                break;
+            }
+            if d.recv.is_empty() {
+                d.recv_codel.idle();
+            }
+        }
+        if dropped > 0 {
+            self.count_dropped(dropped);
+        }
+        match next {
             Some(d) => {
                 super::debit(&mut self.dgram_mut().recv_bytes, d.len());
                 self.meter.add(Count::DatagramReceived, d.len() as u64);
@@ -1632,16 +1705,48 @@ impl SessionCore {
         }
     }
 
-    /// The next datagram of a stream, with its context.
+    /// The next datagram of a stream at `now`, with its context. Datagrams
+    /// queued longer than [`super::Config::datagram_queue_delay`] allows
+    /// are dropped on the way (CoDel), counted.
     pub fn recv_stream_datagram(
         &mut self,
         key: StreamKey,
+        now: Instant,
     ) -> Result<Option<(u64, Bytes)>, StreamError> {
+        self.tick(now);
+        let (target, now) = (self.config.datagram_queue_delay, self.now);
         let s = self
             .streams
             .get_mut(key)
             .ok_or(StreamError::ClosedLocally)?;
-        match s.datagrams.as_mut().and_then(|q| q.queue.pop_front()) {
+        let mut dropped = 0;
+        let mut dropped_bytes = 0;
+        let mut next = None;
+        if let Some(q) = s.datagrams.as_mut() {
+            while let Some((context, data, at)) = q.queue.pop_front() {
+                if q.codel.drop(at, now, target, q.queue.is_empty()) {
+                    super::debit(&mut q.bytes, data.len());
+                    dropped_bytes += data.len();
+                    dropped += 1;
+                    continue;
+                }
+                next = Some((context, data));
+                break;
+            }
+            if q.queue.is_empty() {
+                q.codel.idle();
+            }
+            q.counts.dropped_recv += dropped;
+        }
+        if dropped > 0 {
+            super::debit(&mut self.dgram_mut().stream_bytes, dropped_bytes);
+            self.count_dropped(dropped);
+        }
+        let s = self
+            .streams
+            .get_mut(key)
+            .ok_or(StreamError::ClosedLocally)?;
+        match next {
             Some((context, d)) => {
                 let n = d.len() as u64;
                 let q = s.datagrams_mut();

@@ -7,7 +7,7 @@
     reason = "short conventional names in scenario code"
 )]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use zmux::proto::frame::Dir;
@@ -32,20 +32,21 @@ fn pair(a: Config, b: Config) -> Pair {
     p
 }
 
-fn received(core: &mut SessionCore) -> Vec<Bytes> {
-    std::iter::from_fn(|| core.recv_datagram().unwrap()).collect()
+fn received(core: &mut SessionCore, now: std::time::Instant) -> Vec<Bytes> {
+    std::iter::from_fn(|| core.recv_datagram(now).unwrap()).collect()
 }
 
 #[test]
 fn the_send_queue_keeps_the_newest() {
     let mut p = pair(config(|c| c.datagram_send_queue = 2), config(|_| {}));
     for i in 0..3u8 {
-        p.a.send_datagram(Bytes::from(vec![i]), true).unwrap();
+        p.a.send_datagram(Bytes::from(vec![i]), true, p.now)
+            .unwrap();
     }
     assert!(p.a.datagram_queue_full());
     p.pump();
     assert_eq!(
-        received(&mut p.b),
+        received(&mut p.b, p.now),
         [Bytes::from(vec![1]), Bytes::from(vec![2])]
     );
     assert_eq!(p.a.stats().datagrams_dropped_send, 1);
@@ -55,11 +56,12 @@ fn the_send_queue_keeps_the_newest() {
 fn the_receive_queue_keeps_the_newest() {
     let mut p = pair(config(|_| {}), config(|c| c.datagram_receive_queue = 2));
     for i in 0..3u8 {
-        p.a.send_datagram(Bytes::from(vec![i]), true).unwrap();
+        p.a.send_datagram(Bytes::from(vec![i]), true, p.now)
+            .unwrap();
     }
     p.pump();
     assert_eq!(
-        received(&mut p.b),
+        received(&mut p.b, p.now),
         [Bytes::from(vec![1]), Bytes::from(vec![2])]
     );
     assert_eq!(p.b.stats().datagrams_dropped_recv, 1);
@@ -73,11 +75,11 @@ fn the_stream_queue_keeps_the_newest() {
     p.pump();
     let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
     for i in 0..3u8 {
-        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true)
+        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true, p.now)
             .unwrap();
     }
     p.pump();
-    let got: Vec<_> = std::iter::from_fn(|| p.b.recv_stream_datagram(s).unwrap()).collect();
+    let got: Vec<_> = std::iter::from_fn(|| p.b.recv_stream_datagram(s, p.now).unwrap()).collect();
     assert_eq!(got, [(0, Bytes::from(vec![1])), (0, Bytes::from(vec![2]))]);
     assert_eq!(p.b.stats().datagrams_dropped_recv, 1);
 }
@@ -86,10 +88,11 @@ fn the_stream_queue_keeps_the_newest() {
 fn the_receive_bytes_bound_the_session_queue() {
     let mut p = pair(config(|_| {}), config(|c| c.datagram_receive_bytes = 100));
     for i in 0..3u8 {
-        p.a.send_datagram(Bytes::from(vec![i; 60]), true).unwrap();
+        p.a.send_datagram(Bytes::from(vec![i; 60]), true, p.now)
+            .unwrap();
     }
     p.pump();
-    assert_eq!(received(&mut p.b), [Bytes::from(vec![2; 60])]);
+    assert_eq!(received(&mut p.b, p.now), [Bytes::from(vec![2; 60])]);
     assert_eq!(p.b.stats().datagrams_dropped_recv, 2);
 }
 
@@ -102,18 +105,18 @@ fn to_an_unread_stream(b: Config, n: u8, len: usize) -> (Vec<(u64, Bytes)>, u64)
     p.pump();
     let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
     for i in 0..n {
-        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i; len]), true)
+        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i; len]), true, p.now)
             .unwrap();
     }
     p.pump();
     // A session datagram as large as B's whole receive bytes still fits:
     // the stream queue holds none of them.
     let whole = p.b.config().datagram_receive_bytes.min(1000);
-    p.a.send_datagram(Bytes::from(vec![0xee; whole]), true)
+    p.a.send_datagram(Bytes::from(vec![0xee; whole]), true, p.now)
         .unwrap();
     p.pump();
-    assert_eq!(received(&mut p.b), [Bytes::from(vec![0xee; whole])]);
-    let got = std::iter::from_fn(|| p.b.recv_stream_datagram(s).unwrap()).collect();
+    assert_eq!(received(&mut p.b, p.now), [Bytes::from(vec![0xee; whole])]);
+    let got = std::iter::from_fn(|| p.b.recv_stream_datagram(s, p.now).unwrap()).collect();
     (got, p.b.stats().datagrams_dropped_recv)
 }
 
@@ -185,7 +188,7 @@ fn releasing_the_receiving_part_drops_the_streams_datagrams() {
     p.pump();
     let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
     for i in 0..2u8 {
-        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true)
+        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true, p.now)
             .unwrap();
     }
     p.pump();
@@ -193,15 +196,52 @@ fn releasing_the_receiving_part_drops_the_streams_datagrams() {
     assert_eq!(p.b.stats().datagrams_dropped_recv, 0);
     p.b.release_recv(s);
     // The two queued ones went with the handle.
-    assert_eq!(p.b.recv_stream_datagram(s).unwrap(), None);
+    assert_eq!(p.b.recv_stream_datagram(s, p.now).unwrap(), None);
     assert_eq!(p.b.stats().datagrams_dropped_recv, 2);
     // A later one is dropped on arrival.
-    p.a.send_stream_datagram(k, 0, Bytes::from_static(b"late"), true)
+    p.a.send_stream_datagram(k, 0, Bytes::from_static(b"late"), true, p.now)
         .unwrap();
     p.pump();
-    assert_eq!(p.b.recv_stream_datagram(s).unwrap(), None);
+    assert_eq!(p.b.recv_stream_datagram(s, p.now).unwrap(), None);
     assert_eq!(p.b.stats().datagrams_dropped_recv, 3);
     let st = p.b.stream_stats(s).unwrap();
     assert_eq!(st.datagrams_dropped_recv, 3);
     assert_eq!(st.datagrams_received, 2, "the late one is not counted");
+}
+
+/// A stream queue read late drops by sojourn (CoDel), counted, and keeps
+/// the datagram that arrived last.
+#[test]
+fn a_stream_queue_read_late_drops_by_sojourn() {
+    let mut p = pair(
+        config(|_| {}),
+        config(|c| {
+            c.datagram_stream_queue = 1000;
+            c.datagram_stream_bytes = None;
+        }),
+    );
+    let k = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(k, b"x").unwrap();
+    p.pump();
+    let s = p.b.accept(Dir::Bidi).unwrap().expect("opened");
+    for i in 0..100u8 {
+        p.a.send_stream_datagram(k, 0, Bytes::from(vec![i]), true, p.now)
+            .unwrap();
+        p.pump();
+        p.now += Duration::from_millis(1);
+    }
+    p.now += Duration::from_millis(200);
+    let mut got = Vec::new();
+    while let Some((_, d)) = p.b.recv_stream_datagram(s, p.now).unwrap() {
+        got.push(d[0]);
+        p.now += Duration::from_millis(10);
+    }
+    let dropped = p.b.stats().datagrams_dropped_recv;
+    assert!(
+        !got.is_empty() && got.len() < 100,
+        "delivered {}",
+        got.len()
+    );
+    assert_eq!(dropped, 100 - got.len() as u64);
+    assert_eq!(got.last(), Some(&99), "the last one is kept");
 }

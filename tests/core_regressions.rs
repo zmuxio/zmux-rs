@@ -257,7 +257,7 @@ fn stream_datagrams_stay_within_their_stream_bound() {
     let payload = Bytes::from(vec![9u8; 16_000]);
     for &k in &keys {
         for _ in 0..64 {
-            p.a.send_stream_datagram(k, 0, payload.clone(), true)
+            p.a.send_stream_datagram(k, 0, payload.clone(), true, p.now)
                 .unwrap();
             p.pump();
         }
@@ -265,7 +265,7 @@ fn stream_datagrams_stay_within_their_stream_bound() {
     let mut total = 0usize;
     for &s in &peer {
         let mut held = 0usize;
-        while let Ok(Some((_, d))) = p.b.recv_stream_datagram(s) {
+        while let Ok(Some((_, d))) = p.b.recv_stream_datagram(s, p.now) {
             held += d.len();
         }
         // 32 of 16000 bytes fit 512 KiB, the 33rd does not.

@@ -58,6 +58,13 @@ pub enum CoreEvent {
     /// channel's pipe changed: the driver polls the channels
     /// ([`super::SessionCore::poll_channel`]).
     ChannelDatagrams,
+    /// [`super::SessionCore::path_datagram_size`] changed: the carrier's
+    /// datagram size changed, another pipe carries the datagrams, or they
+    /// moved between the carrier's datagrams and records.
+    DatagramPathChanged {
+        /// The new value.
+        size: Option<usize>,
+    },
     /// Received datagrams were dropped from full queues since the last
     /// event of this kind.
     DatagramsDropped {

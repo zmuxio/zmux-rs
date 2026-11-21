@@ -1,4 +1,4 @@
-doc-valid-idents = ["QMux", ".."]
+doc-valid-idents = ["QMux", "CoDel", ".."]
 # The session core's input/output dispatchers and the drivers' select loops
 # are long match-driven functions whose arms share local state; splitting
 # them would scatter that state across helpers without making them simpler.

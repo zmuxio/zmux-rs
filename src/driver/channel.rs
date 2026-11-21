@@ -291,7 +291,7 @@ async fn run(
         let generation = {
             let mut st = shared.lock();
             st.core.set_pipe_channel(pipe, id, max);
-            let live = st.core.poll_channel(pipe, &mut out);
+            let live = st.core.poll_channel(pipe, &mut out, now());
             let generation = st.core.channel_generation();
             st.after_command();
             if !live {

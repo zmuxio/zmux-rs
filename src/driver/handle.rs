@@ -849,6 +849,9 @@ impl<D: Driver> State<D> {
                 CoreEvent::CapacityRestored { rate } => {
                     self.app_event(AppEvent::CapacityRestored { rate });
                 }
+                CoreEvent::DatagramPathChanged { size } => {
+                    self.app_event(AppEvent::DatagramPathChanged { size });
+                }
                 CoreEvent::Suspended => {
                     self.pipe_changes += 1;
                     w.wake_list(List::Pipes, wakes);
@@ -1039,7 +1042,7 @@ fn stream_send_datagram<D: Driver>(
     let allowance = shared.datagram_allowed(data.len());
     let allowed = allowance.allowed();
     let queued = stream_command(shared, key, |c, k| {
-        c.send_stream_datagram(k, context, data, allowed)
+        c.send_stream_datagram(k, context, data, allowed, D::now())
     })?;
     allowance.queued(Ok(queued))?;
     Ok(queued)
@@ -1055,6 +1058,17 @@ fn stream_max_datagram_size<D: Driver>(
     context: u64,
 ) -> Option<usize> {
     shared.lock().core.max_stream_datagram_size(key, context)
+}
+
+/// The largest datagram payload on stream `key` with Context ID `context`
+/// that leaves as one carrier datagram: the one implementation behind
+/// `SendStream::path_datagram_size` and `StreamHandle::path_datagram_size`.
+fn stream_path_datagram_size<D: Driver>(
+    shared: &Shared<D>,
+    key: StreamKey,
+    context: u64,
+) -> Option<usize> {
+    shared.lock().core.path_stream_datagram_size(key, context)
 }
 
 /// A stream's runtime-setting setters: the one implementation behind the
@@ -1879,7 +1893,7 @@ impl<D: Driver> Session<D> {
                 }
                 let r = st
                     .core
-                    .send_datagram(data.take().unwrap_or_default(), allowed);
+                    .send_datagram(data.take().unwrap_or_default(), allowed, D::now());
                 st.after_command();
                 Some(r)
             },
@@ -1892,7 +1906,7 @@ impl<D: Driver> Session<D> {
         &self,
     ) -> impl Future<Output = Result<Bytes, SessionError>> + '_ {
         Wait::new(&self.conn.inner, List::DatagramRecv, |st: &mut State<D>| {
-            st.core.recv_datagram().transpose()
+            st.core.recv_datagram(D::now()).transpose()
         })
     }
 
@@ -2505,6 +2519,14 @@ impl<D: Driver> StreamHandle<D> {
     /// part and works while a write is in flight.
     pub fn max_datagram_size(&self, context: u64) -> Option<usize> {
         stream_max_datagram_size(&self.shared, self.key, context)
+    }
+
+    /// The largest payload of a datagram on the stream with Context ID
+    /// `context` that leaves as one carrier datagram (see
+    /// [`SendStream::path_datagram_size`]); `None` without datagram flows
+    /// or once the session discarded the stream.
+    pub fn path_datagram_size(&self, context: u64) -> Option<usize> {
+        stream_path_datagram_size(&self.shared, self.key, context)
     }
 
     /// Sends a datagram on the stream (see [`SendStream::send_datagram`]).
@@ -3514,7 +3536,7 @@ impl<D: Driver> RecvStream<D> {
         Wait::new(
             &self.conn.inner,
             List::StreamDatagrams(key),
-            move |st: &mut State<D>| stream_datagram(st.core.recv_stream_datagram(key)),
+            move |st: &mut State<D>| stream_datagram(st.core.recv_stream_datagram(key, D::now())),
         )
     }
 
@@ -3528,7 +3550,9 @@ impl<D: Driver> RecvStream<D> {
             Wait::new(
                 &conn.inner,
                 List::StreamDatagrams(key),
-                move |st: &mut State<D>| stream_datagram(st.core.recv_stream_datagram(key)),
+                move |st: &mut State<D>| {
+                    stream_datagram(st.core.recv_stream_datagram(key, D::now()))
+                },
             )
             .await
         }
@@ -3694,6 +3718,7 @@ pub(crate) trait SessionApi<D: Driver> {
     fn try_open_uni_with(&self, preamble: &Preamble) -> Result<SendStream<D>, OpenError>;
     fn send_datagram(&self, data: Bytes) -> Result<(), DatagramError>;
     fn max_datagram_size(&self) -> Option<usize>;
+    fn path_datagram_size(&self) -> Option<usize>;
     fn close_reason(&self) -> Option<SessionError>;
     fn role(&self) -> Role;
     fn rtt(&self) -> Option<Duration>;
@@ -3788,12 +3813,16 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     fn send_datagram(&self, data: Bytes) -> Result<(), DatagramError> {
         let allowance = self.conn.datagram_allowed(data.len());
         let allowed = allowance.allowed();
-        let queued = self.command(|st| st.core.send_datagram(data, allowed));
+        let queued = self.command(|st| st.core.send_datagram(data, allowed, D::now()));
         allowance.queued(queued)
     }
 
     fn max_datagram_size(&self) -> Option<usize> {
         self.conn.lock().core.max_datagram_size()
+    }
+
+    fn path_datagram_size(&self) -> Option<usize> {
+        self.conn.lock().core.path_datagram_size()
     }
 
     fn close_reason(&self) -> Option<SessionError> {
@@ -4185,6 +4214,18 @@ macro_rules! session_api {
         /// Every pipe of a multipath session takes it.
         pub fn max_datagram_size(&self) -> Option<usize> {
             <Self as crate::driver::handle::SessionApi<$d>>::max_datagram_size(self)
+        }
+
+        /// The largest session datagram payload that leaves as one datagram
+        /// of the carrier instead of in a record: on a carrier with a
+        /// datagram channel (a QUIC connection, HTTP/3, WebTransport) what
+        /// one of its datagrams takes as the carrier last reported it, path
+        /// MTU discovery included; elsewhere [`Self::max_datagram_size`],
+        /// since every datagram rides the records there. A packet forwarder
+        /// uses it as its MTU; `SessionEvent::DatagramPathChanged` reports
+        /// changes. `None` when the peer accepts no datagrams.
+        pub fn path_datagram_size(&self) -> Option<usize> {
+            <Self as crate::driver::handle::SessionApi<$d>>::path_datagram_size(self)
         }
 
         /// Why the session ended, once it has.
@@ -4826,6 +4867,7 @@ pub(crate) trait SendStreamApi<D: Driver> {
     fn priority(&self) -> Priority;
     fn set_send_buffer(&self, bytes: u64) -> Result<(), StreamError>;
     fn max_datagram_size(&self, context: u64) -> Option<usize>;
+    fn path_datagram_size(&self, context: u64) -> Option<usize>;
     fn send_datagram(&self, context: u64, data: Bytes) -> Result<(), DatagramError>;
     fn meter(&self) -> &Arc<Meter>;
     fn stats(&self) -> StreamStats;
@@ -4895,6 +4937,10 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
 
     fn max_datagram_size(&self, context: u64) -> Option<usize> {
         stream_max_datagram_size(&self.conn.0, self.key, context)
+    }
+
+    fn path_datagram_size(&self, context: u64) -> Option<usize> {
+        stream_path_datagram_size(&self.conn.0, self.key, context)
     }
 
     fn send_datagram(&self, context: u64, data: Bytes) -> Result<(), DatagramError> {
@@ -5059,6 +5105,15 @@ macro_rules! sendstream_api {
         /// 8 bytes.
         pub fn max_datagram_size(&self, context: u64) -> Option<usize> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::max_datagram_size(self, context)
+        }
+
+        /// The largest payload of a datagram on this stream with Context ID
+        /// `context` that leaves as one datagram of the carrier instead of
+        /// in a record (the session's `path_datagram_size` less the
+        /// stream's Flow and Context ID), bounded by
+        /// [`Self::max_datagram_size`]; `None` without datagram flows.
+        pub fn path_datagram_size(&self, context: u64) -> Option<usize> {
+            <Self as crate::driver::handle::SendStreamApi<$d>>::path_datagram_size(self, context)
         }
 
         /// Sends a datagram on this stream (Flow = stream ID + 1). Never waits.

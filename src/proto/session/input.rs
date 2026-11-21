@@ -1579,6 +1579,7 @@ impl SessionCore {
         let n = q.queue.len() as u64;
         let bytes = std::mem::take(&mut q.bytes);
         q.queue.clear();
+        q.codel.idle();
         q.counts.dropped_recv += n;
         if n > 0 {
             super::debit(&mut self.dgram_mut().stream_bytes, bytes);
@@ -1765,7 +1766,7 @@ impl SessionCore {
         let held = self.dgram_mut().held_bytes;
         while (self.dgram_mut().recv.len() >= recv_queue
             || self.dgram_mut().recv_bytes + held + data.len() > recv_bytes_cap)
-            && let Some(old) = self.dgram_mut().recv.pop_front()
+            && let Some((old, _)) = self.dgram_mut().recv.pop_front()
         {
             super::debit(&mut self.dgram_mut().recv_bytes, old.len());
             dropped += 1;
@@ -1779,8 +1780,9 @@ impl SessionCore {
             self.count_dropped(dropped);
         }
         self.dgram_mut().recv_bytes += data.len();
+        let at = self.now;
         let was_empty = self.dgram_mut().recv.is_empty();
-        self.dgram_mut().recv.push_back(data);
+        self.dgram_mut().recv.push_back((data, at));
         if was_empty {
             self.events.push_back(CoreEvent::DatagramReceived);
         }
@@ -1796,6 +1798,7 @@ impl SessionCore {
     fn queue_stream_datagram(&mut self, key: StreamKey, context: u64, data: Bytes) -> bool {
         let stream_queue = self.config.datagram_stream_queue;
         let stream_bytes = self.config.datagram_stream_bytes;
+        let now = self.now;
         let mut dropped = 0;
         let len = data.len();
         let Some(s) = self.streams.get_mut(key) else {
@@ -1804,7 +1807,7 @@ impl SessionCore {
         let s = s.datagrams_mut();
         let dgram = self.dgram.get_or_insert_with(Box::default);
         while (s.queue.len() >= stream_queue || stream_bytes.is_some_and(|cap| s.bytes + len > cap))
-            && let Some((_, old)) = s.queue.pop_front()
+            && let Some((_, old, _)) = s.queue.pop_front()
         {
             super::debit(&mut s.bytes, old.len());
             super::debit(&mut dgram.stream_bytes, old.len());
@@ -1812,7 +1815,7 @@ impl SessionCore {
         }
         s.counts.dropped_recv += dropped;
         let was_empty = s.queue.is_empty();
-        s.queue.push_back((context, data));
+        s.queue.push_back((context, data, now));
         s.bytes += len;
         dgram.stream_bytes += len;
         if dropped > 0 {

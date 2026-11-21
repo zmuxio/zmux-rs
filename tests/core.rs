@@ -226,7 +226,7 @@ fn datagrams_waiting_for_the_limiter_stay_within_the_session_bytes() {
     let send = |p: &mut Pair, n: usize| {
         for _ in 0..n {
             for _ in 0..50 {
-                p.a.send_datagram(Bytes::from(vec![9u8; 1000]), true)
+                p.a.send_datagram(Bytes::from(vec![9u8; 1000]), true, p.now)
                     .unwrap();
             }
             p.pump();
@@ -254,7 +254,7 @@ fn datagrams_waiting_for_the_limiter_stay_within_the_session_bytes() {
     let _ = p.b.admit_datagrams(&mut rest);
     assert!(p.b.held_bytes() <= LIMIT);
     let mut n = 0;
-    while p.b.recv_datagram().unwrap().is_some() {
+    while p.b.recv_datagram(p.now).unwrap().is_some() {
         n += 1;
     }
     // The session queue keeps its newest 128.
@@ -296,7 +296,7 @@ fn application_bytes_count_payload_once_and_never_what_was_discarded() {
     for _ in 0..3 {
         let permit = zmux::Permit::try_acquire(&*send_budget, 400, 400);
         let queued =
-            p.a.send_datagram(Bytes::from_static(&[3; 400]), permit.is_some())
+            p.a.send_datagram(Bytes::from_static(&[3; 400]), permit.is_some(), p.now)
                 .unwrap();
         if let (Some(mut permit), true) = (permit, queued) {
             permit.consume(400);
@@ -308,7 +308,11 @@ fn application_bytes_count_payload_once_and_never_what_was_discarded() {
     let mut held = Vec::new();
     p.b.take_received_datagrams(&mut held);
     assert_eq!(held.len(), 2, "held for the limiter");
-    assert_eq!(p.b.recv_datagram().unwrap(), None, "not queued before it");
+    assert_eq!(
+        p.b.recv_datagram(p.now).unwrap(),
+        None,
+        "not queued before it"
+    );
     for d in &mut held {
         d.set_granted(zmux::proto::limit::police(
             &*receive_budget,
@@ -325,8 +329,11 @@ fn application_bytes_count_payload_once_and_never_what_was_discarded() {
     let mut buf = [0u8; 2000];
     assert_eq!(p.b.read(r1, &mut buf).unwrap(), Some((2000, false)));
     p.b.stop(r1, VarInt::from_u32(0)).unwrap();
-    assert_eq!(p.b.recv_datagram().unwrap().map(|d| d.len()), Some(400));
-    assert_eq!(p.b.recv_datagram().unwrap(), None);
+    assert_eq!(
+        p.b.recv_datagram(p.now).unwrap().map(|d| d.len()),
+        Some(400)
+    );
+    assert_eq!(p.b.recv_datagram(p.now).unwrap(), None);
     p.pump();
 
     assert_eq!(meter.bytes_read(), 2000, "the discarded rest is not read");
@@ -675,9 +682,12 @@ fn datagram_pair() -> Pair {
 
 /// Sends `len` bytes from A and returns what B received.
 fn datagram_through(p: &mut Pair, len: usize) -> Option<usize> {
-    assert!(p.a.send_datagram(Bytes::from(vec![7; len]), true).unwrap());
+    assert!(
+        p.a.send_datagram(Bytes::from(vec![7; len]), true, p.now)
+            .unwrap()
+    );
     p.pump();
-    p.b.recv_datagram().unwrap().map(|d| d.len())
+    p.b.recv_datagram(p.now).unwrap().map(|d| d.len())
 }
 
 #[test]
@@ -686,7 +696,7 @@ fn the_largest_datagram_reported_is_exactly_the_largest_delivered() {
     let max = p.a.max_datagram_size().unwrap();
     assert_eq!(datagram_through(&mut p, max), Some(max));
     assert!(matches!(
-        p.a.send_datagram(Bytes::from(vec![0; max + 1]), true),
+        p.a.send_datagram(Bytes::from(vec![0; max + 1]), true, p.now),
         Err(zmux::proto::session::DatagramError::TooLarge { max: m }) if m == max
     ));
     // A carrier whose records are smaller than the peer's bound (a TLS
@@ -696,7 +706,7 @@ fn the_largest_datagram_reported_is_exactly_the_largest_delivered() {
     assert!(capped < max && capped < 8192, "{capped}");
     assert_eq!(datagram_through(&mut p, capped), Some(capped));
     assert!(
-        p.a.send_datagram(Bytes::from(vec![0; capped + 1]), true)
+        p.a.send_datagram(Bytes::from(vec![0; capped + 1]), true, p.now)
             .is_err()
     );
     assert_eq!(p.a.stats().datagrams_dropped_send, 0);
@@ -706,11 +716,14 @@ fn the_largest_datagram_reported_is_exactly_the_largest_delivered() {
 fn a_datagram_no_carrier_takes_any_more_is_dropped_without_holding_the_queue() {
     let mut p = datagram_pair();
     let max = p.a.max_datagram_size().unwrap();
-    assert!(p.a.send_datagram(Bytes::from(vec![1; max]), true).unwrap());
+    assert!(
+        p.a.send_datagram(Bytes::from(vec![1; max]), true, p.now)
+            .unwrap()
+    );
     // The carrier's records shrink before its turn.
     p.a.set_pipe_max_record(P0, 8192).unwrap();
     assert_eq!(datagram_through(&mut p, 10), Some(10));
-    assert_eq!(p.b.recv_datagram().unwrap(), None);
+    assert_eq!(p.b.recv_datagram(p.now).unwrap(), None);
     assert_eq!(p.a.stats().datagrams_dropped_send, 1);
     assert_eq!(datagram_through(&mut p, 20), Some(20));
 }

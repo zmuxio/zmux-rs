@@ -304,6 +304,21 @@ pub enum SessionEvent {
     /// session was established and again on every switch: the latest when
     /// several were not read.
     CarrierChosen(CarrierKind, Option<std::sync::Arc<str>>),
+    /// The largest session datagram payload that leaves as one datagram of
+    /// the carrier instead of in a record changed
+    #[cfg_attr(
+        feature = "tokio",
+        doc = " ([`Session::path_datagram_size`](crate::Session#method.path_datagram_size)):"
+    )]
+    #[cfg_attr(not(feature = "tokio"), doc = " (`Session::path_datagram_size`):")]
+    /// the carrier's datagram size changed (path MTU discovery), another
+    /// pipe carries the datagrams, or they moved between the carrier's
+    /// datagrams and records. It is noticed when the session sends or its
+    /// pipes change. The latest when several were not read.
+    DatagramPathChanged {
+        /// The new value; `None` when the peer accepts no datagram.
+        size: Option<usize>,
+    },
     /// Pipes were retired since the last such event was read (at least
     /// one): their unread events left the queue (only unretired pipes hold
     /// events), and the pipes whose terminal state the application had not

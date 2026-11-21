@@ -488,5 +488,5 @@ fn a_granted_datagram_the_queue_refuses_is_refunded() {
     }];
     assert_eq!(c.admit_datagrams(&mut staged), 10, "the grant is refunded");
     assert_eq!(c.stats.datagrams_dropped_recv, 1);
-    assert_eq!(c.recv_datagram().unwrap(), None);
+    assert_eq!(c.recv_datagram(c.now).unwrap(), None);
 }

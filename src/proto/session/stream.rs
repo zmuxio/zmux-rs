@@ -1656,8 +1656,11 @@ impl StreamExtra {
 /// A stream's datagram flow (datagram flows).
 #[derive(Debug, Default)]
 pub(crate) struct StreamDatagrams {
-    /// Received datagrams, not yet read.
-    pub(crate) queue: VecDeque<(u64, Bytes)>,
+    /// Received datagrams, not yet read: context, payload and when it was
+    /// queued.
+    pub(crate) queue: VecDeque<(u64, Bytes, Instant)>,
+    /// The queue's delay bound ([`Config::datagram_queue_delay`](super::Config::datagram_queue_delay)).
+    pub(crate) codel: super::codel::Codel,
     /// Payload bytes in `queue` ([`Config::datagram_stream_bytes`](super::Config::datagram_stream_bytes)).
     pub(crate) bytes: usize,
     /// Counts.

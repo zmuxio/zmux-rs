@@ -834,6 +834,17 @@ pub struct Config {
     /// alone. The default holds the default 32 datagrams up to 9000-byte
     /// packets without a drop the count would not make.
     pub datagram_stream_bytes: Option<usize>,
+    /// The target queueing delay of every datagram queue: the send queue,
+    /// the session receive queue and each stream's (default `Some(20 ms)`;
+    /// `None` turns the bound off, leaving the count and byte bounds;
+    /// `Some(Duration::ZERO)` is a configuration error). Once the
+    /// datagrams leaving a queue have waited longer than it for 100 ms,
+    /// CoDel (RFC 8289) drops some of them as they leave, more the longer
+    /// the standing delay lasts, each counted as dropped; a datagram alone
+    /// in its queue is never dropped for its delay. A forwarder sets it
+    /// near the delay its traffic tolerates (20 to 50 ms for interactive
+    /// traffic).
+    pub datagram_queue_delay: Option<Duration>,
     /// Written-but-unreleased bytes per session before writes wait
     /// (default 4 MiB): unsent on a single pipe, unacknowledged in a
     /// multipath session. Shared fairly between stream directions, each of
@@ -1224,6 +1235,7 @@ impl Default for Config {
             datagram_stream_queue: 32,
             datagram_receive_bytes: 1024 * 1024,
             datagram_stream_bytes: Some(DEFAULT_DATAGRAM_STREAM_BYTES),
+            datagram_queue_delay: Some(super::codel::DEFAULT_DATAGRAM_QUEUE_DELAY),
             send_buffer: 4 * 1024 * 1024,
             send_buffer_max: Cap::Auto,
             max_send_record: crate::util::usize_sat(crate::proto::params::DEFAULT_MAX_RECORD_SIZE),
@@ -1631,6 +1643,10 @@ impl Config {
             (
                 "datagram_stream_bytes",
                 self.datagram_stream_bytes == Some(0),
+            ),
+            (
+                "datagram_queue_delay",
+                self.datagram_queue_delay == Some(Duration::ZERO),
             ),
         ] {
             if zero {

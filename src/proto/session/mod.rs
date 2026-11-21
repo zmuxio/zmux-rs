@@ -33,6 +33,7 @@
 mod api;
 mod app_event;
 mod channel;
+mod codel;
 mod config;
 mod credit;
 mod early;
@@ -579,14 +580,18 @@ impl SessionCore {
 /// Datagram state.
 #[derive(Debug, Default)]
 pub(super) struct DatagramState {
-    /// Outgoing datagrams: flow prefix (stream ID and context) and payload.
-    send: VecDeque<(Option<(u64, u64)>, Bytes)>,
+    /// Outgoing datagrams.
+    send: VecDeque<OutDatagram>,
+    /// The send queue's delay bound ([`Config::datagram_queue_delay`]).
+    send_codel: codel::Codel,
     /// Datagrams sent before establishment: the stream
     /// (`None` for the session) and context, and the payload. Sent, or
     /// dropped and counted, once the peer's parameters arrive.
     early: VecDeque<(Option<(StreamKey, u64)>, Bytes)>,
-    /// Received session datagrams.
-    recv: VecDeque<Bytes>,
+    /// Received session datagrams and when each was queued.
+    recv: VecDeque<(Bytes, Instant)>,
+    /// The session queue's delay bound ([`Config::datagram_queue_delay`]).
+    recv_codel: codel::Codel,
     /// Bytes held in the session queue and, with an entry cost each, for
     /// streams not opened yet (`waiting`): what
     /// [`Config::datagram_receive_bytes`] bounds.
@@ -607,6 +612,19 @@ pub(super) struct DatagramState {
     waiting: VecDeque<WaitingDatagram>,
     /// [`SessionCore::channel_generation`].
     channel_gen: u64,
+    /// The last [`SessionCore::path_datagram_size`] reported
+    /// ([`CoreEvent::DatagramPathChanged`]).
+    path: Option<usize>,
+}
+
+/// A datagram in the send queue.
+#[derive(Debug)]
+struct OutDatagram {
+    /// The flow prefix: stream ID and context, `None` for the session.
+    flow: Option<(u64, u64)>,
+    data: Bytes,
+    /// When it was queued ([`Config::datagram_queue_delay`]).
+    at: Instant,
 }
 
 /// A received datagram held for a peer stream not opened yet.
@@ -642,12 +660,12 @@ impl DatagramState {
     fn heap_bytes(&self) -> usize {
         use std::mem::size_of;
         size_of::<Self>()
-            + self.send.capacity() * size_of::<(Option<(u64, u64)>, Bytes)>()
+            + self.send.capacity() * size_of::<OutDatagram>()
             + self.early.capacity() * size_of::<(Option<(StreamKey, u64)>, Bytes)>()
-            + self.recv.capacity() * size_of::<Bytes>()
+            + self.recv.capacity() * size_of::<(Bytes, Instant)>()
             + self.held.capacity() * size_of::<ReceivedDatagram>()
             + self.waiting.capacity() * size_of::<WaitingDatagram>()
-            + self.send.iter().map(|(_, b)| b.len()).sum::<usize>()
+            + self.send.iter().map(|o| o.data.len()).sum::<usize>()
             + self.early.iter().map(|(_, b)| b.len()).sum::<usize>()
             + self.recv_bytes
             + self.stream_bytes
@@ -658,14 +676,17 @@ impl DatagramState {
 /// The datagram state of a session that never had one.
 static NO_DGRAM: DatagramState = DatagramState {
     send: VecDeque::new(),
+    send_codel: codel::Codel::new(),
     early: VecDeque::new(),
     recv: VecDeque::new(),
+    recv_codel: codel::Codel::new(),
     recv_bytes: 0,
     stream_bytes: 0,
     held: VecDeque::new(),
     held_bytes: 0,
     waiting: VecDeque::new(),
     channel_gen: 0,
+    path: None,
 };
 
 impl SessionCore {
@@ -1901,7 +1922,15 @@ impl SessionCore {
             // A custom decision made before no longer applies.
             self.advance_pick_generation();
         }
+        let pipes = matches!(
+            e,
+            CoreEvent::PipeState { .. } | CoreEvent::PipeRetired { .. }
+        );
         self.events.push_back(e);
+        if pipes {
+            // Another pipe may carry the datagrams now.
+            self.note_datagram_path();
+        }
     }
 
     fn notify_readable(&mut self, key: StreamKey) {
@@ -2413,6 +2442,7 @@ impl SessionCore {
             features: self.features,
             protocol,
         });
+        self.note_datagram_path();
         // Streams opened before establishment may send now.
         for d in 0..2 {
             let ld = self.streams.local_dir(d);

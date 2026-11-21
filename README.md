@@ -268,6 +268,16 @@ per stream, by `datagram_stream_queue` (32) and `datagram_stream_bytes`
 `max_incoming_streams`, whose range ends at `zmux::MAX_STREAM_CREDIT`
 (2^60, as many as the protocol can count).
 
+Every datagram queue, the send queue included, also bounds how long its
+datagrams wait (`Config::datagram_queue_delay`, 20 ms; `None`: off): once
+the datagrams leaving a queue have waited longer for 100 ms, CoDel drops
+some as they leave, counted, so a slow reader gets fresh datagrams instead
+of stale ones. `Session::path_datagram_size` (and
+`SendStream::path_datagram_size`) is the largest payload that leaves as one
+carrier datagram, a QUIC DATAGRAM as path MTU discovery sizes it, instead
+of in a record; `SessionEvent::DatagramPathChanged` reports changes. A
+packet forwarder uses it as its MTU.
+
 zmux gives memory back as load goes away: idle pipes return their read and
 write buffers after a second, a process-wide pool keeps a bounded number of
 read buffers, and closed streams and sessions free their state. Whether the

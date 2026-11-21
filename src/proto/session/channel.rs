@@ -21,7 +21,7 @@ use std::time::Instant;
 use bytes::{BufMut, Bytes, BytesMut};
 
 use super::pipes::{Attachment, Channel, InState, OutPipe};
-use super::{CoreEvent, PipeId, SessionCore, State};
+use super::{CoreEvent, PipeId, SessionCore, State, StreamKey};
 use crate::proto::frame::{FrameType, channel};
 use crate::proto::payload::Flow;
 
@@ -53,6 +53,7 @@ impl SessionCore {
         o.set_channel(Some(new));
         // A larger maximum may take queued datagrams.
         self.channel_kick();
+        self.note_datagram_path();
     }
 
     /// Changes whenever datagrams were queued that may go on a channel, or
@@ -81,28 +82,31 @@ impl SessionCore {
     /// driver to send in order, outside the lock. Returns [`SessionCore::channel_live`]. Datagrams
     /// returned count as sent; [`SessionCore::channel_send_failed`] counts those the
     /// carrier refused as dropped instead.
-    pub fn poll_channel(&mut self, pipe: PipeId, out: &mut Vec<Bytes>) -> bool {
-        let send_queue = self.config.datagram_send_queue;
+    pub fn poll_channel(&mut self, pipe: PipeId, out: &mut Vec<Bytes>, now: Instant) -> bool {
+        self.tick(now);
         if !self.channel_live(pipe) {
             return false;
         }
+        self.note_datagram_path();
         let Some(ch) = self.channel_for(pipe.0, false) else {
             return true;
         };
         let mut i = 0;
         loop {
-            let Some((flow, data)) = self.dgram().send.get(i) else {
+            let Some(o) = self.dgram().send.get(i) else {
                 return true;
             };
-            let flow = *flow;
+            let flow = o.flow;
             let f = self.flow_of(flow);
-            let n = f.map_or(0, |f| f.encoded_len()) + data.len();
+            let n = f.map_or(0, |f| f.encoded_len()) + o.data.len();
             if self.datagram_pipe(flow).is_some() || channel::datagram_len(ch.id, n) > ch.max {
                 i += 1;
                 continue;
             }
-            let was_full = self.dgram().send.len() >= send_queue;
-            let Some((_, data)) = self.dgram_mut().send.remove(i) else {
+            if self.send_delay_drop(i) {
+                continue;
+            }
+            let Some(data) = self.take_send_datagram(i) else {
                 return true;
             };
             let mut buf = BytesMut::with_capacity(channel::datagram_len(ch.id, n));
@@ -116,9 +120,6 @@ impl SessionCore {
             out.push(buf.freeze());
             self.datagram_sent(f, data.len() as u64);
             self.stats.datagrams_sent_channel += 1;
-            if was_full {
-                self.events.push_back(CoreEvent::DatagramsUnblocked);
-            }
         }
     }
 
@@ -226,6 +227,59 @@ impl SessionCore {
         };
         let n = self.flow_of(flow).map_or(0, |f| f.encoded_len()) + len;
         channel::datagram_len(ch.id, n) <= ch.max
+    }
+
+    /// The largest session datagram payload that leaves as one datagram of
+    /// the carrier's datagram channel instead of in a record (the channel's
+    /// maximum as the driver last gave it, [`SessionCore::set_pipe_channel`],
+    /// less the channel framing and the flow), bounded by
+    /// [`SessionCore::max_datagram_size`]; where datagrams ride records (no
+    /// channel, or none usable now) it is that bound. `None` when the peer
+    /// accepts no datagram. Applications that carry packets use it as their
+    /// MTU.
+    pub fn path_datagram_size(&self) -> Option<usize> {
+        let max = self.max_datagram_size()?;
+        Some(self.path_size(max, self.flow_of(None).map_or(0, |f| f.encoded_len())))
+    }
+
+    /// [`SessionCore::path_datagram_size`] for a datagram of stream `key`
+    /// with Context ID `context`, bounded by
+    /// [`SessionCore::max_stream_datagram_size`]; `None` without datagram
+    /// flows.
+    pub fn path_stream_datagram_size(&self, key: StreamKey, context: u64) -> Option<usize> {
+        let max = self.max_stream_datagram_size(key, context)?;
+        let flow = self
+            .streams
+            .get(key)?
+            .id
+            .map_or(8, |id| crate::proto::varint::len(id + 1));
+        Some(self.path_size(max, flow + crate::proto::varint::len(context)))
+    }
+
+    /// A payload bound `max` (of a datagram with a `flow`-byte prefix)
+    /// narrowed to what one channel datagram of the channel pipe takes.
+    fn path_size(&self, max: usize, flow: usize) -> usize {
+        match self.channel_pipe().and_then(|p| self.channel_for(p, false)) {
+            Some(ch) => max.min(
+                ch.max
+                    .saturating_sub(channel::datagram_len(ch.id, 0) + flow),
+            ),
+            None => max,
+        }
+    }
+
+    /// Reports a change of [`SessionCore::path_datagram_size`]
+    /// ([`CoreEvent::DatagramPathChanged`]).
+    pub(super) fn note_datagram_path(&mut self) {
+        if !self.config.enable_datagrams || !self.is_established() {
+            return;
+        }
+        let size = self.path_datagram_size();
+        if self.dgram().path != size {
+            self.dgram_mut().path = size;
+            self.events
+                .push_back(CoreEvent::DatagramPathChanged { size });
+        }
     }
 
     /// The flow prefix of a queued datagram, with datagram flows in use.

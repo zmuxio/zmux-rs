@@ -426,7 +426,7 @@ impl SessionCore {
                 .dgram()
                 .send
                 .iter()
-                .any(|(f, _)| self.datagram_pipe(*f) == Some(id))
+                .any(|o| self.datagram_pipe(o.flow) == Some(id))
         {
             return true;
         }
@@ -551,7 +551,6 @@ impl SessionCore {
     /// Those that the pipe's datagram channel takes are left to
     /// [`SessionCore::poll_channel`].
     pub(super) fn write_datagrams(&mut self, pipe: u64, control: bool, w: &mut Records<'_>) {
-        let send_queue = self.config.datagram_send_queue;
         let bound = self.max_datagram_frame();
         let max_frame = bound.unwrap_or(0);
         let ch = control
@@ -563,9 +562,10 @@ impl SessionCore {
                 .is_some_and(|o| o.state() == OutState::Active);
         let mut i = 0;
         loop {
-            let Some((flow, data)) = self.dgram().send.get(i) else {
+            let Some(o) = self.dgram().send.get(i) else {
                 return;
             };
+            let (flow, data) = (&o.flow, &o.data);
             let follow = self.datagram_pipe(*flow);
             let here = match follow {
                 Some(p) => p == pipe && carries,
@@ -591,12 +591,8 @@ impl SessionCore {
                 // Larger than any frame the carriers take now (a pipe with
                 // smaller records joined since it was queued): dropped and
                 // counted, so that it does not hold the datagrams after it.
-                let was_full = self.dgram().send.len() >= send_queue;
-                self.dgram_mut().send.remove(i);
+                let _ = self.take_send_datagram(i);
                 self.stats.datagrams_dropped_send += 1;
-                if was_full {
-                    self.events.push_back(CoreEvent::DatagramsUnblocked);
-                }
                 continue;
             }
             // With a Length field when it fits the peer's frame limit and
@@ -613,8 +609,10 @@ impl SessionCore {
             if !room {
                 return;
             }
-            let was_full = self.dgram().send.len() >= send_queue;
-            let Some((_, data)) = self.dgram_mut().send.remove(i) else {
+            if self.send_delay_drop(i) {
+                continue;
+            }
+            let Some(data) = self.take_send_datagram(i) else {
                 return;
             };
             let mut header = [0u8; 9 + 16];
@@ -639,9 +637,6 @@ impl SessionCore {
                 w.end_record();
             }
             self.datagram_sent(flow, len);
-            if was_full {
-                self.events.push_back(CoreEvent::DatagramsUnblocked);
-            }
         }
     }
 

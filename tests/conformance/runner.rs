@@ -2501,10 +2501,15 @@ impl Runner {
                 let r = match &a.stream {
                     Some(st) => {
                         let key = self.key(st)?;
-                        self.session
-                            .send_stream_datagram(key, a.context.unwrap_or(0), data, true)
+                        self.session.send_stream_datagram(
+                            key,
+                            a.context.unwrap_or(0),
+                            data,
+                            true,
+                            self.now(),
+                        )
                     }
-                    None => self.session.send_datagram(data, true),
+                    None => self.session.send_datagram(data, true, self.now()),
                 };
                 match r {
                     Ok(_) => ok,
@@ -2514,13 +2519,13 @@ impl Runner {
             Call::RecvDatagram(a) => match &a.stream {
                 Some(st) => {
                     let key = self.key(st)?;
-                    match self.session.recv_stream_datagram(key) {
+                    match self.session.recv_stream_datagram(key, self.now()) {
                         Ok(Some((ctx, d))) => json!({"data": to_hex(&d), "context": ctx}),
                         Ok(None) => json!({"pending": true}),
                         Err(e) => stream_error(&e),
                     }
                 }
-                None => match self.session.recv_datagram() {
+                None => match self.session.recv_datagram(self.now()) {
                     Ok(Some(d)) => json!({"data": to_hex(&d)}),
                     Ok(None) => json!({"pending": true}),
                     Err(e) => session_error(&e),

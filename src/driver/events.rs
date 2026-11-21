@@ -55,6 +55,7 @@ enum Key {
     CapacityRestored,
     EpochCommitted,
     EpochDeleted,
+    DatagramPath,
     Retired,
     Candidate(CarrierKind, Option<Arc<str>>),
     Chosen,
@@ -99,6 +100,7 @@ impl Key {
             SessionEvent::CapacityRestored { .. } => Self::CapacityRestored,
             SessionEvent::EpochCommitted { .. } => Self::EpochCommitted,
             SessionEvent::EpochDeleted { .. } => Self::EpochDeleted,
+            SessionEvent::DatagramPathChanged { .. } => Self::DatagramPath,
             SessionEvent::CarrierCandidate { kind, variant, .. } => {
                 Self::Candidate(*kind, variant.clone())
             }

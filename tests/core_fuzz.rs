@@ -456,7 +456,7 @@ fn run(ops: &[Op], preamble: bool, datagrams: bool, role: bool) {
                 if let Some(k) = h.handle(*i) {
                     let _ = h.s.read(k, &mut buf);
                     let _ = h.s.read_chunk(k, 100);
-                    let _ = h.s.recv_stream_datagram(k);
+                    let _ = h.s.recv_stream_datagram(k, h.now);
                 }
             }
             Op::Release(i) => {
@@ -484,11 +484,11 @@ fn run(ops: &[Op], preamble: bool, datagrams: bool, role: bool) {
                 let _ = h.s.ping();
             }
             Op::Datagram(i) => {
-                let _ = h.s.send_datagram(Bytes::from_static(b"dgram"), true);
-                let _ = h.s.recv_datagram();
+                let _ = h.s.send_datagram(Bytes::from_static(b"dgram"), true, h.now);
+                let _ = h.s.recv_datagram(h.now);
                 if let Some(k) = h.handle(*i) {
                     let _ =
-                        h.s.send_stream_datagram(k, 3, Bytes::from_static(b"sd"), true);
+                        h.s.send_stream_datagram(k, 3, Bytes::from_static(b"sd"), true, h.now);
                 }
             }
             Op::Shutdown => h.s.shutdown(VarInt::from_u32(0), b"", h.now),

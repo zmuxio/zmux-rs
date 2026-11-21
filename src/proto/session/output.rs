@@ -292,11 +292,9 @@ impl SessionCore {
             || self.streams.control_pending()
             || self.goaway().pending.is_some()
             || self.goaway().resend.is_some()
-            || self
-                .dgram()
-                .send
-                .iter()
-                .any(|(f, d)| self.datagram_pipe(*f).is_none() && !self.channel_takes(*f, d.len()))
+            || self.dgram().send.iter().any(|o| {
+                self.datagram_pipe(o.flow).is_none() && !self.channel_takes(o.flow, o.data.len())
+            })
     }
 
     /// A credit update (`MAX_DATA`, `MAX_STREAMS`, `MAX_STREAM_DATA`) waits:
