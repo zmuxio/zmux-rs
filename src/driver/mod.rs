@@ -227,8 +227,9 @@ pub(crate) const DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_se
 
 /// The end of listener setup, or no deadline when it exceeds the clock range.
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
-#[doc(hidden)]
+#[cfg_attr(feature = "tokio", doc(hidden))]
 #[must_use]
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
 pub fn handshake_deadline(
     start: std::time::Instant,
     limit: std::time::Duration,
