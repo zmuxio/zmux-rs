@@ -31,6 +31,8 @@ struct Slot {
     failure: Option<io::ErrorKind>,
     /// The body was dropped (its exchange is gone).
     gone: bool,
+    /// A split request waiting for its shared setup.
+    on_drop: Option<tokio::sync::oneshot::Sender<()>>,
     /// A request body whose response is still awaited: once the body is
     /// gone, writes wait for the response to tell why ([`Abort::await_response`]).
     awaiting: bool,
@@ -91,6 +93,16 @@ pub(crate) fn body() -> (BodyWriter, PipeBody, Abort) {
 pub(crate) struct Abort(Arc<Shared>);
 
 impl Abort {
+    /// Cancels this request's setup wait when HTTP drops its response.
+    pub(crate) fn dropped(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut s = self.0.lock();
+        if !s.gone {
+            s.on_drop = Some(tx);
+        }
+        rx
+    }
+
     pub(crate) fn run(self) {
         self.0.end(End::Abort);
     }
@@ -262,9 +274,38 @@ enum Inner {
     /// either.
     Fixed(Option<ChunkBuf>),
     Boxed(BoxedBody),
+    Head(Box<(PipeBody, zmux::adapter::ResponseHead)>),
 }
 
 impl PipeBody {
+    pub(crate) fn with_head(self, sent: zmux::adapter::ResponseHead) -> Self {
+        Self(Inner::Head(Box::new((self, sent))))
+    }
+
+    /// Moves the receipt into a separately scheduled header write. A host
+    /// that cancels that write asynchronously keeps it until the write exits.
+    pub fn take_response_head(&mut self) -> Option<zmux::adapter::ResponseHead> {
+        if !matches!(&self.0, Inner::Head(_)) {
+            return None;
+        }
+        let Inner::Head(head) = std::mem::replace(&mut self.0, Inner::Fixed(None)) else {
+            unreachable!()
+        };
+        let (body, sent) = *head;
+        *self = body;
+        Some(sent)
+    }
+
+    /// Confirms that the server successfully flushed this response's headers.
+    /// A custom HTTP server calls this after its header write and flush and
+    /// before driving the response body. The built-in serve functions do this
+    /// internally. Dropping the response before confirmation withdraws takeover.
+    pub fn response_head_flushed(&mut self) {
+        if let Some(sent) = self.take_response_head() {
+            sent.flushed();
+        }
+    }
+
     /// A body without data.
     #[must_use]
     pub fn empty() -> Self {
@@ -335,6 +376,7 @@ impl Body for PipeBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<ChunkBuf>, io::Error>>> {
         let (shared, generation) = match &mut self.get_mut().0 {
+            Inner::Head(head) => return Pin::new(&mut head.0).poll_frame(cx),
             Inner::Fed(shared, g) => (shared, *g),
             Inner::Fixed(chunks) => return Poll::Ready(chunks.take().map(|c| Ok(Frame::data(c)))),
             Inner::Boxed(b) => {
@@ -389,6 +431,7 @@ impl Body for PipeBody {
 
     fn is_end_stream(&self) -> bool {
         match &self.0 {
+            Inner::Head(_) => false,
             Inner::Fed(s, _) => {
                 let s = s.lock();
                 s.chunks.is_empty() && s.end == Some(End::Finish)
@@ -400,6 +443,7 @@ impl Body for PipeBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         match &self.0 {
+            Inner::Head(head) => head.0.size_hint(),
             Inner::Fed(..) => http_body::SizeHint::default(),
             Inner::Fixed(chunks) => {
                 http_body::SizeHint::with_exact(chunks.as_ref().map_or(0, |c| c.len() as u64))
@@ -412,14 +456,15 @@ impl Body for PipeBody {
 impl Drop for PipeBody {
     fn drop(&mut self) {
         if let Inner::Fed(shared, generation) = &self.0 {
-            let waker = {
+            let (waker, on_drop) = {
                 let mut s = shared.lock();
                 if s.generation != *generation {
                     return;
                 }
                 s.gone = true;
-                s.writer.take()
+                (s.writer.take(), s.on_drop.take())
             };
+            drop(on_drop);
             if let Some(w) = waker {
                 w.wake();
             }
@@ -433,6 +478,7 @@ impl Drop for PipeBody {
 pub(crate) struct BodyReader<B> {
     body: B,
     chunk: Bytes,
+    trailers: Option<Box<http::HeaderMap>>,
     ended: bool,
 }
 
@@ -441,13 +487,14 @@ impl<B> BodyReader<B> {
         Self {
             body,
             chunk: Bytes::new(),
+            trailers: None,
             ended: false,
         }
     }
 
-    /// The body and the part of its last frame not read yet.
-    pub(crate) fn into_parts(self) -> (B, Bytes) {
-        (self.body, self.chunk)
+    /// Return every frame consumed by byte-stream admission to the HTTP host.
+    pub(crate) fn replay(self, prefix: Bytes) -> ReplayBody<B> {
+        ReplayBody::new([prefix, self.chunk], Some(self.body)).with_trailers(self.trailers)
     }
 }
 
@@ -458,12 +505,30 @@ impl<B> BodyReader<B> {
 pub struct ReplayBody<B> {
     front: [Bytes; 2],
     rest: Option<B>,
+    trailers: Option<Box<http::HeaderMap>>,
+    stop: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
 impl<B> ReplayBody<B> {
     /// `front` then `rest`.
     pub(crate) fn new(front: [Bytes; 2], rest: Option<B>) -> Self {
-        Self { front, rest }
+        Self {
+            front,
+            rest,
+            trailers: None,
+            stop: None,
+        }
+    }
+
+    pub(crate) fn with_trailers(mut self, trailers: Option<Box<http::HeaderMap>>) -> Self {
+        self.trailers = trailers;
+        self
+    }
+
+    pub(crate) fn stop_with(&mut self, listener: zmux::Listener) {
+        if self.stop.is_none() {
+            self.stop = Some(Box::pin(async move { listener.adapter().closed().await }));
+        }
     }
 
     /// The bytes given back in front not read yet, and the rest of the
@@ -489,6 +554,8 @@ impl<B> std::fmt::Debug for ReplayBody<B> {
         f.debug_struct("ReplayBody")
             .field("front", &(self.front[0].len() + self.front[1].len()))
             .field("rest", &self.rest.is_some())
+            .field("trailers", &self.trailers.is_some())
+            .field("stop", &self.stop.is_some())
             .finish()
     }
 }
@@ -506,10 +573,24 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, B::Error>>> {
         let this = self.get_mut();
+        if this
+            .stop
+            .as_mut()
+            .is_some_and(|stop| stop.as_mut().poll(cx).is_ready())
+        {
+            this.front = Default::default();
+            this.trailers = None;
+            this.rest = None;
+            this.stop = None;
+            return Poll::Ready(None);
+        }
         for b in &mut this.front {
             if !b.is_empty() {
                 return Poll::Ready(Some(Ok(Frame::data(std::mem::take(b)))));
             }
+        }
+        if let Some(trailers) = this.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(*trailers))));
         }
         match &mut this.rest {
             Some(rest) => Pin::new(rest)
@@ -520,7 +601,9 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.front.iter().all(Bytes::is_empty) && self.rest.as_ref().is_none_or(Body::is_end_stream)
+        self.front.iter().all(Bytes::is_empty)
+            && self.trailers.is_none()
+            && self.rest.as_ref().is_none_or(Body::is_end_stream)
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
@@ -568,16 +651,109 @@ where
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
                 }
-                Poll::Ready(Some(Ok(frame))) => {
-                    // Trailers carry nothing of the pipe.
-                    if let Ok(mut data) = frame.into_data() {
-                        // Shared when the frame is one buffer.
-                        self.chunk = data.copy_to_bytes(data.remaining());
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(mut data) => self.chunk = data.copy_to_bytes(data.remaining()),
+                    Err(frame) => {
+                        self.trailers = frame.into_trailers().ok().map(Box::new);
+                        self.ended = true;
                     }
-                }
+                },
             }
         }
     }
+}
+
+/// Before handoff the HTTP reader and setup can both observe a reset. Keep
+/// DATA pulled by the observer in order, bounded by the setup replay budget
+/// plus the one frame currently returned by the HTTP implementation.
+pub(crate) struct SetupBody<B> {
+    reader: BodyReader<B>,
+    ahead: ChunkBuf,
+    failure: Option<io::Error>,
+}
+
+impl<B> SetupBody<B> {
+    pub(crate) fn new(reader: BodyReader<B>) -> Self {
+        Self {
+            reader,
+            ahead: ChunkBuf::new(),
+            failure: None,
+        }
+    }
+}
+
+impl<B> SetupBody<B>
+where
+    B: Body + Unpin,
+    B::Data: Buf,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    fn poll_reset(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        while !self.reader.ended && self.ahead.len() < REPLAY_MAX {
+            // An empty destination leaves the current frame intact.
+            let result = Pin::new(&mut self.reader).poll_read(cx, &mut ReadBuf::new(&mut []));
+            match result {
+                Poll::Ready(Ok(())) => self.ahead.push(std::mem::take(&mut self.reader.chunk)),
+                Poll::Ready(Err(error)) => {
+                    self.failure = Some(error);
+                    return Poll::Ready(());
+                }
+                Poll::Pending => break,
+            }
+        }
+        Poll::Pending
+    }
+}
+
+impl<B> AsyncRead for SetupBody<B>
+where
+    B: Body + Unpin,
+    B::Data: Buf,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.ahead.is_empty() {
+            if let Some(error) = self.failure.take() {
+                return Poll::Ready(Err(error));
+            }
+            return Pin::new(&mut self.reader).poll_read(cx, buf);
+        }
+        let n = self.ahead.chunk().len().min(buf.remaining());
+        buf.put_slice(&self.ahead.chunk()[..n]);
+        self.ahead.advance(n);
+        Poll::Ready(Ok(()))
+    }
+}
+
+pub(crate) async fn request_gone<B>(
+    probe: zmux::adapter::ReadProbe<SetupBody<B>>,
+    response: impl Future,
+    transport: Option<std::sync::Weak<zmux_rustls::TcpReset>>,
+) where
+    B: Body + Unpin,
+    B::Data: Buf,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    let reset = std::future::poll_fn(|cx| {
+        probe
+            .poll(cx, SetupBody::poll_reset)
+            .unwrap_or(Poll::Pending)
+    });
+    let failed = async {
+        match transport {
+            Some(connection) => {
+                if let Some(tcp) = connection.upgrade() {
+                    tcp.failed().await;
+                }
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! { biased; _ = response => {}, () = failed => {}, () = reset => {} }
 }
 
 /// The whole of `body`, at most `limit` bytes: one data frame is taken as
@@ -628,6 +804,7 @@ where
 #[derive(Default)]
 pub(crate) struct Gathered {
     first: Bytes,
+    pub(crate) trailers: Option<Box<http::HeaderMap>>,
     joined: Option<bytes::BytesMut>,
 }
 
@@ -668,12 +845,12 @@ impl Gathered {
 /// `deadline`, without reading beyond the frame that completes them.
 /// Whether it does; a body that ends, fails or passes the deadline first
 /// leaves what was read. A trailers frame read on the way ends the reading
-/// and is lost.
+/// and is retained for HTTP fallback.
 pub(crate) async fn read_to<B>(
     body: &mut B,
     read: &mut Gathered,
     len: usize,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
 ) -> bool
 where
     B: Body + Unpin,
@@ -681,11 +858,17 @@ where
 {
     while read.len() < len {
         let next = std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx));
-        let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, next).await else {
+        let Some(Some(Ok(frame))) =
+            zmux::adapter::while_open(zmux::adapter::wait_deadline(deadline), next).await
+        else {
             return false;
         };
-        let Ok(mut data) = frame.into_data() else {
-            return false;
+        let mut data = match frame.into_data() {
+            Ok(data) => data,
+            Err(frame) => {
+                read.trailers = frame.into_trailers().ok().map(Box::new);
+                return false;
+            }
         };
         let data = data.copy_to_bytes(data.remaining());
         if !data.is_empty() {

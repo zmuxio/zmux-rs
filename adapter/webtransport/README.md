@@ -47,12 +47,10 @@ The carrier wires:
   stopped) with `ZMUX_CARRIER_FAILED`, and a session that ends under a pipe
   is a failure of the pipe.
 
-quinn has no RESET_STREAM_AT, the frame of QUIC stream resets with partial
-delivery, so this adapter does not offer the `reset_stream_at` transport
-parameter: quinn would close the connection on the first such frame it read.
-A client that requires the parameter of its server refuses this one before the
-session starts. As a client this adapter connects to servers that do not
-require it of their clients.
+This adapter omits the `reset_stream_at` transport parameter. A client that
+requires the server to offer it refuses the connection before the session starts.
+When acting as a client, this adapter connects to servers for which the
+parameter is optional.
 
 ```rust,no_run
 # async fn example(client: web_transport_quinn::Client) -> Result<(), Box<dyn std::error::Error>> {

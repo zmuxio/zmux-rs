@@ -112,14 +112,15 @@ use zmux_quinn::{ConnectionDatagrams, QuicChannel};
 
 mod bounded;
 pub use bounded::RecvStream;
+use bounded::SendStream;
 
 /// The HTTP/3 ALPN identifier, which the QUIC endpoints must carry.
 pub const ALPN: &[u8] = b"h3";
 
-type ClientSend = h3::client::RequestStream<h3_quinn::SendStream<ChunkBuf>, ChunkBuf>;
+type ClientSend = h3::client::RequestStream<SendStream<ChunkBuf>, ChunkBuf>;
 type ClientRecv = h3::client::RequestStream<RecvStream, ChunkBuf>;
 /// The sending half of a server's request stream: the response.
-pub type ServerSend = h3::server::RequestStream<h3_quinn::SendStream<ChunkBuf>, ChunkBuf>;
+pub type ServerSend = h3::server::RequestStream<SendStream<ChunkBuf>, ChunkBuf>;
 /// The receiving half of a server's request stream: the request body.
 pub type ServerRecv = h3::server::RequestStream<RecvStream, ChunkBuf>;
 
@@ -132,14 +133,9 @@ pub struct Options {
     /// blocked at once. Lanes are requests, so the requests the peer may
     /// open at once (quinn's `max_concurrent_bidi_streams`) bound them too.
     pub windows: LaneWindows,
-    /// Server: the handler of the requests that carry no pipe: those the
-    /// listener's admission hands to the fallback on their head (a request
-    /// whose body ends before its first byte), every request the admission
-    /// hands to the fallback without a listener's fallback, and those the
-    /// listener does not take (none by default: such requests are answered
-    /// with 404). A request carrier decided on the start of its body goes
-    /// to the listener's fallback ([`zmux::ListenerConfig::fallback`]) as a
-    /// carrier when there is one.
+    /// Serves requests selected by `AdmissionVerdict::Fallback` and requests
+    /// declined by the listener. Without a handler these requests receive 404.
+    /// Explicit carrier takeovers go to [`zmux::ListenerConfig::fallback`].
     pub fallback: Option<Fallback>,
     /// Client: the credential whose prefix ([`CarrierCredential::prefix`], given
     /// the connection's [`zmux_quinn::Handshake::carrier_info`]) is written
@@ -278,7 +274,8 @@ fn with_connection<T: Send + Sync + 'static>(
     conn: fn(&T) -> &Connection,
 ) -> PipeIo {
     let exporter = Arc::downgrade(owner);
-    io.with_carrier_conn(id)
+    zmux_quinn::with_packet_counters(io, owner, conn)
+        .with_carrier_conn(id)
         // HTTP/3 runs over ALPN `h3`, as the other QUIC carriers report theirs.
         .with_terminated_tls(|| Some(zmux::TlsState::new(Some(b"h3".to_vec()), None)))
         .with_carrier_secure()
@@ -584,13 +581,13 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
 ///   [`zmux::CarrierInfo::with_request`] value) and the connection's
 ///   metadata ([`zmux_quinn::Handshake::carrier_info`]). `Accept(k)`
 ///   answers 200 and hands the carrier to the listener, the prefix after
-///   `k` bytes in front; `Fallback` on the start of the body, with a
+///   `k` bytes in front; `Takeover`, with a
 ///   listener's fallback ([`zmux::ListenerConfig::fallback`]), answers 200
 ///   and hands the carrier to it as a [`zmux::Takeover`] (request body in,
 ///   every byte read replayed, response body out, each half closed on its
 ///   own; the halves keep the connection's state, so a detached one
-///   outlives the request's task); `Fallback` on the head, or without a
-///   listener's fallback, hands the request to [`Options::fallback`] with
+///   outlives the request's task). Without a byte-stream target `Takeover`
+///   stalls. `Fallback` hands the request to [`Options::fallback`] with
 ///   every byte read ([`FallbackRequest`]), or answers 404 without one;
 ///   `Stall` reads and discards the body for a
 ///   stall's duration (or until it ends) and then resets the request
@@ -634,25 +631,31 @@ pub async fn serve_connection(
         _charge: charge,
         connection: Mutex::new(None),
     });
+    let request_stop = bounded::RequestStop::default();
     let mut h3 = h3::server::builder()
         .enable_datagram(true)
         .max_field_section_size(bounded::MAX_FIELD_SECTION)
-        .build::<_, ChunkBuf>(bounded::Connection::new(conn.clone()))
+        .build::<_, ChunkBuf>(bounded::Connection::serving(
+            conn.clone(),
+            request_stop.clone(),
+        ))
         .await
         .map_err(h3_error)?;
     // A request's head arrives within the handshake timeout, and so does
     // the connection's first one: a peer that opens streams and sends no
     // HEADERS holds neither tasks nor the connection beyond it.
     let head_limit = listener.adapter().handshake_timeout();
-    let first_by = tokio::time::Instant::now() + head_limit;
+    let first_by =
+        zmux::adapter::handshake_deadline(tokio::time::Instant::now().into_std(), head_limit)
+            .map(tokio::time::Instant::from_std);
     let resolved = Arc::new(AtomicBool::new(false));
     {
         let (conn, resolved) = (conn.clone(), resolved.clone());
         tokio::spawn(async move {
             // Gone with the connection: no wait for a closed one.
-            if tokio::time::timeout_at(first_by, conn.closed())
+            if zmux::adapter::while_open(conn.closed(), zmux::adapter::wait_deadline(first_by))
                 .await
-                .is_ok()
+                .is_none()
             {
                 return;
             }
@@ -669,11 +672,20 @@ pub async fn serve_connection(
             Err(e) if e.is_h3_no_error() => break,
             Err(e) => return Err(h3_error(e)),
         };
+        let (stopped, fallback_stop) = request_stop.take();
         let shared = shared.clone();
         let resolved = resolved.clone();
         tokio::spawn(async move {
-            let Ok(Ok((head, stream))) =
-                tokio::time::timeout(head_limit, pending.resolve_request()).await
+            let deadline = zmux::adapter::handshake_deadline(
+                tokio::time::Instant::now().into_std(),
+                head_limit,
+            )
+            .map(tokio::time::Instant::from_std);
+            let Some(Ok((head, stream))) = zmux::adapter::while_open(
+                zmux::adapter::wait_deadline(deadline),
+                pending.resolve_request(),
+            )
+            .await
             else {
                 return;
             };
@@ -697,13 +709,19 @@ pub async fn serve_connection(
             let source = shared.source(head.headers());
             let Some(entry) = shared.listener.adapter().enter(peer, Some(source)) else {
                 // Not taken, nothing answered: to the fallback.
-                shared.fall_back(head, Bytes::new(), send, recv).await;
+                shared
+                    .fall_back(head, Bytes::new(), send, recv, fallback_stop)
+                    .await;
                 return;
             };
             if shared.listener.adapter().admission().is_some() {
-                shared.admit(entry, head, send, recv).await;
+                shared
+                    .admit(entry, head, send, recv, stopped, fallback_stop)
+                    .await;
             } else {
-                shared.serve_unadmitted(entry, head, send, recv).await;
+                shared
+                    .serve_unadmitted(entry, head, send, recv, stopped, fallback_stop)
+                    .await;
             }
         });
     }
@@ -755,14 +773,16 @@ impl Served {
             .source(self.conn.remote_address(), headers)
     }
 
-    async fn handle(self: &Arc<Self>, io: PipeIo, entry: Entry) {
-        let _ = self
-            .listener
-            .handle_pipe(
+    async fn handle(self: &Arc<Self>, io: PipeIo, entry: Entry, stopped: bounded::Stopped) -> bool {
+        self.listener
+            .adapter()
+            .setup_until(
                 with_connection(io, self.id.clone(), self, |s| &s.conn),
                 PipeHint::from_entry(entry),
+                stopped,
             )
-            .await;
+            .await
+            .is_some()
     }
 
     /// A request the listener does not get: to the fallback, or 404.
@@ -772,8 +792,11 @@ impl Served {
         prefix: Bytes,
         mut send: ServerSend,
         recv: ServerRecv,
+        fallback_stop: bounded::FallbackStop,
     ) {
         if let Some(f) = &self.fallback {
+            let listener = self.listener.clone();
+            fallback_stop.bind(async move { listener.adapter().closed().await });
             let peer = self.source(head.headers());
             f.serve(FallbackRequest {
                 head,
@@ -799,6 +822,8 @@ impl Served {
         head: http::Request<()>,
         mut send: ServerSend,
         recv: ServerRecv,
+        mut stopped: bounded::Stopped,
+        fallback_stop: bounded::FallbackStop,
     ) {
         let mut reader = BodyReader::server(recv);
         let (parts, ()) = head.into_parts();
@@ -809,13 +834,35 @@ impl Served {
                     zmux::adapter::visit_fields(&p.headers, each);
                 },
             );
-            entry.decide_request(info, Some(&mut reader)).await
+            let Some(verdict) = zmux::adapter::while_open(
+                &mut stopped,
+                entry.decide_request(info, Some(&mut reader)),
+            )
+            .await
+            else {
+                return;
+            };
+            verdict
         };
+        if matches!(admit, Admit::Accept(_) | Admit::TakeOver(_)) {
+            // Keep the response writer's state out of the setup and takeover futures.
+            let write = Box::pin(zmux::adapter::while_open(
+                &mut stopped,
+                send.send_response(http::Response::new(())),
+            ));
+            let written = if matches!(admit, Admit::TakeOver(_)) {
+                entry
+                    .takeover_head(async { matches!(write.await, Some(Ok(()))) })
+                    .await
+            } else {
+                matches!(entry.setup_step(write).await, Some(Some(Ok(()))))
+            };
+            if !written {
+                return;
+            }
+        }
         match admit {
             Admit::Accept(rest) => {
-                if send.send_response(http::Response::new(())).await.is_err() {
-                    return;
-                }
                 let channel = self.channel(&send);
                 let (r, w) = paired(reader, BodyWriter::new(SendHalf::Server(send), None));
                 self.handle(
@@ -824,6 +871,7 @@ impl Served {
                         .with_prefix(rest)
                         .with_datagram_channel(channel),
                     entry,
+                    stopped,
                 )
                 .await;
             }
@@ -832,9 +880,6 @@ impl Served {
                 // fallback: answered as an accepted one. Its halves keep
                 // the connection's state: a detached carrier outlives this
                 // request's task.
-                if send.send_response(http::Response::new(())).await.is_err() {
-                    return;
-                }
                 let channel = self.channel(&send);
                 let keep: Keep = self.clone();
                 #[expect(
@@ -858,6 +903,7 @@ impl Served {
                 entry.take_over(io, prefix).await;
             }
             Admit::Fallback(prefix) => {
+                entry.complete_request_fallback(self.fallback.is_some());
                 drop(entry);
                 let (recv, unread) = reader.into_server();
                 let mut replay = prefix;
@@ -867,12 +913,15 @@ impl Served {
                     replay.into(),
                     send,
                     recv,
+                    fallback_stop,
                 )
                 .await;
             }
             Admit::Stall => {
-                entry.stall(Some(&mut reader)).await;
-                send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+                let stall = entry.stall_request(Some(reader), move |_| async move {
+                    send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+                });
+                zmux::adapter::while_open(stopped, stall).await;
             }
             _ => send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED),
         }
@@ -885,6 +934,8 @@ impl Served {
         head: http::Request<()>,
         send: ServerSend,
         recv: ServerRecv,
+        stopped: bounded::Stopped,
+        fallback_stop: bounded::FallbackStop,
     ) {
         // Without an admission, accepted at once.
         let _ = entry
@@ -894,15 +945,20 @@ impl Served {
         let answer = Arc::new(Answer::new(send));
         let mut reader = BodyReader::server(recv);
         reader.answer = Some(answer.clone());
-        let (r, w) = paired(reader, BodyWriter::unanswered(answer.clone()));
-        let taken = answer.clone();
-        let io = PipeIo::from_chunk_halves(r, w)
+        let (gone, released) = tokio::sync::oneshot::channel();
+        let mut writer = BodyWriter::unanswered(answer.clone());
+        writer.answer_owner = Some(gone);
+        let (r, w) = paired(reader, writer);
+        let io = answer
+            .on_taken(PipeIo::from_chunk_halves(r, w), released)
             .with_carrier(zmux::CarrierKind::Http3)
-            .with_taken(move || Answer::taken(taken))
             .with_datagram_channel(channel);
-        self.handle(io, entry).await;
+        if !self.handle(io, entry, stopped).await {
+            return;
+        }
         if let Some((send, recv)) = answer.reclaim() {
-            self.fall_back(head, Bytes::new(), send, recv).await;
+            self.fall_back(head, Bytes::new(), send, recv, fallback_stop)
+                .await;
         }
     }
 }
@@ -963,7 +1019,7 @@ impl Fallback {
     /// Serves `req`.
     pub async fn serve(&self, req: FallbackRequest) {
         let handler = &self.0;
-        handler(req).await;
+        zmux::adapter::host_future(|| handler(req)).await;
     }
 }
 
@@ -991,6 +1047,24 @@ impl Answer {
         }
     }
 
+    /// The writer's release interrupts the response task even while its
+    /// send is pending. Its worker belongs to the carrier from construction.
+    fn on_taken(
+        self: &Arc<Self>,
+        mut io: PipeIo,
+        released: tokio::sync::oneshot::Receiver<()>,
+    ) -> PipeIo {
+        let answer = self.clone();
+        let worker = io.worker_guard();
+        io.with_taken(move || {
+            answer.committed.store(true, Ordering::Release);
+            tokio::spawn(async move {
+                let _worker = worker;
+                zmux::adapter::while_open(released, answer.taken()).await;
+            });
+        })
+    }
+
     /// Sends the response on `half`, once per request.
     async fn respond(&self, half: &mut SendHalf) -> io::Result<()> {
         if self.responded.swap(true, Ordering::AcqRel) {
@@ -1000,14 +1074,11 @@ impl Answer {
     }
 
     /// The listener took the carrier: the response is sent now.
-    fn taken(this: Arc<Self>) {
-        this.committed.store(true, Ordering::Release);
-        tokio::spawn(async move {
-            let mut slot = this.send.lock().await;
-            if let Some(half) = slot.as_mut() {
-                let _ = this.respond(half).await;
-            }
-        });
+    async fn taken(&self) {
+        let mut slot = self.send.lock().await;
+        if let Some(half) = slot.as_mut() {
+            let _ = self.respond(half).await;
+        }
     }
 
     /// The sending half for the writer, the response sent.
@@ -1248,6 +1319,7 @@ enum Sending {
 /// otherwise is reset with `ZMUX_CARRIER_FAILED`, also with a write in
 /// flight, with or without a runtime.
 struct BodyWriter {
+    answer_owner: Option<tokio::sync::oneshot::Sender<()>>,
     sending: Sending,
     /// The end of the body is in flight.
     finishing: bool,
@@ -1265,6 +1337,7 @@ struct BodyWriter {
 impl BodyWriter {
     fn new(half: SendHalf, keep: Option<Keep>) -> Self {
         Self {
+            answer_owner: None,
             sending: Sending::Idle(Box::new(half)),
             finishing: false,
             finished: false,
@@ -1277,6 +1350,7 @@ impl BodyWriter {
     /// A server's half that sends its response before its first write.
     fn unanswered(answer: Arc<Answer>) -> Self {
         Self {
+            answer_owner: None,
             sending: Sending::Unanswered(answer),
             finishing: false,
             finished: false,
@@ -1606,7 +1680,7 @@ pub fn candidate(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")))]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -1676,7 +1750,7 @@ mod tests {
                 .resolve_request()
                 .await
                 .unwrap();
-            let (_send, recv) = request.split();
+            let (response, recv) = request.split();
             let mut reader = BodyReader::server(recv);
             let mut byte = [0];
             reader.read_exact(&mut byte).await.unwrap();
@@ -1685,12 +1759,49 @@ mod tests {
             // transport read. Dropping used to call stop_sending and panic.
             drop(reader);
             assert_eq!(send.stopped().await.unwrap(), Some(0u32.into()));
+            blocked_response_belongs_to_its_carrier(response).await;
             drop(client);
             c.close(0u32.into(), b"");
             s.close(0u32.into(), b"");
         })
         .await
         .unwrap();
+    }
+
+    // Hold the actual HTTP/3 response half away from the response task.
+    // Carrier release must reap that task while the send gate is still shut.
+    async fn blocked_response_belongs_to_its_carrier(response: ServerSend) {
+        let answer = Arc::new(Answer::new(response));
+        let send_gate = answer.send.lock().await;
+        let (gone, released) = tokio::sync::oneshot::channel();
+        let mut writer = BodyWriter::unanswered(answer.clone());
+        writer.answer_owner = Some(gone);
+        let (near, far) = tokio::io::duplex(8192);
+        let io = answer.on_taken(PipeIo::new(near), released);
+        let listener =
+            Listener::new(zmux::Config::default(), zmux::ListenerConfig::default()).unwrap();
+        let (result, client) = tokio::join!(
+            listener.handle_pipe(io, PipeHint::default()),
+            Session::connect(PipeIo::new(far), zmux::Config::default()),
+        );
+        result.unwrap();
+        let _client = client.unwrap();
+        let server = listener.accept().await.unwrap();
+        let pipe = server.pipe(zmux::PipeId::new(0)).unwrap();
+        assert!(answer.committed.load(Ordering::Acquire));
+        server.close().await;
+        server.closed().await;
+        let mut closed = std::pin::pin!(pipe.closed());
+        assert!(
+            closed
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        drop(writer);
+        let _ = closed.await;
+        assert_eq!(Arc::strong_count(&answer), 1);
+        drop(send_gate);
     }
 
     /// The carrier contract (`zmux::test_hooks::carrier_conformance`) on a

@@ -323,6 +323,22 @@ async fn through_proxy(faults: Faults, seed: u64, len: usize) -> std::sync::Arc<
     stats
 }
 
+#[test]
+fn an_overflowing_handshake_deadline_allows_an_http1_exchange() {
+    run(10, || async {
+        let mut limits = ListenerConfig::default();
+        limits.handshake_timeout = Duration::MAX;
+        let options = quick();
+        let srv = server_with(options.clone(), limits).await;
+        let client = zmux_http::connect_exchange(&srv.addr, &options, Config::default())
+            .await
+            .unwrap();
+        echo(&client, 1024, 7).await;
+        client.close().await;
+        srv.listener.close();
+    });
+}
+
 /// A held DOWN request on a connection of its own (a proxy that opens one
 /// per request) outlives the listener's handshake timeout: the setup
 /// deadline bounds connections without a request in progress only, so an

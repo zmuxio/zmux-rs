@@ -1130,12 +1130,62 @@ async fn proofs_give_pq_authentication_both_ways() {
     assert!(!peer.pq_authenticated);
 }
 
+#[tokio::test]
+async fn client_credential_failures_expose_the_check_and_cause() {
+    use std::error::Error as _;
+    use zmux_seal::{CredentialFailure, CredentialFailureReason as Reason};
+
+    struct Check(Reason);
+    impl Verifier for Check {
+        fn verify<'a>(
+            &'a self,
+            input: VerifyInput<'a>,
+        ) -> BoxFuture<'a, Result<VerifyVerdict, VerifyError>> {
+            Box::pin(async move {
+                if self.0 == Reason::Verifier {
+                    return Err(VerifyError::rejected("test verifier denied the peer"));
+                }
+                Ok(VerifyVerdict {
+                    principal: Principal::StaticKey(input.peer_static.to_vec()),
+                    proof_key: (self.0 == Reason::Proof).then_some([1; 32]),
+                    value: None,
+                })
+            })
+        }
+    }
+    for reason in [Reason::Proof, Reason::PqAuthRequired, Reason::Verifier] {
+        let l = listener(None, keys().psk.to_vec());
+        let mut cfg = client(Arc::new(Check(reason)));
+        cfg.require_pq_auth = reason == Reason::PqAuthRequired;
+        let error = run(&l, &cfg).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let detail = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<CredentialFailure>()
+            .unwrap();
+        assert_eq!(detail.class(), Error::CredentialsFailed);
+        assert_eq!(detail.reason, reason);
+        match reason {
+            Reason::Verifier => assert_eq!(
+                detail.source().unwrap().downcast_ref::<VerifyError>(),
+                Some(&VerifyError::rejected("test verifier denied the peer"))
+            ),
+            Reason::Proof | Reason::PqAuthRequired => {
+                assert!(detail.source().unwrap().is::<Error>());
+            }
+            _ => panic!("unexpected credential failure"),
+        }
+        l.close();
+    }
+}
+
 /// What a server's reject policy is told of its own credential decisions: a verifier's
-/// rejection is `credentials_failed`, a missing or wrong proof `proof`, a missing PQ
-/// authentication that is required `pq_auth_required`; a verifier that cannot decide closes
-/// the carrier without asking the policy.
+/// rejection, missing proof and missing required PQ authentication share the
+/// credential failure class. A temporarily unavailable verifier closes the carrier.
 #[tokio::test]
 async fn server_credential_decisions_name_their_reason() {
+    use zmux_seal::CredentialFailureReason as Reason;
     struct Decides(Result<Option<KeyId>, bool>);
     impl Verifier for Decides {
         fn verify<'a>(
@@ -1157,13 +1207,13 @@ async fn server_credential_decisions_name_their_reason() {
     }
     let client_key = SigningKey::generate(KEYALG_MLDSA44).unwrap();
     let client_id = client_key.key_id();
-    let cases: [(Decides, bool, &[&str]); 4] = [
-        (Decides(Err(true)), false, &["credentials_failed"]),
-        (Decides(Err(false)), false, &[]),
+    let cases = [
+        (Decides(Err(true)), false, Some(Reason::Verifier)),
+        (Decides(Err(false)), false, None),
         // The client does not sign: the proof the verdict names is missing.
-        (Decides(Ok(Some(client_id))), false, &["proof"]),
+        (Decides(Ok(Some(client_id))), false, Some(Reason::Proof)),
         // A proof key is not named and PQ authentication is required.
-        (Decides(Ok(None)), true, &["pq_auth_required"]),
+        (Decides(Ok(None)), true, Some(Reason::PqAuthRequired)),
     ];
     for (verifier, require_pq_auth, want) in cases {
         let server = ServerConfig::new(
@@ -1185,7 +1235,22 @@ async fn server_credential_decisions_name_their_reason() {
         lc.on_reject = Some(zmux::proto::listener::OnReject::new({
             let reasons = reasons.clone();
             move |i| {
-                reasons.lock().unwrap().push(i.reason);
+                use std::error::Error as _;
+                assert_eq!(i.reason, "credentials_failed");
+                let detail = i
+                    .error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CredentialFailure>()
+                    .unwrap();
+                assert_eq!(detail.class(), Error::CredentialsFailed);
+                match detail.reason {
+                    Reason::Verifier => assert!(detail.source().unwrap().is::<VerifyError>()),
+                    Reason::Proof => assert!(detail.source().unwrap().is::<Error>()),
+                    Reason::PqAuthRequired => assert!(detail.source().is_none()),
+                    _ => panic!("unexpected credential failure"),
+                }
+                reasons.lock().unwrap().push(detail.reason);
                 zmux::proto::listener::RejectAction::Close
             }
         }));
@@ -1207,7 +1272,7 @@ async fn server_credential_decisions_name_their_reason() {
             .await
             .expect("in time")
             .expect("no panic escapes");
-        assert_eq!(*reasons.lock().unwrap(), want);
+        assert_eq!(reasons.lock().unwrap().as_slice(), want.as_slice());
         assert!(r.is_err());
     }
 }
@@ -1311,11 +1376,16 @@ async fn a_bound_establish_with_another_binding_is_refused_by_the_policy() {
         let l = mismatch_listener(action, seen.clone());
         let (a, b) = duplex(1 << 20);
         let start = tokio::time::Instant::now();
+        let (release, mut released) = tokio::sync::oneshot::channel::<()>();
         let served = {
             let l = l.clone();
             tokio::spawn(async move {
+                let io = PipeIo::new(b).with_unsent(move || {
+                    let _ = &release;
+                    None
+                });
                 let r = l
-                    .handle_pipe(exporter(2, PipeIo::new(b)), zmux::PipeHint::default())
+                    .handle_pipe(exporter(2, io), zmux::PipeHint::default())
                     .await;
                 (r, start.elapsed())
             })
@@ -1334,16 +1404,23 @@ async fn a_bound_establish_with_another_binding_is_refused_by_the_policy() {
             // The client gave up at its reply timeout, and the carrier
             // is still held.
             assert!(gave_up >= Duration::from_millis(290), "{gave_up:?}");
-            assert!(!served.is_finished(), "a stall holds the carrier");
+            assert!(matches!(
+                released.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
             let (r, took) = tokio::time::timeout(Duration::from_secs(5), served)
                 .await
                 .unwrap()
                 .unwrap();
             assert!(r.is_err());
+            assert!(took < Duration::from_millis(290), "{took:?}");
             assert!(
-                took >= Duration::from_millis(1400) && took < Duration::from_secs(4),
-                "{took:?}"
+                tokio::time::timeout(Duration::from_secs(4), released)
+                    .await
+                    .unwrap()
+                    .is_err()
             );
+            assert!(start.elapsed() >= Duration::from_millis(1400));
         } else {
             // The carrier ended before the client's reply timeout.
             assert!(gave_up < Duration::from_millis(290), "{gave_up:?}");

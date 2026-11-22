@@ -43,12 +43,18 @@ mod accept;
 mod account;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod admission;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+mod attachment;
+#[cfg(all(feature = "test-hooks", feature = "tokio"))]
+pub(crate) use attachment::attachment_footprint;
 #[cfg(all(feature = "blocking", not(loom)))]
 pub(crate) mod blocking;
 #[cfg(all(feature = "blocking", not(loom)))]
 pub(crate) mod blocking_listen;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod cache;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+mod carrier_stats;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod channel;
 #[cfg(all(feature = "tokio", not(loom)))]
@@ -81,6 +87,10 @@ pub(crate) mod resources;
 pub(crate) mod sealed;
 #[cfg(all(feature = "blocking", not(loom)))]
 mod session_timer;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub(crate) mod setup;
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod setup_read;
 #[cfg(all(test, shuttle, feature = "blocking", not(loom)))]
 mod shuttle;
 #[cfg(all(feature = "tokio", not(loom)))]
@@ -210,6 +220,31 @@ pub(crate) mod read_pool {
 /// buffer again.
 #[cfg(any(feature = "tokio", feature = "blocking"))]
 pub(crate) const IDLE_READ: usize = 4096;
+
+/// Maximum cleanup time for a carrier after a completed setup decision.
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub(crate) const DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The end of listener setup, or no deadline when it exceeds the clock range.
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+#[doc(hidden)]
+#[must_use]
+pub fn handshake_deadline(
+    start: std::time::Instant,
+    limit: std::time::Duration,
+) -> Option<std::time::Instant> {
+    start.checked_add(limit)
+}
+
+/// Waits for a representable setup deadline.
+#[cfg(all(feature = "tokio", not(loom)))]
+#[doc(hidden)]
+pub async fn wait_deadline(end: Option<::tokio::time::Instant>) {
+    match end {
+        Some(end) => ::tokio::time::sleep_until(end).await,
+        None => std::future::pending().await,
+    }
+}
 
 /// The room of one read of a handshake (a join's, a transform's) on either
 /// driver: a whole unit of a message carrier fits, and on a byte stream a

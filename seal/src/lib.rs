@@ -122,3 +122,59 @@ pub(crate) fn proof_placeholder(signer: Option<&std::sync::Arc<dyn Signer>>) -> 
     }
     .encode()
 }
+
+/// The reason behind a `credentials_failed` refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CredentialFailureReason {
+    /// The peer proof failed verification.
+    Proof,
+    /// Required post-quantum authentication was absent.
+    PqAuthRequired,
+    /// The host verifier failed.
+    Verifier,
+}
+
+/// A credential failure with its original cause when one was returned.
+#[derive(Debug)]
+pub struct CredentialFailure {
+    /// Which credential check failed.
+    pub reason: CredentialFailureReason,
+    cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl CredentialFailure {
+    fn new(reason: CredentialFailureReason) -> Self {
+        Self {
+            reason,
+            cause: None,
+        }
+    }
+
+    fn with_cause(mut self, cause: impl std::error::Error + Send + Sync + 'static) -> Self {
+        self.cause = Some(Box::new(cause));
+        self
+    }
+
+    /// The stable class of this failure.
+    #[must_use]
+    pub fn class(&self) -> Error {
+        Error::CredentialsFailed
+    }
+}
+
+impl std::fmt::Display for CredentialFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {:?}", self.class().class(), self.reason)?;
+        if let Some(cause) = &self.cause {
+            write!(f, ": {cause}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CredentialFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause.as_deref().map(|e| e as &dyn std::error::Error)
+    }
+}

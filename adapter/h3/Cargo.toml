@@ -35,7 +35,7 @@ zmux = { path = "../..", features = ["test-hooks"] }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 zmux-testcert = { path = "../../testcert" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1.54", features = ["full"] }
+tokio = { version = "1.54", features = ["full", "test-util"] }
 
 [lints]
 workspace = true

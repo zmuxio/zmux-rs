@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 
+use super::attachment::{Attachment, PipeOutcome};
 use super::events::EventQueue;
 use super::hooks::{HookStart, TraceQueue, WindowHook, ask, trace};
 use super::resources::{Kind, Live};
@@ -72,6 +73,17 @@ pub trait Driver: sealed::Sealed + Sized + Send + Sync + 'static {
     /// `zmux::blocking::Dial`).
     #[doc(hidden)]
     type Dial: Clone + Send + Sync + 'static;
+
+    #[doc(hidden)]
+    fn join_session(s: Session<Self>) -> JoinSession;
+
+    #[doc(hidden)]
+    fn spawn_join(shared: &Shared<Self>, f: impl Future<Output = ()> + Send + 'static);
+
+    #[doc(hidden)]
+    fn join_callback(
+        call: impl FnOnce() -> crate::Decision<()> + Send + 'static,
+    ) -> impl Future<Output = Option<crate::Decision<()>>> + Send;
 
     /// The session clock.
     #[doc(hidden)]
@@ -146,6 +158,10 @@ pub trait Driver: sealed::Sealed + Sized + Send + Sync + 'static {
     #[doc(hidden)]
     fn carrier_info(carrier: &mut Self::Carrier) -> CarrierInfo;
 
+    /// Seeds the statistics before the carrier is published, outside driver locks.
+    #[doc(hidden)]
+    fn register_carrier_stats(carrier: &mut Self::Carrier);
+
     /// Whether `carrier` may become a pipe of the session: not when it
     /// runs over the session itself.
     #[doc(hidden)]
@@ -184,6 +200,7 @@ mod sealed {
 
 /// What the core needs to know about a carrier.
 pub struct CarrierInfo {
+    pub(crate) attachment: Arc<Attachment>,
     pub(crate) inbound: Option<Framing>,
     pub(crate) outbound: Option<Framing>,
     pub(crate) exporter: Option<CarrierExporter>,
@@ -418,6 +435,29 @@ impl<T> LocatorTable<T> {
     }
 }
 
+impl<D: Driver> LocatorTable<Shared<D>> {
+    /// Publish only a bootstrap that holds a place in the accept queue.
+    /// Install epoch rotation at the same boundary as the initial locator.
+    pub(super) fn advertise(self: &Arc<Self>, shared: &Arc<Shared<D>>, instance: usize) {
+        let mut state = shared.lock();
+        let locator = state.core.local_locator().to_vec();
+        if locator.is_empty() {
+            return;
+        }
+        let session = Arc::downgrade(shared);
+        self.insert(locator.clone(), session.clone());
+        let routes = Arc::downgrade(self);
+        let mut held = vec![locator];
+        state.core.set_locator_instance(instance);
+        state.locator_hook = Some(Box::new(move |now| {
+            if let Some(routes) = routes.upgrade() {
+                routes.replace(&held, now, &session);
+                held = now.to_vec();
+            }
+        }));
+    }
+}
+
 /// A listener's link to a session's Locators: called with the Locators the session accepts
 /// whenever an epoch changes them.
 pub(crate) type LocatorHook = Box<dyn FnMut(&[Vec<u8>]) + Send>;
@@ -448,7 +488,9 @@ pub struct State<D: Driver> {
     pipe_changes: u64,
     /// The outcome slots of the unretired pipes that have handles
     /// ([`Pipe::end`]).
-    pipe_ends: std::collections::HashMap<u64, Weak<OnceLock<PipeError>>>,
+    pipe_ends: std::collections::HashMap<u64, Weak<PipeOutcome>>,
+    /// The common single-pipe session needs no table or wait slot until a handle is taken.
+    bootstrap: Weak<Attachment>,
     protocol: Option<String>,
     /// The bootstrap carrier's TLS handshake, when this process ran it.
     tls: Option<crate::TlsState>,
@@ -653,6 +695,7 @@ impl<D: Driver> State<D> {
             events,
             pipe_changes: 0,
             locator_hook: None,
+            bootstrap: Arc::downgrade(&carrier.attachment),
             pipe_ends: std::collections::HashMap::new(),
             protocol: carrier.protocol,
             tls: carrier.tls,
@@ -674,11 +717,21 @@ impl<D: Driver> State<D> {
     }
 
     /// The outcome slot that the handles of pipe `id` share.
-    fn pipe_end(&mut self, id: PipeId) -> Arc<OnceLock<PipeError>> {
+    fn pipe_end(&mut self, id: PipeId) -> Arc<PipeOutcome> {
         if let Some(end) = self.pipe_ends.get(&id.0).and_then(Weak::upgrade) {
             return end;
         }
-        let end = Arc::new(OnceLock::new());
+        let end = if id == PipeId(0)
+            && let Some(carrier) = self.bootstrap.upgrade()
+        {
+            carrier.outcome().clone()
+        } else {
+            // A handle first requested after retirement has no live resources.
+            // Even this empty group completes through the last-owner destructor.
+            let end = Arc::<PipeOutcome>::default();
+            end.released.finish_into(&mut WakeList::default());
+            end
+        };
         self.pipe_ends.insert(id.0, Arc::downgrade(&end));
         end
     }
@@ -758,7 +811,10 @@ impl<D: Driver> State<D> {
                 CoreEvent::PipeReceiving { .. } => {
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                 }
-                CoreEvent::PipeAttached { .. } => {
+                CoreEvent::PipeAttached { pipe } => {
+                    if let Some(end) = self.pipe_ends.get(&pipe.0).and_then(Weak::upgrade) {
+                        let _ = end.join.set(Ok(()));
+                    }
                     self.pipe_changes += 1;
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                 }
@@ -770,10 +826,10 @@ impl<D: Driver> State<D> {
                     self.pipe_changes += 1;
                     // Set before the waits wake: a join that ended unconfirmed
                     // (refused, say) keeps its error for its handles.
-                    if let Some(end) = self.pipe_ends.remove(&pipe.0).and_then(|w| w.upgrade())
+                    if let Some(end) = self.pipe_ends.remove(&pipe.0).and_then(|end| end.upgrade())
                         && let Some(f) = join_failure
                     {
-                        let _ = end.set(PipeError::Failed(f));
+                        let _ = end.join.set(Err(PipeError::Failed(f)));
                     }
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                     self.waiters.wake_list(List::Channel, &mut self.wakes);
@@ -873,6 +929,10 @@ impl<D: Driver> State<D> {
                 }
                 CoreEvent::PingAnswered { .. } => w.wake_list(List::Ping, wakes),
                 CoreEvent::Closed(e) => {
+                    for end in self.pipe_ends.values().filter_map(Weak::upgrade) {
+                        end.join
+                            .get_or_init(|| Err(PipeError::SessionLost(e.clone())));
+                    }
                     w.close(wakes);
                     // From CLOSED on nothing enters the queue, and the
                     // tracer's `closed` is the last call.
@@ -914,6 +974,10 @@ impl<D: Driver> State<D> {
             self.carrier = Some(Box::new((kind, variant.clone())));
             self.app_event(AppEvent::CarrierChosen(kind, variant));
         }
+    }
+
+    fn wake_events(&mut self) {
+        self.waiters.wake_list(List::Events, &mut self.wakes);
     }
 
     fn app_event(&mut self, e: AppEvent) {
@@ -1440,7 +1504,6 @@ impl<D: Driver> WeakSession<D> {
 
     /// The shared state, while it exists: held, it does not keep the
     /// session open.
-    #[cfg(feature = "tokio")]
     pub(crate) fn shared(&self) -> Option<Arc<Shared<D>>> {
         self.0.upgrade()
     }
@@ -1528,13 +1591,15 @@ impl<D: Driver> Shared<D> {
         Some(v)
     }
 
-    /// Refuses the session (the core's `refuse`) and waits until its
-    /// carriers took `CONNECTION_CLOSE` or it ended.
-    pub(crate) fn refuse(&self, reason: &'static str) -> impl Future<Output = ()> + '_ {
-        self.command(|st| st.core.refuse(reason, D::now()));
-        Wait::new(&self.inner, List::Close, |st: &mut State<D>| {
-            st.core.close_handed_off().then_some(())
-        })
+    /// A listener stopped before the application accepted this session.
+    pub(crate) fn close_unaccepted(&self) {
+        const UNACCEPTED_CLOSE_CODE: VarInt = VarInt::ZERO;
+        self.command(|st| st.core.close(UNACCEPTED_CLOSE_CODE, b"", D::now()));
+    }
+
+    /// Queues `CONNECTION_REFUSED` for the session driver to flush within its close deadline.
+    pub(crate) fn refuse(&self, reason: Bytes) {
+        self.command(|st| st.core.refuse_with_reason(reason, D::now()));
     }
 
     /// Ends the session while it is suspended (the suspended-session
@@ -1594,57 +1659,36 @@ impl<D: Driver> Shared<D> {
         &self,
         join: crate::proto::session::PeerJoin,
         carrier: crate::proto::session::PeerCarrier,
+        outcome: &Arc<PipeOutcome>,
+        deadline: Option<Instant>,
         (kind, overhead, admitted, reports_failure): (
             Option<crate::CarrierKind>,
             u16,
             Option<crate::AdmittedValue>,
             bool,
         ),
-    ) -> crate::proto::session::ConfirmedJoin {
+    ) -> Result<crate::proto::session::ConfirmedJoin, JoinError> {
         use crate::proto::session::ConfirmedJoin;
         let mut st = self.lock();
-        let v = st.core.confirm_join(join, carrier, D::now());
+        let now = st.core.join_clock(D::now());
+        if deadline.is_some_and(|limit| now >= limit) {
+            return Err(JoinError::Timeout);
+        }
+        if let Some(e) = st.core.error() {
+            return Err(JoinError::SessionLost(e.clone()));
+        }
+        let v = st.core.confirm_join(join, carrier, now);
         if let ConfirmedJoin::Attached { pipe, .. } = &v {
             // Before the session's first record on it.
             let pipe = *pipe;
+            st.pipe_ends.insert(pipe.0, Arc::downgrade(outcome));
             st.core.set_pipe_carrier(pipe, kind);
             st.core.set_pipe_write_overhead(pipe, overhead);
             st.core.set_pipe_reports_failure(pipe, reports_failure);
             st.core.set_pipe_admitted(pipe, admitted);
         }
         st.after_command();
-        v
-    }
-
-    /// The session's checks of a Hello's mode and of the join at the acceptor,
-    /// asked now: a later answer is the caller's to await, bounded by the
-    /// join's deadline. A check that panics refuses.
-    pub(crate) fn join_allowed(
-        &self,
-        info: &crate::proto::session::RecordPolicyInput,
-        join: &crate::proto::session::PeerJoin,
-        admitted: Option<&crate::AdmittedValue>,
-    ) -> crate::Decision<bool> {
-        let (allow, authorize) = {
-            let st = self.lock();
-            let c = st.core.config();
-            (c.allow_record_mode.clone(), c.authorize_join.clone())
-        };
-        let mode = join.mode();
-        let pipe = PipeId(join.pipe().id);
-        let authorized = move |authorize: Option<crate::AuthorizeJoin>| match authorize {
-            None => crate::Decision::Now(true),
-            Some(f) => f.allows(pipe).map(|v| v == Some(true)),
-        };
-        match allow.map(|f| f.allows(info, mode, admitted)) {
-            None if mode == crate::proto::seal::RecordMode::Sealed => authorized(authorize),
-            Some(crate::Decision::Now(Some(true))) => authorized(authorize),
-            None | Some(crate::Decision::Now(_)) => crate::Decision::Now(false),
-            Some(later) => crate::Decision::later(async move {
-                later.settle().await.flatten() == Some(true)
-                    && authorized(authorize).settle().await == Some(true)
-            }),
-        }
+        Ok(v)
     }
 }
 
@@ -1653,7 +1697,7 @@ impl<D: Driver> Shared<D> {
 pub(crate) fn replacement<D: Driver>(
     pipe: &Pipe<D>,
 ) -> Option<(super::PipeDirection, PipeOptions)> {
-    let stats = PipeApi::stats(pipe)?;
+    let stats = pipe.pipe_signals()?;
     let direction = match (stats.inbound.is_some(), stats.outbound.is_some()) {
         (true, false) => super::PipeDirection::In,
         (false, true) => super::PipeDirection::Out,
@@ -1698,7 +1742,7 @@ impl<D: Driver> Drop for CloseOnDrop<'_, D> {
 /// Aborts a pipe that `add_pipe` started unless the call succeeded, also
 /// when its future is dropped: a failed or cancelled call leaves no pipe
 /// behind.
-pub(crate) struct AbortUnlessAdded<'a, D: Driver>(pub(crate) Option<&'a Pipe<D>>);
+pub(crate) struct AbortUnlessAdded<'a, D: Driver>(pub(crate) Option<&'a Pipe<D>>, pub(crate) bool);
 
 impl<D: Driver> AbortUnlessAdded<'_, D> {
     /// The call succeeded: the pipe stays.
@@ -1710,9 +1754,82 @@ impl<D: Driver> AbortUnlessAdded<'_, D> {
 impl<D: Driver> Drop for AbortUnlessAdded<'_, D> {
     fn drop(&mut self) {
         if let Some(p) = self.0.take() {
-            // A pipe that failed or went first is gone already.
-            let _ = p.command(|c, id| c.remove_pipe(id, false, D::now()));
+            p.command(|core, id| {
+                withdraw_join(
+                    core,
+                    id,
+                    &p.end,
+                    self.1,
+                    PipeError::CallerCancelled(None),
+                    D::now(),
+                );
+            });
         }
+    }
+}
+
+/// Cancellation receipt for a binding whose runtime can withdraw a join
+/// synchronously, before it schedules the Rust future's destruction.
+#[cfg(feature = "tokio")]
+pub struct JoinCancellation {
+    session: Weak<Shared<super::tokio::Tokio>>,
+    end: Arc<PipeOutcome>,
+    reply: bool,
+}
+
+#[cfg(feature = "tokio")]
+impl std::fmt::Debug for JoinCancellation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinCancellation").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl JoinCancellation {
+    pub(super) fn new(
+        session: &Arc<Shared<super::tokio::Tokio>>,
+        end: &Arc<PipeOutcome>,
+        reply: bool,
+    ) -> Self {
+        Self {
+            session: Arc::downgrade(session),
+            end: end.clone(),
+            reply,
+        }
+    }
+
+    /// Competes with attachment on its session lock. A receipt does not keep
+    /// the session alive. A submitted carrier without an ID can also be withdrawn.
+    /// Returns whether this cancellation chose the outcome. Otherwise the
+    /// binding must deliver the result already committed for its caller.
+    #[must_use]
+    pub fn cancel(&self, error: std::io::Error) -> bool {
+        let Some(session) = self.session.upgrade() else {
+            return false;
+        };
+        session.command(|st| {
+            if self.end.join.get().is_some() {
+                return false;
+            }
+            if let Some(&id) = self.end.id.get() {
+                withdraw_join(
+                    &mut st.core,
+                    id,
+                    &self.end,
+                    self.reply,
+                    PipeError::CallerCancelled(Some(Arc::new(error))),
+                    super::tokio::Tokio::now(),
+                )
+            } else if let Some(e) = st.core.error() {
+                let _ = self.end.join.set(Err(PipeError::SessionLost(e.clone())));
+                false
+            } else {
+                self.end
+                    .join
+                    .set(Err(PipeError::CallerCancelled(Some(Arc::new(error)))))
+                    .is_ok()
+            }
+        })
     }
 }
 
@@ -1722,6 +1839,180 @@ fn shutdown_result(e: SessionError) -> Result<(), SessionError> {
     match e {
         SessionError::ApplicationClosed { remote: false, .. } => Ok(()),
         e => Err(e),
+    }
+}
+
+/// The endpoint whose join completed.
+#[derive(Debug, Clone)]
+pub enum JoinSession {
+    /// A Tokio session.
+    #[cfg(feature = "tokio")]
+    Tokio(crate::Session),
+    /// A blocking session.
+    #[cfg(feature = "blocking")]
+    Blocking(crate::blocking::Session),
+}
+
+/// Why a join ended before peer attachment.
+#[derive(Debug, Clone)]
+pub enum JoinError {
+    /// A caller that can supply its cancellation error. The original error is retained.
+    CallerCancelled(Arc<std::io::Error>),
+    /// The caller's explicit deadline elapsed before attachment.
+    CallerDeadline,
+    /// Confirmation deadline elapsed.
+    Timeout,
+    /// The authorized carrier was refused.
+    Refused,
+    /// Another pending join evicted it.
+    Evicted,
+    /// Setup was withdrawn.
+    Cancelled,
+    /// The listener stopped.
+    ListenerClosed,
+    /// The joining carrier ended.
+    PipeGone,
+    /// The pipe was aborted locally before peer attachment.
+    PipeAborted,
+    /// A handshake or carrier validation failed.
+    Handshake(PipeError),
+    /// The session's terminal error.
+    SessionLost(SessionError),
+}
+
+impl JoinError {
+    /// Whether the carrier disappeared before confirmation, including local abort.
+    #[must_use]
+    pub const fn is_gone(&self) -> bool {
+        matches!(self, Self::PipeGone | Self::PipeAborted)
+    }
+}
+
+impl From<PipeError> for JoinError {
+    fn from(e: PipeError) -> Self {
+        match e {
+            PipeError::CallerCancelled(Some(reason)) => Self::CallerCancelled(reason),
+            PipeError::CallerCancelled(None) => Self::Cancelled,
+            PipeError::Failed(crate::PipeFailure::CallerDeadline) => Self::CallerDeadline,
+            PipeError::Failed(crate::PipeFailure::JoinTimedOut) => Self::Timeout,
+            PipeError::Failed(crate::PipeFailure::JoinRefused) | PipeError::Deferred => {
+                Self::Refused
+            }
+            PipeError::Failed(crate::PipeFailure::Carrier(std::io::ErrorKind::InvalidData)) => {
+                Self::Handshake(e)
+            }
+            PipeError::Failed(crate::PipeFailure::Carrier(_)) | PipeError::UnknownPipe => {
+                Self::PipeGone
+            }
+            PipeError::Failed(crate::PipeFailure::Aborted) => Self::PipeAborted,
+            PipeError::SessionLost(e) => Self::SessionLost(e),
+            e => Self::Handshake(e),
+        }
+    }
+}
+
+type JoinedFn = dyn Fn(JoinSession, PipeId, Option<JoinError>) -> crate::Decision<()> + Send + Sync;
+
+/// A join completion callback. A join that ended before allocation reports
+/// [`PipeId::UNASSIGNED`].
+#[derive(Clone)]
+pub struct JoinOutcome(Arc<JoinedFn>);
+impl std::fmt::Debug for JoinOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JoinOutcome(..)")
+    }
+}
+impl JoinOutcome {
+    /// Creates a callback. Its decision may complete asynchronously.
+    pub fn new(
+        f: impl Fn(JoinSession, PipeId, Option<JoinError>) -> crate::Decision<()>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+struct HeldJoinKey<D: Driver> {
+    shared: Arc<Shared<D>>,
+    pipe: PipeId,
+}
+
+impl<D: Driver> Drop for HeldJoinKey<D> {
+    fn drop(&mut self) {
+        let mut st = self.shared.lock();
+        st.events.release_hold(self.pipe.0);
+        st.wake_events();
+    }
+}
+
+pub(super) struct JoinReport<D: Driver> {
+    shared: Arc<Shared<D>>,
+    callback: Option<JoinOutcome>,
+    submitted: Option<Arc<PipeOutcome>>,
+    pipe: Option<PipeId>,
+}
+
+impl<D: Driver> JoinReport<D> {
+    pub(super) fn new(shared: &Arc<Shared<D>>, pipe: Option<PipeId>) -> Option<Self> {
+        let mut st = shared.lock();
+        let callback = st.core.config().join_outcome.clone()?;
+        if let Some(id) = pipe {
+            st.events.hold(id.0);
+        }
+        Some(Self {
+            shared: shared.clone(),
+            callback: Some(callback),
+            submitted: None,
+            pipe,
+        })
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(super) fn observe(&mut self, end: &Arc<PipeOutcome>) {
+        self.submitted = Some(end.clone());
+    }
+
+    pub(super) fn complete(mut self, error: Option<JoinError>) {
+        self.dispatch(error);
+    }
+
+    fn dispatch(&mut self, error: Option<JoinError>) {
+        let Some(callback) = self.callback.take() else {
+            return;
+        };
+        let shared = self.shared.clone();
+        let pipe = self.pipe;
+        let session = D::join_session(Session {
+            conn: ConnRef::new(shared.clone()),
+        });
+        let mut key = pipe.map(|pipe| HeldJoinKey { shared, pipe });
+        let pipe = pipe.unwrap_or(PipeId::UNASSIGNED);
+        if error.is_some() {
+            drop(key.take());
+        }
+        D::spawn_join(&self.shared, async move {
+            let _key = key;
+            if let Some(decision) = D::join_callback(move || callback.0(session, pipe, error)).await
+            {
+                decision.settle().await;
+            }
+        });
+    }
+}
+
+impl<D: Driver> Drop for JoinReport<D> {
+    fn drop(&mut self) {
+        if self.callback.is_some() {
+            let reason = self
+                .submitted
+                .as_ref()
+                .and_then(|end| end.join.get()?.as_ref().err())
+                .cloned()
+                .map_or(JoinError::Cancelled, Into::into);
+            self.dispatch(Some(reason));
+        }
     }
 }
 
@@ -1927,9 +2218,10 @@ impl<D: Driver> Session<D> {
             code,
             reason,
         };
-        let r = shutdown_result(self.closing_op().await);
+        let result = shutdown_result(self.closing_op().await);
+        self.close_handoff_op().await;
         std::mem::forget(guard);
-        r
+        result
     }
 
     pub(crate) fn established_op(&self) -> impl Future<Output = Result<(), SessionError>> + '_ {
@@ -2023,10 +2315,150 @@ impl<D: Driver> Session<D> {
         })
     }
 
-    /// The bound of `add_pipe` without one of the caller's: the handshake
-    /// timeout, or its default without one.
-    pub(crate) fn add_pipe_limit(&self) -> Duration {
-        self.conn.lock().core.config().join_wait()
+    /// A dial has returned a carrier. The dial held only shared state, so
+    /// dropping the last application handle already initiated close. Let the
+    /// core judge the returned carrier even if that close won the race.
+    pub(crate) fn after_dial(shared: Arc<Shared<D>>) -> Self {
+        Self {
+            conn: ConnRef::new(shared),
+        }
+    }
+
+    pub(super) fn join_report(&self) -> Option<JoinReport<D>> {
+        JoinReport::new(&self.conn.0, None)
+    }
+
+    pub(super) fn start_join(
+        &self,
+        mut pipe: D::Carrier,
+        opts: &PipeOptions,
+        mut report: Option<JoinReport<D>>,
+        deadline: Option<core::JoinDeadline>,
+    ) -> Result<Pipe<D>, PipeError> {
+        let c = D::carrier_info(&mut pipe);
+        let end = c.attachment.outcome().clone();
+        let result = (|| {
+            D::check_carrier(&self.conn.0, &pipe)?;
+            opts.validate()?;
+            // The handshake needs both directions, whatever the attachment's.
+            let (Some(input), Some(output)) = (c.inbound, c.outbound) else {
+                return Err(PipeError::InvalidArgument);
+            };
+            let info = crate::proto::session::RecordPolicyInput {
+                has_exporter: c.exporter.is_some(),
+                secure: c.secure,
+                label: opts.label.clone(),
+                is_first_pipe: false,
+            };
+            // Asked with no zmux lock held: the policy is the host's code. One that panics
+            // leaves the default.
+            let policy = self.conn.lock().core.config().record_policy.clone();
+            let mode = match (opts.record_mode, policy) {
+                (core::Inherit::Set(m), _) => m,
+                (core::Inherit::Session, Some(policy)) => {
+                    crate::proto::decision::host(|| policy.choose(&info))
+                        .unwrap_or(crate::proto::seal::RecordMode::Sealed)
+                }
+                (core::Inherit::Session, None) => crate::proto::seal::RecordMode::Sealed,
+            };
+            // Unmanaged is reported only: no pipe is joined in it.
+            if !mode.joinable() {
+                return Err(PipeError::InvalidOptions(crate::InvalidConfig::new(
+                    "record_policy",
+                    "chose Unmanaged, which no pipe is joined in",
+                )));
+            }
+            // The limit the pipe ends with: a Sealed transform takes its overhead off.
+            let limit = pipe_record_limit(mode, c.max_record, input);
+            check_pipe_record_limit(limit).map_err(PipeError::InvalidOptions)?;
+            // Read here, without the lock: the carrier's handshake completed.
+            let binding = if mode == crate::proto::seal::RecordMode::Bound {
+                if !c.secure || c.split {
+                    return Err(PipeError::InvalidArgument);
+                }
+                let binding = c.exporter.as_ref().and_then(CarrierExporter::pipe_binding);
+                Some(binding.ok_or(PipeError::InvalidArgument)?)
+            } else {
+                None
+            };
+            let inbound = (opts.direction != crate::PipeDirection::Out).then_some(input);
+            let outbound = (opts.direction != crate::PipeDirection::In).then_some(output);
+            if outbound.is_some() {
+                D::register_carrier_stats(&mut pipe);
+            }
+            let (id, slots) = self.command(|st| {
+                let now = st.core.join_clock(D::now());
+                if let Some(Err(e)) = c.attachment.outcome().join.get() {
+                    return Err(e.clone());
+                }
+                if let Some(e) = st.core.error() {
+                    return Err(PipeError::SessionLost(e.clone()));
+                }
+                if let Some(d) = deadline.filter(|d| now >= d.at()) {
+                    return Err(PipeError::Failed(d.cause()));
+                }
+                let id = st.core.add_pipe_with_deadline(
+                    (inbound, outbound),
+                    opts,
+                    mode,
+                    binding.as_deref(),
+                    deadline,
+                )?;
+                end.id.set(id).expect("one ID per submitted carrier");
+                if let Some(report) = &mut report {
+                    st.events.hold(id.0);
+                    report.pipe = Some(id);
+                }
+                c.describe(&mut st.core, id);
+                st.pipe_ends.insert(id.0, Arc::downgrade(&end));
+                Ok::<_, PipeError>((id, st.pipe_slots(id)))
+            })?;
+            self.attach(id, slots, pipe)
+        })()
+        .map_err(|cause| {
+            // A binding can withdraw while the carrier's host validation or
+            // installation runs. Preserve whichever error was committed first.
+            end.join
+                .get_or_init(|| Err(cause.clone()))
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or(cause)
+        });
+        if let Some(report) = report {
+            match &result {
+                Ok(pipe) => {
+                    let end = pipe.end.clone();
+                    let id = pipe.id;
+                    D::spawn_join(&self.conn, async move {
+                        let wait =
+                            Wait::new(&report.shared.inner, List::Pipes, |st: &mut State<D>| {
+                                attachment_result(&st.core, id, &end)
+                            });
+                        let result = wait.await;
+                        report.complete(result.err().map(JoinError::from));
+                    });
+                }
+                Err(e) => report.complete(Some(JoinError::from(e.clone()))),
+            }
+        }
+        result
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn pipe_signals(&self) -> Vec<PipeStats> {
+        let mut st = self.conn.lock();
+        st.core.tick(D::now());
+        st.core.pipes()
+    }
+
+    /// The configured deadline for an individual submitted carrier.
+    pub(crate) fn join_deadline(&self) -> Option<core::JoinDeadline> {
+        let mut st = self.conn.lock();
+        st.core
+            .join_clock(D::now())
+            .checked_add(st.core.config().join_wait())
+            .map(core::JoinDeadline::Protocol)
     }
 
     /// The count of pipe state changes and suspensions so far.
@@ -2094,10 +2526,12 @@ impl<D: Driver> Session<D> {
 
     /// Starts the I/O of a pipe the core knows; if that fails, the pipe
     /// fails.
-    fn attach(&self, id: PipeId, pipe: D::Carrier) -> Result<Pipe<D>, PipeError> {
-        // The outcome slot exists before the I/O starts, so that an outcome the I/O
-        // reports at once is kept.
-        let (end, last) = self.conn.lock().pipe_slots(id);
+    fn attach(
+        &self,
+        id: PipeId,
+        (end, last): PipeSlots,
+        pipe: D::Carrier,
+    ) -> Result<Pipe<D>, PipeError> {
         if let Err(e) = D::attach(&self.conn.0, id.0, pipe) {
             drop(end);
             self.command(|st| {
@@ -2119,7 +2553,7 @@ impl<D: Driver> Session<D> {
             if let Some(e) = st.events.pop() {
                 return Some(Some(e));
             }
-            st.core.error().is_some().then_some(None)
+            (st.core.error().is_some() && !st.events.holding()).then_some(None)
         })
     }
 
@@ -2160,13 +2594,19 @@ pub struct Pipe<D: Driver> {
     id: PipeId,
     /// How the pipe's join ended when it ended unconfirmed, kept past its
     /// retirement, when the core no longer knows the pipe.
-    end: Arc<OnceLock<PipeError>>,
+    end: Arc<PipeOutcome>,
     /// The options the pipe held and how it ended when the session retired
     /// it, set by the core under the lock it is read under.
     last: Arc<OnceLock<core::PipeFinal>>,
 }
 
 impl<D: Driver> Pipe<D> {
+    pub(crate) fn pipe_signals(&self) -> Option<PipeStats> {
+        let mut st = self.conn.lock();
+        st.core.tick(D::now());
+        st.core.pipe_info(self.id)
+    }
+
     /// Resolves once the pipe's inbound direction received a record, or
     /// it has none, or the pipe or session is gone: woken by the core's
     /// `PipeReceiving` and the pipe changes.
@@ -2203,16 +2643,55 @@ impl<D: Driver> std::fmt::Debug for Pipe<D> {
     }
 }
 
-/// What the core says of a pipe's join, or, once it no longer knows the
-/// pipe, how its join ended when it ended unconfirmed.
-fn ended(
-    end: &OnceLock<PipeError>,
-    r: Option<Result<(), PipeError>>,
+/// The first terminal decision is retained across retirement. All callers
+/// consult or settle it under the same session lock that processes ACKs.
+fn attachment_result(
+    core: &core::SessionCore,
+    id: PipeId,
+    end: &PipeOutcome,
 ) -> Option<Result<(), PipeError>> {
-    match (r, end.get()) {
-        (Some(Err(PipeError::UnknownPipe)), Some(e)) => Some(Err(e.clone())),
-        (r, _) => r,
+    if let Some(result) = end.join.get() {
+        return Some(result.clone());
     }
+    let result = core.pipe_attached(id)?;
+    // Added pipes commit success at their ACK (outbound) or installation
+    // (inbound). A confirmed core entry can still be waiting for its I/O.
+    if id != PipeId(0) && result.is_ok() {
+        return None;
+    }
+    Some(end.join.get_or_init(|| result).clone())
+}
+
+fn added_result(
+    core: &core::SessionCore,
+    id: PipeId,
+    end: &PipeOutcome,
+    reply: bool,
+) -> Option<Result<(), PipeError>> {
+    attachment_result(core, id, end).or_else(|| reply.then(|| core.pipe_joined(id)).flatten())
+}
+
+fn withdraw_join(
+    core: &mut core::SessionCore,
+    id: PipeId,
+    end: &PipeOutcome,
+    reply: bool,
+    reason: PipeError,
+    now: Instant,
+) -> bool {
+    // An expired attachment cannot be withdrawn with a different cause while
+    // the timer worker is waiting for this same session lock.
+    if let Some(cause) = core.expire_join(id.get(), now) {
+        // A deferred pipe may already have been retired by expiry.
+        let _ = end.join.set(Err(PipeError::Failed(cause)));
+        return false;
+    }
+    if added_result(core, id, end, reply).is_some() {
+        return false;
+    }
+    let _ = end.join.set(Err(reason));
+    let _ = core.remove_pipe(id, false, now);
+    true
 }
 
 impl<D: Driver> Pipe<D> {
@@ -2247,7 +2726,7 @@ impl<D: Driver> Pipe<D> {
     pub(crate) fn joined_op(&self) -> impl Future<Output = Result<(), PipeError>> + '_ {
         let (id, end) = (self.id, &self.end);
         Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
-            ended(end, st.core.pipe_joined(id))
+            added_result(&st.core, id, end, true)
         })
     }
 }
@@ -2258,42 +2737,39 @@ impl<D: Driver> Pipe<D> {
     pub(crate) fn attached_op(&self) -> impl Future<Output = Result<(), PipeError>> + '_ {
         let (id, end) = (self.id, &self.end);
         Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
-            ended(end, st.core.pipe_attached(id))
+            attachment_result(&st.core, id, end)
         })
     }
 
     /// What `add_pipe` waits for: the verified Reply with
     /// `return_on_reply`, else the peer's attachment. The core's join
-    /// timeout is the call's own bound (both the handshake timeout from the
-    /// start): [`core::PipeFailure::JoinTimedOut`].
+    /// timeout runs from carrier submission: [`core::PipeFailure::JoinTimedOut`].
     pub(crate) fn added_op(
         &self,
         return_on_reply: bool,
     ) -> impl Future<Output = Result<(), PipeError>> + '_ {
         let (id, end) = (self.id, &self.end);
         Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
-            let r = if return_on_reply {
-                st.core.pipe_joined(id)
-            } else {
-                st.core.pipe_attached(id)
-            };
-            ended(end, r)
+            added_result(&st.core, id, end, return_on_reply)
         })
     }
 
     /// Whether the peer attached the pipe now (see the core's
     /// `pipe_attached`).
     pub(crate) fn is_attached(&self) -> bool {
-        matches!(self.conn.lock().core.pipe_attached(self.id), Some(Ok(())))
+        matches!(
+            attachment_result(&self.conn.lock().core, self.id, &self.end),
+            Some(Ok(()))
+        )
     }
 
     /// Waits until the pipe ended (see the core's `pipe_closed`). Once the
     /// core retired the pipe, the end it had then answers: a wait that
     /// starts after the retirement reports the same cause as one that
     /// started before.
-    pub(crate) fn closed_op(&self) -> impl Future<Output = Result<(), PipeError>> + '_ {
+    pub(crate) async fn closed_op(&self) -> Result<(), PipeError> {
         let (id, last) = (self.id, &self.last);
-        Wait::new(
+        let result = Wait::new(
             &self.conn.inner,
             List::Pipes,
             move |st: &mut State<D>| match (st.core.pipe_closed(id), last.get()) {
@@ -2301,6 +2777,9 @@ impl<D: Driver> Pipe<D> {
                 (r, _) => r,
             },
         )
+        .await;
+        self.end.released.wait().await;
+        result
     }
 
     /// The session the pipe belongs to.
@@ -4041,63 +4520,8 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         self.conn.lock().core.shaper()
     }
 
-    fn begin_add_pipe(
-        &self,
-        mut pipe: D::Carrier,
-        opts: PipeOptions,
-    ) -> Result<Pipe<D>, PipeError> {
-        D::check_carrier(&self.conn.0, &pipe)?;
-        opts.validate()?;
-        let c = D::carrier_info(&mut pipe);
-        // The handshake needs both directions, whatever the attachment's.
-        let (Some(input), Some(output)) = (c.inbound, c.outbound) else {
-            return Err(PipeError::InvalidArgument);
-        };
-        let info = crate::proto::session::RecordPolicyInput {
-            has_exporter: c.exporter.is_some(),
-            secure: c.secure,
-            label: opts.label.clone(),
-            is_first_pipe: false,
-        };
-        // Asked with no zmux lock held: the policy is the host's code. One that panics
-        // leaves the default.
-        let policy = self.conn.lock().core.config().record_policy.clone();
-        let mode = match (opts.record_mode, policy) {
-            (core::Inherit::Set(m), _) => m,
-            (core::Inherit::Session, Some(policy)) => {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| policy.choose(&info)))
-                    .unwrap_or(crate::proto::seal::RecordMode::Sealed)
-            }
-            (core::Inherit::Session, None) => crate::proto::seal::RecordMode::Sealed,
-        };
-        // Unmanaged is reported only: no pipe is joined in it.
-        if !mode.joinable() {
-            return Err(PipeError::InvalidOptions(crate::InvalidConfig::new(
-                "record_policy",
-                "chose Unmanaged, which no pipe is joined in",
-            )));
-        }
-        // The limit the pipe ends with: a Sealed transform takes its overhead off.
-        let limit = pipe_record_limit(mode, c.max_record, input);
-        check_pipe_record_limit(limit).map_err(PipeError::InvalidOptions)?;
-        // Read here, without the lock: the carrier's handshake completed.
-        let binding = if mode == crate::proto::seal::RecordMode::Bound {
-            if !c.secure || c.split {
-                return Err(PipeError::InvalidArgument);
-            }
-            let binding = c.exporter.as_ref().and_then(CarrierExporter::pipe_binding);
-            Some(binding.ok_or(PipeError::InvalidArgument)?)
-        } else {
-            None
-        };
-        let inbound = (opts.direction != crate::PipeDirection::Out).then_some(input);
-        let outbound = (opts.direction != crate::PipeDirection::In).then_some(output);
-        let id = self.command(|st| {
-            st.core
-                .add_pipe(inbound, outbound, &opts, mode, binding.as_deref(), D::now())
-                .inspect(|&id| c.describe(&mut st.core, id))
-        })?;
-        self.attach(id, pipe)
+    fn begin_add_pipe(&self, pipe: D::Carrier, opts: PipeOptions) -> Result<Pipe<D>, PipeError> {
+        self.start_join(pipe, &opts, self.join_report(), self.join_deadline())
     }
 
     fn join_ready(&self) -> bool {
@@ -4147,9 +4571,35 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     }
 
     fn pipe_stats(&self) -> Vec<PipeStats> {
-        let mut st = self.conn.lock();
-        st.core.tick(D::now());
-        st.core.pipes()
+        let now = D::now();
+        let mut refreshes = Vec::new();
+        let pipes = {
+            let mut st = self.conn.lock();
+            st.core.tick(now);
+            let mut pipes = st.core.pipes();
+            let bootstrap = st.bootstrap.upgrade();
+            for stats in &mut pipes {
+                let end = st.pipe_ends.get(&stats.pipe.0).and_then(Weak::upgrade);
+                let cache = if stats.pipe == PipeId(0) {
+                    bootstrap
+                        .as_ref()
+                        .and_then(|attachment| attachment.sample_cache())
+                        .or_else(|| end.as_ref().and_then(|end| end.sample.get()))
+                } else {
+                    end.as_ref().and_then(|end| end.sample.get())
+                };
+                if let Some(cache) = cache {
+                    let (sample, refresh) = cache.read(now);
+                    stats.carrier_sample = sample;
+                    refreshes.extend(refresh);
+                }
+            }
+            pipes
+        };
+        for refresh in refreshes {
+            refresh.submit();
+        }
+        pipes
     }
 
     fn revalidate_pipes(&self) -> Result<(), PipeError> {
@@ -4699,7 +5149,7 @@ pub(crate) use session_adapter;
 
 /// The shared slots of a [`Pipe`] handle: how its join ended and its last
 /// options.
-type PipeSlots = (Arc<OnceLock<PipeError>>, Arc<OnceLock<core::PipeFinal>>);
+type PipeSlots = (Arc<PipeOutcome>, Arc<OnceLock<core::PipeFinal>>);
 
 /// The Pipe operations both drivers share: the public methods of each
 /// driver's type (`pipe_api!`) call them.
@@ -4721,9 +5171,15 @@ impl<D: Driver> PipeApi<D> for Pipe<D> {
     }
 
     fn stats(&self) -> Option<PipeStats> {
-        let mut st = self.conn.lock();
-        st.core.tick(D::now());
-        st.core.pipe_info(self.id)
+        let mut stats = self.pipe_signals()?;
+        if let Some(cache) = self.end.sample.get() {
+            let (sample, refresh) = cache.read(D::now());
+            stats.carrier_sample = sample;
+            if let Some(refresh) = refresh {
+                refresh.submit();
+            }
+        }
+        Some(stats)
     }
 
     fn admitted(&self) -> Option<crate::AdmittedValue> {

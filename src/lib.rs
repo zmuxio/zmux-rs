@@ -206,9 +206,12 @@
 #![warn(missing_debug_implementations)]
 mod backoff;
 mod driver;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub use driver::handle::{JoinError, JoinOutcome, JoinSession};
 mod error;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub mod helpers;
+mod lock_scope;
 // The sans-IO core and the wire codecs: what the drivers, the carrier
 // adapters, the secure carrier crates and the language bindings build on.
 // No stable API: applications use the items the crate root re-exports.
@@ -251,18 +254,18 @@ pub use proto::session::{
     AllowRecordMode, AuthorizeJoin, RecordMode, RecordPolicy, RecordPolicyInput,
 };
 pub use proto::session::{
-    CandidateOutcome, CandidateResult, Cap, CapacityFloor, CarrierKind, Change, Config,
-    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_JOIN_TIMEOUT, DEFAULT_KEEP_ALIVE_PERIOD,
-    DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF, DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_MEMORY_BUDGET,
-    DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER,
-    DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE, DEFAULT_SUSPECT_FLOOR, DatagramError,
-    DeadTimeout, DirectionState, EarlyData, EarlyDataState, EpochPolicy, GoAway, InboundState,
-    Inherit, JoinMissing, LaneStats, Liveness, LogLevel, Logger, MAX_STREAM_CREDIT, Multipath,
-    OpenError, OutboundState, PipeAuth, PipeError, PipeFailure, PipeHalf, PipeId, PipeLiveness,
-    PipeOptions, PipeStats, PipeUpdate, Preamble, PrioritySource, QualityBand, Redial, Redundancy,
-    RttSource, SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR, SessionError, SessionEvent, SessionId,
-    SessionStats, State as SessionState, StreamError, StreamStats, Support, TraceRecord, Tracer,
-    UniCredit, WindowIncrease,
+    CandidateOutcome, CandidateResult, Cap, CapacityFloor, CarrierConnId, CarrierCounts,
+    CarrierKind, CarrierSample, CarrierSource, Change, Config, DEFAULT_HANDSHAKE_TIMEOUT,
+    DEFAULT_JOIN_TIMEOUT, DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF,
+    DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_MEMORY_BUDGET, DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY,
+    DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER, DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE,
+    DEFAULT_SUSPECT_FLOOR, DatagramError, DeadTimeout, DirectionState, EarlyData, EarlyDataState,
+    EpochPolicy, GoAway, InboundState, Inherit, JoinMissing, LaneStats, Liveness, LogLevel, Logger,
+    MAX_STREAM_CREDIT, Multipath, OpenError, OutboundState, PipeAuth, PipeError, PipeFailure,
+    PipeHalf, PipeId, PipeLiveness, PipeOptions, PipeStats, PipeUpdate, Preamble, PrioritySource,
+    QualityBand, Redial, Redundancy, RttSource, SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR,
+    SessionError, SessionEvent, SessionId, SessionStats, State as SessionState, StreamError,
+    StreamStats, Support, TraceRecord, Tracer, UniCredit, WindowIncrease,
 };
 pub use proto::session::{InvalidConfig, check_max_record};
 pub use proto::{Decision, LaterFuture};
@@ -334,14 +337,21 @@ pub mod adapter {
     pub use crate::driver::channel::{
         ChannelDemux, ChannelReceiver, ChannelRegistration, DatagramChannel,
     };
+    #[doc(hidden)]
+    pub use crate::driver::handle::JoinCancellation;
     pub use crate::driver::lanes::{CarrierConnId, Lane, handle_lane};
     pub use crate::driver::listen::{
-        Admit, Admitted, Entry, JoinPrefix, ListenerAdapter, MemoryCharge, SetupGuard,
+        Admit, Admitted, Entry, JoinPrefix, ListenerAdapter, MemoryCharge, ResponseHead,
+        SetupCancellation, SetupGuard,
     };
+    #[doc(hidden)]
+    pub use crate::driver::listen::{RequestFallback, TrackRequestFallback};
+    #[doc(hidden)]
+    pub use crate::driver::setup_read::{ReadProbe, SetupRead};
     pub use crate::driver::tokio::{
         ChunkBuf, ChunkWrite, DRAIN_LIMIT, SessionAdapter, spawn_drain, within,
     };
-    pub use crate::driver::{empty_message, message_too_large};
+    pub use crate::driver::{empty_message, handshake_deadline, message_too_large, wait_deadline};
     pub use crate::proto::exporter::{CarrierExporter, RESERVED_EXPORTER_PREFIX};
     pub use crate::proto::ident::{FirstBytes, MAX_FIRST_BYTES, classify_first_bytes};
     pub use crate::proto::oob::{PAIR_HEADER, PAIRING_TOKEN_LEN};
@@ -349,6 +359,16 @@ pub mod adapter {
     pub use crate::proto::trusted::{forwarded_early_data, visit_fields};
     // Primitives zmux's own adapters share; hidden and outside the stable
     // API: they may change or go in any release.
+    #[doc(hidden)]
+    pub async fn while_open<T>(stop: impl Future, work: impl Future<Output = T>) -> Option<T> {
+        crate::driver::setup::while_open(stop, work).await
+    }
+
+    #[doc(hidden)]
+    pub async fn host_future<F: Future>(call: impl FnOnce() -> F) -> Option<F::Output> {
+        crate::proto::decision::host_future(call).await
+    }
+
     #[doc(hidden)]
     pub use crate::util::{HmacSha256, random_u64};
 
@@ -397,6 +417,22 @@ pub mod test_hooks {
     /// The packet stream's capsule decoder run over a byte string, for the fuzz
     /// targets.
     pub use crate::helpers::capsule::{CapsuleRun, decode_run as decode_capsules};
+
+    /// Incremental live heap of an idle attachment, worker registration and split adoption.
+    #[cfg(feature = "tokio")]
+    pub fn attachment_footprint(sample: impl Fn() -> i64) -> [i64; 3] {
+        crate::driver::attachment_footprint(sample)
+    }
+
+    #[cfg(feature = "tokio")]
+    pub use crate::driver::tokio::measure_session_polls;
+
+    /// Pipe observations without triggering a carrier refresh.
+    #[cfg(feature = "tokio")]
+    #[must_use]
+    pub fn pipe_signals(session: &crate::Session) -> Vec<crate::PipeStats> {
+        session.pipe_signals()
+    }
 
     /// Read buffers in the process-wide pool of idle pipes' buffers.
     #[must_use]

@@ -3,6 +3,8 @@
 //! stream over, the close without one, and streams held back until the
 //! first stream is accepted.
 
+#![cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+
 use std::sync::Arc;
 use std::time::Duration;
 

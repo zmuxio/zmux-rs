@@ -82,8 +82,8 @@ pub struct ExchangeOptions {
     /// by default, which must be set unless
     /// [`unauthenticated`](Self::unauthenticated) is).
     pub psk: Vec<u8>,
-    /// Client: the credential whose prefix ([`zmux::CarrierCredential::prefix`],
-    /// given no metadata) the uplink starts with, for a server's admission
+    /// Client: the credential whose header ([`zmux::CarrierCredential::header`])
+    /// accompanies the request that creates the exchange, for server admission
     /// ([`zmux::ListenerConfig::admission`]; none by default).
     pub carrier_credential: Option<std::sync::Arc<dyn zmux::CarrierCredential>>,
     /// Runs without a PSK, explicitly (false by default): the MACs then
@@ -249,7 +249,7 @@ impl Default for ExchangeOptions {
 }
 
 impl ExchangeOptions {
-    /// Client: starts the uplink with the prefix of `credential`.
+    /// Client: authenticates the creating request with the header of `credential`.
     #[must_use]
     pub fn with_carrier_credential(
         mut self,

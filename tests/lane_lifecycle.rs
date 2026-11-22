@@ -64,16 +64,181 @@ fn pipe_lane_record(key: &[u8; 16]) -> Vec<u8> {
 /// connection `conn`: it is aborted (its writer sees the end), and the
 /// routing refuses it.
 async fn lane_is_aborted(conn: &CarrierConnId, key: &[u8; 16]) {
-    let (mut w, r) = tokio::io::duplex(4096);
-    w.write_all(&pipe_lane_record(key)).await.unwrap();
-    let routed =
-        zmux::adapter::handle_lane(PipeIo::reader(r).with_carrier_conn(conn.clone())).await;
-    assert!(routed.is_err(), "a closing or closed session takes no lane");
-    let mut b = [0u8; 1];
-    assert!(
-        matches!(w.read(&mut b).await, Ok(0) | Err(_)),
-        "the lane stream is closed"
-    );
+    let record = pipe_lane_record(key);
+    for prefix_len in [1, record.len(), record.len() + 3] {
+        let mut payload = record.clone();
+        payload.extend_from_slice(b"end");
+        for direct in [true, false] {
+            let (mut w, r) = tokio::io::duplex(4096);
+            w.write_all(&payload[prefix_len..]).await.unwrap();
+            let io = PipeIo::reader(r)
+                .with_carrier_conn(conn.clone())
+                .with_prefix(payload[..prefix_len].to_vec());
+            let routed = if direct {
+                zmux::adapter::handle_lane(io).await
+            } else {
+                let l = zmux::Listener::new(Config::default(), zmux::ListenerConfig::default())
+                    .unwrap();
+                l.handle_pipe(io, zmux::PipeHint::default()).await
+            };
+            assert!(matches!(
+                routed,
+                Err(zmux::HandleError::Rejected | zmux::HandleError::Refused)
+            ));
+            assert!(matches!(w.read(&mut [0]).await, Ok(0) | Err(_)));
+        }
+    }
+}
+
+/// The bytes before and after a prefetched lane header reach the same live lane.
+#[test]
+// HS-31, HS-52, HS-58
+fn prefetched_lane_records_attach_and_replay_their_suffix() {
+    // Once the underlying reader has yielded the suffix, its next poll
+    // acknowledges that the owner loop has processed the preceding record.
+    struct Suffix {
+        bytes: bytes::Bytes,
+        consumed: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tokio::io::AsyncRead for Suffix {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.bytes.is_empty() {
+                if let Some(consumed) = self.consumed.take() {
+                    let _ = consumed.send(());
+                }
+                return std::task::Poll::Pending;
+            }
+            let n = self.bytes.len().min(buf.remaining());
+            buf.put_slice(&self.bytes.split_to(n));
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct EmptyLane {
+        _dropped: tokio::sync::oneshot::Sender<()>,
+    }
+    impl tokio::io::AsyncRead for EmptyLane {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    multi_thread(async {
+        let (ca, sa) = (Arc::new(()), Arc::new(()));
+        let (cid, sid) = (CarrierConnId::new(&ca), CarrierConnId::new(&sa));
+        let mut settings = config(Some(KEY));
+        settings.max_lanes = 8u64.try_into().unwrap();
+        let listener = zmux::Listener::new(settings, zmux::ListenerConfig::default()).unwrap();
+        let (x, y) = tokio::io::duplex(8192);
+        let (x, _) = Carrier::new(x);
+        let (y, acknowledgements) = Carrier::new(y);
+        let (handled, client) = tokio::join!(
+            listener.handle_pipe(
+                PipeIo::new(y)
+                    .with_carrier_conn(sid.clone())
+                    .with_lane_opener(std::future::pending),
+                zmux::PipeHint::default()
+            ),
+            Session::connect(
+                PipeIo::new(x)
+                    .with_carrier_conn(cid)
+                    .with_lane_opener(std::future::pending),
+                config(None)
+            )
+        );
+        handled.unwrap();
+        let client = client.unwrap();
+        let server = listener.accept().await.unwrap();
+        let pipe = server.pipe(zmux::PipeId::new(0)).unwrap();
+        // These streams stand in for peer-opened lanes. Keep their ACKs
+        // from reaching the client, which did not originate their headers.
+        acknowledgements.stall(true);
+        listener.drain(b"lane routing during drain");
+        // HS-58. The lane key and connection are genuine, but the other listener
+        // never admitted this session.
+        let lane = || {
+            PipeIo::reader(tokio::io::empty())
+                .with_carrier_conn(sid.clone())
+                .with_prefix(pipe_lane_record(&KEY))
+        };
+        let other = zmux::Listener::new(config(None), zmux::ListenerConfig::default()).unwrap();
+        assert_eq!(
+            other.handle_pipe(lane(), zmux::PipeHint::default()).await,
+            Err(zmux::HandleError::Rejected)
+        );
+        let mut number = 0u8;
+        for direct in [true, false] {
+            for prefetch in [
+                1,
+                pipe_lane_record(&KEY).len(),
+                pipe_lane_record(&KEY).len() + 4,
+            ] {
+                number += 1;
+                let mut record = pipe_lane_record(&KEY);
+                *record.last_mut().unwrap() = number;
+                // A complete record of padding following the first frame.
+                record.extend_from_slice(&[3, 0, 0, 0]);
+                let (consumed, processed) = tokio::sync::oneshot::channel();
+                let r = Suffix {
+                    bytes: bytes::Bytes::copy_from_slice(&record[prefetch..]),
+                    consumed: Some(consumed),
+                };
+                let io = PipeIo::reader(r)
+                    .with_carrier_conn(sid.clone())
+                    .with_prefix(record[..prefetch].to_vec());
+                if direct {
+                    zmux::adapter::handle_lane(io).await.unwrap();
+                } else {
+                    listener
+                        .handle_pipe(io, zmux::PipeHint::default())
+                        .await
+                        .unwrap();
+                }
+                watchdog(3, "lane reader resumed after its suffix", processed)
+                    .await
+                    .unwrap();
+                let stats = pipe.stats().unwrap();
+                let lane = stats
+                    .lanes
+                    .iter()
+                    .find(|l| l.lane.get() == u64::from(number))
+                    .unwrap();
+                assert_eq!(lane.position_received, Some(record.len() as u64));
+            }
+        }
+        // HS-52. A fresh lane can retire before its second record without
+        // involving the main pipe. Wait for the actual reader's destructor.
+        let (dropped, released) = tokio::sync::oneshot::channel();
+        let mut header = pipe_lane_record(&KEY);
+        *header.last_mut().unwrap() = number + 1;
+        let io = PipeIo::reader(EmptyLane { _dropped: dropped })
+            .with_carrier_conn(sid.clone())
+            .with_prefix(header);
+        zmux::adapter::handle_lane(io).await.unwrap();
+        assert!(released.await.is_err());
+        let (mut send, _recv) = client.open_bi().await.unwrap();
+        send.write_all(b"after lane EOF").await.unwrap();
+        send.finish().unwrap();
+        let (_, mut recv) = server.accept_bi().await.unwrap();
+        assert_eq!(
+            recv.read_to_end(32).await.unwrap().as_slice(),
+            b"after lane EOF"
+        );
+        listener.close();
+        assert_eq!(
+            zmux::adapter::handle_lane(lane()).await,
+            Err(zmux::HandleError::Refused)
+        );
+    });
 }
 
 /// Adding a pipe fails, and its carrier is closed.
@@ -146,6 +311,76 @@ fn a_closing_or_closed_session_takes_no_lanes_or_pipes_and_keeps_no_lane_state()
         drop((client, server, srecv, crecv));
         settle(base, 10, "sessions with lanes").await;
         tokio::time::sleep(Duration::from_millis(1)).await;
+    });
+}
+
+/// A retiring pipe wakes the pending opener before its public completion.
+#[test]
+// HS-52
+fn pipe_closed_waits_for_lane_worker_exit() {
+    struct Worker {
+        stopping: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    struct Gate(Option<Worker>);
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            let worker = self.0.take().unwrap();
+            let _ = worker.stopping.send(());
+            let _ = worker.release.recv_timeout(Duration::from_secs(5));
+        }
+    }
+    multi_thread(async {
+        let (ca, sa) = (Arc::new(()), Arc::new(()));
+        let (cid, sid) = (CarrierConnId::new(&ca), CarrierConnId::new(&sa));
+        let (x, y) = tokio::io::duplex(1 << 20);
+        let (y, _) = Carrier::new(y);
+        let server = tokio::spawn(common::accept(
+            lane_carrier(y, &sid, cid.clone()),
+            config(Some(KEY)),
+        ));
+        let (stop, stopping) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let (start, started) = tokio::sync::oneshot::channel();
+        let worker = std::sync::Mutex::new(Some((
+            start,
+            Worker {
+                stopping: stop,
+                release: gate,
+            },
+        )));
+        let io = PipeIo::new(x)
+            .with_carrier_conn(cid)
+            .with_lane_opener(move || {
+                let worker = worker.lock().unwrap().take();
+                async move {
+                    let _hold = worker.map(|(start, worker)| {
+                        let _ = start.send(());
+                        Gate(Some(worker))
+                    });
+                    std::future::pending::<std::io::Result<zmux::adapter::Lane>>().await
+                }
+            });
+        let client = Session::connect(io, config(None)).await.unwrap();
+        let _server = server.await.unwrap().unwrap();
+        let pipe = client.pipe(zmux::PipeId::new(0)).unwrap();
+        let (mut send, _recv) = client.open_bi().await.unwrap();
+        tokio::spawn(async move { send.write_all(&vec![7; 4 << 20]).await });
+        watchdog(5, "lane opened", started).await.unwrap();
+        pipe.abort().unwrap();
+        watchdog(5, "opener retiring", stopping).await.unwrap();
+        let mut closed = std::pin::pin!(pipe.closed());
+        assert!(
+            closed
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        release.send(()).unwrap();
+        assert!(matches!(
+            watchdog(5, "lane worker released", closed).await,
+            Err(zmux::PipeError::Failed(_))
+        ));
     });
 }
 

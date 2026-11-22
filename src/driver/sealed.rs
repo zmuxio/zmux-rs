@@ -3,7 +3,6 @@
 //! AEAD message. The carrier's lanes, datagram channel and exporter are hidden, since
 //! they would pass the protection; what is asked of its socket stays.
 
-use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -281,19 +280,7 @@ pub(crate) async fn read_unit(p: &mut PipeIo, into: &mut Vec<u8>) -> io::Result<
 }
 
 /// Runs `f` until the carrier's other wait says to stop: `stop` ready gives `None`.
-pub(crate) async fn until<T>(
-    stop: impl Future<Output = ()>,
-    f: impl Future<Output = T>,
-) -> Option<T> {
-    let (mut stop, mut f) = (std::pin::pin!(stop), std::pin::pin!(f));
-    std::future::poll_fn(|cx| {
-        if let Poll::Ready(v) = f.as_mut().poll(cx) {
-            return Poll::Ready(Some(v));
-        }
-        stop.as_mut().poll(cx).map(|()| None)
-    })
-    .await
-}
+pub(crate) use super::hooks::first as until;
 
 #[cfg(test)]
 mod tests {

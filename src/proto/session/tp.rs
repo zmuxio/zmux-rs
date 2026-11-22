@@ -49,8 +49,8 @@ pub(super) struct TpValues {
     pub(super) window_uni: u64,
     /// `initial_max_streams_bidi`.
     pub(super) streams_bidi: u64,
-    /// `max_idle_timeout` in milliseconds (0: none).
-    pub(super) max_idle_timeout: u64,
+    /// Idle timeout on this endpoint, or the peer's advertised limit.
+    pub(super) max_idle_timeout: Option<std::time::Duration>,
     /// The nonce of `zmux_role` auto.
     pub(super) role_nonce: Option<u64>,
     /// `zmux_multipath` (the local one as the session sends it: its locator
@@ -80,7 +80,10 @@ impl TpValues {
             window_bidi_remote: tp.initial_max_stream_data_bidi_remote.unwrap_or(0),
             window_uni: tp.initial_max_stream_data_uni.unwrap_or(0),
             streams_bidi: tp.initial_max_streams_bidi.unwrap_or(0),
-            max_idle_timeout: tp.max_idle_timeout.unwrap_or(0),
+            max_idle_timeout: tp
+                .max_idle_timeout
+                .filter(|&ms| ms != 0)
+                .map(std::time::Duration::from_millis),
             role_nonce: match tp.zmux_role {
                 Some(RoleParameter::Auto { nonce }) => Some(nonce),
                 _ => None,
@@ -112,7 +115,7 @@ impl TpValues {
             window_bidi_remote: window,
             window_uni: window,
             streams_bidi: config.max_incoming_streams,
-            max_idle_timeout: config.idle_millis(),
+            max_idle_timeout: config.max_idle_timeout,
             role_nonce: own.role_nonce,
             multipath: own.multipath.as_ref().map(MultipathValues::of),
             lane_key: Some(own.lane_key),

@@ -1035,9 +1035,7 @@ impl Maintainer {
                     break;
                 }
                 Wake::Dial(dialing, r) => {
-                    if let Some(session) = self.link.get() {
-                        self.dialled(&session, &dialing, *r);
-                    }
+                    self.dialled(&Session::after_dial(sh), &dialing, *r);
                 }
                 Wake::Tick => {}
             }
@@ -1069,7 +1067,7 @@ impl Maintainer {
     fn infos(&self) -> Vec<Vec<Option<PipeStats>>> {
         self.members
             .iter()
-            .map(|m| m.pipes.iter().map(Pipe::stats).collect())
+            .map(|m| m.pipes.iter().map(Pipe::pipe_signals).collect())
             .collect()
     }
 
@@ -1470,7 +1468,7 @@ impl Maintainer {
         if session.state() == State::Suspended {
             return false;
         }
-        let pipes = session.pipe_stats();
+        let pipes = session.pipe_signals();
         pipes
             .iter()
             .any(|p| p.outbound == Some(OutboundState::Active) && !p.in_probation)

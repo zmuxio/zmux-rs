@@ -27,13 +27,33 @@ use crate::{Options, PROTOCOL_HEADER, pipe, ws_config};
 /// completed).
 pub type UpgradedCarrier = Pin<Box<dyn Future<Output = Option<(PipeIo, PipeHint)>> + Send>>;
 
+/// The accepted extended CONNECT response's header-flush receipt. Hyper
+/// makes an HTTP/2 tunnel available as soon as its headers are queued.
+#[derive(Clone, Debug)]
+pub struct UpgradeFlush(std::sync::Arc<std::sync::Mutex<Option<zmux::adapter::ResponseHead>>>);
+
+impl UpgradeFlush {
+    /// Takes the receipt from the response extensions. The HTTP server sends
+    /// it after its successful header flush; dropping it withdraws the upgrade.
+    pub fn take(response: &mut http::Response<()>) -> Option<zmux::adapter::ResponseHead> {
+        response
+            .extensions_mut()
+            .remove::<Self>()?
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
 /// What became of a request ([`accept_request`]).
 pub enum RequestUpgrade<B> {
     /// Accepted, or the decision deferred to the carrier: answer the
     /// request with `response` (101 on HTTP/1.1, 200 on HTTP/2); `carrier`
     /// resolves once the connection is upgraded and the carrier admitted.
     Accepted {
-        /// The response, without a body.
+        /// The response, without a body. On an extended CONNECT which may
+        /// transfer the carrier to the host, forward its [`UpgradeFlush`].
         response: http::Response<()>,
         /// The carrier, after the upgrade.
         carrier: UpgradedCarrier,
@@ -163,17 +183,35 @@ where
             .extensions
             .get::<zmux_rustls::TlsBinding>()
             .map_or_else(CarrierInfo::new, zmux_rustls::TlsBinding::info);
-        let info =
-            info(base).with_request_head(std::sync::Arc::new(parts.clone()), crate::header_fields);
-        entry.decide_upgrade(info).await
+        let Some(info) = entry.host(|| info(base)) else {
+            return RequestUpgrade::Ended;
+        };
+        entry
+            .decide_upgrade(
+                info.with_request_head(std::sync::Arc::new(parts.clone()), crate::header_fields),
+            )
+            .await
     };
     match admit {
-        Admit::Accept(_) | Admit::Defer => {}
+        Admit::Accept(_) | Admit::Defer | Admit::TakeOver(_) => {}
         Admit::Fallback(_) => {
+            if parts
+                .extensions
+                .get::<zmux::adapter::TrackRequestFallback>()
+                .is_some()
+            {
+                if let Some(outcome) = entry.request_fallback() {
+                    parts.extensions.insert(outcome);
+                }
+            } else {
+                entry.complete_request_fallback(true);
+            }
             return RequestUpgrade::Refused(http::Request::from_parts(parts, body));
         }
         Admit::Stall => {
-            entry.stall(None::<&mut tokio::io::Empty>).await;
+            entry
+                .stall_local(http::Request::from_parts(parts, body))
+                .await;
             return RequestUpgrade::Ended;
         }
         _ => return RequestUpgrade::Ended,
@@ -202,11 +240,25 @@ where
         h.insert(PROTOCOL_HEADER, p);
     }
     let binding = parts.extensions.get::<zmux_rustls::TlsBinding>().cloned();
+    let flush = (parts.method == Method::CONNECT
+        && matches!(admit, Admit::TakeOver(_) | Admit::Defer))
+    .then(|| {
+        let (sent, ready) = entry.response_head();
+        response
+            .extensions_mut()
+            .insert(UpgradeFlush(std::sync::Arc::new(std::sync::Mutex::new(
+                Some(sent),
+            ))));
+        ready
+    });
     let carrier = Box::pin(async move {
         // The upgrade, within what remains of a deferred decision's peek
         // timeout.
         let first = async move {
             let upgraded = on_upgrade.await.map_err(io::Error::other)?;
+            if let Some(flush) = flush {
+                flush.await.map_err(io::Error::other)?;
+            }
             let ws = WebSocketStream::from_raw_socket(
                 TokioIo::new(upgraded),
                 Role::Server,
@@ -224,4 +276,57 @@ where
         Some((io, PipeHint::from_entry(entry)))
     });
     RequestUpgrade::Accepted { response, carrier }
+}
+
+#[cfg(test)]
+mod local_body_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_borrowed_non_send_upgrade_body_drops_before_its_slot() {
+        use std::{cell::Cell, rc::Rc};
+        struct Body<'a>(&'a Rc<Cell<bool>>, &'a Listener, SocketAddr);
+        impl Drop for Body<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+                assert!(self.1.adapter().enter(self.2, None).is_none());
+            }
+        }
+        let mut config = zmux::ListenerConfig::default();
+        config.limits.max_pending_per_source = 2;
+        config.admission = Some(zmux::Admission::new(0, |_, _| {
+            zmux::AdmissionVerdict::Stall
+        }));
+        let listener = Listener::new(zmux::Config::default(), config).unwrap();
+        let addr = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+        let _other = listener.adapter().enter(addr, None).unwrap();
+        let dropped = Rc::new(Cell::new(false));
+        let request = http::Request::builder()
+            .header("Connection", "upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "test")
+            .header(PROTOCOL_HEADER, "qmux-02")
+            .body(Body(&dropped, &listener, addr))
+            .unwrap();
+        let options = Options::default();
+        let mut future = Box::pin(accept_request(
+            request,
+            addr,
+            std::convert::identity,
+            &listener,
+            &options,
+        ));
+        assert!(
+            Future::poll(
+                future.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        assert!(!dropped.get());
+        drop(future);
+        assert!(dropped.get());
+        assert!(listener.adapter().enter(addr, None).is_some());
+    }
 }

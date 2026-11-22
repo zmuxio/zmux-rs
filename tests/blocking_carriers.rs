@@ -340,6 +340,187 @@ fn add_pipe_releases_a_failed_carrier_once() {
     });
 }
 
+struct ReplyWriter {
+    buffered: io::BufWriter<TcpStream>,
+    gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+}
+
+impl Write for ReplyWriter {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.buffered.write(b)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some((entered, release)) = self.gate.take() {
+            entered.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        self.buffered.flush()
+    }
+}
+
+#[test]
+// HS-04
+fn authenticated_refusal_returns_before_reply_flush() {
+    watchdog(10, "authenticated refusal", || {
+        let mut config = multipath();
+        config.max_pipes = 2;
+        config.pipe_headroom = 0;
+        let reports = |config: &mut Config| {
+            let (tx, rx) = mpsc::channel();
+            config.join_outcome = Some(zmux::JoinOutcome::new(move |_, pipe, error| {
+                tx.send((pipe, error)).unwrap();
+                zmux::Decision::Now(())
+            }));
+            rx
+        };
+        let incoming = reports(&mut config);
+        let (listener, addr) = listening(config);
+        let dial = || PipeIo::from_tcp(TcpStream::connect(addr).unwrap());
+        let mut config = multipath();
+        let outgoing = reports(&mut config);
+        let client = Session::connect(dial(), config).unwrap();
+        let _server = listener.accept().unwrap();
+        let first = client.add_pipe(dial(), PipeOptions::default()).unwrap();
+        for rx in [&incoming, &outgoing] {
+            assert!(
+                matches!(rx.recv_timeout(Duration::from_secs(3)), Ok((id, None)) if id == first.id())
+            );
+        }
+        let mut limits = listener.limits();
+        limits.max_pending = Some(1);
+        listener.set_limits(limits).unwrap();
+        let (near, far) = tcp_pair();
+        let (entered, flushing) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let (result, setup) = mpsc::channel();
+        let writer = ReplyWriter {
+            buffered: io::BufWriter::new(far.try_clone().unwrap()),
+            gate: Some((entered, gate)),
+        };
+        let closer = far.try_clone().unwrap();
+        let io = PipeIo::from_halves(far, writer).with_closer(move |how| {
+            let _ = closer.shutdown(how);
+        });
+        let l = listener.clone();
+        thread::spawn(move || {
+            result.send(l.handle_pipe(io, PipeHint::default())).unwrap();
+        });
+        let refused = client
+            .begin_add_pipe(PipeIo::from_tcp(near), PipeOptions::default())
+            .unwrap();
+        flushing.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            setup.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(HandleError::Refused)
+        );
+        // An EOF carrier reaches first-record classification only with a slot.
+        let probe = || {
+            let entered = Arc::new(AtomicBool::new(false));
+            let seen = entered.clone();
+            let (local, peer) = tcp_pair();
+            drop(peer);
+            let io = PipeIo::from_tcp(local).with_exporter_async(move |_| {
+                seen.store(true, Ordering::SeqCst);
+                std::future::ready(Ok(vec![0; 32]))
+            });
+            let _ = listener.handle_pipe(io, PipeHint::default());
+            entered.load(Ordering::SeqCst)
+        };
+        assert!(!probe());
+        let mut limits = listener.limits();
+        limits.max_pending = Some(4);
+        limits.max_pending_per_source = 2;
+        listener.set_limits(limits).unwrap();
+        let (local, _peer) = tcp_pair();
+        let (started, waiting) = mpsc::channel();
+        let second = PipeIo::from_tcp(local).with_exporter_async(move |_| {
+            started.send(()).unwrap();
+            std::future::pending()
+        });
+        let other = listener.clone();
+        let held = thread::spawn(move || other.handle_pipe(second, PipeHint::default()));
+        waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!probe());
+        release.send(()).unwrap();
+        assert!(matches!(
+            refused.joined(),
+            Err(WaitError::Failed(PipeError::Failed(
+                zmux::PipeFailure::JoinRefused
+            )))
+        ));
+        for rx in [&incoming, &outgoing] {
+            assert!(
+                matches!(rx.recv_timeout(Duration::from_secs(3)), Ok((id, Some(zmux::JoinError::Refused))) if id == refused.id())
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        let until = Instant::now() + Duration::from_secs(1);
+        while !probe() {
+            assert!(Instant::now() < until, "the refusal still holds the slot");
+            thread::yield_now();
+        }
+        listener.close();
+        assert_eq!(held.join().unwrap(), Err(HandleError::Refused));
+    });
+}
+
+/// Retirement wakes the reader; releasing it can finish later.
+#[test]
+fn pipe_closed_waits_for_the_blocking_reader() {
+    struct Reader {
+        stream: TcpStream,
+        ending: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Read for Reader {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            self.stream.read(b)
+        }
+    }
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            let _ = self.ending.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+        }
+    }
+    watchdog(10, "pipe reader cleanup", || {
+        let (listener, addr) = listening(multipath());
+        let client = Session::connect(
+            PipeIo::from_tcp(TcpStream::connect(addr).unwrap()),
+            multipath(),
+        )
+        .unwrap();
+        let _server = listener.accept().unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        let (ending, at_drop) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let reader = Reader {
+            stream: stream.try_clone().unwrap(),
+            ending,
+            release: gate,
+        };
+        let closer = stream.try_clone().unwrap();
+        let io = PipeIo::from_halves(reader, stream).with_closer(move |how| {
+            let _ = closer.shutdown(how);
+        });
+        let pipe = client.add_pipe(io, PipeOptions::default()).unwrap();
+        pipe.abort().unwrap();
+        at_drop.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(
+            pipe.closed_timeout(Duration::ZERO),
+            Err(WaitError::TimedOut)
+        ));
+        release.send(()).unwrap();
+        assert!(matches!(
+            pipe.closed_timeout(Duration::from_secs(3)),
+            Err(WaitError::Failed(PipeError::Failed(
+                zmux::PipeFailure::Aborted
+            )))
+        ));
+        listener.close();
+    });
+}
+
 /// A listener's new session: not zmux, a silent carrier, a carrier after `close`, and a
 /// session whose handshake fails each release the carrier once.
 #[test]
@@ -670,6 +851,7 @@ fn the_redial_hook_replaces_a_lost_pipe() {
 /// dialled through the redial hook and joined in the new epoch; without the hook it is the
 /// configuration error.
 #[test]
+// HS-21
 fn replace_pipes_replaces_every_pipe() {
     watchdog(30, "replace_pipes", || {
         let manual = || {
@@ -782,7 +964,26 @@ impl Gate {
     }
 }
 
-struct GatedWrite(TcpStream, Arc<Gate>);
+#[derive(Clone)]
+struct SharedSocket(Arc<TcpStream>);
+
+impl Read for SharedSocket {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        (&*self.0).read(b)
+    }
+}
+
+impl Write for SharedSocket {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        (&*self.0).write(b)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
+struct GatedWrite(SharedSocket, Arc<Gate>);
 
 impl Write for GatedWrite {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -801,8 +1002,9 @@ impl Write for GatedWrite {
 
 /// A carrier on `s` whose writes pass `gate`.
 fn gated(s: TcpStream, gate: &Arc<Gate>) -> PipeIo {
-    let closer = PipeIo::tcp_closer(s.try_clone().unwrap());
-    PipeIo::from_halves(s.try_clone().unwrap(), GatedWrite(s, gate.clone())).with_closer(closer)
+    let socket = SharedSocket(Arc::new(s));
+    let closer = PipeIo::tcp_closer(socket.0.clone());
+    PipeIo::from_halves(socket.clone(), GatedWrite(socket, gate.clone())).with_closer(closer)
 }
 
 /// Dropped stream handles are released by the session, promptly and without blocking the
@@ -863,5 +1065,482 @@ fn dropped_streams_are_released_after_pipe_0_went() {
         assert!(p1.stats().is_some());
         c.close();
         l.close();
+    });
+}
+
+#[test]
+fn closing_listener_interrupts_pending_blocking_exporter() {
+    watchdog(5, "blocking exporter cancellation", || {
+        let mut limits = ListenerConfig::default();
+        limits.handshake_timeout = Duration::MAX;
+        let listener = Listener::new(multipath(), limits, None).unwrap();
+        let (local, mut peer) = tcp_pair();
+        let (entered, started) = mpsc::channel();
+        let io = PipeIo::from_tcp(local).with_exporter_async(move |_| {
+            entered.send(()).unwrap();
+            std::future::pending()
+        });
+        let l = listener.clone();
+        let handler = thread::spawn(move || l.handle_pipe(io, PipeHint::default()));
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        listener.close();
+        assert_eq!(handler.join().unwrap(), Err(HandleError::Refused));
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    });
+}
+
+#[test]
+fn one_way_handoff_ends_only_the_unused_tcp_direction() {
+    watchdog(8, "directional TCP handoff", || {
+        let (listener, addr) = listening(multipath());
+        let client = Session::connect(
+            PipeIo::from_tcp(TcpStream::connect(addr).unwrap()),
+            multipath(),
+        )
+        .unwrap();
+        let server = listener.accept().unwrap();
+        let (near, far) = tcp_pair();
+        let mut eof = near.try_clone().unwrap();
+        let (done, handled) = mpsc::channel();
+        let l = listener.clone();
+        thread::spawn(move || {
+            done.send(l.handle_pipe(PipeIo::from_tcp(far), PipeHint::default()))
+                .unwrap();
+        });
+        let mut options = PipeOptions::new();
+        options.direction = zmux::PipeDirection::Out;
+        // Keep the probe's socket read side open when the client retires
+        // its unused reader. EOF can now come only from the server's FIN.
+        let closer = near.try_clone().unwrap();
+        let observed =
+            PipeIo::from_halves(near.try_clone().unwrap(), near).with_closer(move |how| {
+                if how != Shutdown::Read {
+                    let _ = closer.shutdown(how);
+                }
+            });
+        let added = client.add_pipe(observed, options).unwrap();
+        handled
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        eof.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(eof.read(&mut [0]).unwrap(), 0);
+        let mut reverse = PipeOptions::new();
+        reverse.direction = zmux::PipeDirection::In;
+        let _reverse = client
+            .add_pipe(PipeIo::from_tcp(TcpStream::connect(addr).unwrap()), reverse)
+            .unwrap();
+        added.attached().unwrap();
+        client.pipe(PipeId::new(0)).unwrap().abort().unwrap();
+        let payload = vec![83; 32768];
+        let before = added.stats().unwrap().bytes_sent;
+        let mut send = client.open_uni().unwrap();
+        send.write_all(&payload).unwrap();
+        send.finish().unwrap();
+        let mut recv = server.accept_uni().unwrap();
+        assert_eq!(recv.read_to_end(payload.len()).unwrap(), payload);
+        assert!(added.stats().unwrap().bytes_sent - before >= payload.len() as u64);
+        listener.close();
+    });
+}
+
+#[test]
+fn confirmed_blocking_join_returns_while_unused_half_drops() {
+    struct Half {
+        stream: TcpStream,
+        gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+    impl Read for Half {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            self.stream.read(b)
+        }
+    }
+    impl Write for Half {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.stream.write(b)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+    impl Drop for Half {
+        fn drop(&mut self) {
+            if let Some((entered, gate)) = self.gate.take() {
+                let _ = entered.send(());
+                let _ = gate.recv_timeout(Duration::from_secs(4));
+            }
+        }
+    }
+    watchdog(12, "one-way half cleanup", || {
+        let (listener, addr) = listening(multipath());
+        let client = Session::connect(
+            PipeIo::from_tcp(TcpStream::connect(addr).unwrap()),
+            multipath(),
+        )
+        .unwrap();
+        let _server = listener.accept().unwrap();
+        for direction in [zmux::PipeDirection::Out, zmux::PipeDirection::In] {
+            let (near, far) = tcp_pair();
+            let (entered, dropping) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let mut latch = Some((entered, gate));
+            let r = Half {
+                stream: far.try_clone().unwrap(),
+                gate: if direction == zmux::PipeDirection::In {
+                    latch.take()
+                } else {
+                    None
+                },
+            };
+            let w = Half {
+                stream: far.try_clone().unwrap(),
+                gate: latch,
+            };
+            let io = PipeIo::from_halves(r, w).with_closer(move |how| {
+                let _ = far.shutdown(how);
+            });
+            let l = listener.clone();
+            let (done, handled) = mpsc::channel();
+            thread::spawn(move || done.send(l.handle_pipe(io, PipeHint::default())).unwrap());
+            let mut options = PipeOptions::new();
+            options.direction = direction;
+            let _pipe = client
+                .begin_add_pipe(PipeIo::from_tcp(near), options)
+                .unwrap();
+            dropping.recv_timeout(Duration::from_secs(3)).unwrap();
+            handled
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            release.send(()).unwrap();
+        }
+        listener.close();
+    });
+}
+
+#[test]
+fn replacement_carrier_receives_setup_interrupts() {
+    struct Reading(SharedSocket, mpsc::Sender<()>);
+    impl Read for Reading {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            self.1.send(()).unwrap();
+            self.0.read(b)
+        }
+    }
+    watchdog(8, "replacement closer", || {
+        for stop in [true, false] {
+            let (input, _peer) = tcp_pair();
+            let (output, mut actual_peer) = tcp_pair();
+            let (at_read, entered) = mpsc::channel();
+            let output = SharedSocket(Arc::new(output));
+            let closer = PipeIo::tcp_closer(output.0.clone());
+            let replacement = Mutex::new(Some(
+                PipeIo::from_halves(Reading(output.clone(), at_read), output).with_closer(closer),
+            ));
+            let transform = zmux::blocking::InboundTransform::new(move |_, _| {
+                Ok(replacement.lock().unwrap().take().unwrap())
+            });
+            let mut limits = ListenerConfig::default();
+            limits.limits.first_record_timeout = if stop {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(250)
+            };
+            let listener = Listener::new(multipath(), limits, Some(transform)).unwrap();
+            let l = listener.clone();
+            let task =
+                thread::spawn(move || l.handle_pipe(PipeIo::from_tcp(input), PipeHint::default()));
+            entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            if stop {
+                listener.close();
+            }
+            assert!(task.join().unwrap().is_err());
+            assert_eq!(actual_peer.read(&mut [0]).unwrap(), 0);
+        }
+    });
+}
+
+#[test]
+fn listener_close_before_accept_uses_application_zero() {
+    watchdog(5, "closing a queued session", || {
+        let listener = Listener::new(Config::default(), ListenerConfig::default(), None).unwrap();
+        let (a, b) = tcp_pair();
+        let client = thread::spawn(move || {
+            Session::connect(PipeIo::from_tcp(a), Config::default()).unwrap()
+        });
+        listener
+            .handle_pipe(PipeIo::from_tcp(b), PipeHint::default())
+            .unwrap();
+        let client = client.join().unwrap();
+        listener.close();
+        assert!(matches!(
+            client.closing().unwrap(),
+            zmux::SessionError::ApplicationClosed {
+                code: VarInt::ZERO,
+                remote: true,
+                ..
+            }
+        ));
+    });
+}
+
+#[test]
+// HS-35
+fn close_during_bootstrap_transport_handoff() {
+    struct Gate(TcpStream, Option<Listener>);
+    impl Write for Gate {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(listener) = self.1.take() {
+                listener.close();
+            }
+            self.0.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+    watchdog(5, "closing while the session writes its bootstrap", || {
+        let listener = Listener::new(Config::default(), ListenerConfig::default(), None).unwrap();
+        let (a, b) = tcp_pair();
+        let client =
+            thread::spawn(move || Session::connect(PipeIo::from_tcp(a), Config::default()));
+        let closer = b.try_clone().unwrap();
+        let reader = b.try_clone().unwrap();
+        let pipe =
+            PipeIo::from_halves(reader, Gate(b, Some(listener.clone()))).with_closer(move |how| {
+                let _ = closer.shutdown(how);
+            });
+        let _ = listener.handle_pipe(pipe, PipeHint::default());
+        match client.join().unwrap() {
+            Ok(session) => assert!(matches!(
+                session.closing().unwrap(),
+                zmux::SessionError::ApplicationClosed {
+                    code: VarInt::ZERO,
+                    remote: true,
+                    ..
+                }
+            )),
+            Err(WaitError::Failed(ConnectError::SessionLost(
+                zmux::SessionError::ApplicationClosed {
+                    code: VarInt::ZERO,
+                    remote: true,
+                    ..
+                },
+            ))) => {}
+            Err(e) => panic!("peer did not see an application close: {e:?}"),
+        }
+    });
+}
+
+#[test]
+fn shutdown_codes_distinguish_queued_and_accepted_sessions() {
+    watchdog(8, "closing queued and accepted sessions", || {
+        let listener = Listener::new(Config::default(), ListenerConfig::default(), None).unwrap();
+        let mut clients = Vec::new();
+        let mut accepted = Vec::new();
+        for i in 0..2 {
+            let (near, far) = tcp_pair();
+            let l = listener.clone();
+            let setup =
+                thread::spawn(move || l.handle_pipe(PipeIo::from_tcp(far), PipeHint::default()));
+            clients.push(Session::connect(PipeIo::from_tcp(near), Config::default()).unwrap());
+            setup.join().unwrap().unwrap();
+            if i == 0 {
+                accepted.push(listener.accept().unwrap());
+            }
+        }
+        listener.shutdown(VarInt::from_u32(79), b"maintenance");
+        for (client, want) in clients.iter().zip([79, 0]) {
+            let error = client.closing_timeout(Duration::from_secs(3)).unwrap();
+            assert!(
+                matches!(error, zmux::SessionError::ApplicationClosed {code, remote: true, ..} if code == VarInt::from_u32(want)),
+                "{error:?}"
+            );
+        }
+    });
+}
+
+#[test]
+// HS-26
+fn a_join_callback_can_wait_for_its_own_session_to_close() {
+    watchdog(8, "callback waits for blocking session", || {
+        let (entered, entering) = mpsc::channel();
+        let (left, leaving) = mpsc::channel();
+        let mut cfg = multipath();
+        cfg.join_outcome = Some(zmux::JoinOutcome::new(move |session, _, why| {
+            assert!(why.is_none());
+            let s = match session {
+                zmux::JoinSession::Blocking(s) => s,
+                #[cfg(feature = "tokio")]
+                zmux::JoinSession::Tokio(_) => unreachable!(),
+            };
+            entered.send(()).unwrap();
+            left.send(s.closed().unwrap()).unwrap();
+            zmux::Decision::Now(())
+        }));
+        let listener = Listener::new(cfg.clone(), ListenerConfig::default(), None).unwrap();
+        let incoming = || {
+            let (a, b) = tcp_pair();
+            let l = listener.clone();
+            (
+                PipeIo::from_tcp(a),
+                thread::spawn(move || l.handle_pipe(PipeIo::from_tcp(b), PipeHint::default())),
+            )
+        };
+        let (bootstrap, setup) = incoming();
+        let client = Session::connect(bootstrap, cfg).unwrap();
+        setup.join().unwrap().unwrap();
+        let _server = listener.accept().unwrap();
+        let (next, setup) = incoming();
+        let pipe = client.add_pipe(next, PipeOptions::default()).unwrap();
+        setup.join().unwrap().unwrap();
+        entering.recv().unwrap();
+        entering.recv().unwrap();
+        client.close();
+        leaving.recv().unwrap();
+        leaving.recv().unwrap();
+        pipe.attached().unwrap();
+    });
+}
+
+#[test]
+// HS-24
+fn replacement_preserves_the_callers_deadline_in_its_join_outcome() {
+    watchdog(10, "join with caller deadline", || {
+        let mut cfg = multipath();
+        cfg.epoch_policy = zmux::EpochPolicy::MANUAL;
+        let (listener, addr) = listening(cfg.clone());
+        let (silent, _peer) = tcp_pair();
+        let carrier = Mutex::new(Some(silent));
+        cfg.redial = Some(zmux::Redial::blocking(move |_| {
+            Ok(PipeIo::from_tcp(carrier.lock().unwrap().take().unwrap()))
+        }));
+        let (tx, rx) = mpsc::channel();
+        cfg.join_outcome = Some(zmux::JoinOutcome::new(move |_, id, error| {
+            tx.send((id, error)).unwrap();
+            zmux::Decision::Now(())
+        }));
+        let client =
+            Session::connect(PipeIo::from_tcp(TcpStream::connect(addr).unwrap()), cfg).unwrap();
+        let _server = listener.accept().unwrap();
+        client
+            .add_pipe(
+                PipeIo::from_tcp(TcpStream::connect(addr).unwrap()),
+                PipeOptions::new(),
+            )
+            .unwrap();
+        assert!(rx.recv().unwrap().1.is_none());
+        assert!(matches!(
+            client.replace_pipes_timeout(Duration::from_secs(1)),
+            Err(WaitError::TimedOut)
+        ));
+        let (id, outcome) = rx.recv().unwrap();
+        assert_ne!(id, PipeId::UNASSIGNED);
+        assert!(
+            matches!(outcome, Some(zmux::JoinError::CallerDeadline)),
+            "{outcome:?}"
+        );
+    });
+}
+
+/// Confirm traverses a real TCP carrier, but the first record cannot reach the
+/// peer until after the caller's deadline. Keep a public handle across cleanup.
+#[test]
+// HS-23
+fn caller_deadline_aborts_a_locally_installed_replacement() {
+    struct RecordsGate {
+        stream: SharedSocket,
+        handshakes: u8,
+        entered: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Write for RecordsGate {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.handshakes > 0 {
+                self.handshakes -= 1;
+            } else if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                let _ = self.release.recv();
+            }
+            self.stream.write_all(bytes)?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    watchdog(10, "deadline after replacement Confirm", || {
+        let mut cfg = multipath();
+        cfg.epoch_policy = zmux::EpochPolicy::MANUAL;
+        let (listener, addr) = listening(cfg.clone());
+        let stream = SharedSocket(Arc::new(TcpStream::connect(addr).unwrap()));
+        let closer = PipeIo::tcp_closer(stream.0.clone());
+        let (notify, entered) = mpsc::channel();
+        let (release, signal) = mpsc::channel();
+        let io = PipeIo::from_halves(
+            stream.clone(),
+            RecordsGate {
+                stream,
+                handshakes: 2,
+                entered: Some(notify),
+                release: signal,
+            },
+        )
+        .with_closer(closer);
+        let carrier = Mutex::new(Some(io));
+        cfg.redial = Some(zmux::Redial::blocking(move |_| {
+            Ok(carrier.lock().unwrap().take().unwrap())
+        }));
+        let (tx, rx) = mpsc::channel();
+        cfg.join_outcome = Some(zmux::JoinOutcome::new(move |_, id, error| {
+            tx.send((id, error)).unwrap();
+            zmux::Decision::Now(())
+        }));
+        let client =
+            Session::connect(PipeIo::from_tcp(TcpStream::connect(addr).unwrap()), cfg).unwrap();
+        let _server = listener.accept().unwrap();
+        let old = client
+            .add_pipe(
+                PipeIo::from_tcp(TcpStream::connect(addr).unwrap()),
+                PipeOptions::new(),
+            )
+            .unwrap();
+        assert!(rx.recv().unwrap().1.is_none());
+        let replacing = client.clone();
+        let task = thread::spawn(move || replacing.replace_pipes_timeout(Duration::from_secs(2)));
+        entered.recv().unwrap();
+        let pipe = client
+            .pipes()
+            .into_iter()
+            .find(|p| p.id() != PipeId::new(0) && p.id() != old.id())
+            .unwrap();
+        pipe.joined().unwrap();
+        assert!(!pipe.stats().unwrap().peer_attached);
+        assert!(matches!(task.join().unwrap(), Err(WaitError::TimedOut)));
+        assert!(matches!(
+            pipe.attached(),
+            Err(WaitError::Failed(PipeError::Failed(
+                zmux::PipeFailure::CallerDeadline
+            )))
+        ));
+        let (id, reason) = rx.recv().unwrap();
+        assert_eq!(id, pipe.id());
+        assert!(client.pipes().iter().all(|live| live.id() != id));
+        assert!(matches!(reason, Some(zmux::JoinError::CallerDeadline)));
+        release.send(()).unwrap();
+        assert!(matches!(
+            pipe.closed(),
+            Err(WaitError::Failed(PipeError::Failed(
+                zmux::PipeFailure::CallerDeadline
+            )))
+        ));
+        assert!(matches!(
+            pipe.attached(),
+            Err(WaitError::Failed(PipeError::Failed(
+                zmux::PipeFailure::CallerDeadline
+            )))
+        ));
+        assert!(rx.try_recv().is_err());
     });
 }

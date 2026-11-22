@@ -61,7 +61,7 @@ bytes = "1.12"
 getrandom = "0.4"
 hmac = "0.13"
 # The ML-KEM-768 of Group 2 (Join and session epochs) and of the Establish Profiles.
-libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768", "std"] }
+libcrux-ml-kem = { version = "=0.0.12", default-features = false, features = ["mlkem768", "std"] }
 sha2 = "0.11"
 tokio = { version = "1.54", optional = true, features = ["rt", "net", "io-util", "sync", "time"] }
 # The X25519 of Groups 1 and 2 and of the Establish Profiles.
@@ -82,6 +82,10 @@ zmux = { path = ".", features = ["test-hooks", "blocking", "seal-chacha"] }
 zmux-testcert = { path = "testcert" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# Queue an overlapped receive before exercising the blocking TCP closer.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 # Model checking of the drivers' synchronization units (src/driver/loom.rs):
 # LOOM_MAX_PREEMPTIONS=2 RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom \

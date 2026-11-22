@@ -5,6 +5,8 @@
 //! rejects 0-RTT (here, a new server that cannot read the ticket) gets
 //! everything again on a new stream, and no stream fails.
 
+#![cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

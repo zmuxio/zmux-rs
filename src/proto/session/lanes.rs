@@ -210,7 +210,11 @@ impl SessionCore {
             l.lane_closed(n);
         }
         if confirmed {
-            self.outbound_failed(pipe, super::PipeFailure::Carrier(kind), now);
+            self.outbound_failed(
+                super::PipeId::new(pipe).lane(n),
+                super::PipeFailure::Carrier(kind),
+                now,
+            );
         }
     }
 
@@ -371,7 +375,7 @@ impl SessionCore {
     /// Whether an orderly `CONNECTION_CLOSE` waits for a `PIPE_ACK` to
     /// cover the records it must not overtake ([`Self::close_covered`]).
     pub(super) fn close_waiting(&self) -> bool {
-        self.close_wait.is_some()
+        self.close.as_ref().is_some_and(|c| c.wait.is_some())
     }
 
     /// Whether a `PIPE_ACK` covers the records `CONNECTION_CLOSE` must not
@@ -463,7 +467,7 @@ impl SessionCore {
     /// The timers of the close wait: the acknowledgement deadline, and the
     /// end of a reinjection hold that keeps reinjected data back.
     pub(super) fn close_wait_deadline(&self) -> Option<Instant> {
-        if self.close_wait.is_none() || self.mp.is_none() {
+        if !self.close_waiting() || self.mp.is_none() {
             return None;
         }
         let now = self.now;
@@ -485,7 +489,7 @@ impl SessionCore {
     /// `until`.
     pub(super) fn start_close_wait(&mut self, until: Instant) {
         let remote = self.error.as_deref().is_some_and(SessionError::is_remote);
-        let orderly = match self.close.as_deref() {
+        let orderly = match self.close.as_ref().map(|c| &c.frame) {
             Some(super::CloseFrame::Application { .. }) => true,
             Some(super::CloseFrame::Transport { code, .. }) => *code == 0,
             None => false,
@@ -493,7 +497,7 @@ impl SessionCore {
         if remote || !orderly || self.close_covered() {
             return;
         }
-        self.close_wait = Some(until);
+        self.close.as_mut().expect("orderly close has a frame").wait = Some(until);
         // The hand-off limit of CONNECTION_CLOSE counts from the end of the
         // wait, which lasts up to the linger timeout of its own.
         if self.handoff_deadline.is_some() {
@@ -504,7 +508,8 @@ impl SessionCore {
     /// The close waits no longer: the records are covered, the wait is
     /// over, or the peer's `CONNECTION_CLOSE` arrived.
     pub(super) fn end_close_wait(&mut self) {
-        if self.close_wait.take().is_some() && self.state == State::Closing {
+        if self.close.as_mut().and_then(|c| c.wait.take()).is_some() && self.state == State::Closing
+        {
             // The write sides the wait kept open shut down after
             // CONNECTION_CLOSE, which gets its whole hand-off limit from now.
             self.shut_down_outs();
@@ -517,7 +522,7 @@ impl SessionCore {
     /// An acknowledgement moved or a pipe failed: the close stops waiting
     /// once what it waits for is covered (a failed pipe no longer counts).
     pub(super) fn recheck_close_wait(&mut self) {
-        if self.close_wait.is_some() && self.close_covered() {
+        if self.close_waiting() && self.close_covered() {
             self.end_close_wait();
         }
     }
@@ -566,6 +571,7 @@ impl SessionCore {
 pub(super) fn lane_infos(
     o: Option<&OutPipe>,
     i: Option<&super::pipes::InPipe>,
+    acknowledgements: bool,
 ) -> Vec<super::LaneStats> {
     fn at(lanes: &mut Vec<super::LaneStats>, n: u64) -> &mut super::LaneStats {
         let k = match lanes.binary_search_by_key(&n, |l| l.lane.0) {
@@ -597,7 +603,7 @@ pub(super) fn lane_infos(
         for n in numbers {
             let x = at(&mut lanes, n);
             x.position_sent = Some(o.sent_on(n));
-            x.position_acked = Some(o.acked_on(n));
+            x.position_acked = acknowledgements.then(|| o.acked_on(n));
         }
     }
     if let Some(p) = i {

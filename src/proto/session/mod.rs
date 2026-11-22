@@ -116,8 +116,8 @@ pub use join::{
 };
 pub use lanes::LaneAccept;
 pub use mpath::{
-    LaneStats, Multipath, PipeDirection, PipeFinal, PipeLiveness, PipeOptions, PipeStats,
-    PipeWrite, RttSource,
+    CarrierConnId, CarrierCounts, CarrierSample, CarrierSource, LaneStats, Multipath,
+    PipeDirection, PipeFinal, PipeLiveness, PipeOptions, PipeStats, PipeWrite, RttSource,
 };
 pub use pipes::{DirectionState, InboundState, OutboundState, PipeHalf, PrioritySource};
 pub use policy::{FrameInfo, Pick, PickAnswer, PickRequest, PipeSnapshot, Scheduler};
@@ -132,6 +132,40 @@ pub use transmit::{Piece, PieceCursor, TransmitBuf};
 use pipes::{Attachment, Attachments, InPipe, InState, OutPipe, OutState};
 use streams::Streams;
 
+/// Absolute end of the attachment handshake, with the error its winner reports.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum JoinDeadline {
+    Protocol(Instant),
+    #[cfg(feature = "blocking")]
+    Caller(Instant),
+}
+
+impl JoinDeadline {
+    pub(crate) fn at(self) -> Instant {
+        match self {
+            Self::Protocol(t) => t,
+            #[cfg(feature = "blocking")]
+            Self::Caller(t) => t,
+        }
+    }
+
+    pub(crate) fn cause(self) -> PipeFailure {
+        match self {
+            Self::Protocol(_) => PipeFailure::JoinTimedOut,
+            #[cfg(feature = "blocking")]
+            Self::Caller(_) => PipeFailure::CallerDeadline,
+        }
+    }
+
+    #[cfg(feature = "blocking")]
+    pub(crate) fn with_caller(own: Option<Self>, caller: Option<Instant>) -> Option<Self> {
+        match caller {
+            Some(t) if own.is_none_or(|d| t <= d.at()) => Some(Self::Caller(t)),
+            _ => own,
+        }
+    }
+}
+
 /// Identifies a pipe attachment. Pipe 0 is the
 /// bootstrap pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -144,6 +178,21 @@ impl std::fmt::Display for PipeId {
 }
 
 impl PipeId {
+    /// A join ended before a pipe ID was allocated. This value lies outside
+    /// the wire varint range and is never assigned to an attachment.
+    pub const UNASSIGNED: Self = Self(crate::proto::varint::MAX + 1);
+
+    /// Allocates from this endpoint's parity. A counter past the wire range
+    /// remains exhausted for the lifetime of the session.
+    fn allocate(next: &mut u64) -> Result<Self, PipeError> {
+        let id = Self(*next);
+        if id >= Self::UNASSIGNED {
+            return Err(PipeError::IdExhausted);
+        }
+        *next += 2;
+        Ok(id)
+    }
+
     /// The pipe with ID `id` (pipe 0 is the bootstrap pair).
     #[inline]
     #[must_use]
@@ -389,7 +438,7 @@ pub struct SessionStats {
     pub join_pending: u64,
     /// Frames of a first batch or of return frames dropped in error.
     pub join_batch_dropped: u64,
-    /// Own consecutive failed joins, reset by a Proven join.
+    /// Gauge: own consecutive failed joins, reset by a Proven join.
     pub join_failures: u64,
     /// Joins closed as replays or too late.
     pub join_replays: u64,
@@ -825,6 +874,12 @@ enum CloseFrame {
     Application { code: u64, reason: Bytes },
 }
 
+#[derive(Debug)]
+struct ClosingFrame {
+    frame: CloseFrame,
+    wait: Option<Instant>,
+}
+
 /// The sans-IO state machine of one session.
 ///
 /// The session never performs I/O and never reads a clock: the driver
@@ -966,7 +1021,7 @@ pub struct SessionCore {
     events: VecDeque<CoreEvent>,
     /// Boxed: an open session has neither.
     error: Option<Box<SessionError>>,
-    close: Option<Box<CloseFrame>>,
+    close: Option<Box<ClosingFrame>>,
     /// Whether the GREASE TLV was used in a preamble already.
     grease_tlv_used: bool,
     srtt: Option<Duration>,
@@ -1009,16 +1064,16 @@ pub struct SessionCore {
     /// The generator of the keep-alive waits' draws.
     keep_alive_rng: u64,
     linger_deadline: Option<Instant>,
-    /// An orderly close waits until a `PIPE_ACK` covers what
-    /// `CONNECTION_CLOSE` must not overtake, at most until then
-    /// ([`SessionCore::start_close_wait`]).
-    close_wait: Option<Instant>,
+    /// Lane 0 lost its writer; give its reader time to deliver the peer's close.
+    write_failure: Option<PipeFailure>,
     /// When an application close stops waiting for the carriers to take
     /// `CONNECTION_CLOSE` ([`SessionCore::close_handed_off`]).
     handoff_deadline: Option<Instant>,
     /// The hand-off limit passed: a close no longer waits for the
     /// carriers ([`SessionCore::close_returned`]).
     handoff_expired: bool,
+    // The final stream was discarded without a fresh clock sample.
+    untimed_shutdown_close: bool,
     /// A graceful close sends what the streams wrote before its
     /// `CONNECTION_CLOSE`: its code and reason while it does.
     close_flush: Option<Box<(VarInt, Bytes)>>,
@@ -1211,9 +1266,10 @@ impl SessionCore {
             keep_alive_sent: false,
             keep_alive_rng,
             linger_deadline: None,
-            close_wait: None,
+            write_failure: None,
             handoff_deadline: None,
             handoff_expired: false,
+            untimed_shutdown_close: false,
             close_flush: None,
             close_aborted: false,
             stats: SessionStats::default(),
@@ -1634,6 +1690,7 @@ impl SessionCore {
                 }
                 self.maybe_closed(now);
             }
+            _ if self.write_failure.is_some() => self.finish_write_failure_linger(),
             _ if clean && self.state != State::Establishing && !self.acknowledged() => {
                 // The peer's idle close; with
                 // acknowledgement a graceful end without CONNECTION_CLOSE is
@@ -1662,7 +1719,7 @@ impl SessionCore {
             self.outbound_lane_failed(at.pipe.0, at.lane.0, kind, now);
             return;
         }
-        self.outbound_failed(at.pipe.0, PipeFailure::Carrier(kind), now);
+        self.outbound_failed(at, PipeFailure::Carrier(kind), now);
     }
 
     // ---- events and timers ---------------------------------------------
@@ -1708,6 +1765,9 @@ impl SessionCore {
     pub fn poll_timeout(&self) -> Option<Instant> {
         if self.state == State::Closed {
             return None;
+        }
+        if self.write_failure.is_some() {
+            return self.linger_deadline;
         }
         let ping = self
             .ping
@@ -1759,15 +1819,31 @@ impl SessionCore {
         self.refresh_waiting();
         self.tick(now);
         self.pick_input();
+        if self.write_failure.is_some() {
+            // The read side can still deliver a close. Its linger bounds this wait.
+            if self.linger_deadline.is_some_and(|deadline| now >= deadline) {
+                self.finish_write_failure_linger();
+            }
+            return;
+        }
         self.pacing_timeout(now);
         if self.state == State::Closed {
             return;
         }
         self.expire_waiting(now);
-        if self.close_wait.is_some_and(|d| now >= d) {
+        if self
+            .close
+            .as_ref()
+            .and_then(|c| c.wait)
+            .is_some_and(|d| now >= d)
+        {
             // The close waited for the acknowledgements long enough.
             self.end_close_wait();
         }
+        let untimed_shutdown_close = std::mem::take(&mut self.untimed_shutdown_close);
+        let stale_linger = untimed_shutdown_close
+            && self.linger_deadline.is_some_and(|d| now >= d)
+            && self.atts.outs().any(OutPipe::unwritten);
         if self.handoff_deadline.is_some_and(|d| now >= d) {
             self.handoff_deadline = None;
             self.handoff_expired = true;
@@ -1779,7 +1855,10 @@ impl SessionCore {
                 self.handoff_deadline = Some(now + self.handoff_limit());
                 return;
             }
-            if !self.close_handed_off() {
+            // A command without a clock can start both timers in the past.
+            // Release the hand-off waiter, then give the unwritten close its
+            // one linger period before tearing down the carriers.
+            if !stale_linger && !self.close_handed_off() {
                 if self.peer_close_unread > 0 {
                     // The application still reads what arrived before the
                     // peer's close: the linger deadline bounds it.
@@ -1980,8 +2059,28 @@ impl SessionCore {
     /// after the session's own parameters, so that the peer reads why. It does
     /// nothing once the session is closing.
     pub fn refuse(&mut self, reason: &'static str, now: Instant) {
-        self.protocol_error(
-            Error::new(TransportErrorCode::CONNECTION_REFUSED, 0, reason),
+        self.refuse_with_reason(Bytes::from_static(reason.as_bytes()), now);
+    }
+
+    /// Refuses a bootstrap with the listener's opaque reason bytes.
+    pub fn refuse_with_reason(&mut self, reason: Bytes, now: Instant) {
+        if self.state >= State::Closing {
+            return;
+        }
+        let code = TransportErrorCode::CONNECTION_REFUSED;
+        self.set_error(SessionError::TransportClosed {
+            code,
+            frame_type: 0,
+            reason: reason.clone(),
+            details: Vec::new(),
+            remote: false,
+        });
+        self.enter_closing(
+            Some(CloseFrame::Transport {
+                code: code.0,
+                frame_type: 0,
+                reason,
+            }),
             now,
         );
     }
@@ -2027,8 +2126,9 @@ impl SessionCore {
             return;
         }
         self.state = State::Closing;
+        self.write_failure = None;
         self.wipe_exporter();
-        self.close = frame.map(Box::new);
+        self.close = frame.map(|frame| Box::new(ClosingFrame { frame, wait: None }));
         self.handshake_deadline = None;
         self.idle_deadline = None;
         self.keep_alive_deadline = None;
@@ -2065,7 +2165,9 @@ impl SessionCore {
             let out_closed = a.out().is_some_and(OutPipe::out_closed);
             let in_done =
                 a.inp().is_none_or(|p| p.state() == InState::Ended) || (single && out_closed);
-            let out_done = a.out().is_none_or(OutPipe::write_done);
+            let out_done = a.out().is_none_or(|out| {
+                out.write_done() && (self.close.is_none() || out.close_handed_off())
+            });
             in_done && out_done
         });
         if !done {
@@ -2171,6 +2273,13 @@ impl SessionCore {
         self.state == State::Closing && self.peer_close_processed
     }
 
+    fn finish_write_failure_linger(&mut self) {
+        if let Some(cause) = self.write_failure.take() {
+            self.set_error(SessionError::PipesLost { last: Some(cause) });
+            self.closed_now();
+        }
+    }
+
     /// CLOSED: release everything.
     fn closed_now(&mut self) {
         if self.state == State::Closed {
@@ -2180,6 +2289,7 @@ impl SessionCore {
             self.set_error(SessionError::PipesLost { last: None });
         }
         self.state = State::Closed;
+        self.write_failure = None;
         self.events.push_back(CoreEvent::Released);
         self.wipe_exporter();
         self.handshake_deadline = None;
@@ -2238,8 +2348,7 @@ impl SessionCore {
             return;
         }
         if self.state >= State::Closing {
-            // Closing already (a shutdown's close, which has no hand-off
-            // limit, or a protocol error's): this call is still bounded.
+            // Closing already: bound the wait if no hand-off limit has been set.
             if self.state == State::Closing
                 && self.handoff_deadline.is_none()
                 && !self.handoff_expired
@@ -2324,8 +2433,7 @@ impl SessionCore {
         })
     }
 
-    /// The application `CONNECTION_CLOSE` of a close or of a completed
-    /// shutdown (which has no hand-off limit).
+    /// The application `CONNECTION_CLOSE` of a close or of a completed shutdown.
     fn close_with(&mut self, code: VarInt, reason: &[u8], now: Instant) {
         if self.state >= State::Closing {
             return;
@@ -2461,7 +2569,7 @@ impl SessionCore {
         // A shutdown requested before establishment starts now.
         if let Some(code) = self.goaway().shutdown {
             self.start_drain(code);
-            self.check_shutdown_done(now);
+            self.check_shutdown_done(Some(now));
         }
         Ok(())
     }
@@ -2471,9 +2579,8 @@ impl SessionCore {
         let peer = self.peer_tp.as_ref()?.max_idle_timeout;
         [self.local_tp().max_idle_timeout, peer]
             .into_iter()
-            .filter(|&v| v > 0)
+            .flatten()
             .min()
-            .map(Duration::from_millis)
     }
 
     /// Activity: a record completely received or passed to the carrier
@@ -2525,7 +2632,7 @@ impl SessionCore {
         if self.is_established() {
             self.start_drain(code);
         }
-        self.check_shutdown_done(now);
+        self.check_shutdown_done(Some(now));
     }
 
     /// Enters DRAINING for a shutdown; with GOAWAY in use, phase 1: the
@@ -2547,13 +2654,16 @@ impl SessionCore {
     }
 
     /// After a shutdown, closes once no stream remains.
-    fn check_shutdown_done(&mut self, now: Instant) {
+    fn check_shutdown_done(&mut self, now: Option<Instant>) {
         if let Some(code) = self.goaway().shutdown
             && self.state < State::Closing
             && self.streams.len() == 0
             && (self.goaway().final_sent || !self.features.goaway || !self.is_established())
         {
             let reason = std::mem::take(&mut self.goaway_mut().reason);
+            self.untimed_shutdown_close = now.is_none();
+            let now = now.unwrap_or(self.now);
+            self.handoff_deadline = Some(now.max(self.now) + self.handoff_limit());
             self.close_with(VarInt::from_u64(code).unwrap_or(VarInt::ZERO), &reason, now);
         }
     }
@@ -2580,7 +2690,7 @@ impl SessionCore {
             self.streams.set_goaway_watermark(UNI, u2);
             self.reject_above_watermarks(now);
         }
-        self.check_shutdown_done(now);
+        self.check_shutdown_done(Some(now));
     }
 
     /// Rejects every peer stream at or above the GOAWAY watermark that was

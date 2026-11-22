@@ -276,6 +276,7 @@ pub struct AdmitIo {
     io: Box<dyn Subject>,
     connection: Option<ConnectionValue>,
     on_return: Option<OnReturn>,
+    pub(crate) stall_until: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
 /// What an adapter closes of a carrier beside its parts once the
@@ -307,6 +308,7 @@ impl AdmitIo {
             io: Box::new(pipe),
             connection: None,
             on_return: None,
+            stall_until: None,
         }
     }
 
@@ -326,6 +328,7 @@ impl AdmitIo {
             }),
             connection: None,
             on_return: None,
+            stall_until: None,
         }
     }
 
@@ -349,6 +352,18 @@ impl AdmitIo {
     pub fn with_on_return(mut self, close: impl FnOnce() + Send + 'static) -> Self {
         self.on_return = Some(Box::new(close));
         self
+    }
+
+    /// Keeps an upgraded session stalled until it closes or the stall ends.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_stall_until(mut self, closed: impl Future<Output = ()> + Send + 'static) -> Self {
+        self.stall_until = Some(Box::pin(closed));
+        self
+    }
+
+    pub(crate) fn attachment(&mut self) -> Option<&Arc<super::attachment::Attachment>> {
+        self.io.attachment()
     }
 
     pub(crate) fn framing(&self) -> Framing {
@@ -396,6 +411,9 @@ impl AdmitIo {
 
 /// The carrier under admission, of either kind.
 trait Subject: Send {
+    fn attachment(&mut self) -> Option<&Arc<super::attachment::Attachment>> {
+        None
+    }
     fn framing(&self) -> Framing;
     fn reader(&mut self) -> Option<&mut (dyn AsyncRead + Unpin + Send)>;
     fn given_back(&mut self) -> Vec<u8>;
@@ -405,6 +423,10 @@ trait Subject: Send {
 }
 
 impl Subject for PipeIo {
+    fn attachment(&mut self) -> Option<&Arc<super::attachment::Attachment>> {
+        Some(PipeIo::attachment(self))
+    }
+
     fn framing(&self) -> Framing {
         self.framing
     }
@@ -895,7 +917,8 @@ async fn read_unit<R: AsyncRead + Unpin + ?Sized>(
     Ok(Some(buf[..n].to_vec()))
 }
 
-type FallbackFn = dyn Fn(Takeover) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
+type FallbackFn =
+    dyn Fn(Takeover) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> + Send + Sync;
 
 /// The listener's fallback ([`crate::ListenerConfig::fallback`]): a
 /// handler given every carrier the admission hands back, as a
@@ -913,10 +936,10 @@ impl std::fmt::Debug for Fallback {
 }
 
 /// How a fallback's future ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Served {
-    /// The handler panicked.
-    pub(crate) panicked: bool,
+    /// The handler failed or its task ended without a successful return.
+    pub(crate) error: Option<io::Error>,
     /// The host detached the carrier.
     pub(crate) detached: bool,
 }
@@ -928,6 +951,21 @@ impl Fallback {
         F: Fn(Takeover) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        Self::try_new(move |t| {
+            let future = f(t);
+            async move {
+                future.await;
+                Ok(())
+            }
+        })
+    }
+
+    /// A fallible callback. An error ends setup with `HandleError::SetupFailed`.
+    pub fn try_new<F, Fut>(f: F) -> Self
+    where
+        F: Fn(Takeover) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = io::Result<()>> + Send + 'static,
+    {
         Self(Arc::new(move |t| Box::pin(f(t))))
     }
 
@@ -936,7 +974,11 @@ impl Fallback {
     /// panicked, or dropped by the runtime's shutdown) is acted on there:
     /// the takeover returned unless detached, and the adapter's
     /// [`AdmitIo::with_on_return`] run then.
-    pub(crate) async fn serve(&self, mut takeover: Takeover) -> Served {
+    pub(crate) async fn serve(
+        &self,
+        mut takeover: Takeover,
+        dispatched: impl FnOnce() + Send + 'static,
+    ) -> Served {
         let state = takeover.0.state.clone();
         let end = Returned {
             state: state.clone(),
@@ -944,16 +986,31 @@ impl Fallback {
         };
         let handler = self.0.clone();
         let task = tokio::spawn(async move {
-            let _end = end;
-            handler(takeover).await;
+            let mut end = end;
+            dispatched();
+            let result = crate::proto::decision::host_result(|| handler(takeover)).await;
+            let cleaned = end.finish();
+            let outcome = result.map_err(|payload| {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("fallback panicked");
+                io::Error::other(msg.to_owned())
+            })?;
+            outcome?;
+            if cleaned {
+                Ok(())
+            } else {
+                Err(io::Error::other("fallback return hook panicked"))
+            }
         });
-        let panicked = match task.await {
-            Ok(()) => false,
-            // A runtime shutting down cancelled it: no failure of the host.
-            Err(e) => e.is_panic(),
+        let error = match task.await {
+            Ok(result) => result.err(),
+            Err(e) => Some(io::Error::other(e)),
         };
         Served {
-            panicked,
+            error,
             detached: state.is_detached(),
         }
     }
@@ -966,13 +1023,20 @@ struct Returned {
     on_return: Option<OnReturn>,
 }
 
-impl Drop for Returned {
-    fn drop(&mut self) {
+impl Returned {
+    fn finish(&mut self) -> bool {
         if !self.state.finish()
             && let Some(close) = self.on_return.take()
         {
-            close();
+            return crate::proto::decision::host(close).is_some();
         }
+        true
+    }
+}
+
+impl Drop for Returned {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -1088,7 +1152,6 @@ mod tests {
             .with_variant("v")
             .with_terminated_tls(|| Some(crate::TlsState::new(Some(b"h2".to_vec()), None)))
             .with_unsent(|| Some(1))
-            .with_retransmitted(|| Some(2))
             .with_handshake_padding(3)
             .with_write_overhead(4)
             .with_max_record(16_384)
@@ -1129,7 +1192,6 @@ mod tests {
             // A TCP socket's: part of the moved carrier.
             socket: _,
             unsent,
-            retransmitted,
             handshake_padding,
             write_overhead,
             max_record,
@@ -1149,9 +1211,11 @@ mod tests {
             taken,
             // A split bootstrap's, which is never taken over.
             split_bootstrap: _,
+            attachment: _,
             close_code,
             drain,
             reports_failure,
+            ..
         } = p;
         assert!(reader.is_some() && writer.is_some());
         assert_eq!(framing, Framing::ByteStream);
@@ -1160,7 +1224,7 @@ mod tests {
         assert_eq!(carrier, Some(crate::CarrierKind::Streaming));
         assert_eq!(variant.as_deref(), Some("v"));
         assert_eq!(prefix, replay);
-        assert!(unsent.is_some() && retransmitted.is_some());
+        assert!(unsent.is_some());
         assert_eq!((handshake_padding, write_overhead), (3, 4));
         assert_eq!(max_record, Some(16_384));
         assert!(secure && low_water && partial_reads && reports_failure);
@@ -1288,7 +1352,7 @@ mod tests {
         let t = AdmitIo::pipe(PipeIo::new(a))
             .with_on_return(move || c.store(true, Ordering::SeqCst))
             .into_takeover(CarrierInfo::new(), Vec::new(), None);
-        let mut serving = Box::pin(f.serve(t));
+        let mut serving = Box::pin(f.serve(t, || {}));
         assert!(futures_poll_once(serving.as_mut()).await.is_none());
         drop(serving);
         assert!(!closed.load(Ordering::SeqCst), "held while the future runs");
@@ -1311,9 +1375,31 @@ mod tests {
         let t = AdmitIo::pipe(PipeIo::new(a))
             .with_on_return(move || c.store(true, Ordering::SeqCst))
             .into_takeover(CarrierInfo::new(), Vec::new(), None);
-        let served = f.serve(t).await;
-        assert!(served.panicked && !served.detached);
+        let served = f.serve(t, || {}).await;
+        assert!(served.error.is_some() && !served.detached);
         assert!(closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    // HS-07
+    async fn a_panicking_return_hook_fails_fallback_once() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = count.clone();
+        let (a, _) = tokio::io::duplex(64);
+        let takeover = AdmitIo::pipe(PipeIo::new(a))
+            .with_on_return(move || {
+                called.fetch_add(1, Ordering::SeqCst);
+                panic!("adapter close");
+            })
+            .into_takeover(CarrierInfo::new(), Vec::new(), None);
+        assert!(
+            Fallback::new(|_| async {})
+                .serve(takeover, || {})
+                .await
+                .error
+                .is_some()
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     /// A detached takeover leaves the close to the host.
@@ -1327,8 +1413,8 @@ mod tests {
         let t = AdmitIo::pipe(PipeIo::new(a))
             .with_on_return(move || c.store(true, Ordering::SeqCst))
             .into_takeover(CarrierInfo::new(), Vec::new(), None);
-        let served = f.serve(t).await;
-        assert!(served.detached && !served.panicked);
+        let served = f.serve(t, || {}).await;
+        assert!(served.detached && served.error.is_none());
         assert!(!closed.load(Ordering::SeqCst));
     }
 

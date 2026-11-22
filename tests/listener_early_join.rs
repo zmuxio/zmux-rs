@@ -76,3 +76,31 @@ async fn an_early_join_goes_on_once_the_handshake_completed() {
     .await
     .unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn listener_close_interrupts_named_early_join() {
+    let listener = Listener::new(config(), limits()).unwrap();
+    let (c0, s0) = tokio::io::duplex(1 << 16);
+    let l = listener.clone();
+    tokio::spawn(async move { l.handle_pipe(PipeIo::new(s0), PipeHint::default()).await });
+    let client = Session::connect(PipeIo::new(c0), config()).await.unwrap();
+    let _server = listener.accept().await.unwrap();
+    let (near, far) = tokio::io::duplex(1 << 16);
+    let _pipe = client
+        .begin_add_pipe(PipeIo::new(near), zmux::PipeOptions::new())
+        .unwrap();
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let entered = started.clone();
+    let io = PipeIo::new(far).with_early_data_in(move || {
+        entered.notify_one();
+        std::future::pending::<()>()
+    });
+    let l = listener.clone();
+    let handler = tokio::spawn(async move { l.handle_pipe(io, PipeHint::default()).await });
+    started.notified().await;
+    let before = tokio::time::Instant::now();
+    listener.close();
+    assert_eq!(handler.await.unwrap(), Err(HandleError::Refused));
+    assert_eq!(listener.stats().setup_failures, 0);
+    assert_eq!(before, tokio::time::Instant::now());
+}

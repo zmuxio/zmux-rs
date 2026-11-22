@@ -70,6 +70,8 @@ struct Stall {
     writer: Mutex<Option<Waker>>,
     /// The write side's shutdown takes 50 ms (a TLS `close_notify`, say).
     slow_shutdown: AtomicBool,
+    hold_shutdown: AtomicBool,
+    shutdown_entered: tokio::sync::Notify,
     /// The write side was shut.
     shut: AtomicBool,
     /// Nothing arrives any more, the end of input included: the peer keeps its write side
@@ -144,6 +146,13 @@ impl AsyncWrite for Held {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.stall.hold_shutdown.load(Ordering::SeqCst) {
+            *self.stall.writer.lock().unwrap() = Some(cx.waker().clone());
+            self.stall.shutdown_entered.notify_one();
+            if self.stall.hold_shutdown.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+        }
         if self.stall.slow_shutdown.load(Ordering::SeqCst) {
             let delay = self
                 .shutting
@@ -404,6 +413,53 @@ async fn a_cancelled_shutdown_closes() {
     listener.close();
 }
 
+#[tokio::test]
+async fn shutdown_waits_for_connection_close_on_each_joined_carrier() {
+    let (client, server, listener, first) = setup(untimed_close(config())).await;
+    let second = Arc::new(Stall::default());
+    let joined = client
+        .add_pipe(carrier(&listener, &second, None), PipeOptions::new())
+        .await
+        .unwrap();
+    joined.attached().await.unwrap();
+    for stall in [&first, &second] {
+        stall.hold_shutdown.store(true, Ordering::SeqCst);
+    }
+    let mut shutdown = std::pin::pin!(client.shutdown(VarInt::ZERO, b"done"));
+    assert!(std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await);
+    tokio::time::timeout(GUARD, async {
+        first.shutdown_entered.notified().await;
+        second.shutdown_entered.notified().await;
+    })
+    .await
+    .unwrap();
+    assert!(std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await);
+    first.hold_shutdown.store(false, Ordering::SeqCst);
+    first.release();
+    until("bootstrap carrier shutdown", 5, || {
+        first.shut.load(Ordering::SeqCst)
+    })
+    .await;
+    assert!(std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await);
+    second.hold_shutdown.store(false, Ordering::SeqCst);
+    second.release();
+    let result = tokio::time::timeout(Duration::from_secs(5), shutdown).await;
+    assert!(
+        result.is_ok(),
+        "state={:?}, first={}, second={}, pipes={:?}",
+        client.state(),
+        first.shut.load(Ordering::SeqCst),
+        second.shut.load(Ordering::SeqCst),
+        client.pipe_stats()
+    );
+    result.unwrap().unwrap();
+    let peer = tokio::time::timeout(GUARD, server.closing()).await.unwrap();
+    assert!(closed_with(&peer, 0, b"done"), "{peer:?}");
+    assert!(first.shut.load(Ordering::SeqCst));
+    assert!(second.shut.load(Ordering::SeqCst));
+    listener.close();
+}
+
 /// The joiner's pipes other than pipe 0 that are still live.
 fn live_joins(s: &Session) -> usize {
     s.pipe_stats()
@@ -565,9 +621,8 @@ async fn add_pipe_fails_when_the_pipe_or_the_session_goes() {
     listener.close();
 }
 
-/// A session already closing, by a shutdown whose `CONNECTION_CLOSE` has no
-/// hand-off limit, still bounds `close` by the hand-off limit when the
-/// carrier takes nothing.
+/// Shutdown and a concurrent close both finish within the hand-off bound
+/// when a carrier takes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_after_a_shutdown_is_bounded() {
     let mut c = untimed_close(config());
@@ -602,7 +657,11 @@ async fn close_after_a_shutdown_is_bounded() {
     tokio::time::timeout(GUARD, client.close())
         .await
         .expect("close waited past its hand-off limit");
-    shut.abort();
+    tokio::time::timeout(GUARD, shut)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     listener.close();
 }
 

@@ -10,13 +10,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use crate::Unhandled;
 use bytes::{Buf, Bytes, BytesMut};
 use http::{Request, Response, header};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
 use tokio::time::Instant;
-use zmux::adapter::Entry;
 use zmux::adapter::MemoryCharge;
+use zmux::adapter::{Admit, Entry};
 use zmux::{Listener, PipeHint, PipeIo};
 
 use super::ExchangeOptions;
@@ -78,9 +79,22 @@ struct Shared {
 #[derive(Default)]
 struct Table {
     live: HashMap<CarrierId, Arc<Carrier>>,
+    // Only the first authenticated request decides a new carrier's admission.
+    deciding: HashMap<CarrierId, tokio::sync::watch::Sender<()>>,
     /// Carriers that ended, until their expiry, oldest first in `order`.
     gone: HashMap<CarrierId, Instant>,
     order: VecDeque<(CarrierId, Instant)>,
+}
+
+type Arrival = (Entry, Option<tokio::sync::oneshot::Receiver<()>>);
+
+struct Creation<'a>(&'a Shared, CarrierId);
+
+impl Drop for Creation<'_> {
+    fn drop(&mut self) {
+        let notify = lock(&self.0.table).deciding.remove(&self.1);
+        drop(notify);
+    }
 }
 
 impl Table {
@@ -209,8 +223,9 @@ impl ExchangeServer {
     /// bytes read replayed in front of the rest, for the host server's
     /// fallback. A request of a known carrier gives its place back once
     /// authenticated; one that creates a carrier keeps it until the
-    /// carrier enters a session, and the listener's admission decides on
-    /// the new carrier ([`Listener::handle_pipe`]). A carrier that the
+    /// carrier enters a session. Admission decides on the creating request's
+    /// head after authentication. Takeover hands the assembled byte stream to
+    /// the host. Fallback replays the encoded request to the HTTP handler. A carrier that the
     /// listener refuses because it closed after the request arrived is
     /// answered BUSY.
     ///
@@ -230,8 +245,8 @@ impl ExchangeServer {
     ///
     /// # Errors
     ///
-    /// The request back, with every body byte read in front of the rest, when
-    /// it is not an exchange request this server takes.
+    /// [`Unhandled::Fallback`] replays the complete request to the HTTP
+    /// handler. [`Unhandled::Abort`] ends a closed or stalled request.
     #[allow(
         clippy::result_large_err,
         reason = "the request is handed back by value, as a host server routes it"
@@ -241,23 +256,25 @@ impl ExchangeServer {
         req: Request<B>,
         peer: Option<SocketAddr>,
         pair: &crate::PairField,
-    ) -> Result<Response<PipeBody>, Request<ReplayBody<B>>>
+    ) -> Result<Response<PipeBody>, Unhandled<B>>
     where
         B: http_body::Body + Unpin,
         B::Data: Buf,
     {
         let arrival = Instant::now();
-        let (parts, mut body) = req.into_parts();
-        let back = |parts, read: Bytes, body| {
-            Err(Request::from_parts(
-                parts,
-                ReplayBody::new([read, Bytes::new()], Some(body)),
-            ))
+        let (mut parts, mut body) = req.into_parts();
+        let back = |parts, read: Bytes, trailers, body| {
+            let mut replay =
+                ReplayBody::new([read, Bytes::new()], Some(body)).with_trailers(trailers);
+            replay.stop_with(self.inner.listener.clone());
+            Err(Unhandled::Fallback(Box::new(Request::from_parts(
+                parts, replay,
+            ))))
         };
         // The one classification: any other request is the host's, before
         // anything else.
         if crate::classify(&parts, pair) != Some(crate::RequestClass::Exchange) {
-            return back(parts, Bytes::new(), body);
+            return back(parts, Bytes::new(), None, body);
         }
         let s = &self.inner;
         let first_record = s.listener.limits().first_record_timeout;
@@ -281,13 +298,20 @@ impl ExchangeServer {
             if let Some(e) = entry {
                 e.release();
             }
-            return back(parts, Bytes::new(), body);
+            return back(parts, Bytes::new(), None, body);
         };
 
         // The authentication header, and nothing more, within the
         // listener's first-record timeout as the request arrived.
         let mut read = Gathered::default();
-        let arrived = read_to(&mut body, &mut read, s.header_len, arrival + first_record).await;
+        let arrived = read_to(
+            &mut body,
+            &mut read,
+            s.header_len,
+            zmux::adapter::handshake_deadline(arrival.into_std(), first_record)
+                .map(Instant::from_std),
+        )
+        .await;
         let authenticated = arrived
             .then(|| s.header(&read.as_slice()[..s.header_len]))
             .flatten()
@@ -295,15 +319,16 @@ impl ExchangeServer {
                 let (lookup, key) = s.authenticate(&h, len)?;
                 Some((h, lookup, key))
             });
-        let Some((header, lookup, key)) = authenticated else {
+        let Some((header, mut lookup, key)) = authenticated else {
             if let Some(e) = entry {
                 e.release();
             }
-            return back(parts, read.freeze(), body);
+            let trailers = read.trailers.take();
+            return back(parts, read.freeze(), trailers, body);
         };
         // A request of a known carrier gives its place back now; one that
         // may create a carrier keeps it.
-        let entry = if let Lookup::New = lookup {
+        let mut entry = if let Lookup::New = lookup {
             entry
         } else {
             if let Some(e) = entry {
@@ -313,10 +338,18 @@ impl ExchangeServer {
         };
 
         // Data and the Data MAC, within the handshake timeout.
-        let complete = read_to(&mut body, &mut read, len, Instant::now() + s.handshake).await
+        let complete = read_to(
+            &mut body,
+            &mut read,
+            len,
+            zmux::adapter::handshake_deadline(Instant::now().into_std(), s.handshake)
+                .map(Instant::from_std),
+        )
+        .await
             && read.len() == len;
         let data_len = header.data_len as usize;
-        let rest = read.freeze().slice(s.header_len..);
+        let raw = read.freeze();
+        let rest = raw.slice(s.header_len..);
         let bin = complete
             .then(|| wire::decode_body(s.options.encoding, rest))
             .flatten()
@@ -330,8 +363,65 @@ impl ExchangeServer {
             return Ok(crate::server::status(http::StatusCode::BAD_REQUEST));
         };
         let data = bin.slice(..data_len);
-        let answer = s.process(&header, &data, lookup, &key, entry).await;
-        Ok(self.respond(&key, &header.answering(), answer))
+        let kind = header.valid_kind(&data);
+        let mut creation = None;
+        let mut head = None;
+        if let Some(arrival) = &mut entry
+            && matches!(kind, Some(Kind::Up | Kind::Down))
+            && s.listener.adapter().admission().is_some()
+        {
+            match arrival.setup_step(s.creation(header.cid)).await {
+                None => return Err(Unhandled::Abort),
+                Some(Err(existing)) => lookup = existing,
+                Some(Ok(permit)) => {
+                    creation = Some(permit);
+                    let info = zmux::CarrierInfo::new().with_request_head(
+                        Arc::new(parts.clone()),
+                        |head, each| {
+                            zmux::adapter::visit_fields(&head.headers, each);
+                        },
+                    );
+                    match arrival
+                        .decide_request(info, None::<&mut tokio::io::Empty>)
+                        .await
+                    {
+                        Admit::Accept(_) => {}
+                        Admit::TakeOver(_) => head = Some(arrival.response_head()),
+                        Admit::Fallback(_) => {
+                            if parts
+                                .extensions
+                                .get::<zmux::adapter::TrackRequestFallback>()
+                                .is_some()
+                            {
+                                if let Some(outcome) = arrival.request_fallback() {
+                                    parts.extensions.insert(outcome);
+                                }
+                            } else {
+                                arrival.complete_request_fallback(true);
+                            }
+                            return back(parts, raw, None, body);
+                        }
+                        Admit::Stall => {
+                            arrival.stall_local(body).await;
+                            return Err(Unhandled::Abort);
+                        }
+                        _ => return Err(Unhandled::Abort),
+                    }
+                }
+            }
+        }
+        let (receipt, wait) = head.map_or((None, None), |(sent, ready)| (Some(sent), Some(ready)));
+        let carrier = s.carrier(kind, &header, lookup, &key, entry.map(|e| (e, wait)));
+        drop(creation);
+        let answer = match carrier {
+            Ok((kind, carrier)) => carrier.request(kind, &header, &data).await,
+            Err(answer) => answer,
+        };
+        let response = self.respond(&key, &header.answering(), answer);
+        Ok(match receipt {
+            Some(sent) => response.map(|body| body.with_head(sent)),
+            None => response,
+        })
     }
 
     fn respond(&self, key: &Key, to: &wire::Answering<'_>, answer: Answer) -> Response<PipeBody> {
@@ -454,50 +544,78 @@ impl Shared {
             .then_some((lookup, key))
     }
 
+    async fn creation(&self, cid: CarrierId) -> Result<Creation<'_>, Lookup> {
+        loop {
+            let mut wait = {
+                let mut table = lock(&self.table);
+                if let Some(c) = table.live.get(&cid) {
+                    return Err(Lookup::Live(c.clone()));
+                }
+                if table.gone.contains_key(&cid) {
+                    return Err(Lookup::Gone);
+                }
+                match table.deciding.entry(cid) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.get().subscribe(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(tokio::sync::watch::channel(()).0);
+                        return Ok(Creation(self, cid));
+                    }
+                }
+            };
+            // The owner leaving, including on cancellation, releases all contenders.
+            let _ = wait.changed().await;
+        }
+    }
+
     /// Processes an authenticated request whose Data MAC verified; returns
     /// its answer. `entry` is the place of a request that may create a
     /// carrier.
-    async fn process(
+    fn carrier(
         self: &Arc<Self>,
+        kind: Option<Kind>,
         h: &Header,
-        data: &Bytes,
         lookup: Lookup,
         key: &Key,
-        entry: Option<Entry>,
-    ) -> Answer {
+        entry: Option<Arrival>,
+    ) -> Result<(Kind, Arc<Carrier>), Answer> {
         let o = &self.options;
-        let Some(kind) = h.valid_kind(data) else {
+        let Some(kind) = kind else {
             // Authenticated, but its fields break the request rules.
             if let Lookup::Live(c) = lookup {
                 c.fail();
             }
-            if let Some(e) = entry {
+            if let Some((e, _)) = entry {
                 e.release();
             }
-            return Answer::flags(GONE);
+            return Err(Answer::flags(GONE));
         };
         let carrier = match lookup {
-            Lookup::Live(c) => c,
-            Lookup::Gone => return Answer::flags(GONE),
+            Lookup::Live(c) => {
+                if let Some((e, _)) = entry {
+                    e.release();
+                }
+                c
+            }
+            Lookup::Gone => return Err(Answer::flags(GONE)),
             Lookup::New if kind == Kind::Close => {
                 // Created and closed at once.
-                if let Some(e) = entry {
+                if let Some((e, _)) = entry {
                     e.release();
                 }
                 let until = Instant::now() + o.gone_memory;
                 lock(&self.table).remember(h.cid, until, o.max_carriers);
-                return Answer::flags(0);
+                return Err(Answer::flags(0));
             }
             // Arrived at a closed listener, which takes no new carrier.
             Lookup::New => match entry {
-                None => return Answer::flags(GONE),
+                None => return Err(Answer::flags(GONE)),
                 Some(e) => match self.create(h.cid, key.clone(), e) {
                     Ok(c) => c,
-                    Err(flags) => return Answer::flags(flags),
+                    Err(flags) => return Err(Answer::flags(flags)),
                 },
             },
         };
-        carrier.request(kind, h, data).await
+        Ok((kind, carrier))
     }
 
     /// The carrier `cid`: a new one handed to the listener with the
@@ -509,7 +627,7 @@ impl Shared {
         self: &Arc<Self>,
         cid: CarrierId,
         key: Key,
-        entry: Entry,
+        (entry, head): Arrival,
     ) -> Result<Arc<Carrier>, u8> {
         let o = &self.options;
         let carrier = {
@@ -536,26 +654,31 @@ impl Shared {
             t.live.insert(cid, c.clone());
             c
         };
-        let io = PipeIo::from_halves(UpReader(carrier.clone()), DownWriter(carrier.clone()))
+        let mut io = PipeIo::from_halves(UpReader(carrier.clone()), DownWriter(carrier.clone()))
             .with_abort({
                 let c = carrier.clone();
                 move || c.fail()
             })
             .with_carrier(zmux::CarrierKind::Exchange);
-        let hint = PipeHint::from_entry(entry);
+        let _ = carrier.worker.set(Box::new(io.worker_guard()));
         let l = self.listener.clone();
-        let mut handle = Box::pin(async move { l.handle_pipe(io, hint).await });
+        let mut entry = entry;
+        let mut handle = Box::pin(async move {
+            if let Some(head) = head
+                && !entry.takeover_head(async { head.await.is_ok() }).await
+            {
+                return Err(zmux::HandleError::Refused);
+            }
+            l.handle_pipe(io, PipeHint::from_entry(entry)).await
+        });
         // The listener takes or refuses the carrier on the first poll,
         // before it waits for anything: a carrier of a closed listener is
         // refused now, so that it holds no state and the request is
         // answered BUSY.
-        let refused = matches!(
-            handle
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(zmux::HandleError::Refused))
-        );
-        if refused {
+        let first_poll = handle
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        if matches!(first_poll, Poll::Ready(Err(zmux::HandleError::Refused))) {
             // Not remembered as ended either (the dropped pipe may have
             // retired it): a refused request consumed nothing.
             let mut t = lock(&self.table);
@@ -567,7 +690,9 @@ impl Shared {
             }
             return Err(BUSY);
         }
-        tokio::spawn(handle);
+        if first_poll.is_pending() {
+            tokio::spawn(handle);
+        }
         tokio::spawn(carrier.clone().watch_idle());
         Ok(carrier)
     }
@@ -602,6 +727,8 @@ struct Carrier {
     changed: Notify,
     /// The idle watch waits on it: the carrier left the table.
     ended: Notify,
+    // Released after the table, watcher, in-flight requests and local state.
+    worker: std::sync::OnceLock<Box<dyn Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -899,6 +1026,7 @@ impl Carrier {
         listener: &Listener,
     ) -> Self {
         Self {
+            worker: std::sync::OnceLock::new(),
             cid,
             key,
             server,
@@ -1308,8 +1436,75 @@ mod tests {
     }
 
     /// The bytes of a body handed back.
-    async fn replayed(req: Request<ReplayBody<PipeBody>>) -> Bytes {
-        collect(req.into_body(), 4 << 20).await.unwrap().unwrap()
+    fn fallback<B>(unhandled: Unhandled<B>) -> Request<ReplayBody<B>> {
+        let Unhandled::Fallback(req) = unhandled else {
+            panic!("expected HTTP fallback")
+        };
+        *req
+    }
+    async fn replayed(back: Unhandled<PipeBody>) -> Bytes {
+        collect(fallback(back).into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    // HS-15, HS-17
+    // HS-17. Discarding a response without a header receipt closes the pending takeover.
+    async fn a_new_exchange_routes_fallback_and_takeover_once() {
+        use tokio::io::AsyncReadExt;
+        for verdict in ["fallback", "takeover", "discard"] {
+            let mut limits = zmux::ListenerConfig::default();
+            limits.admission = Some(zmux::Admission::new(0, move |_, _| {
+                if verdict == "fallback" {
+                    zmux::AdmissionVerdict::fallback()
+                } else {
+                    zmux::AdmissionVerdict::takeover()
+                }
+            }));
+            let (sent, mut host) = tokio::sync::mpsc::unbounded_channel();
+            limits.fallback = Some(zmux::Fallback::new(move |taken| {
+                let sent = sent.clone();
+                async move {
+                    let mut payload = [0; 5];
+                    taken
+                        .into_pipe()
+                        .into_stream()
+                        .read_exact(&mut payload)
+                        .await
+                        .unwrap();
+                    sent.send(payload).unwrap();
+                }
+            }));
+            let listener = Listener::new(zmux::Config::default(), limits).unwrap();
+            let server =
+                ExchangeServer::new(&listener, ExchangeOptions::default().with_unauthenticated())
+                    .unwrap();
+            let cid = [17; 16];
+            let (out, req) = request(&cid, Kind::Up, 0, 0, wire::unix_time(), [9; 8], b"hello");
+            let result = server.handle(req, None, &PairField::default()).await;
+            if verdict == "fallback" {
+                let expected = [&out.header[..], &b"hello"[..], &out.data_mac[..]].concat();
+                assert_eq!(replayed(result.unwrap_err()).await, expected);
+            } else {
+                let mut resp = result.unwrap();
+                assert!(host.try_recv().is_err());
+                if verdict == "takeover" {
+                    resp.body_mut().response_head_flushed();
+                    assert_eq!(host.recv().await.unwrap(), *b"hello");
+                } else {
+                    drop(resp);
+                    while !lock(&server.inner.table).live.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(host.try_recv().is_err());
+                }
+            }
+            let counts = listener.stats().admission;
+            assert_eq!(counts.takeover, u64::from(verdict == "takeover"));
+            assert_eq!(counts.fallback, u64::from(verdict == "fallback"));
+        }
     }
 
     /// Only an exchange request as the endpoint classifies it is served: a
@@ -1527,6 +1722,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn completion_waits_for_the_last_exchange_acknowledgement() {
+        let options = ExchangeOptions::default().with_unauthenticated();
+        let (listener, exchange) = server(options.clone());
+        let socket = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let gate = Arc::new(Mutex::new(Some((entered, wait))));
+        let srv = exchange.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((io, _)) = socket.accept().await {
+                let srv = srv.clone();
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    let service =
+                        hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                            let srv = srv.clone();
+                            let gate = gate.clone();
+                            async move {
+                                let (parts, body) = req.into_parts();
+                                let bytes = collect(body, 2 << 20).await.unwrap().unwrap();
+                                let header =
+                                    srv.inner.header(&bytes[..srv.inner.header_len]).unwrap();
+                                if header.valid_kind(&[]) == Some(Kind::Close) {
+                                    let hold = lock(&gate).take();
+                                    if let Some((entered, wait)) = hold {
+                                        entered.send(()).unwrap();
+                                        wait.await.unwrap();
+                                    }
+                                }
+                                let req = Request::from_parts(parts, PipeBody::full(bytes));
+                                let response = srv
+                                    .handle(req, None, &PairField::default())
+                                    .await
+                                    .unwrap_or_else(|_| panic!("exchange request"));
+                                Ok::<_, std::convert::Infallible>(response)
+                            }
+                        });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(io), service)
+                        .await;
+                });
+            }
+        });
+        let client = crate::connect_exchange(&addr.to_string(), &options, zmux::Config::default())
+            .await
+            .unwrap();
+        let session = listener.accept().await.unwrap();
+        let client_pipe = client.pipe(zmux::PipeId::new(0)).unwrap();
+        let server_pipe = session.pipe(zmux::PipeId::new(0)).unwrap();
+        client.close().await;
+        tokio::time::timeout(Duration::from_secs(8), seen)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            std::pin::pin!(client_pipe.closed())
+                .as_mut()
+                .poll(&mut cx)
+                .is_pending()
+        );
+        release.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client_pipe.closed())
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_pipe.closed())
+            .await
+            .unwrap();
+        assert_eq!(exchange.carriers(), 0);
+        task.abort();
+    }
+
     /// A request that arrived while the listener was open, whose carrier
     /// the listener refuses because it closed before the carrier was
     /// created, is answered BUSY and leaves no state.
@@ -1731,7 +2002,7 @@ mod tests {
             .handle(req, None, &PairField::default())
             .await
             .unwrap_err();
-        let (front, rest) = back.into_body().into_parts();
+        let (front, rest) = fallback(back).into_body().into_parts();
         assert_eq!(front.len(), 10);
         assert!(rest.is_some());
         drop(tx);
@@ -1802,6 +2073,65 @@ mod tests {
         listener.close();
     }
 
+    #[tokio::test]
+    async fn attachment_waits_for_an_authenticated_down_request_after_retirement() {
+        let opts = ExchangeOptions::default().with_unauthenticated();
+        let (listener, exchange) = server(opts.clone());
+        let tcp = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = tcp.local_addr().unwrap().to_string();
+        let serving = tokio::spawn(crate::serve(
+            listener.clone(),
+            tcp,
+            crate::Options::default().with_exchange(exchange.clone()),
+        ));
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let client = crate::connect_exchange(&addr, &opts, zmux::Config::default())
+                .await
+                .unwrap();
+            let session = listener.accept().await.unwrap();
+            let pipe = session.pipe(zmux::PipeId::new(0)).unwrap();
+            let cid = *lock(&exchange.inner.table).live.keys().next().unwrap();
+            let nonce = NONCES.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+            let (_, req) = request(&cid, Kind::Down, 0, 0, wire::unix_time(), nonce, b"");
+            let all = collect(req.into_body(), 1024).await.unwrap().unwrap();
+            let (tx, body) = tokio::sync::mpsc::channel(2);
+            tx.send(all.slice(..HEADER_LEN)).await.unwrap();
+            let req = Request::post("/zmux/exchange")
+                .header(header::CONTENT_LENGTH, all.len())
+                .body(Chan(body))
+                .unwrap();
+            let pair = PairField::default();
+            let mut down = Box::pin(exchange.handle(req, None, &pair));
+            // Parsed and authenticated, still waiting for the data MAC.
+            assert!(
+                down.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            client.close().await;
+            session.closed().await;
+            while exchange.carriers() != 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(lock(&exchange.inner.table).gone.contains_key(&cid));
+            let mut closed = Box::pin(pipe.closed());
+            assert!(
+                closed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(down);
+            let _ = closed.await;
+        })
+        .await
+        .unwrap();
+        listener.close();
+        serving.await.unwrap();
+    }
+
     /// A request repeated with the same (Carrier ID, Nonce) is handed back.
     #[tokio::test]
     async fn a_repeated_nonce_is_handed_back() {
@@ -1863,8 +2193,15 @@ mod tests {
             .handle(req, None, &PairField::default())
             .await
             .unwrap_err();
-        assert_eq!(back.method(), http::Method::GET);
-        assert!(replayed(back).await.is_empty());
+        let req = fallback(back);
+        assert_eq!(req.method(), http::Method::GET);
+        assert!(
+            collect(req.into_body(), 1024)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
         // Without a Content-Length: nothing read.
         let req = Request::post("/zmux/exchange")
             .body(PipeBody::full(Bytes::from_static(b"body")))

@@ -14,6 +14,7 @@ use zmux::{Config, PipeIo, Session};
 struct Held {
     ran: AtomicBool,
     gone: AtomicBool,
+    released: tokio::sync::Notify,
 }
 
 struct Guard(Arc<Held>);
@@ -21,6 +22,7 @@ struct Guard(Arc<Held>);
 impl Drop for Guard {
     fn drop(&mut self) {
         self.0.gone.store(true, Ordering::SeqCst);
+        self.0.released.notify_one();
     }
 }
 
@@ -36,13 +38,14 @@ fn endless(held: &Arc<Held>) -> impl Future<Output = ()> + Send + 'static {
 
 async fn wait_gone(held: &Held) {
     while !held.gone.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        held.released.notified().await;
     }
 }
 
 const LIMIT: Duration = Duration::from_secs(3);
 
 #[tokio::test(start_paused = true)]
+// HS-50
 async fn a_drain_that_never_ends_is_dropped_at_its_limit() {
     let held = Arc::new(Held::default());
     let (a, b) = tokio::io::duplex(1 << 16);
@@ -150,6 +153,36 @@ async fn a_drain_that_ends_releases_at_once() {
     assert!(held.ran.load(Ordering::SeqCst));
     assert!(ended.elapsed() < Duration::from_millis(50));
     drop(server);
+}
+
+#[tokio::test(start_paused = true)]
+// HS-50
+async fn pipe_closed_waits_for_its_carrier_drain() {
+    let (a, b) = tokio::io::duplex(1 << 16);
+    let (entered, draining) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let io = PipeIo::new(a).with_drain(
+        async move {
+            entered.send(()).unwrap();
+            gate.await.unwrap();
+        },
+        LIMIT,
+    );
+    let server = tokio::spawn(Session::accept(PipeIo::new(b), Config::default()));
+    let client = Session::connect(io, Config::default()).await.unwrap();
+    let _server = server.await.unwrap().unwrap();
+    let pipe = client.pipe(zmux::PipeId::new(0)).unwrap();
+    client.close().await;
+    draining.await.unwrap();
+    let mut closed = std::pin::pin!(pipe.closed());
+    assert!(
+        closed
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
+    release.send(()).unwrap();
+    assert!(matches!(closed.await, Err(zmux::PipeError::SessionLost(_))));
 }
 
 /// Two drains on one carrier (`with_drain` twice) both run after its
@@ -266,4 +299,34 @@ async fn a_joined_carriers_unused_half_arms_its_drain() {
         .expect("the drain was kept");
     assert!(held.ran.load(Ordering::SeqCst), "the drain did not run");
     drop(server);
+}
+
+#[test]
+// HS-53
+fn runtime_exit_releases_the_drain_even_before_first_poll() {
+    for poll in [false, true] {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let held = Arc::new(Held::default());
+        let (notify, entered) = tokio::sync::oneshot::channel();
+        {
+            let _entered = rt.enter();
+            let work = endless(&held);
+            zmux::adapter::spawn_drain(
+                async move {
+                    let _ = notify.send(());
+                    work.await;
+                },
+                LIMIT,
+            );
+        }
+        if poll {
+            rt.block_on(entered).unwrap();
+        }
+        drop(rt);
+        assert_eq!(held.ran.load(Ordering::SeqCst), poll);
+        assert!(held.gone.load(Ordering::SeqCst));
+    }
 }

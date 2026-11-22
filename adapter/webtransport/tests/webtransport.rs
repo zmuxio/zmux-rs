@@ -8,119 +8,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use web_transport_quinn::quinn;
 use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeFailure, Session, SessionError};
 use zmux_webtransport::{Carrier, Options, Url};
 
-/// A WebTransport server and a client for it over loopback.
-struct Wt {
-    server: Option<web_transport_quinn::Server>,
-    client: web_transport_quinn::Client,
-    url: Url,
-    /// The client's endpoint and configuration, for connections made
-    /// outside `client`.
-    client_ep: quinn::Endpoint,
-    client_config: quinn::ClientConfig,
-}
-
-impl Wt {
-    fn new(opts: &Options) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cert = zmux_testcert::self_signed(vec!["127.0.0.1".into()]).unwrap();
-        let der = CertificateDer::from(cert.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let alpn = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![der.clone()], key)
-            .unwrap();
-        tls.alpn_protocols.clone_from(&alpn);
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
-        ));
-        server_config.transport_config(Arc::new(opts.transport_config()));
-        let endpoint =
-            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = endpoint.local_addr().unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(der).unwrap();
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls.alpn_protocols = alpn;
-        let mut client_config = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
-        ));
-        client_config.transport_config(Arc::new(opts.transport_config()));
-        let client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        Self {
-            server: Some(web_transport_quinn::Server::new(endpoint)),
-            client: web_transport_quinn::Client::new(client_ep.clone(), client_config.clone()),
-            url: format!("https://{addr}/zmux").parse().unwrap(),
-            client_ep,
-            client_config,
-        }
-    }
-
-    /// A WebTransport session: the client's end and the server's.
-    async fn pair(&mut self) -> (web_transport_quinn::Session, web_transport_quinn::Session) {
-        let server = self.server.as_mut().unwrap();
-        let (c, s) = tokio::join!(self.client.connect(self.url.clone()), async {
-            server.accept().await.unwrap().ok().await
-        });
-        (c.unwrap(), s.unwrap())
-    }
-}
-
-/// Sends `n` streams of `len` bytes each from `from` to `to` at once and
-/// checks every byte.
-async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
-    let receiver = {
-        let to = to.clone();
-        tokio::spawn(async move {
-            let mut readers = Vec::new();
-            for _ in 0..n {
-                let mut recv = to.accept_uni().await.unwrap();
-                readers.push(tokio::spawn(async move {
-                    recv.read_to_end(len + 1).await.unwrap()
-                }));
-            }
-            for r in readers {
-                let data = r.await.unwrap();
-                assert_eq!(data.len(), len);
-                assert!(
-                    data.iter()
-                        .enumerate()
-                        .all(|(i, &b)| b == u8::try_from(i % 251).unwrap())
-                );
-            }
-        })
-    };
-    let data = bytes::Bytes::from(
-        (0..len)
-            .map(|i| u8::try_from(i % 251).unwrap())
-            .collect::<Vec<_>>(),
-    );
-    let mut writers = Vec::new();
-    for _ in 0..n {
-        let mut send = from.open_uni().await.unwrap();
-        let data = data.clone();
-        writers.push(tokio::spawn(async move {
-            send.write_chunk(data).await.unwrap();
-            send.finish().unwrap();
-            send
-        }));
-    }
-    for w in writers {
-        drop(w.await.unwrap());
-    }
-    receiver.await.unwrap();
-}
+mod common;
+use common::{Wt, transfer};
 
 /// One step from a client to a session and from a server to its sessions:
 /// streams go both ways and a close reaches the peer.
@@ -353,7 +245,7 @@ async fn an_admission_decides_on_the_session_request() {
     other.set_path("/other");
     assert!(wt.client.connect(other).await.is_err());
     let a = listener.stats().admission;
-    assert_eq!((a.accepted, a.fallback), (1, 1));
+    assert_eq!((a.accepted, a.fallback, a.stalled), (1, 0, 1));
     client.close().await;
     listener.close();
     serving.await.unwrap();
@@ -366,11 +258,20 @@ async fn an_admission_decides_on_the_session_request() {
 /// closed once the fallback completed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deferred_decision_on_the_first_stream_accepts_or_takes_over() {
+    deferred_first_stream(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_takeover_dispatches_the_first_stream() {
+    deferred_first_stream(true).await;
+}
+
+async fn deferred_first_stream(explicit_takeover: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zmux::adapter::{FirstBytes, Framing, classify_first_bytes};
     use zmux::{AdmissionVerdict, Fallback, Takeover};
 
-    let admission = zmux::Admission::new(1, |info, prefix| {
+    let admission = zmux::Admission::new(1, move |info, prefix| {
         if info.is_head() {
             return AdmissionVerdict::Defer;
         }
@@ -379,6 +280,7 @@ async fn a_deferred_decision_on_the_first_stream_accepts_or_takes_over() {
         match classify_first_bytes(prefix, info.framing) {
             FirstBytes::Record => AdmissionVerdict::accept(0),
             FirstBytes::NeedMore(n) => AdmissionVerdict::More { need: n },
+            FirstBytes::Other if explicit_takeover => AdmissionVerdict::takeover(),
             FirstBytes::Other => AdmissionVerdict::fallback(),
         }
     })
@@ -464,8 +366,20 @@ async fn a_deferred_decision_on_the_first_stream_accepts_or_takes_over() {
         .unwrap();
     let a = listener.stats().admission;
     assert_eq!(
-        (a.accepted, a.fallback, a.closed, a.peek_timed_out),
-        (1, 1, 0, 0)
+        (
+            a.accepted,
+            a.fallback,
+            a.takeover,
+            a.closed,
+            a.peek_timed_out
+        ),
+        (
+            1,
+            u64::from(!explicit_takeover),
+            u64::from(explicit_takeover),
+            0,
+            0
+        )
     );
     listener.close();
     serving.await.unwrap();
@@ -474,6 +388,7 @@ async fn a_deferred_decision_on_the_first_stream_accepts_or_takes_over() {
 /// A session whose head deferred the decision and that opens no stream in
 /// time is closed, counted as timed out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// HS-57
 async fn a_deferred_session_without_a_stream_times_out() {
     let admission = zmux::Admission::new(1, |info, _| {
         assert!(info.is_head(), "no stream to decide on");
@@ -650,4 +565,146 @@ fn assert_kind(sessions: [&Session; 2], kind: zmux::CarrierKind) {
         let p = s.pipe(zmux::PipeId::new(0)).unwrap();
         assert_eq!(p.stats().unwrap().carrier, Some(kind));
     }
+}
+
+// HS-57. No session request exists yet, including after peer SETTINGS.
+#[tokio::test]
+// HS-57
+async fn settings_and_connect_share_the_listener_setup_deadline() {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use web_transport_quinn::proto::Settings;
+    for stop in [true, false] {
+        for settings in [false, true] {
+            let options = Options::default();
+            let mut wt = Wt::new(&options);
+            let mut limits = ListenerConfig::default();
+            limits.handshake_timeout = if stop {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_secs(1)
+            };
+            let listener = Listener::new(Config::default(), limits).unwrap();
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, wt.url.port().unwrap()));
+            let serving = tokio::spawn(zmux_webtransport::serve(
+                listener.clone(),
+                (*wt.server.take().unwrap()).clone(),
+                options,
+            ));
+            let conn = wt
+                .client_ep
+                .connect_with(wt.client_config.clone(), addr, wt.url.host_str().unwrap())
+                .unwrap()
+                .await
+                .unwrap();
+            let mut recv = conn.accept_uni().await.unwrap();
+            let exchanged = Settings::read(&mut recv).await.unwrap();
+            let _send = if settings {
+                let mut send = conn.open_uni().await.unwrap();
+                exchanged.write(&mut send).await.unwrap();
+                Some(send)
+            } else {
+                None
+            };
+            if stop {
+                listener.close();
+            }
+            tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                .await
+                .unwrap();
+            assert_eq!(listener.stats().sessions, 0);
+            assert_eq!(listener.stats().setup_failures, 1);
+            listener.close();
+            serving.await.unwrap();
+        }
+    }
+}
+
+/// A stream that starts but leaves either prefix read pending must close
+/// at the peek deadline even if the listener enables timeout fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_prefix_timeout_never_reaches_fallback() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for (peek, expected_calls) in [(2, 0), (1, 1)] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let decisions = calls.clone();
+        let admission = zmux::Admission::new(peek, move |info, _| {
+            if info.is_head() {
+                return zmux::AdmissionVerdict::Defer;
+            }
+            decisions.fetch_add(1, Ordering::Relaxed);
+            zmux::AdmissionVerdict::More { need: 2 }
+        })
+        .with_max_peek(2)
+        .with_peek_timeout(Duration::from_secs(1))
+        .with_fallback_on_peek_timeout(true);
+        let opts = Options::default();
+        let mut wt = Wt::new(&opts);
+        let mut config = admitted(Some(admission));
+        config.fallback = Some(zmux::Fallback::new(|_| async {}));
+        let listener = Listener::new(Config::default(), config).unwrap();
+        let serving = tokio::spawn(zmux_webtransport::serve(
+            listener.clone(),
+            (*wt.server.take().unwrap()).clone(),
+            opts,
+        ));
+        let session = wt.client.connect(wt.url).await.unwrap();
+        let (mut send, _recv) = session.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), session.closed())
+            .await
+            .unwrap();
+        let stats = listener.stats().admission;
+        assert_eq!(
+            (stats.peek_timed_out, stats.fallback, stats.closed),
+            (1, 0, 0)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
+        listener.close();
+        serving.await.unwrap();
+    }
+}
+
+/// EOF on the carrier's first stream leaves a targetless upgraded
+/// fallback stalled until the session or listener ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgraded_fallback_without_a_target_stalls_the_session() {
+    let (decided, observed) = tokio::sync::oneshot::channel();
+    let decided = std::sync::Mutex::new(Some(decided));
+    let admission = zmux::Admission::new(1, move |info, _| {
+        if info.is_head() {
+            return zmux::AdmissionVerdict::Defer;
+        }
+        decided.lock().unwrap().take().unwrap().send(()).unwrap();
+        zmux::AdmissionVerdict::fallback()
+    })
+    .with_stall_interval(Duration::from_secs(10), Duration::from_secs(10));
+    let opts = Options::default();
+    let mut wt = Wt::new(&opts);
+    let listener = Listener::new(Config::default(), admitted(Some(admission))).unwrap();
+    let serving = tokio::spawn(zmux_webtransport::serve(
+        listener.clone(),
+        (*wt.server.take().unwrap()).clone(),
+        opts,
+    ));
+    let session = wt.client.connect(wt.url).await.unwrap();
+    let (mut send, mut recv) = session.open_bi().await.unwrap();
+    send.write_all(b"x").await.unwrap();
+    send.finish().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), observed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), recv.read_to_end(1))
+            .await
+            .is_err()
+    );
+    let stats = listener.stats().admission;
+    assert_eq!((stats.stalled, stats.fallback, stats.takeover), (1, 0, 0));
+    listener.close();
+    let _ = tokio::time::timeout(Duration::from_secs(5), session.closed())
+        .await
+        .unwrap();
+    serving.await.unwrap();
 }

@@ -36,6 +36,15 @@ pub(crate) struct Attachment {
     traffic_at: Option<Instant>,
 }
 
+/// Peer evidence can only advance a pending local join. Retirement and
+/// public statistics use this decision even if a late ACK advanced counters.
+#[derive(Debug, Clone, Copy)]
+enum PeerAttachment {
+    Pending(Option<crate::proto::session::JoinDeadline>),
+    Attached,
+    Ended,
+}
+
 /// The multipath part of an attachment: its fate group, join and failure
 /// state, the `PIPE_ABANDON` exchange and the tier settings.
 #[derive(Debug)]
@@ -52,6 +61,7 @@ struct AttMp {
     /// The join was confirmed: the acceptor attached it. Always true for
     /// attachments the peer joined.
     joined: bool,
+    peer: PeerAttachment,
     /// The attachment failed (or was refused).
     failed: bool,
     /// Creation order, for "oldest".
@@ -104,6 +114,7 @@ impl AttMp {
             fate_group,
             unattached: false,
             joined: false,
+            peer: PeerAttachment::Attached,
             failed: false,
             seq,
             mode: None,
@@ -137,7 +148,14 @@ impl Attachment {
             joiner_local,
             inp: None,
             out: None,
-            mp: Some(Box::new(AttMp::new(fate_group, seq))),
+            mp: Some(Box::new(AttMp {
+                peer: if id != 0 && joiner_local {
+                    PeerAttachment::Pending(None)
+                } else {
+                    PeerAttachment::Attached
+                },
+                ..AttMp::new(fate_group, seq)
+            })),
             carrier: None,
             carrier_reports_failure: false,
             write_overhead: 0,
@@ -250,6 +268,19 @@ impl Attachment {
         self.id
     }
 
+    pub(crate) fn attach_by(&self) -> Option<crate::proto::session::JoinDeadline> {
+        match self.mp().peer {
+            PeerAttachment::Pending(deadline) => deadline,
+            PeerAttachment::Attached | PeerAttachment::Ended => None,
+        }
+    }
+
+    pub(crate) fn set_attach_by(&mut self, deadline: Option<crate::proto::session::JoinDeadline>) {
+        if let PeerAttachment::Pending(slot) = &mut self.mp_mut().peer {
+            *slot = deadline;
+        }
+    }
+
     /// The local endpoint joined it.
     #[inline]
     pub(crate) fn joiner_local(&self) -> bool {
@@ -262,14 +293,22 @@ impl Attachment {
     /// outbound pipe or, for an inbound-only pipe, by a record received
     /// on it.
     pub(crate) fn peer_attached(&self) -> bool {
-        if self.id == 0 || !self.joiner_local {
-            return true;
+        matches!(self.mp().peer, PeerAttachment::Attached)
+    }
+
+    pub(crate) fn confirm_peer(&mut self) -> bool {
+        if !matches!(self.mp().peer, PeerAttachment::Pending(_)) {
+            return false;
         }
-        match (self.out(), self.inp()) {
+        let confirmed = match (self.out(), self.inp()) {
             (Some(o), _) => o.acked_total() > 0,
             (None, Some(i)) => i.records_received() > 0,
             (None, None) => false,
+        };
+        if confirmed {
+            self.mp_mut().peer = PeerAttachment::Attached;
         }
+        confirmed
     }
 
     #[inline]
@@ -394,6 +433,9 @@ impl Attachment {
         if m.failed {
             return false;
         }
+        if matches!(m.peer, PeerAttachment::Pending(_)) {
+            m.peer = PeerAttachment::Ended;
+        }
         m.failed = true;
         m.abandon_on_self = false;
         true
@@ -411,7 +453,7 @@ impl Attachment {
 
     /// Why our join ended before it was confirmed, if it did.
     pub(crate) fn join_failure(&self) -> Option<crate::proto::session::PipeFailure> {
-        if !self.joiner_local() || self.joined() {
+        if !self.joiner_local() || self.peer_attached() {
             return None;
         }
         self.failure()

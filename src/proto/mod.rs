@@ -34,7 +34,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
-mod decision;
+pub(crate) mod decision;
 pub use decision::{Decision, LaterFuture};
 mod codec;
 pub mod draft;

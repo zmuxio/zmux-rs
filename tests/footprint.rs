@@ -3,7 +3,7 @@
 //! sessions, counted by a global allocator by the requested layout sizes
 //! (independent of the allocator's size classes). Each row fails above its
 //! bound (the specification's, except where its constant says otherwise) and, on the platforms whose baseline is recorded
-//! here (Apple platforms), above this implementation's own baseline by more
+//! here (64-bit Apple and Linux targets), above this implementation's own baseline by more
 //! than the run-to-run variation; an improvement moves the baseline down
 //! here. Elsewhere the rows are reported and checked against the bounds.
 //!
@@ -123,20 +123,26 @@ impl Row {
     }
 }
 
-/// The baseline of this platform: recorded for Apple platforms only.
-const fn base(apple: f64) -> Option<f64> {
+/// Recorded baselines for 64-bit Apple and Linux targets.
+const fn base(apple: f64, linux_arm64: f64, linux_x86_64: f64) -> Option<f64> {
     if cfg!(target_vendor = "apple") {
         Some(apple)
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some(linux_arm64)
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some(linux_x86_64)
     } else {
         None
     }
 }
 
-/// The core of a session (one end, single pipe): deterministic.
+/// One single-pipe end. The close-ack deadline shares the close frame;
+/// an independent lane-zero position is needed only after a lane opens.
+/// Datagram scheduler state is allocated separately when negotiated.
 const CORE: Row = Row {
     name: "idle core per session",
     bound: f64::INFINITY,
-    baseline: base(4088.0),
+    baseline: base(4120.0, 4120.0, 4120.0),
     noise: 0.0,
 };
 
@@ -144,7 +150,7 @@ const CORE: Row = Row {
 const STREAM: Row = Row {
     name: "idle stream per end",
     bound: 768.0,
-    baseline: base(685.0),
+    baseline: base(701.0, 701.0, 701.0),
     noise: 0.01,
 };
 
@@ -153,7 +159,7 @@ const STREAM: Row = Row {
 const PAIR_MEMORY: Row = Row {
     name: "idle session pair, in-memory pipe",
     bound: 17_408.0,
-    baseline: base(16_920.0),
+    baseline: base(16_920.0, 16_483.0, 16_533.0),
     noise: 0.005,
 };
 
@@ -164,7 +170,7 @@ const PAIR_MEMORY: Row = Row {
 const PAIR_TCP: Row = Row {
     name: "idle session pair, loopback TCP",
     bound: 17_408.0,
-    baseline: base(17_010.0),
+    baseline: base(17_010.0, 16_231.0, 16_565.0),
     noise: 0.01,
 };
 
@@ -177,7 +183,7 @@ const PAIR_TCP: Row = Row {
 const MULTIPATH: Row = Row {
     name: "idle multipath session pair, two pipes",
     bound: 49_152.0,
-    baseline: base(46_470.0),
+    baseline: base(47_728.0, 45_308.0, 45_377.0),
     noise: 0.02,
 };
 
@@ -369,7 +375,7 @@ async fn mp_pairs(
         v.push((client, server));
     }
     let active = |x: &Session| {
-        x.pipe_stats()
+        zmux::test_hooks::pipe_signals(x)
             .iter()
             .filter(|i| i.outbound == Some(OutboundState::Active))
             .count()
@@ -388,6 +394,11 @@ async fn mp_pairs(
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release builds only")]
 fn idle_footprint_stays_within_its_bounds_and_baselines() {
+    let sizes = zmux::test_hooks::attachment_footprint(|| LIVE.load(Relaxed));
+    println!(
+        "ATTACHMENT bytes idle={} worker={} split_adopt={}",
+        sizes[0], sizes[1], sizes[2]
+    );
     core_rows();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

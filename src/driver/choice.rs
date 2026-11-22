@@ -578,7 +578,7 @@ async fn start(
         Role::Client,
         Some(Role::Client),
         None,
-        |_| {},
+        |_| None,
     ) {
         Ok(s) => s,
         Err(e) => {

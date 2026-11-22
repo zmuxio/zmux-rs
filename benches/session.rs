@@ -2053,6 +2053,122 @@ async fn multipath() {
     }
 }
 
+fn carrier_stats() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::pause();
+            let (a, b) = tcp_pair().await;
+            let (client, server) = tokio::join!(
+                Session::connect(PipeIo::from_tcp(a), Config::default()),
+                Session::accept(PipeIo::from_tcp(b), Config::default()),
+            );
+            let client = client.unwrap();
+            let _server = server.unwrap();
+            let pipe = client.pipes().remove(0);
+            let stats = || std::hint::black_box(pipe.stats().unwrap().carrier_sample.unwrap());
+            let first = stats();
+            for _ in 0..32 {
+                let _ = stats();
+            }
+            let hits = 100_000_u32;
+            let before = ALLOCS.load(Relaxed);
+            let start = Instant::now();
+            for _ in 0..hits {
+                assert_eq!(stats().sampled_at, first.sampled_at);
+            }
+            let hit_ns = start.elapsed().as_nanos() / u128::from(hits);
+            let hit_allocs = ALLOCS.load(Relaxed) - before;
+
+            if matches!(
+                first.source,
+                zmux::CarrierSource::Unknown | zmux::CarrierSource::WindowsSioTcpInfo
+            ) {
+                tokio::time::advance(Duration::from_secs(2)).await;
+                assert_eq!(stats(), first);
+                println!(
+                    "RESULT scen=carrier-stats source={:?} hit_ns={hit_ns} hit_allocations={hit_allocs}",
+                    first.source,
+                );
+                return;
+            }
+
+            let refreshes = 1_000_u32;
+            let mut elapsed = Duration::ZERO;
+            let source = first.source;
+            let mut previous = first;
+            for _ in 0..refreshes {
+                let due = previous.sampled_at + Duration::from_secs(1);
+                let step = due.saturating_duration_since(tokio::time::Instant::now().into_std());
+                tokio::time::advance(step).await;
+                let start = Instant::now();
+                let cached = stats();
+                elapsed += start.elapsed();
+                assert_eq!(cached, previous);
+                let limit = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let refreshed = stats();
+                    if refreshed.sampled_at > previous.sampled_at {
+                        previous = refreshed;
+                        break;
+                    }
+                    assert!(Instant::now() < limit, "statistics refresh did not finish");
+                    tokio::task::yield_now().await;
+                }
+            }
+            println!(
+                "RESULT scen=carrier-stats source={:?} hit_ns={hit_ns} hit_allocations={hit_allocs} trigger_ns={}",
+                source,
+                elapsed.as_nanos() / u128::from(refreshes),
+            );
+        });
+}
+
+fn idle_carrier_stats() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut config = Config::default();
+            config.max_idle_timeout = None;
+            config.liveness.keep_alive_period = None;
+            let config = Arc::new(config);
+            let calls = Arc::new(AtomicU64::new(0));
+            let carrier = |io, owner: &Arc<()>| {
+                let calls = calls.clone();
+                PipeIo::new(io).with_carrier_conn(zmux::CarrierConnId::new(owner)).with_carrier_counters(zmux::CarrierSource::Quinn, move || {
+                    calls.fetch_add(1, Relaxed);
+                    Some(zmux::CarrierCounts::Quic { packets_sent: 0, packets_lost: 0 })
+                })
+            };
+            let mut pairs = Vec::with_capacity(500);
+            for _ in 0..500 {
+                let (a, b) = tokio::io::duplex(65536);
+                let (near, far) = (Arc::new(()), Arc::new(()));
+                let (client, server) = tokio::join!(
+                    Session::connect(carrier(a, &near), config.clone()),
+                    Session::accept(carrier(b, &far), config.clone()),
+                );
+                pairs.push((client.unwrap(), server.unwrap(), near, far));
+            }
+            // Let the protocol's own idle-buffer reclamation finish before
+            // measuring idle sessions. No public stats method is called.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(calls.load(Relaxed), 1000);
+            zmux::test_hooks::measure_session_polls(true);
+            let before = ALLOCS.load(Relaxed);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let allocs = ALLOCS.load(Relaxed) - before;
+            let polls = zmux::test_hooks::measure_session_polls(false);
+            println!("RESULT scen=idle-carrier-stats sessions=1000 seconds=10 polls={polls} allocations={allocs}");
+            assert_eq!((polls, allocs, calls.load(Relaxed)), (0, 0, 1000));
+            std::hint::black_box(&pairs);
+        });
+}
+
 fn main() {
     let filter: Vec<String> = std::env::args()
         .skip(1)
@@ -2075,6 +2191,12 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
+    if want("carrier-stats") && !filter.is_empty() {
+        carrier_stats();
+    }
+    if want("idle-carrier-stats") && !filter.is_empty() {
+        idle_carrier_stats();
+    }
     if want("core-bulk") {
         core_bulk(false);
         core_bulk(true);

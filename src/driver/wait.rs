@@ -560,8 +560,7 @@ impl<T: Waiting, F, A> Drop for Open<'_, T, F, A> {
     }
 }
 
-/// Resolves when a pipe was closed (a listener's `handle_pipe` lives as long
-/// as its pipe).
+/// Signals pipe retirement to workers waiting on the pipe.
 #[derive(Default)]
 pub(crate) struct PipeDone {
     state: Mutex<DoneState>,
@@ -844,15 +843,18 @@ mod tests {
     }
 
     #[test]
+    // HS-54
     fn a_cancelled_done_wait_leaves() {
         let done = PipeDone::default();
         let (c, waker) = counter();
         let cx = Context::from_waker(&waker);
         let mut ticket = None;
-        assert!(done.poll_done(&mut ticket, &cx).is_pending());
-        assert_eq!(done.waiting(), 1);
-        done.cancel(ticket.take().unwrap());
-        assert_eq!(done.waiting(), 0);
+        for _ in 0..64 {
+            assert!(done.poll_done(&mut ticket, &cx).is_pending());
+            assert_eq!(done.waiting(), 1);
+            done.cancel(ticket.take().unwrap());
+            assert_eq!(done.waiting(), 0);
+        }
         assert!(done.poll_done(&mut ticket, &cx).is_pending());
         let mut deferred = WakeList::default();
         done.finish_into(&mut deferred);

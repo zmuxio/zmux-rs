@@ -102,6 +102,119 @@ impl<T: AsyncWrite + Unpin + Send + 'static> AsyncWrite for NoHalfClose<T> {
     }
 }
 
+#[derive(Default)]
+struct WriteFailureGate {
+    armed: AtomicBool,
+    failed: AtomicBool,
+    reader: atomic_waker::AtomicWaker,
+}
+
+struct WriteFailsAfterArm {
+    io: tokio::io::DuplexStream,
+    gate: Arc<WriteFailureGate>,
+}
+
+impl AsyncRead for WriteFailsAfterArm {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.gate.armed.load(Ordering::SeqCst) {
+            self.gate.reader.register(cx.waker());
+            if !self.gate.failed.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+        }
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for WriteFailsAfterArm {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.gate.armed.load(Ordering::SeqCst) {
+            self.gate.failed.store(true, Ordering::SeqCst);
+            self.gate.reader.wake();
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+async fn fail_write_before_reading(peer_closes: bool) -> SessionError {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let gate = Arc::new(WriteFailureGate::default());
+        let config = config(Duration::from_millis(250));
+        let listener =
+            zmux::Listener::new(config.clone(), zmux::ListenerConfig::default()).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let l = listener.clone();
+        tokio::spawn(async move {
+            let _ = l.handle_pipe(zmux::PipeIo::new(b), hint()).await;
+        });
+        let client = zmux::Session::connect(
+            zmux::PipeIo::new(WriteFailsAfterArm {
+                io: a,
+                gate: gate.clone(),
+            }),
+            config,
+        )
+        .await
+        .unwrap();
+        let server = listener.accept().await.unwrap();
+        let mut stream = client.open_uni().await.unwrap();
+        gate.armed.store(true, Ordering::SeqCst);
+        if peer_closes {
+            server
+                .close_with_error(VarInt::from_u32(9), b"peer close")
+                .await;
+        }
+        // The application write may be buffered or may observe the carrier failure.
+        let _ = stream.write_all(b"trigger write failure").await;
+        let error = client.closed().await;
+        assert!(gate.failed.load(Ordering::SeqCst));
+        error
+    })
+    .await
+    .expect("the session closes")
+}
+
+#[tokio::test]
+async fn lane_zero_write_failure_preserves_the_peer_close() {
+    let error = fail_write_before_reading(true).await;
+    assert!(
+        matches!(error, SessionError::ApplicationClosed { code, remote: true, .. }
+            if code == VarInt::from_u32(9)),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn lane_zero_write_failure_with_no_peer_close_keeps_the_write_error() {
+    let error = fail_write_before_reading(false).await;
+    assert!(
+        matches!(
+            error,
+            SessionError::PipesLost {
+                last: Some(zmux::PipeFailure::Carrier(io::ErrorKind::BrokenPipe)),
+            }
+        ),
+        "{error:?}"
+    );
+}
+
 /// How the two ends of a carrier are made.
 #[derive(Clone, Copy, Debug)]
 enum Kind {

@@ -178,6 +178,7 @@ pub(crate) struct OutLane {
 #[derive(Debug)]
 pub(crate) struct OutLanes {
     zero: LaneTx,
+    pub(super) eliciting_zero: u64,
     /// The send order written before the pipe had lanes, all on lane 0:
     /// whose directions are not bound.
     before: u64,
@@ -279,8 +280,9 @@ impl HeldBytes {
 impl OutLanes {
     /// The lanes of a pipe that carried its send order on lane 0 alone up
     /// to `sent`, acknowledged up to `acked`, its carrier holding `unsent`.
-    pub(crate) fn new(sent: u64, acked: u64, unsent: u64) -> Self {
+    pub(crate) fn new(sent: u64, acked: u64, unsent: u64, eliciting_zero: u64) -> Self {
         Self {
+            eliciting_zero,
             zero: LaneTx::identity(sent, acked),
             before: sent,
             zero_unsent: unsent,
@@ -892,7 +894,7 @@ mod tests {
     fn the_shortest_lane_stall_capped_by_any_progress() {
         let t0 = Instant::now();
         let ms = |m: u64| t0 + Duration::from_millis(m);
-        let mut l = OutLanes::new(0, 0, 0);
+        let mut l = OutLanes::new(0, 0, 0, 0);
         assert_eq!(l.request(), 1);
         assert_eq!(l.request(), 2);
         assert_eq!(l.stall_from(None), None);

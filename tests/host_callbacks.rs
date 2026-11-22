@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-#[cfg(unix)]
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex};
 use zmux::adapter::PAIRING_TOKEN_LEN;
@@ -310,11 +309,10 @@ async fn bound_on_a_split_acceptor_is_auth() {
             .with_carrier_secure()
             .with_exporter(export);
         let (l2, p1) = (l.clone(), pair());
-        let second = tokio::spawn(async move { l2.handle_pipe(down, p1).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        // The downlink came first: its handler takes the pair.
-        l.handle_pipe(up, pair()).await.unwrap();
-        assert_eq!(second.await.unwrap(), Err(HandleError::Rejected));
+        let mut down = Box::pin(l2.handle_pipe(down, p1));
+        assert!(!poll(down.as_mut()));
+        assert_eq!(l.handle_pipe(up, pair()).await, Err(HandleError::Rejected));
+        assert_eq!(down.await, Err(HandleError::Rejected));
         assert_eq!(*reasons.lock().unwrap(), vec!["auth"]);
     })
     .await
@@ -645,10 +643,10 @@ fn poll<F: Future>(f: Pin<&mut F>) -> bool {
     f.poll(&mut cx).is_ready()
 }
 
-/// The first half of a split bootstrap goes (its handler cancelled) with the second in its
-/// slot: the second half ends and the token starts a new pairing.
+/// A paired setup survives one withdrawal and releases both halves after the second.
 #[tokio::test(flavor = "current_thread")]
-async fn a_dropped_first_half_releases_the_second_and_the_token() {
+// HS-43
+async fn both_requests_withdraw_from_a_matched_pair() {
     let mut limits = ListenerConfig::default();
     limits.handshake_timeout = Duration::from_secs(30);
     let l = Listener::new(config(), limits).expect("valid listener configuration");
@@ -657,19 +655,23 @@ async fn a_dropped_first_half_releases_the_second_and_the_token() {
         h.pair = Some(vec![7; PAIRING_TOKEN_LEN]);
         h
     };
-    let (r1, _w1) = duplex(1024);
+    let (r1, mut peer) = duplex(1024);
     let (_r2, w2) = duplex(1024);
     let mut first = Box::pin(l.handle_pipe(PipeIo::reader(r1), hint()));
     assert!(!poll(first.as_mut()));
     let mut second = Box::pin(l.handle_pipe(PipeIo::writer(w2), hint()));
-    for _ in 0..5 {
-        assert!(!poll(second.as_mut()));
-    }
+    assert!(!poll(second.as_mut()));
     drop(first);
-    tokio::time::timeout(Duration::from_secs(3), second)
-        .await
-        .expect("the second half ends")
-        .unwrap();
+    assert!(!poll(second.as_mut()));
+    drop(second);
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
     // Waits as a first half: not refused for a pairing nobody is in.
     let (r3, _w3) = duplex(1024);
     let mut third = Box::pin(l.handle_pipe(PipeIo::reader(r3), hint()));
@@ -678,6 +680,7 @@ async fn a_dropped_first_half_releases_the_second_and_the_token() {
 
 /// The same with no second half yet: nothing of the token stays.
 #[tokio::test(flavor = "current_thread")]
+// HS-41
 async fn a_lone_first_half_dropped_frees_the_token() {
     let l =
         Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");

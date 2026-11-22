@@ -152,6 +152,7 @@ async fn the_fallback_verdicts_value_reaches_the_takeover() {
 }
 
 #[tokio::test]
+// HS-10
 async fn a_detached_carrier_outlives_the_future_and_closes_once() {
     let (tx, rx) = oneshot::channel();
     let tx = std::sync::Mutex::new(Some(tx));
@@ -290,6 +291,7 @@ async fn a_message_carrier_is_taken_over_by_whole_messages() {
 }
 
 #[tokio::test]
+// HS-12
 async fn the_fallback_runs_on_when_its_entry_is_cancelled() {
     let (go_tx, go_rx) = oneshot::channel::<()>();
     let (started_tx, started_rx) = oneshot::channel();

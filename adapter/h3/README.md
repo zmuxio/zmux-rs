@@ -22,9 +22,10 @@ proxies and load balancers that forward HTTP/3 requests.
   writes on the carrier or has taken it. Requests that carry no pipe go to
   `Options::fallback` (`Fallback`, given the request with the body bytes
   read) or are answered with 404; a stalled or closed request is reset
-  without a response. A request is the carrier here, so it is taken over
-  as a request, by this HTTP fallback, never by the listener's
-  (`ListenerConfig::fallback`, which takes over carriers).
+  without a response. Admission `Fallback` selects the HTTP handler.
+  `Takeover` writes the accepted response head and hands both directions
+  to `ListenerConfig::fallback`, replaying any request prefix. It stalls
+  when there is no byte-stream target.
 - `Options::carrier_credential` makes the client write the prefix of a
   `zmux::CarrierCredential`, such as a `zmux::PrefixAuth` token, first on every
   request body, its pipes' and its lanes', given the QUIC connection's

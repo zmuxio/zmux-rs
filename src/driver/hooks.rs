@@ -284,14 +284,7 @@ pub(crate) async fn first<T>(
     stop: impl Future<Output = ()>,
     f: impl Future<Output = T>,
 ) -> Option<T> {
-    let (mut stop, mut f) = (std::pin::pin!(stop), std::pin::pin!(f));
-    std::future::poll_fn(|cx| {
-        if let std::task::Poll::Ready(v) = f.as_mut().poll(cx) {
-            return std::task::Poll::Ready(Some(v));
-        }
-        stop.as_mut().poll(cx).map(|()| None)
-    })
-    .await
+    super::setup::while_open(stop, f).await
 }
 
 #[cfg(test)]

@@ -37,6 +37,19 @@ pub trait Decide: Send + Sync + 'static {
     /// first message) are `prefix`.
     fn decide(&self, info: CarrierInfo, prefix: &[u8])
     -> crate::proto::Decision<AdmissionDecision>;
+
+    /// Decides within a listener setup. A decider that dispatches to an
+    /// independent runtime can register its work before dispatch and move
+    /// the returned guard to its actual completion callback. That work
+    /// continues to occupy admission capacity while processing cancellation.
+    fn decide_with_worker(
+        &self,
+        info: CarrierInfo,
+        prefix: &[u8],
+        _worker: &mut dyn FnMut() -> Box<dyn Send + Sync>,
+    ) -> crate::proto::Decision<AdmissionDecision> {
+        self.decide(info, prefix)
+    }
 }
 
 impl<F, D> Decide for F
@@ -223,9 +236,9 @@ impl Admission {
     /// round, to [`AdmissionVerdict::Fallback`] with every byte read replayed,
     /// instead of closing it (default off). Without a fallback
     /// (`ListenerConfig::fallback`) it is stalled, as for any
-    /// fallback. It is counted in both `peek_timed_out` and `fallback`. A
-    /// message-framed carrier, an HTTP request carrier and a decision that
-    /// does not return in time are closed either way.
+    /// fallback. Admission counts the outcome of that fallback path. A
+    /// message-framed carrier, an HTTP request, a carrier deferred from an
+    /// upgrade, or a decision that runs past the deadline closes either way.
     #[must_use]
     pub fn with_fallback_on_peek_timeout(mut self, on: bool) -> Self {
         self.fallback_on_peek_timeout = on;
@@ -366,14 +379,17 @@ pub enum AdmissionVerdict {
     /// request rather than a carrier to take over: its adapter's HTTP
     /// fallback serves it (without one: a not-found response). The carrier
     /// of an upgrade decided after an [`AdmissionVerdict::Defer`] is a
-    /// carrier: it goes to the listener's fallback. An HTTP request
-    /// carrier decided on the start of its body is a carrier too: with a
-    /// listener's fallback it is taken over as the full-duplex pipe of its
-    /// request and response bodies. `value` is the host's value for the
+    /// carrier: it goes to the listener's fallback. `value` is the host's value for the
     /// takeover (`Takeover::value`), routing it to the host's service; it
     /// does not reach an adapter's HTTP fallback.
     Fallback {
         /// The host's value for the carrier's takeover.
+        value: Option<AdmittedValue>,
+    },
+    /// Serve the carrier itself through the listener's byte-stream target,
+    /// after the accepted response or upgrade. Without a target, stall.
+    Takeover {
+        /// Host value delivered with the carrier.
         value: Option<AdmittedValue>,
     },
     /// Nothing is sent; what arrives is read and discarded, and the carrier
@@ -439,7 +455,8 @@ impl PartialEq for AdmissionVerdict {
             (Self::Accept { skip: a, value: x }, Self::Accept { skip: b, value: y }) => {
                 a == b && same(x.as_ref(), y.as_ref())
             }
-            (Self::Fallback { value: x }, Self::Fallback { value: y }) => {
+            (Self::Fallback { value: x }, Self::Fallback { value: y })
+            | (Self::Takeover { value: x }, Self::Takeover { value: y }) => {
                 same(x.as_ref(), y.as_ref())
             }
             (Self::Stall, Self::Stall)
@@ -469,6 +486,12 @@ impl AdmissionVerdict {
         Self::Accept { skip, value: None }
     }
 
+    /// Take over the carrier with its prefetched input.
+    #[must_use]
+    pub const fn takeover() -> Self {
+        Self::Takeover { value: None }
+    }
+
     /// [`AdmissionVerdict::Fallback`] without a value.
     #[must_use]
     pub const fn fallback() -> Self {
@@ -476,7 +499,7 @@ impl AdmissionVerdict {
     }
 
     /// With the host's value for an accepted carrier or a takeover
-    /// ([`AdmissionVerdict::Accept`], [`AdmissionVerdict::Fallback`]); other
+    /// ([`AdmissionVerdict::Accept`], [`AdmissionVerdict::Fallback`], [`AdmissionVerdict::Takeover`]); other
     /// verdicts carry none and are returned as they are.
     #[must_use]
     pub fn with_value(self, value: AdmittedValue) -> Self {
@@ -485,6 +508,7 @@ impl AdmissionVerdict {
                 skip,
                 value: Some(value),
             },
+            Self::Takeover { .. } => Self::Takeover { value: Some(value) },
             Self::Fallback { .. } => Self::Fallback { value: Some(value) },
             v => v,
         }

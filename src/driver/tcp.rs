@@ -132,77 +132,33 @@ impl TcpSocket {
         None
     }
 
-    /// The carrier's retransmission-count query of this socket, where the
-    /// platform reports one: Linux and Android `tcpi_bytes_retrans` (Linux
-    /// 4.19 and later), Apple platforms `tcpi_txretransmitbytes`, Windows
-    /// `BytesRetrans` of `SIO_TCP_INFO` (32 bits, widened here: a count
-    /// queried less than 4 GiB of retransmissions apart).
-    #[allow(
-        clippy::unused_self,
-        clippy::unnecessary_wraps,
-        reason = "the socket is queried only on the platforms that report it"
-    )]
-    pub(crate) fn retransmitted_query(&self) -> Option<super::unsent::Unsent> {
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-        {
-            let s = self.clone();
-            Some(Box::new(move || s.retransmitted()))
-        }
-        #[cfg(windows)]
-        {
-            let s = self.clone();
-            let widened = std::sync::atomic::AtomicU64::new(0);
-            Some(Box::new(move || {
-                use std::sync::atomic::Ordering::Relaxed;
-                let n = s.retransmitted()?;
-                let prev = widened.load(Relaxed);
-                let mut v = (prev & !0xffff_ffff) | n;
-                if v < prev {
-                    v += 1 << 32;
-                }
-                widened.store(v, Relaxed);
-                Some(v)
-            }))
-        }
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_vendor = "apple",
-            windows
-        )))]
-        None
+    pub(crate) fn from_weak(socket: &std::sync::Weak<std::net::TcpStream>) -> Option<Self> {
+        Some(Self {
+            socket: socket.upgrade()?,
+        })
     }
 
-    /// The bytes the socket retransmitted (one system call), where the
-    /// platform reports them.
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_vendor = "apple",
-        windows
-    ))]
-    fn retransmitted(&self) -> Option<u64> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn counter_source(&self) -> super::carrier_stats::Source {
+        super::carrier_stats::Source::tcp(tcp_source(), std::sync::Arc::downgrade(&self.socket))
+    }
+
+    /// Samples the platform's pair with a single socket query.
+    pub(crate) fn carrier_counters(&self) -> Option<crate::CarrierCounts> {
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
         {
             use std::os::fd::AsRawFd;
-            linux::retransmitted(self.socket.as_raw_fd())
+            let mut buf = [0u8; 160];
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let (option, parse) = (libc::TCP_INFO, linux_counters as CounterParser);
+            #[cfg(target_os = "macos")]
+            let (option, parse) = (0x106, macos_counters as CounterParser);
+            let len = getsockopt(self.socket.as_raw_fd(), libc::IPPROTO_TCP, option, &mut buf)?;
+            parse(&buf, len)
         }
-        #[cfg(target_vendor = "apple")]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         {
-            use std::os::fd::AsRawFd;
-            let mut buf = [0u8; APPLE_TXRETRANSMITBYTES + 8];
-            let len = getsockopt(
-                self.socket.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                APPLE_TCP_CONNECTION_INFO,
-                &mut buf,
-            )?;
-            field64(&buf, len, APPLE_TXRETRANSMITBYTES)
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawSocket;
-            windows::retransmitted(self.socket.as_raw_socket())
+            let _ = self;
+            None
         }
     }
 
@@ -326,7 +282,7 @@ fn changed(old: u64, new: u64) -> bool {
 }
 
 /// Reads a socket option into `buf`; the bytes the kernel wrote.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn getsockopt(
     fd: std::os::fd::RawFd,
     level: libc::c_int,
@@ -362,25 +318,49 @@ fn setsockopt(fd: std::os::fd::RawFd, name: libc::c_int, value: u64) -> bool {
 }
 
 /// A native-endian u32 at `off`, when the kernel wrote all of it.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+))]
 fn field(buf: &[u8], len: usize, off: usize) -> Option<u32> {
     let b = buf.get(off..off + 4).filter(|_| len >= off + 4)?;
     Some(u32::from_ne_bytes(b.try_into().ok()?))
 }
 
-/// A native-endian u64 at `off`, when the kernel wrote all of it.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn field64(buf: &[u8], len: usize, off: usize) -> Option<u64> {
-    let b = buf.get(off..off + 8).filter(|_| len >= off + 8)?;
-    Some(u64::from_ne_bytes(b.try_into().ok()?))
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+type CounterParser = fn(&[u8], usize) -> Option<crate::CarrierCounts>;
+
+fn tcp_source() -> crate::CarrierSource {
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        crate::CarrierSource::LinuxTcpInfo
+    } else if cfg!(target_os = "macos") {
+        crate::CarrierSource::DarwinTcpConnectionInfo
+    } else if cfg!(windows) {
+        crate::CarrierSource::WindowsSioTcpInfo
+    } else {
+        crate::CarrierSource::Unknown
+    }
 }
 
-/// `TCP_CONNECTION_INFO` (`<netinet/tcp.h>`), and the offset of
-/// `tcpi_txretransmitbytes` in its `struct tcp_connection_info`.
-#[cfg(target_vendor = "apple")]
-const APPLE_TCP_CONNECTION_INFO: libc::c_int = 0x106;
-#[cfg(target_vendor = "apple")]
-const APPLE_TXRETRANSMITBYTES: usize = 72;
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn linux_counters(buf: &[u8], len: usize) -> Option<crate::CarrierCounts> {
+    Some(crate::CarrierCounts::TcpSegments {
+        data_segs_out: u64::from(field(buf, len, 156)?),
+        total_retrans: u64::from(field(buf, len, 100)?),
+    })
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_counters(buf: &[u8], len: usize) -> Option<crate::CarrierCounts> {
+    // XNU tcp_connection_info: txpackets at 56, txretransmitpackets at 104.
+    let bytes = buf.get(..len)?;
+    Some(crate::CarrierCounts::TcpPackets {
+        packets_sent: u64::from_ne_bytes(bytes.get(56..64)?.try_into().ok()?),
+        packets_retransmitted: u64::from_ne_bytes(bytes.get(104..112)?.try_into().ok()?),
+    })
+}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
@@ -405,15 +385,6 @@ mod linux {
             .map(|us| Duration::from_micros(u64::from(us)));
         let unsent = field(&buf, len, NOTSENT_BYTES).map(u64::from);
         TcpInfo { min_rtt, unsent }
-    }
-
-    /// The offset of `tcpi_bytes_retrans` (u64, Linux 4.19 and later).
-    pub(super) const BYTES_RETRANS: usize = 208;
-
-    pub(super) fn retransmitted(fd: std::os::fd::RawFd) -> Option<u64> {
-        let mut buf = [0u8; BYTES_RETRANS + 8];
-        let len = getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_INFO, &mut buf)?;
-        super::field64(&buf, len, BYTES_RETRANS)
     }
 }
 
@@ -483,12 +454,6 @@ mod windows {
             overlapped: *mut c_void,
             completion: *mut c_void,
         ) -> i32;
-    }
-
-    pub(super) fn retransmitted(socket: std::os::windows::io::RawSocket) -> Option<u64> {
-        let (out, returned) = query(socket)?;
-        let end = std::mem::offset_of!(TcpInfoV0, bytes_retrans) + 4;
-        ((returned as usize) >= end).then_some(u64::from(out.bytes_retrans))
     }
 
     pub(super) fn info(socket: std::os::windows::io::RawSocket) -> TcpInfo {
@@ -585,13 +550,66 @@ mod tests {
         } else {
             assert_eq!(info.unsent, None);
         }
-        // Loopback retransmits nothing.
-        let retrans = s.retransmitted_query().and_then(|q| q());
-        if cfg!(any(target_vendor = "apple", windows)) {
-            assert_eq!(retrans, Some(0));
-        } else if cfg!(any(target_os = "linux", target_os = "android")) {
-            // Older kernels (before 4.19) have no count.
-            assert!(retrans.is_none_or(|n| n == 0), "{retrans:?}");
+        assert!(s.carrier_counters().is_none_or(|pair| matches!(
+            pair,
+            crate::CarrierCounts::TcpSegments {
+                total_retrans: 0,
+                ..
+            } | crate::CarrierCounts::TcpPackets {
+                packets_retransmitted: 0,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn carrier_counter_layouts_require_the_complete_pair() {
+        use crate::CarrierCounts;
+
+        let mut linux = [0; 160];
+        linux[100..104].copy_from_slice(&7_u32.to_ne_bytes());
+        linux[156..160].copy_from_slice(&42_u32.to_ne_bytes());
+        assert_eq!(linux_counters(&linux, 159), None);
+        assert_eq!(
+            linux_counters(&linux, 160),
+            Some(CarrierCounts::TcpSegments {
+                data_segs_out: 42,
+                total_retrans: 7,
+            })
+        );
+        let mut macos = [0; 112];
+        macos[56..64].copy_from_slice(&u64::MAX.to_ne_bytes());
+        macos[104..112].copy_from_slice(&5_u64.to_ne_bytes());
+        assert_eq!(macos_counters(&macos, 111), None);
+        assert_eq!(
+            macos_counters(&macos, 112),
+            Some(CarrierCounts::TcpPackets {
+                packets_sent: u64::MAX,
+                packets_retransmitted: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn unavailable_tcp_pairs_keep_their_provider() {
+        use super::super::carrier_stats::Source;
+        use crate::CarrierSource;
+
+        let fixtures = [
+            (CarrierSource::LinuxTcpInfo, linux_counters(&[0; 160], 159)),
+            (
+                CarrierSource::DarwinTcpConnectionInfo,
+                macos_counters(&[0; 112], 111),
+            ),
+            (CarrierSource::WindowsSioTcpInfo, None),
+        ];
+        for (provider, counts) in fixtures {
+            let mut source = Source::new(provider, move || counts);
+            source.dedicated = true;
+            let registration = source.attach(Instant::now).unwrap();
+            let sample = registration.cache.read(Instant::now()).0.unwrap();
+            assert_eq!(sample.source, provider);
+            assert_eq!(sample.counts, None);
         }
     }
 

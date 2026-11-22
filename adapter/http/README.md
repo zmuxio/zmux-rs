@@ -17,7 +17,10 @@ HTTP/1.1 and HTTP/2 carriers of [zmux](../../README.md) pipes over `hyper`.
   with the carriers' contents.
   Where an intermediary strips unknown fields, both ends may pair by
   another field (`Options::pair_field`, `PairField`).
-- **Exchange**: bounded `POST` requests with a `Content-Length`, for paths
+- **Exchange**: the authenticated creating request is decided on its head.
+  Fallback replays the complete encoded request to the HTTP handler. Takeover
+  hands the assembled exchange byte stream to the byte-stream target.
+  The transport uses bounded `POST` requests with a `Content-Length`, for paths
   that buffer whole bodies (below).
 
 The server classifies every request by its head alone (`classify`): an
@@ -60,9 +63,10 @@ error at the other end, never a clean end.
   (`Unhandled::Abort`: an admission's stall, once over, or close). Requests
   that carry no pipe go to `Options::fallback`, an HTTP handler
   (`Fallback`), or are answered with 404. A request is the carrier here,
-  so the admission's `Fallback` takes it over as a request, by this HTTP
-  fallback, never by the listener's (`ListenerConfig::fallback`, which
-  takes over carriers); a WebSocket upgrade decided on its first message
+  so an admission `Fallback` uses that HTTP handler or returns 404, even
+  when the listener has a byte-stream target. An explicit `Takeover`
+  flushes the accepted response head and gives the carrier itself to
+  `ListenerConfig::fallback`, or stalls when that target is absent. A WebSocket upgrade decided on its first message
   after a deferral is a carrier, and goes to the listener's. A served connection that has
   had no request or response in progress for `Options::idle_timeout`
   (60 s) is closed gracefully, on HTTP/2 as on HTTP/1.1; a carrier's

@@ -620,7 +620,7 @@ impl SessionCore {
         if self.state == State::Closing {
             if live
                 && !close_sent
-                && let Some(cf) = self.close.as_deref().cloned()
+                && let Some(cf) = self.close.as_ref().map(|c| c.frame.clone())
             {
                 let frame = match &cf {
                     CloseFrame::Transport {

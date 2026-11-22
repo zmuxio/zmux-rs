@@ -93,7 +93,7 @@
 #[cfg(feature = "hyper")]
 mod hyper_upgrade;
 #[cfg(feature = "hyper")]
-pub use hyper_upgrade::{RequestUpgrade, UpgradedCarrier, accept_request};
+pub use hyper_upgrade::{RequestUpgrade, UpgradeFlush, UpgradedCarrier, accept_request};
 pub use zmux::adapter::redirect::{DEFAULT_MAX_REDIRECTS, RedirectError};
 
 use std::io;
@@ -706,8 +706,8 @@ impl Upgraded {
 /// A read or write error of `io` while the request head is read or the
 /// response written.
 pub async fn accept<S, I>(
-    mut io: S,
-    mut entry: Entry,
+    io: S,
+    entry: Entry,
     info: I,
     listener: &Listener,
     options: &Options,
@@ -716,7 +716,28 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     I: FnOnce(&S) -> CarrierInfo,
 {
-    let (buf, head_len) = read_head(&mut io, options.max_request_head).await?;
+    accept_with_fallback(io, entry, info, listener, options, None).await
+}
+
+async fn accept_with_fallback<S, I>(
+    mut io: S,
+    mut entry: Entry,
+    info: I,
+    listener: &Listener,
+    options: &Options,
+    outcome: Option<&mut Option<zmux::adapter::RequestFallback>>,
+) -> io::Result<Upgrade<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    I: FnOnce(&S) -> CarrierInfo,
+{
+    let Some(head) = entry
+        .setup_step(read_head(&mut io, options.max_request_head))
+        .await
+    else {
+        return Ok(Upgrade::Ended);
+    };
+    let (buf, head_len) = head?;
     // Not an upgrade this server takes: a failed upgrade (the entry
     // dropped counts it).
     let Some(head_len) = head_len else {
@@ -744,15 +765,31 @@ where
         return Ok(Upgrade::Ended);
     }
     let admit = {
-        let info = info(&io).with_request_head(Arc::new(upgrade.parts.clone()), header_fields);
-        entry.decide_upgrade(info).await
+        let Some(info) = entry.host(|| info(&io)) else {
+            return Ok(Upgrade::Ended);
+        };
+        entry
+            .decide_upgrade(info.with_request_head(Arc::new(upgrade.parts.clone()), header_fields))
+            .await
     };
     match admit {
-        Admit::Accept(_) | Admit::Defer => {}
-        Admit::Fallback(_) => return Ok(Upgrade::Refused(Prefixed::new(io, buf))),
+        Admit::Accept(_) | Admit::Defer | Admit::TakeOver(_) => {}
+        Admit::Fallback(_) => {
+            if let Some(outcome) = outcome {
+                *outcome = entry.request_fallback();
+            } else {
+                entry.complete_request_fallback(true);
+            }
+            return Ok(Upgrade::Refused(Prefixed::new(io, buf)));
+        }
         Admit::Stall => {
-            entry.stall(Some(&mut io)).await;
-            let _ = io.shutdown().await;
+            entry
+                .stall_request(Some(io), |io| async move {
+                    if let Some(mut io) = io {
+                        let _ = io.shutdown().await;
+                    }
+                })
+                .await;
             return Ok(Upgrade::Ended);
         }
         _ => return Ok(Upgrade::Ended),
@@ -767,8 +804,16 @@ where
          Sec-WebSocket-Accept: {}\r\n{selected}\r\n",
         upgrade.accept_key
     );
-    io.write_all(response.as_bytes()).await?;
-    io.flush().await?;
+    let Some(flushed) = entry
+        .upgrade_step(async {
+            io.write_all(response.as_bytes()).await?;
+            io.flush().await
+        })
+        .await
+    else {
+        return Ok(Upgrade::Ended);
+    };
+    flushed?;
     let rest = buf[head_len..].to_vec();
     let ws = WebSocketStream::from_partially_read(io, rest, Role::Server, Some(ws_config())).await;
     Ok(Upgrade::Upgraded(Upgraded {
@@ -985,51 +1030,62 @@ async fn serve_over<C, S, SF>(
                 // A failed handshake or upgrade counts with the entry.
                 let conn = setup(conn).await.map_err(drop)?;
                 let binding = binding(&conn);
-                let upgraded = accept(conn, entry, info, &listener, options)
-                    .await
-                    .map_err(drop)?;
-                Ok((upgraded, socket, source, binding))
+                let mut outcome = None;
+                let upgraded =
+                    accept_with_fallback(conn, entry, info, &listener, options, Some(&mut outcome))
+                        .await
+                        .map_err(drop)?;
+                Ok((upgraded, socket, source, binding, outcome))
             }
         }
     };
-    let served =
-        move |l: Listener, (upgraded, socket, source, binding): (_, _, _, Option<TlsBinding>)| async move {
-            match upgraded {
-                Upgrade::Upgraded(carrier) => {
-                    let carrier = carrier.map_pipe(|io| {
-                        let io = with_socket(io, socket);
+    let served = move |l: Listener,
+                       (upgraded, socket, source, binding, outcome): (
+        _,
+        _,
+        _,
+        Option<TlsBinding>,
+        Option<zmux::adapter::RequestFallback>,
+    )| async move {
+        match upgraded {
+            Upgrade::Upgraded(carrier) => {
+                let carrier = carrier.map_pipe(|io| {
+                    let io = with_socket(io, socket);
+                    match &binding {
+                        Some(b) => b.apply(io),
+                        None => io,
+                    }
+                });
+                if let Some((io, hint)) = carrier.admit().await {
+                    let _ = l.handle_pipe(io, hint).await;
+                }
+            }
+            Upgrade::Refused(conn) => {
+                let adapter = l.adapter();
+                if adapter.has_fallback() {
+                    let (conn, prefix) = conn.into_parts();
+                    let info = CarrierInfo::new().with_source(source);
+                    // Made a pipe with the capabilities of the other
+                    // paths: the TCP socket and the TLS binding.
+                    let io = zmux::adapter::AdmitIo::stream(conn, move |c| {
+                        let io = with_socket(PipeIo::new(c), socket);
                         match &binding {
                             Some(b) => b.apply(io),
                             None => io,
                         }
                     });
-                    if let Some((io, hint)) = carrier.admit().await {
-                        let _ = l.handle_pipe(io, hint).await;
+                    adapter.take_over_request(info, io, prefix, outcome).await;
+                } else {
+                    if let Some(outcome) = outcome {
+                        outcome.complete(false);
                     }
+                    let mut conn = conn;
+                    let _ = not_found(&mut conn).await;
                 }
-                Upgrade::Refused(conn) => {
-                    let adapter = l.adapter();
-                    if adapter.has_fallback() {
-                        let (conn, prefix) = conn.into_parts();
-                        let info = CarrierInfo::new().with_source(source);
-                        // Made a pipe with the capabilities of the other
-                        // paths: the TCP socket and the TLS binding.
-                        let io = zmux::adapter::AdmitIo::stream(conn, move |c| {
-                            let io = with_socket(PipeIo::new(c), socket);
-                            match &binding {
-                                Some(b) => b.apply(io),
-                                None => io,
-                            }
-                        });
-                        adapter.take_over(info, io, prefix).await;
-                    } else {
-                        let mut conn = conn;
-                        let _ = not_found(&mut conn).await;
-                    }
-                }
-                Upgrade::Ended => {}
             }
-        };
+            Upgrade::Ended => {}
+        }
+    };
     listener
         .serve_connections(|| async { Some(tcp.accept().await) }, upgrade, served)
         .await;

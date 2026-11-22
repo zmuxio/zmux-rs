@@ -259,36 +259,37 @@ where
     if let (Some(_), Some((_, abort))) = (&follow, &sent.body) {
         abort.keep_replay();
     }
-    match (sent.head.direction, sent.body) {
+    let abort = sent.body.as_ref().map(|(_, a)| a.clone());
+    let (mut reader, head) = ResponseReader::new(timeout, sent.resp, abort, follow);
+    let mut pipe = match (sent.head.direction, sent.body) {
         (PipeDirection::In, _) | (_, None) => {
-            PipeIo::reader(ResponseReader::spawn(timeout, sent.resp, None, follow))
-                .with_carrier(CarrierKind::Split)
+            PipeIo::reader(reader).with_carrier(CarrierKind::Split)
         }
-        (PipeDirection::Bidi, Some((writer, abort))) => {
-            let reader = ResponseReader::spawn(timeout, sent.resp, Some(abort.clone()), follow);
-            PipeIo::from_chunk_halves(reader, writer)
-                .with_abort(move || abort.run())
-                .with_carrier(CarrierKind::Streaming)
-        }
+        (PipeDirection::Bidi, Some((writer, abort))) => PipeIo::from_chunk_halves(reader, writer)
+            .with_abort(move || abort.run())
+            .with_carrier(CarrierKind::Streaming),
         (PipeDirection::Out, Some((writer, abort))) => {
-            // The response carries no pipe bytes: it is read to its end,
-            // which ends the carrier, as does a failure or another status.
-            // After the request body's graceful end it is read on, within
-            // the exchange timeout, as the carrier's drain.
-            let mut reader = ResponseReader::spawn(timeout, sent.resp, Some(abort.clone()), follow);
+            let mut io = PipeIo::chunk_writer(writer);
+            let worker = io.worker_guard();
             let ended = abort.clone();
             let response = Reading::spawn(async move {
+                let _worker = worker;
                 match tokio::io::copy(&mut reader, &mut tokio::io::sink()).await {
                     Ok(_) => ended.run(),
                     Err(e) => ended.fail(e.kind()),
                 }
             });
-            PipeIo::chunk_writer(writer)
-                .with_drain(response.finish(), timeout)
+            io.with_drain(response.finish(), timeout)
                 .with_abort(move || abort.run())
                 .with_carrier(CarrierKind::Split)
         }
-    }
+    };
+    let worker = pipe.worker_guard();
+    tokio::spawn(async move {
+        let _worker = worker;
+        head.await;
+    });
+    pipe
 }
 
 /// The response body of a carrier as its inbound half. The server answers
@@ -311,29 +312,31 @@ impl ResponseReader {
     /// outcome: its writes fail as the response did
     /// ([`body::Abort::await_response`]). With `follow`, redirects are
     /// followed, and its target records the URL they led to.
-    pub(crate) fn spawn<F>(
+    fn new<F>(
         timeout: Duration,
         resp: F,
         request: Option<body::Abort>,
         follow: Option<Follow>,
-    ) -> Self
+    ) -> (Self, impl Future<Output = ()> + Send)
     where
         F: Future<Output = Result<Response<Incoming>, hyper::Error>> + Send + 'static,
     {
         if let Some(a) = &request {
             a.await_response();
         }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let r = within(timeout, async {
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
+        let head = async move {
+            let response = within(timeout, async {
                 let resp = resp.await.map_err(hyper_err)?;
                 match &follow {
                     Some(f) => f.run(resp).await,
                     None => Ok((resp, String::new())),
                 }
-            })
-            .await
-            .and_then(|(resp, url)| Ok((answered(resp)?, url)));
+            });
+            let Some(response) = zmux::adapter::while_open(tx.closed(), response).await else {
+                return;
+            };
+            let r = response.and_then(|(resp, url)| Ok((answered(resp)?, url)));
             if let Some(t) = follow.as_ref().and_then(|f| f.target.as_ref()) {
                 match &r {
                     Ok((_, url)) => t.redirected(url),
@@ -347,10 +350,13 @@ impl ResponseReader {
                 (_, None) => {}
             }
             let _ = tx.send(r);
-        });
-        Self {
-            state: ReaderState::Waiting(rx),
-        }
+        };
+        (
+            Self {
+                state: ReaderState::Waiting(rx),
+            },
+            head,
+        )
     }
 }
 
@@ -882,12 +888,7 @@ impl Http2Connection {
             let inner = self.inner.clone();
             io = io.with_lane_opener(move || {
                 let inner = inner.clone();
-                async move {
-                    inner
-                        .open_lane()
-                        .await
-                        .map(zmux::adapter::Lane::from_chunks)
-                }
+                async move { inner.open_lane().await }
             });
         }
         Ok(io)
@@ -1030,7 +1031,7 @@ impl H2Inner {
     /// request is under way. Its response, the unused reverse half, is read
     /// to its end meanwhile; one that fails, is not 200 or does not arrive
     /// within [`Options::timeout`] fails the lane's writes.
-    async fn open_lane(self: Arc<Self>) -> io::Result<LaneBody> {
+    async fn open_lane(self: Arc<Self>) -> io::Result<zmux::adapter::Lane> {
         let head = Head {
             direction: PipeDirection::Bidi,
             pair: None,
@@ -1043,21 +1044,24 @@ impl H2Inner {
         let Some((writer, abort)) = body else {
             return Err(io::Error::other("a lane request without a body"));
         };
-        let mut reader = ResponseReader::spawn(self.options.timeout, resp, None, None);
+        let mut lane = zmux::adapter::Lane::from_chunks(writer);
+        let worker = lane.worker_guard();
+        let timeout = self.options.timeout;
         let response = Reading::spawn(async move {
-            if tokio::io::copy(&mut reader, &mut tokio::io::sink())
-                .await
-                .is_err()
-            {
-                abort.run();
+            let _worker = worker;
+            let head = within(timeout, async { answered(resp.await.map_err(hyper_err)?) }).await;
+            if let Ok(head) = head {
+                let mut reader = BodyReader::new(head.into_body());
+                if tokio::io::copy(&mut reader, &mut tokio::io::sink())
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
             }
+            abort.run();
         });
-        Ok(LaneBody {
-            body: writer,
-            response: Some(response),
-            finished: false,
-            limit: self.options.timeout,
-        })
+        Ok(lane.with_drain(response.finish(), timeout))
     }
 }
 
@@ -1079,49 +1083,6 @@ impl Reading {
 impl Drop for Reading {
     fn drop(&mut self) {
         self.0.abort();
-    }
-}
-
-/// A lane's request body: its response is read on after the body's
-/// graceful end, within the exchange timeout, as the drain of a pipe's
-/// carrier is ([`PipeIo::with_drain`]), and stopped at once after any
-/// other end.
-struct LaneBody {
-    body: body::BodyWriter,
-    response: Option<Reading>,
-    finished: bool,
-    limit: Duration,
-}
-
-impl zmux::adapter::ChunkWrite for LaneBody {
-    fn poll_write_chunks(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        chunks: &mut [bytes::Bytes],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.body).poll_write_chunks(cx, chunks)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.body).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let r = Pin::new(&mut self.body).poll_shutdown(cx);
-        if matches!(r, Poll::Ready(Ok(()))) {
-            self.finished = true;
-        }
-        r
-    }
-}
-
-impl Drop for LaneBody {
-    fn drop(&mut self) {
-        if self.finished
-            && let Some(r) = self.response.take()
-        {
-            zmux::adapter::spawn_drain(r.finish(), self.limit);
-        }
     }
 }
 

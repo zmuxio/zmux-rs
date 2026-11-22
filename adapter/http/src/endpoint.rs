@@ -122,14 +122,21 @@ impl Endpoint {
         let peer = peer.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
         let info = remote_info(|i| i);
         match zmux_websocket::accept_request(req, peer, info, &self.listener, ws).await {
-            RequestUpgrade::Accepted { response, carrier } => {
+            RequestUpgrade::Accepted {
+                mut response,
+                carrier,
+            } => {
                 let l = self.listener.clone();
                 tokio::spawn(async move {
                     if let Some((io, hint)) = carrier.await {
                         let _ = l.handle_pipe(io, hint).await;
                     }
                 });
-                Ok(response.map(|()| PipeBody::empty()))
+                let head = zmux_websocket::UpgradeFlush::take(&mut response);
+                Ok(response.map(|()| match head {
+                    Some(sent) => PipeBody::empty().with_head(sent),
+                    None => PipeBody::empty(),
+                }))
             }
             RequestUpgrade::Refused(req) => Err(Unhandled::Fallback(Box::new(req.map(|b| {
                 crate::ReplayBody::new([bytes::Bytes::new(), bytes::Bytes::new()], Some(b))

@@ -18,7 +18,10 @@ use crate::trust::{
     VerifyError, VerifyInput, ask_app_data, check_pq_auth, guarded, host_panicked, judge,
     signer_panicked,
 };
-use crate::{credential_value, message_items, proof_placeholder};
+use crate::{
+    CredentialFailure, CredentialFailureReason as Reason, credential_value, message_items,
+    proof_placeholder,
+};
 
 /// The check of [`ServerOptions::allow_record_mode`]: asked outside every
 /// lock while the Hello is answered; a later answer is bounded as the
@@ -395,6 +398,12 @@ impl ServerConfig {
         let (complete, payload) = wait.read_finish(&finish).map_err(|e| refuse(e.class()))?;
         let client = complete.peer_static().unwrap_or_default().to_vec();
         app_data.extend(AppData::of(3, payload.app_data()));
+        let refuse_credentials = |error: CredentialFailure| {
+            io::Error::other(
+                RejectError::new(Some(profile.value()), Some(mode), error.class().class())
+                    .with_source(error),
+            )
+        };
         let mut pq_authenticated = false;
         let verdict = match &self.options.client_verifier {
             None => None,
@@ -409,16 +418,24 @@ impl ServerConfig {
                     peer_app_data: &app_data,
                     local_context: &self.options.local_context,
                 };
-                let verdict = judge(v.as_ref(), input)
-                    .await
-                    .map_err(|e| gate_error("credentials_failed", e))?;
+                let verdict = judge(v.as_ref(), input).await.map_err(|e| {
+                    if e.is_rejection() {
+                        refuse_credentials(CredentialFailure::new(Reason::Verifier).with_cause(e))
+                    } else {
+                        io::Error::other(e)
+                    }
+                })?;
                 // The core checks the proof the verdict names; the reason names which
                 // requirement failed: the proof, or the PQ authentication required.
                 pq_authenticated = complete
                     .check_proof(verdict.proof_key.as_ref(), false)
-                    .map_err(|_| refuse("proof"))?;
+                    .map_err(|e| {
+                        refuse_credentials(CredentialFailure::new(Reason::Proof).with_cause(e))
+                    })?;
                 if self.options.require_pq_auth && !pq_authenticated {
-                    return Err(refuse("pq_auth_required"));
+                    return Err(refuse_credentials(CredentialFailure::new(
+                        Reason::PqAuthRequired,
+                    )));
                 }
                 Some(verdict)
             }

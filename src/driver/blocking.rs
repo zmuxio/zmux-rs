@@ -21,7 +21,7 @@ use super::handle::{self, CarrierInfo, Driver, Shared, State};
 use super::session_timer::{self, Next};
 use super::sync::{park, thread_waker};
 use super::tcp::{Probe, TcpSocket};
-use super::unsent::{RetransmittedQuery, Unsent, UnsentQuery};
+use super::unsent::{Unsent, UnsentQuery};
 use super::wait::WaitList;
 use super::{Event, IDLE_READ, IDLE_RELEASE, MAX_SLICES};
 use crate::error::{ConnectError, ReadExactError, ReadToEndError};
@@ -242,8 +242,7 @@ pub struct PipeIo {
     socket: Option<TcpSocket>,
     /// The carrier's unsent count ([`PipeIo::with_unsent`]).
     unsent: Option<Unsent>,
-    /// The carrier's retransmission count ([`PipeIo::with_retransmitted`]).
-    retransmitted: Option<Unsent>,
+    carrier_stats: Option<Box<super::carrier_stats::Source>>,
     /// The padding of a handshake run on the carrier before this pipe
     /// ([`PipeIo::with_handshake_padding`]).
     handshake_padding: u64,
@@ -263,6 +262,7 @@ pub struct PipeIo {
     first_mode: Option<crate::proto::seal::RecordMode>,
     /// The value of the peer a transform authenticated.
     admitted: Option<crate::AdmittedValue>,
+    pub(crate) attachment: Option<Arc<super::attachment::Attachment>>,
 }
 
 impl PipeIo {
@@ -496,13 +496,26 @@ impl PipeIo {
     }
 
     /// Ends what the attachment's direction does not use.
-    pub(crate) fn keep_directions(&mut self, inbound: bool, outbound: bool) {
-        if !inbound {
-            self.reader = None;
+    pub(crate) fn keep_directions(&mut self, inbound: bool, outbound: bool) -> io::Result<()> {
+        if inbound && outbound {
+            return Ok(());
         }
-        if !outbound {
-            self.writer = None;
-        }
+        let reader = (!inbound).then(|| self.reader.take());
+        let writer = (!outbound).then(|| self.writer.take());
+        let closer = self.shared_closer();
+        let lease = self.attachment.clone();
+        thread::Builder::new().spawn(move || {
+            let _lease = lease;
+            if let Some(c) = closer {
+                c(if inbound {
+                    Shutdown::Write
+                } else {
+                    Shutdown::Read
+                });
+            }
+            drop((reader, writer));
+        })?;
+        Ok(())
     }
 
     /// Ends the writing half gracefully: what is written is flushed, then
@@ -521,9 +534,22 @@ impl PipeIo {
     pub(crate) fn shared_closer(&mut self) -> Option<Arc<Closer>> {
         let inner = self.closer.take()?;
         let wait = self.wait.clone();
+        // The watchdog, listener and session threads may race to interrupt
+        // the same carrier. Only the first full shutdown reaches the host.
+        let closed = std::sync::atomic::AtomicBool::new(false);
         let c: Arc<Closer> = Arc::new(Box::new(move |how| {
-            wait.shut();
-            inner(how);
+            use std::sync::atomic::Ordering::Relaxed;
+            if how == Shutdown::Both {
+                if closed.swap(true, Relaxed) {
+                    return;
+                }
+            } else if closed.load(Relaxed) {
+                return;
+            }
+            if how == Shutdown::Both {
+                wait.shut();
+            }
+            crate::proto::decision::host(|| inner(how));
         }));
         let kept = c.clone();
         self.closer = Some(Box::new(move |how| kept(how)));
@@ -553,6 +579,7 @@ impl PipeIo {
             max_record: None,
             first_mode: None,
             wait: HandshakeWait::default(),
+            attachment: None,
             admitted: None,
             reader: Some(Box::new(SharedTcp(stream.clone()))),
             writer: Some(Box::new(SharedTcp(stream))),
@@ -564,7 +591,7 @@ impl PipeIo {
             protocol: None,
             carrier: None,
             unsent: socket.as_ref().and_then(TcpSocket::unsent_query),
-            retransmitted: socket.as_ref().and_then(TcpSocket::retransmitted_query),
+            carrier_stats: None,
             write_overhead: 0,
             handshake_padding: 0,
             socket,
@@ -576,7 +603,10 @@ impl PipeIo {
     /// (separate halves, a wrapper that frames or counts), for [`PipeIo::with_closer`]:
     /// [`Shutdown::Read`] and [`Shutdown::Write`] shut that side, [`Shutdown::Both`] shuts
     /// both sides one by one and, on Windows, cancels the I/O blocked in other threads, which
-    /// a shutdown alone does not end. `socket` is the stream or a shared handle to it.
+    /// a shutdown alone does not end. Share the same `TcpStream` between the
+    /// reader, writer and closer with an `Arc`. A socket created by
+    /// `TcpStream::try_clone` has a different handle on Windows, so its
+    /// cancellation cannot reach I/O pending on the original stream.
     pub fn tcp_closer<S>(socket: S) -> impl Fn(Shutdown) + Send + Sync + 'static
     where
         S: std::borrow::Borrow<TcpStream> + Send + Sync + 'static,
@@ -605,7 +635,7 @@ impl PipeIo {
             carrier: None,
             socket: None,
             unsent: None,
-            retransmitted: None,
+            carrier_stats: None,
             write_overhead: 0,
             handshake_padding: 0,
             secure: false,
@@ -614,6 +644,7 @@ impl PipeIo {
             max_record: None,
             first_mode: None,
             wait: HandshakeWait::default(),
+            attachment: None,
             admitted: None,
             low_water: false,
         }
@@ -654,7 +685,9 @@ impl PipeIo {
     /// should be built with [`PipeIo::tcp_closer`].
     #[must_use]
     pub fn with_closer(mut self, closer: impl Fn(Shutdown) + Send + Sync + 'static) -> Self {
-        self.closer = Some(Box::new(closer));
+        self.closer = Some(Box::new(move |direction| {
+            crate::proto::decision::host(|| closer(direction));
+        }));
         self
     }
 
@@ -672,18 +705,28 @@ impl PipeIo {
         self
     }
 
-    /// The carrier's retransmission count, an optional capability, as
-    /// `zmux::PipeIo::with_retransmitted`: the writer thread calls it
-    /// at most once a second, outside the session lock.
-    /// [`PipeIo::from_tcp`] installs the socket's query where the platform has
-    /// one.
+    /// Supplies the connection's paired counters for on-demand pipe statistics.
     #[must_use]
-    pub fn with_retransmitted(
+    pub fn with_carrier_counters(
         mut self,
-        retransmitted: impl Fn() -> Option<u64> + Send + Sync + 'static,
+        provider: crate::CarrierSource,
+        query: impl Fn() -> Option<crate::CarrierCounts> + Send + Sync + 'static,
     ) -> Self {
-        self.retransmitted = Some(Box::new(retransmitted));
+        self.carrier_stats = Some(Box::new(super::carrier_stats::Source::new(provider, query)));
         self
+    }
+
+    pub(super) fn register_carrier_stats(&mut self) {
+        let mut source = self
+            .carrier_stats
+            .take()
+            .map(|source| *source)
+            .or_else(|| self.socket.as_ref().map(TcpSocket::counter_source))
+            .unwrap_or_default();
+        source.dedicated |= self.socket.is_some();
+        self.attachment
+            .get_or_insert_default()
+            .register_sample(source, Instant::now);
     }
 
     /// With the padding bytes a handshake run on the carrier before this pipe added; the
@@ -977,6 +1020,22 @@ impl Driver for Blocking {
     type Timeout = Option<Duration>;
     type Dial = Dial;
 
+    fn join_session(s: Session) -> crate::JoinSession {
+        crate::JoinSession::Blocking(s)
+    }
+
+    fn spawn_join(_: &Shared<Self>, f: impl Future<Output = ()> + Send + 'static) {
+        thread::spawn(move || {
+            run(f, None);
+        });
+    }
+
+    fn join_callback(
+        call: impl FnOnce() -> crate::Decision<()> + Send + 'static,
+    ) -> impl Future<Output = Option<crate::Decision<()>>> + Send {
+        std::future::ready(crate::Decision::catch(call))
+    }
+
     fn now() -> Instant {
         Instant::now()
     }
@@ -997,6 +1056,10 @@ impl Driver for Blocking {
                 .shutdowns
                 .push((p.closer.clone(), Shutdown::Read));
         }
+    }
+
+    fn session_closed(state: &mut State<Self>) {
+        state.io.account = None;
     }
 
     /// The writer threads have ended: the last of what goes out on the
@@ -1033,6 +1096,7 @@ impl Driver for Blocking {
 
     fn carrier_info(carrier: &mut PipeIo) -> CarrierInfo {
         CarrierInfo {
+            attachment: carrier.attachment.get_or_insert_default().clone(),
             inbound: carrier.reader.is_some().then_some(carrier.framing),
             outbound: carrier.writer.is_some().then_some(carrier.framing),
             // Also kept: pipe 0's reader reads it (`spawn_pipe`).
@@ -1053,6 +1117,10 @@ impl Driver for Blocking {
         }
     }
 
+    fn register_carrier_stats(carrier: &mut PipeIo) {
+        carrier.register_carrier_stats();
+    }
+
     fn attach(shared: &Arc<Shared<Self>>, id: u64, mut carrier: PipeIo) -> Result<(), PipeError> {
         if let Some(s) = &carrier.socket {
             s.set_notsent_lowat(super::NOTSENT_LOWAT_MULTIPATH);
@@ -1066,9 +1134,13 @@ impl Driver for Blocking {
             carrier.closer = Some(Box::new(move |how| c(how)));
         }
         let s = shared.clone();
+        let lease = carrier.attachment.clone();
         thread::Builder::new()
             .name("zmux-join".into())
-            .spawn(move || join_thread(&s, PipeId(id), carrier, closer.is_some()))
+            .spawn(move || {
+                let _lease = lease;
+                join_thread(&s, PipeId(id), carrier, closer.is_some());
+            })
             .map(drop)
             .map_err(|e| PipeError::Io(Arc::new(e)))
     }
@@ -1077,9 +1149,11 @@ impl Driver for Blocking {
         thread::Builder::new()
             .name("zmux-rejoin".into())
             .spawn(move || {
-                if let Ok(pipe) = dial.dial(super::DialRequest::bidi())
-                    && let Some(session) = session.upgrade()
-                {
+                let Some(shared) = session.shared() else {
+                    return;
+                };
+                if let Ok(pipe) = dial.dial(super::DialRequest::bidi()) {
+                    let session = Session::after_dial(shared);
                     // Started only: waiting would keep the session in use,
                     // and a rejoin must not wait for a PIPE_ACK that only
                     // the direction it restores could carry. The core
@@ -1188,14 +1262,14 @@ impl Redialer {
         if self
             .retiring
             .as_ref()
-            .is_some_and(|p| handle::dead(p.stats().as_ref()))
+            .is_some_and(|p| handle::dead(p.pipe_signals().as_ref()))
         {
             self.retiring = None;
         }
         let Some(p) = &self.member else {
             return;
         };
-        let info = p.stats();
+        let info = p.pipe_signals();
         if handle::dead(info.as_ref()) {
             let _ = p.close();
             self.member = None;
@@ -1218,11 +1292,12 @@ impl Redialer {
 
     /// Dials a replacement and starts its join; `false` when the session takes no more.
     fn redial(&mut self) -> bool {
+        let Some(shared) = self.session.shared() else {
+            return false;
+        };
         let added = match self.dial.dial(super::DialRequest::bidi()) {
             Ok(io) => {
-                let Some(session) = self.session.upgrade() else {
-                    return false;
-                };
+                let session = Session::after_dial(shared);
                 // A redial must not wait for a PIPE_ACK that only the direction it
                 // restores could carry.
                 session.begin_add_pipe(io, PipeOptions::new().with_return_on_reply(true))
@@ -1294,7 +1369,6 @@ impl State<Blocking> {
 struct Queries {
     probe: Option<Probe>,
     unsent: Option<UnsentQuery>,
-    retransmitted: Option<RetransmittedQuery>,
 }
 
 impl Queries {
@@ -1306,9 +1380,6 @@ impl Queries {
         if let Some(q) = &mut self.unsent {
             q.query(now);
         }
-        if let Some(q) = &mut self.retransmitted {
-            q.query(now);
-        }
     }
 
     /// Under the lock: their results go to the core.
@@ -1318,9 +1389,6 @@ impl Queries {
         }
         if let Some(q) = &mut self.unsent {
             q.feed(core, id.into(), now);
-        }
-        if let Some(q) = &mut self.retransmitted {
-            q.feed(core, id, now);
         }
     }
 }
@@ -1394,11 +1462,9 @@ fn join_thread(shared: &Arc<Shared<Blocking>>, id: PipeId, mut pipe: PipeIo, clo
     if let Some((sealer, opener)) = records {
         pipe = pipe.seal_records(sealer, opener);
     }
-    if !inbound {
-        pipe.reader = None;
-    }
-    if !outbound {
-        pipe.writer = None;
+    if let Err(err) = pipe.keep_directions(inbound, outbound) {
+        dial.failed(err.kind());
+        return done(shared);
     }
     let gone = {
         let mut st = shared.lock();
@@ -1491,9 +1557,13 @@ impl Watchdog {
 
     /// Moves the deadline to `timeout` from now.
     pub fn reset(&self, timeout: Duration) {
-        if let Some(t) = Instant::now().checked_add(timeout) {
-            let _ = self.deadline.send(t);
+        if let Some(at) = Instant::now().checked_add(timeout) {
+            self.reset_at(at);
         }
+    }
+
+    pub(super) fn reset_at(&self, deadline: Instant) {
+        let _ = self.deadline.send(deadline);
     }
 
     /// Ends the watch: once this returns, the carrier is never shut down by
@@ -1610,9 +1680,91 @@ impl Write for SealedWrite {
     }
 }
 
+#[cfg(test)]
+pub(super) mod install_test {
+    use super::*;
+    type Hook = Box<dyn Fn(u64, bool) -> io::Result<()>>;
+    thread_local! { pub(super) static HOOK: std::cell::RefCell<Option<Hook>> = const {std::cell::RefCell::new(None)}; }
+    pub(in crate::driver) fn set(f: impl Fn(u64, bool) -> io::Result<()> + 'static) {
+        HOOK.with_borrow_mut(|h| *h = Some(Box::new(f)));
+    }
+    pub(super) fn before(id: u64, writer: bool) -> io::Result<()> {
+        HOOK.with_borrow(|h| h.as_ref().map_or(Ok(()), |f| f(id, writer)))
+    }
+}
+
+/// An unstarted half remains the installer's responsibility until its thread exists.
+struct ThreadInstall<'a> {
+    shared: &'a Arc<Shared<Blocking>>,
+    id: PipeId,
+    closer: Option<&'a Arc<Closer>>,
+    reader: bool,
+    writer: bool,
+}
+
+impl<'a> ThreadInstall<'a> {
+    fn reserve(
+        shared: &'a Arc<Shared<Blocking>>,
+        id: u64,
+        closer: Option<&'a Arc<Closer>>,
+        reader: bool,
+        writer: bool,
+    ) -> io::Result<Self> {
+        let mut st = shared.lock();
+        if st.core.state() >= CoreState::Closing
+            || matches!(st.core.pipe_joined(PipeId(id)), Some(Err(_)))
+        {
+            drop(st);
+            if let Some(c) = closer {
+                crate::proto::decision::host(|| c(Shutdown::Both));
+            }
+            return Err(io::ErrorKind::NotConnected.into());
+        }
+        if let Some(c) = closer {
+            st.io
+                .add_threads(id, c, usize::from(reader) + usize::from(writer));
+        }
+        st.io.writers_alive += usize::from(writer);
+        Ok(Self {
+            shared,
+            id: PipeId(id),
+            closer,
+            reader,
+            writer,
+        })
+    }
+}
+
+impl Drop for ThreadInstall<'_> {
+    fn drop(&mut self) {
+        if !self.reader && !self.writer {
+            return;
+        }
+        {
+            let mut st = self.shared.lock();
+            st.io.writers_alive -= usize::from(self.writer);
+            for _ in 0..usize::from(self.reader) + usize::from(self.writer) {
+                st.thread_done(self.id);
+            }
+        }
+        if let Some(close) = self.closer {
+            crate::proto::decision::host(|| close(Shutdown::Both));
+        }
+    }
+}
+
 /// Starts the threads of a pipe's halves. Added pipes (`id` > 0) belong to
 /// a multipath session.
 pub(crate) fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) -> io::Result<()> {
+    spawn_registered(shared, id, pipe, || {})
+}
+
+fn spawn_registered(
+    shared: &Arc<Shared<Blocking>>,
+    id: u64,
+    pipe: PipeIo,
+    registered: impl FnOnce(),
+) -> io::Result<()> {
     let PipeIo {
         exporter,
         reader,
@@ -1622,8 +1774,8 @@ pub(crate) fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) 
         abort,
         socket,
         unsent,
-        retransmitted,
         low_water,
+        attachment,
         ..
     } = pipe;
     let lowat = if id == 0 {
@@ -1641,46 +1793,51 @@ pub(crate) fn spawn_pipe(shared: &Arc<Shared<Blocking>>, id: u64, pipe: PipeIo) 
     let queries = Queries {
         probe: socket.map(|s| Probe::new(s, lowat, Instant::now())),
         unsent: unsent.map(|q| UnsentQuery::new(q, Instant::now())),
-        retransmitted: retransmitted.map(|q| RetransmittedQuery::new(q, Instant::now())),
     };
     let closer: Option<Arc<Closer>> = closer.map(Arc::new);
-    if let Some(c) = &closer {
-        let threads = usize::from(reader.is_some()) + usize::from(writer.is_some());
-        shared.lock().io.add_threads(id, c, threads);
-    }
+    #[cfg(test)]
+    install_test::before(id, false)?;
+    let mut install = ThreadInstall::reserve(
+        shared,
+        id,
+        closer.as_ref(),
+        reader.is_some(),
+        writer.is_some(),
+    )?;
+    // Bootstrap transfers stop responsibility after registration but before
+    // the first protocol write. A concurrently closing session owns its flush.
+    registered();
     if let Some(r) = reader {
         let s = shared.clone();
+        let lease = attachment.clone();
         let late_exporter = exporter.filter(|_| id == 0);
         let spawned = thread::Builder::new()
             .name("zmux-read".into())
-            .spawn(move || reader_thread(&s, PipeId(id), r, framing, late_exporter));
-        if let Err(e) = spawned {
-            let mut st = shared.lock();
-            st.thread_done(PipeId(id));
-            if writer.is_some() {
-                st.thread_done(PipeId(id));
-            }
-            return Err(e);
-        }
+            .spawn(move || {
+                let _lease = lease;
+                reader_thread(&s, PipeId(id), r, framing, late_exporter);
+            });
+        spawned?;
+        install.reader = false;
     }
     if let Some(w) = writer {
         let s = shared.clone();
         let c = closer.clone();
         {
             let mut st = shared.lock();
-            st.io.writers_alive += 1;
             // Before the pipe's first write.
             st.core.set_pipe_low_water(PipeId(id), low_water);
         }
+        #[cfg(test)]
+        install_test::before(id, true)?;
         let spawned = thread::Builder::new()
             .name("zmux-write".into())
-            .spawn(move || writer_thread(&s, PipeId(id), w, c, abort, framing, queries));
-        if let Err(e) = spawned {
-            let mut st = shared.lock();
-            st.io.writers_alive -= 1;
-            st.thread_done(PipeId(id));
-            return Err(e);
-        }
+            .spawn(move || {
+                let _lease = attachment;
+                writer_thread(&s, PipeId(id), w, c, abort, framing, queries);
+            });
+        spawned?;
+        install.writer = false;
     }
     Ok(())
 }
@@ -2157,8 +2314,6 @@ fn fire_timers(shared: &Arc<Shared<Blocking>>, me: &Waker) -> Option<Next> {
         // After the hook start: a tracer is told even of a session that
         // ended before the first round.
         if st.core.state() == CoreState::Closed {
-            // Its charge leaves the listener's account.
-            st.io.account = None;
             return None;
         }
         let mut until = engine::timer_deadline(st.core.poll_timeout(), now);
@@ -2255,6 +2410,7 @@ impl Session {
         }
         let config = config.into();
         pipe.resolve_exporter(Instant::now().checked_add(config.handshake_wait()));
+        pipe.register_carrier_stats();
         let carrier = Blocking::carrier_info(&mut pipe);
         let io = Io {
             closing: Vec::new(),
@@ -2269,13 +2425,13 @@ impl Session {
             State::new(config, role, transport, locator, carrier, io)?,
             (),
         ));
-        register(&shared);
         // The handle counted first: if a thread cannot be started, dropping
         // it closes the session, and the threads started end.
         let establish = shared.clone().established();
         session_timer::spawn(timer_task(shared.clone()))
             .map_err(|e| ConnectError::Io(Arc::new(e)))?;
-        spawn_pipe(&shared, 0, pipe).map_err(|e| ConnectError::Io(Arc::new(e)))?;
+        spawn_registered(&shared, 0, pipe, || register(&shared))
+            .map_err(|e| ConnectError::Io(Arc::new(e)))?;
         drop(shared);
         call(establish)
     }
@@ -2430,16 +2586,44 @@ impl Session {
     /// once with [`WaitError::OnDriverThread`], starting nothing;
     /// [`Session::begin_add_pipe`](blocking::Session#method.begin_add_pipe)
     /// starts a join without waiting.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "same owned options as the Tokio driver and begin_add_pipe"
+    )]
     pub fn add_pipe(&self, pipe: PipeIo, opts: PipeOptions) -> Result<Pipe, WaitError<PipeError>> {
+        self.add_pipe_until(pipe, &opts, None)
+    }
+
+    fn add_pipe_until(
+        &self,
+        pipe: PipeIo,
+        opts: &PipeOptions,
+        caller: Option<Instant>,
+    ) -> Result<Pipe, WaitError<PipeError>> {
+        let report = self.join_report();
         if on_driver_thread() {
+            if let Some(report) = report {
+                report.complete(Some(crate::JoinError::Handshake(
+                    PipeError::InvalidArgument,
+                )));
+            }
             return Err(WaitError::OnDriverThread);
         }
-        let deadline = Instant::now() + self.add_pipe_limit();
+        let deadline =
+            crate::proto::session::JoinDeadline::with_caller(self.join_deadline(), caller);
         let no_wait = opts.return_on_reply;
-        pipe.resolve_exporter(Some(deadline));
-        let p = self.begin_add_pipe(pipe, opts)?;
-        let guard = handle::AbortUnlessAdded(Some(&p));
-        run(p.added_op(no_wait), Some(deadline)).unwrap_or(Err(JOIN_TIMED_OUT))?;
+        if let Some(exporter) = pipe.exporter_ref().filter(|e| !e.is_resolved()) {
+            let _ = run(
+                super::setup::while_open(
+                    handle::session_ended_wait(self.shared()),
+                    exporter.resolve(),
+                ),
+                deadline.map(crate::proto::session::JoinDeadline::at),
+            );
+        }
+        let p = self.start_join(pipe, opts, report, deadline)?;
+        let guard = handle::AbortUnlessAdded(Some(&p), no_wait);
+        run(p.added_op(no_wait), None).expect("unbounded join wait")?;
         guard.added();
         Ok(p)
     }
@@ -2501,16 +2685,14 @@ impl Session {
             let io = redial
                 .dial(super::DialRequest::new(direction))
                 .map_err(|e| PipeError::Io(Arc::new(e)))?;
-            let limit = Instant::now() + self.add_pipe_limit();
-            let p = self.begin_add_pipe(io, opts)?;
-            let guard = handle::AbortUnlessAdded(Some(&p));
-            match deadline {
-                Some(d) if d < limit => {
-                    run(p.added_op(false), Some(d)).ok_or(WaitError::TimedOut)??;
+            match self.add_pipe_until(io, &opts.with_return_on_reply(false), deadline) {
+                Err(WaitError::Failed(PipeError::Failed(crate::PipeFailure::CallerDeadline))) => {
+                    return Err(WaitError::TimedOut);
                 }
-                _ => run(p.added_op(false), Some(limit)).unwrap_or(Err(JOIN_TIMED_OUT))?,
+                result => {
+                    result?;
+                }
             }
-            guard.added();
             match pipe.close() {
                 Ok(()) | Err(PipeError::UnknownPipe) => {}
                 Err(e) => return Err(e.into()),
@@ -2519,8 +2701,9 @@ impl Session {
         Ok(())
     }
 
-    /// Closes gracefully and waits until the session ended: `Ok` when it
-    /// closed as requested, otherwise the error that ended it first. On a
+    /// Closes gracefully and waits for the close to be handed to the usable
+    /// carriers or for the hand-off deadline. Returns `Ok` for the requested
+    /// close, otherwise the error that ended it first. On a
     /// thread that drives sessions it fails at once and does nothing.
     pub fn shutdown(&self, code: VarInt, reason: &[u8]) -> Result<(), WaitError> {
         call(self.shutdown_op(code, reason))
@@ -2606,9 +2789,6 @@ impl Session {
         wait_for(Some(timeout), self.next_event_op())
     }
 }
-
-/// What `add_pipe` fails with when its join bound passed.
-const JOIN_TIMED_OUT: PipeError = PipeError::Failed(crate::PipeFailure::JoinTimedOut);
 
 impl Pipe {
     /// Waits until the pipe's join is confirmed or failed (see
@@ -2826,6 +3006,93 @@ impl std::fmt::Debug for Deferred {
 #[cfg(test)]
 mod tests {
     use super::PipeIo;
+
+    #[test]
+    fn setup_and_driver_share_one_full_shutdown() {
+        use std::net::Shutdown;
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let host = calls.clone();
+        let mut pipe = PipeIo::reader(std::io::empty()).with_closer(move |how| {
+            host.lock().unwrap().push(how);
+        });
+        let setup = pipe.shared_closer().unwrap();
+        let driver = pipe.closer.take().unwrap();
+        driver(Shutdown::Write);
+        setup(Shutdown::Both);
+        driver(Shutdown::Both);
+        assert_eq!(*calls.lock().unwrap(), [Shutdown::Write, Shutdown::Both]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tcp_closer_interrupts_a_pending_receive_on_the_original_handle() {
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::os::windows::io::AsRawSocket;
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        use windows_sys::Win32::Networking::WinSock::{
+            SOCKET_ERROR, WSA_INVALID_EVENT, WSA_IO_PENDING, WSA_OPERATION_ABORTED, WSABUF,
+            WSACloseEvent, WSACreateEvent, WSAGetLastError, WSAGetOverlappedResult, WSARecv,
+        };
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = Arc::new(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+        let (peer, _) = listener.accept().unwrap();
+        let closer = PipeIo::tcp_closer(socket.clone());
+        let (started, pending) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let id = usize::try_from(socket.as_raw_socket()).unwrap();
+            let mut byte = 0;
+            let buffer = WSABUF {
+                len: 1,
+                buf: &mut byte,
+            };
+            let (mut bytes, mut flags) = (0, 0);
+            // SAFETY: The socket, event and operation storage stay live until
+            // WSAGetOverlappedResult has waited for the pending receive.
+            #[allow(unsafe_code)]
+            let error = unsafe {
+                let event = WSACreateEvent();
+                assert_ne!(event, WSA_INVALID_EVENT);
+                let mut op = OVERLAPPED {
+                    hEvent: event as _,
+                    ..OVERLAPPED::default()
+                };
+                let result = WSARecv(
+                    id,
+                    &buffer,
+                    1,
+                    std::ptr::null_mut(),
+                    &mut flags,
+                    &mut op,
+                    None,
+                );
+                if result != SOCKET_ERROR || WSAGetLastError() != WSA_IO_PENDING {
+                    WSACloseEvent(event);
+                    panic!("WSARecv did not pend");
+                }
+                let _ = started.send(());
+                let result = WSAGetOverlappedResult(id, &op, &mut bytes, 1, &mut flags);
+                let error = if result == 0 { WSAGetLastError() } else { 0 };
+                WSACloseEvent(event);
+                error
+            };
+            let _ = finished.send((error, bytes));
+        });
+        pending.recv_timeout(Duration::from_secs(5)).unwrap();
+        closer(Shutdown::Both);
+        let (error, bytes) = completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            error == WSA_OPERATION_ABORTED || (error == 0 && bytes == 0),
+            "{error}, {bytes}"
+        );
+        worker.join().unwrap();
+        drop(peer);
+    }
 
     /// A split carrier reports its own failure only if both halves do: a
     /// half that does not can stall silently, so stall death stays on.

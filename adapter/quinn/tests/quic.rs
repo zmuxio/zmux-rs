@@ -2,6 +2,8 @@
 //! its connection, a Bound join over a second connection through a
 //! listener, and a connection that closes once nothing of zmux holds it.
 
+#![cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -350,6 +352,17 @@ async fn graceful_ends_finish_their_streams() {
         .add_pipe(carrier.open_pipe().await.unwrap(), PipeOptions::default())
         .await
         .unwrap();
+    for session in [&client, &server] {
+        let stats = session.pipe_stats();
+        assert_eq!(stats.len(), 2);
+        let sample = stats[0].carrier_sample.as_ref().unwrap();
+        assert_eq!(sample.generation, 0);
+        assert_eq!(sample.source, zmux::CarrierSource::Quinn);
+        assert!(
+            matches!(sample.counts, Some(zmux::CarrierCounts::Quic { packets_sent, .. }) if packets_sent > 0)
+        );
+        assert_eq!(stats[1].carrier_sample.as_ref(), Some(sample));
+    }
     // Lanes on both pipes.
     transfer(&client, &server, 8, 1 << 20).await;
     let clean = |s: &Session| {
@@ -575,4 +588,142 @@ async fn a_dial_without_stream_credit_times_out() {
     assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(3));
     drop(held.await.unwrap());
+}
+
+/// Hold the acknowledgement wait of each finished QUIC lane. Lane zero
+/// is an in-memory duplex with no drain, so only lanes can hold completion.
+#[tokio::test]
+async fn closed_waits_for_finished_quic_lanes() {
+    use std::io;
+    use std::pin::{Pin, pin};
+    use std::task::{Context, Poll, Waker};
+    use tokio::io::AsyncWrite;
+    use zmux::adapter::CarrierConnId;
+    use zmux_quinn::parts::{self, SendPart};
+
+    struct Send {
+        stream: quinn::SendStream,
+        draining: Arc<tokio::sync::Notify>,
+        gate: tokio::sync::watch::Receiver<bool>,
+    }
+    impl SendPart for Send {
+        fn poll_write_chunks(
+            &mut self,
+            cx: &mut Context<'_>,
+            chunks: &mut [bytes::Bytes],
+        ) -> Poll<io::Result<usize>> {
+            pin!(self.stream.write_chunks(chunks))
+                .poll(cx)
+                .map_ok(|r| r.bytes)
+                .map_err(Into::into)
+        }
+        fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            AsyncWrite::poll_flush(Pin::new(&mut self.stream), cx)
+        }
+        fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            AsyncWrite::poll_shutdown(Pin::new(&mut self.stream), cx)
+        }
+        fn reset(&mut self) {
+            let _ = self.stream.reset(0u32.into());
+        }
+        fn stopped(&self) -> impl Future<Output = ()> + std::marker::Send + 'static {
+            let stopped = self.stream.stopped();
+            let draining = self.draining.clone();
+            let mut gate = self.gate.clone();
+            async move {
+                draining.notify_one();
+                let _ = gate.wait_for(|open| *open).await;
+                let _ = stopped.await;
+            }
+        }
+    }
+
+    let quic = Quic::new();
+    let (cc, sc) = quic.connect().await;
+    let peer = CarrierConnId::new(&Arc::new(()));
+    let (a, b) = tokio::io::duplex(1 << 16);
+    let server = tokio::spawn(Session::accept(
+        zmux::PipeIo::new(b)
+            .with_carrier_conn(peer.clone())
+            .with_lanes(true),
+        Config::default(),
+    ));
+    let draining = Arc::new(tokio::sync::Notify::new());
+    let entered = draining.clone();
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let io = zmux::PipeIo::new(a)
+        .with_carrier_conn(CarrierConnId::new(&Arc::new(())))
+        .with_lane_opener(move || {
+            let (cc, sc, peer, draining, gate) = (
+                cc.clone(),
+                sc.clone(),
+                peer.clone(),
+                entered.clone(),
+                gate.clone(),
+            );
+            async move {
+                let stream = cc.open_uni().await.map_err(io::Error::other)?;
+                tokio::spawn(async move {
+                    if let Ok(recv) = sc.accept_uni().await {
+                        let _ = zmux::adapter::handle_lane(
+                            zmux::PipeIo::reader(recv).with_carrier_conn(peer),
+                        )
+                        .await;
+                    }
+                });
+                Ok(parts::lane(
+                    Send {
+                        stream,
+                        draining,
+                        gate,
+                    },
+                    Arc::new(cc),
+                ))
+            }
+        });
+    let client = Session::connect(io, Config::default()).await.unwrap();
+    let server = server.await.unwrap().unwrap();
+    transfer(&client, &server, 3, 512 << 10).await;
+    let pipe = client.pipe(zmux::PipeId::new(0)).unwrap();
+    client.close().await;
+    tokio::time::timeout(Duration::from_secs(2), draining.notified())
+        .await
+        .expect("lane started its acknowledgement wait");
+    client.closed().await;
+    let mut closed = pin!(pipe.closed());
+    assert!(
+        closed
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    release.send(true).unwrap();
+    assert!(matches!(closed.await, Err(zmux::PipeError::SessionLost(_))));
+}
+
+#[tokio::test]
+// HS-57
+async fn a_connection_without_a_first_stream_releases_its_entry_at_setup_deadline() {
+    let quic = Quic::new();
+    let (_client, server) = quic.connect().await;
+    let peer = server.remote_address();
+    let mut config = ListenerConfig::default();
+    config.handshake_timeout = Duration::from_secs(4);
+    config.limits.max_pending_per_source = 2;
+    let listener = Listener::new(Config::default(), config).unwrap();
+    let _other = listener.adapter().enter(peer, None).unwrap();
+    let options = Options::default();
+    tokio::time::pause();
+    let mut serving = Box::pin(zmux_quinn::serve_connection(&listener, server, &options));
+    assert!(
+        serving
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
+    assert!(listener.adapter().enter(peer, None).is_none());
+    tokio::time::advance(Duration::from_secs(4)).await;
+    serving.await.unwrap();
+    assert!(listener.adapter().enter(peer, None).is_some());
+    assert_eq!(listener.stats().sessions, 0);
 }

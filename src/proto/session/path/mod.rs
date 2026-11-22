@@ -784,8 +784,7 @@ impl SessionCore {
             self.stream_count_credit(di(s.dir));
         }
         self.streams.recycle(s);
-        let now = self.now;
-        self.check_shutdown_done(now);
+        self.check_shutdown_done(None);
     }
 }
 
@@ -876,7 +875,7 @@ impl SessionCore {
         n += self.mp.as_deref().map_or(0, mpath::Mp::heap_bytes);
         n += self.grease.1.capacity();
         n += self.error.as_ref().map_or(0, |_| size_of::<SessionError>());
-        n += self.close.as_ref().map_or(0, |_| size_of::<CloseFrame>());
+        n += self.close.as_ref().map_or(0, |_| size_of::<ClosingFrame>());
         n += self
             .goaway
             .as_deref()
@@ -889,9 +888,14 @@ impl SessionCore {
         n
     }
 
-    /// Outbound pipe `pipe` failed under us.
-    pub(super) fn outbound_failed(&mut self, pipe: u64, cause: PipeFailure, now: Instant) {
+    /// Lane `at` failed and took the outbound pipe down.
+    pub(super) fn outbound_failed(&mut self, at: LaneId, cause: PipeFailure, now: Instant) {
+        let pipe = at.pipe.0;
         if !self.out_mut(pipe).is_some_and(OutPipe::write_failed) {
+            if at.lane.0 != 0 && self.write_failure.is_some() {
+                self.set_error(SessionError::PipesLost { last: Some(cause) });
+                self.closed_now();
+            }
             return;
         }
         self.views_changed();
@@ -904,10 +908,22 @@ impl SessionCore {
             self.maybe_closed(now);
             return;
         }
-        if self.state != State::Closed {
-            self.set_error(SessionError::PipesLost { last: Some(cause) });
-            self.closed_now();
+        if self.state == State::Closed {
+            return;
         }
+        if self.mp.is_none()
+            && at.lane.0 == 0
+            && self
+                .att(pipe)
+                .and_then(Attachment::inp)
+                .is_some_and(|p| p.state() != InState::Ended && p.lane_reads(0))
+        {
+            self.write_failure = Some(cause);
+            self.linger_deadline = Some(now + self.linger_timeout());
+            return;
+        }
+        self.set_error(SessionError::PipesLost { last: Some(cause) });
+        self.closed_now();
     }
 
     /// The GOAWAY PING fence completed: phase 2 follows at once, or one

@@ -114,7 +114,7 @@ use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeIo, Sessi
 
 mod connection;
 
-pub use connection::{TlsBinding, TlsConnection, is_bound};
+pub use connection::{TcpReset, TlsBinding, TlsConnection, is_bound};
 
 /// A pipe carrier from an established TLS stream over any transport: the
 /// exporter (TLS 1.3, handshake complete), partial reads and the ALPN

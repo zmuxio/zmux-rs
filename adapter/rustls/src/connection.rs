@@ -1,6 +1,7 @@
 //! A TLS connection that another layer (an HTTP server or client, a
 //! WebSocket) owns while the carriers on it read its exporter.
 
+use std::any::Any;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
@@ -23,12 +24,17 @@ pub fn is_bound(conn: &CommonState) -> bool {
 /// A tokio-rustls stream, client or server, as the shared connection holds it.
 trait Stream: AsyncRead + AsyncWrite + Send + Unpin {
     fn common(&self) -> &CommonState;
+    fn tcp(&self) -> Option<&tokio::net::TcpStream>;
     fn export(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> bool;
 }
 
-impl<IO: AsyncRead + AsyncWrite + Send + Unpin> Stream for TlsStream<IO> {
+impl<IO: AsyncRead + AsyncWrite + Send + Unpin + 'static> Stream for TlsStream<IO> {
     fn common(&self) -> &CommonState {
         self.get_ref().1
+    }
+
+    fn tcp(&self) -> Option<&tokio::net::TcpStream> {
+        (self.get_ref().0 as &dyn Any).downcast_ref()
     }
 
     fn export(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> bool {
@@ -46,6 +52,84 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> Stream for TlsStream<IO> {
                 .export_keying_material(out, label, Some(context)),
         }
         .is_ok()
+    }
+}
+
+/// Observes failure of a shared TCP connection even while an upper
+/// protocol applies read backpressure. A normal peer half-close is valid.
+#[derive(Debug)]
+pub struct TcpReset(tokio::net::TcpStream);
+
+impl TcpReset {
+    /// Observe plain TCP or TCP beneath a terminated TLS connection.
+    /// There is one observation descriptor per connection, shared across requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the socket or reactor error if registering the observer fails.
+    pub fn observe(io: &dyn Any) -> io::Result<Option<Self>> {
+        use tokio::net::TcpStream;
+        let tcp = io
+            .downcast_ref::<TcpStream>()
+            .or_else(|| {
+                io.downcast_ref::<TlsStream<TcpStream>>()
+                    .map(|s| s.get_ref().0)
+            })
+            .or_else(|| {
+                io.downcast_ref::<tokio_rustls::server::TlsStream<TcpStream>>()
+                    .map(|s| s.get_ref().0)
+            })
+            .or_else(|| {
+                io.downcast_ref::<tokio_rustls::client::TlsStream<TcpStream>>()
+                    .map(|s| s.get_ref().0)
+            });
+        if let Some(tcp) = tcp {
+            return Self::register(tcp).map(Some);
+        }
+        if let Some(tls) = io.downcast_ref::<TlsConnection>() {
+            return lock(&tls.stream).tcp().map(Self::register).transpose();
+        }
+        Ok(None)
+    }
+
+    fn register(tcp: &tokio::net::TcpStream) -> io::Result<Self> {
+        #[cfg(unix)]
+        let socket = std::os::fd::AsFd::as_fd(tcp).try_clone_to_owned()?.into();
+        #[cfg(windows)]
+        let socket = std::os::windows::io::AsSocket::as_socket(tcp)
+            .try_clone_to_owned()?
+            .into();
+        let observer = tokio::net::TcpStream::from_std(socket)?;
+        Ok(Self(observer))
+    }
+
+    /// Wait for a transport error without consuming DATA or clearing the socket error.
+    ///
+    /// On Windows, requires a Tokio runtime with the time driver enabled.
+    pub async fn failed(&self) {
+        self.wait_for_failure().await;
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_failure(&self) {
+        let _ = self.0.ready(tokio::io::Interest::ERROR).await;
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_failure(&self) {
+        use tokio::io::Interest;
+        let interest = Interest::ERROR | Interest::WRITABLE;
+        loop {
+            match self.0.ready(interest).await {
+                Ok(ready) if !ready.is_error() && !ready.is_write_closed() => {}
+                _ => return,
+            }
+            // Mio reports an established connection abort as write-closed on
+            // Windows. Writable readiness also matches a healthy TCP socket,
+            // so sample the cached readiness without spinning or doing I/O.
+            // HTTP only waits here before handoff, within the setup deadline.
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 }
 

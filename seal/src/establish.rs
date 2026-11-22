@@ -17,7 +17,10 @@ use crate::trust::{
     AppData, AppDataRequest, AppDataSource, ConfigError, Credential, Signer, Verifier, VerifyError,
     VerifyInput, VerifyVerdict, ask_app_data, check_pq_auth, judge,
 };
-use crate::{MAX_FRAME, credential_value, handshake_payload, message_items, proof_placeholder};
+use crate::{
+    CredentialFailure, CredentialFailureReason as Reason, MAX_FRAME, credential_value,
+    handshake_payload, message_items, proof_placeholder,
+};
 
 /// Asks the hook about a message and waits as it says.
 /// Each handshake family has its own name: a plan made for the lengths of one is never
@@ -512,14 +515,32 @@ pub(crate) async fn run_client<C: Carrier>(
         peer_app_data: &app_data,
         local_context: &cfg.local_context,
     };
-    let verdict = cfg.judge(input).await.map_err(refused)?;
+    let verdict = cfg.judge(input).await.map_err(|e| {
+        let kind = if e.is_rejection() {
+            io::ErrorKind::PermissionDenied
+        } else {
+            io::ErrorKind::Other
+        };
+        io::Error::new(kind, CredentialFailure::new(Reason::Verifier).with_cause(e))
+    })?;
     // The core checks the proof the verdict names.
     let pq_authenticated = match &verdict {
         Some(v) => verify
-            .check_proof(v.proof_key.as_ref(), cfg.require_pq_auth)
-            .map_err(auth)?,
+            .check_proof(v.proof_key.as_ref(), false)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    CredentialFailure::new(Reason::Proof).with_cause(e),
+                )
+            })?,
         None => false,
     };
+    if cfg.require_pq_auth && !pq_authenticated {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            CredentialFailure::new(Reason::PqAuthRequired).with_cause(Error::CredentialsFailed),
+        ));
+    }
     // The data is the verified server's only once its verifier passed.
     let mut judged = app_data.clone();
     if verdict.is_some() {

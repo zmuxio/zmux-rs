@@ -123,8 +123,11 @@ fn a_session_over_http2() {
 #[test]
 fn one_exchange_carries_both_directions() {
     support::run(2, 90, || async {
-        let listener = Listener::new(Config::default(), ListenerConfig::default())
-            .expect("valid listener configuration");
+        let mut limits = ListenerConfig::default();
+        limits.admission = Some(zmux::Admission::new(0, |_, _| {
+            zmux::AdmissionVerdict::accept(0)
+        }));
+        let listener = Listener::new(Config::default(), limits).unwrap();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap().to_string();
         let requests = Arc::new(AtomicUsize::new(0));
@@ -156,6 +159,7 @@ fn one_exchange_carries_both_directions() {
             .await
             .unwrap();
         let server = listener.accept().await.unwrap();
+        listener.close();
         transfer(&client, &server, 1, 1 << 20).await;
         transfer(&server, &client, 1, 1 << 20).await;
         assert_eq!(requests.load(Ordering::SeqCst), 1, "one exchange");
@@ -259,10 +263,17 @@ fn a_cut_connection_is_a_failure_not_a_clean_end() {
 
 /// TLS configurations whose ALPN offers `h2` and `http/1.1` (the client
 /// offers only `client_alpn`).
-fn tls(client_alpn: &[u8]) -> (tokio_rustls::TlsConnector, tokio_rustls::TlsAcceptor) {
+fn tls(
+    client_alpn: &[u8],
+) -> (
+    tokio_rustls::TlsConnector,
+    tokio_rustls::TlsAcceptor,
+    rustls::pki_types::ServerName<'static>,
+) {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
+    let name = std::net::Ipv4Addr::LOCALHOST;
+    let cert = zmux_testcert::self_signed(vec![name.to_string()]).unwrap();
     let der = CertificateDer::from(cert.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -283,6 +294,7 @@ fn tls(client_alpn: &[u8]) -> (tokio_rustls::TlsConnector, tokio_rustls::TlsAcce
     (
         tokio_rustls::TlsConnector::from(Arc::new(client)),
         tokio_rustls::TlsAcceptor::from(Arc::new(server)),
+        std::net::IpAddr::V4(name).into(),
     )
 }
 
@@ -290,10 +302,11 @@ fn tls(client_alpn: &[u8]) -> (tokio_rustls::TlsConnector, tokio_rustls::TlsAcce
 /// application made, served by `serve_with` with a TLS setup step; a
 /// connection whose TLS handshake fails is counted, not silently dropped.
 #[test]
+// HS-08
 fn sessions_over_tls_and_a_failed_handshake_is_counted() {
     support::run(2, 90, || async {
         for alpn in [&b"h2"[..], b"http/1.1"] {
-            let (connector, acceptor) = tls(alpn);
+            let (connector, acceptor, name) = tls(alpn);
             let listener = Listener::new(Config::default(), ListenerConfig::default())
                 .expect("valid listener configuration");
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -308,7 +321,13 @@ fn sessions_over_tls_and_a_failed_handshake_is_counted() {
                 )
                 .await;
             });
-            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            // Not TLS at all: a setup failure.
+            let mut plain = TcpStream::connect(addr).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut plain, b"GET / HTTP/1.1\r\n\r\n")
+                .await
+                .unwrap();
+            // The rejected connection ends before the next handshake starts.
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut plain, &mut Vec::new()).await;
             let conn = connector
                 .connect(name, TcpStream::connect(addr).await.unwrap())
                 .await
@@ -334,20 +353,6 @@ fn sessions_over_tls_and_a_failed_handshake_is_counted() {
             let server = listener.accept().await.unwrap();
             round_trip_and_close(client, server).await;
 
-            // Not TLS at all: a setup failure.
-            let mut plain = TcpStream::connect(addr).await.unwrap();
-            tokio::io::AsyncWriteExt::write_all(&mut plain, b"GET / HTTP/1.1\r\n\r\n")
-                .await
-                .unwrap();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while listener.stats().setup_failures == 0 {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "{:?}",
-                    listener.stats()
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
             let stats = listener.stats();
             assert_eq!((stats.sessions, stats.setup_failures), (1, 1), "{stats:?}");
             listener.close();
@@ -377,6 +382,7 @@ async fn serve_admitted(
 }
 
 /// A request body read from a byte stream.
+#[derive(Debug)]
 struct StreamBody<R>(R);
 
 impl<R: tokio::io::AsyncRead + Unpin> http_body::Body for StreamBody<R> {
@@ -399,6 +405,231 @@ impl<R: tokio::io::AsyncRead + Unpin> http_body::Body for StreamBody<R> {
             }
         }
     }
+}
+
+#[tokio::test]
+// HS-05
+async fn dropping_a_post_response_releases_pending_transform() {
+    use tokio::io::AsyncReadExt;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let gate = entered.clone();
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(zmux::Admission::new(0, |_, _| {
+        zmux::AdmissionVerdict::accept(0)
+    }));
+    limits.handshake_timeout = Duration::from_secs(60);
+    limits.limits.max_pending = Some(1);
+    limits.inbound_transform = Some(zmux::InboundTransform::new(
+        move |io, _: &zmux::PipeHint| {
+            let gate = gate.clone();
+            async move {
+                gate.notify_one();
+                std::future::pending::<()>().await;
+                Ok(io)
+            }
+        },
+    ));
+    let listener = Listener::new(Config::default(), limits).unwrap();
+    let (mut peer, body) = tokio::io::duplex(4096);
+    let request = http::Request::post("/")
+        .version(http::Version::HTTP_2)
+        .body(StreamBody(body))
+        .unwrap();
+    let response = zmux_http::handle_request(
+        &listener,
+        request,
+        None,
+        None,
+        &zmux_http::PairField::default(),
+    )
+    .await
+    .ok()
+    .unwrap();
+    entered.notified().await;
+    let peer_addr = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+    assert!(listener.adapter().enter(peer_addr, None).is_none());
+    drop(response.into_body());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), peer.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(listener.stats().sessions, 0);
+    assert!(listener.adapter().enter(peer_addr, None).is_some());
+}
+
+#[derive(Clone, Copy)]
+enum ResetTransport {
+    Tcp,
+    Tls,
+    BoundTls,
+}
+
+// HS-05. Backpressure above the setup replay limit must not hide a TCP reset.
+#[tokio::test]
+async fn a_backpressured_tcp_request_observes_transport_reset() {
+    backpressured_request_observes_transport_reset(ResetTransport::Tcp).await;
+}
+
+#[tokio::test]
+async fn a_backpressured_tls_request_observes_transport_reset() {
+    backpressured_request_observes_transport_reset(ResetTransport::Tls).await;
+}
+
+#[tokio::test]
+async fn a_backpressured_bound_tls_request_observes_transport_reset() {
+    backpressured_request_observes_transport_reset(ResetTransport::BoundTls).await;
+}
+
+async fn backpressured_request_observes_transport_reset(transport: ResetTransport) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn upload<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        mut peer: T,
+        address: std::net::SocketAddr,
+    ) -> T {
+        peer.write_all(
+            format!("POST /zmux HTTP/1.1\r\nHost: {address}\r\nTransfer-Encoding: chunked\r\n\r\n40000\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        peer.write_all(&vec![0; 128 * 1024]).await.unwrap();
+        peer.flush().await.unwrap();
+        let mut byte = [0];
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            peer.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 200 "));
+        peer
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (started, mut entered) = tokio::sync::mpsc::unbounded_channel();
+        let mut limits = ListenerConfig::default();
+        limits.admission = Some(zmux::Admission::new(0, |_, _| {
+            zmux::AdmissionVerdict::accept(0)
+        }));
+        limits.handshake_timeout = Duration::from_secs(60);
+        limits.inbound_transform = Some(zmux::InboundTransform::new(
+            move |io, _: &zmux::PipeHint| {
+                let (worker, exited) = tokio::sync::oneshot::channel::<()>();
+                started.send(exited).unwrap();
+                async move {
+                    std::future::pending::<()>().await;
+                    drop(worker);
+                    Ok(io)
+                }
+            },
+        ));
+        let listener = Listener::new(Config::default(), limits).unwrap();
+        let server = listener.clone();
+        let tcp = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = tcp.local_addr().unwrap();
+        let peer = TcpStream::connect(address).await.unwrap();
+        peer.set_zero_linger().unwrap();
+        let (sock, addr) = tcp.accept().await.unwrap();
+        let (connector, acceptor, name) = tls(b"http/1.1");
+        let serving = tokio::spawn(async move {
+            let endpoint = zmux_http::Endpoint::new(server, Options::default());
+            match transport {
+                ResetTransport::Tcp => endpoint.serve_connection(sock, Some(addr)).await,
+                ResetTransport::Tls => {
+                    endpoint
+                        .serve_connection(acceptor.accept(sock).await.unwrap(), Some(addr))
+                        .await;
+                }
+                ResetTransport::BoundTls => {
+                    let stream =
+                        zmux_rustls::TlsConnection::new(acceptor.accept(sock).await.unwrap());
+                    endpoint.serve_connection(stream, Some(addr)).await;
+                }
+            }
+        });
+        let exited = if matches!(transport, ResetTransport::Tcp) {
+            let peer = upload(peer, address).await;
+            let exited = entered.recv().await.unwrap();
+            drop(peer);
+            exited
+        } else {
+            let peer = upload(connector.connect(name, peer).await.unwrap(), address).await;
+            let exited = entered.recv().await.unwrap();
+            drop(peer);
+            exited
+        };
+        assert!(exited.await.is_err());
+        serving.await.unwrap();
+        assert_eq!(listener.stats().sessions, 0);
+    })
+    .await
+    .expect("the reset ends setup before its handshake deadline");
+}
+
+#[tokio::test]
+// HS-02
+async fn response_drop_after_accept_leaves_the_session_in_charge() {
+    use bytes::Buf;
+    use http_body::Body;
+    use std::future::poll_fn;
+    use tokio::io::AsyncWriteExt;
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(zmux::Admission::new(0, |_, _| {
+        zmux::AdmissionVerdict::accept(0)
+    }));
+    let listener = Listener::new(multipath(), limits).unwrap();
+    let (near, far) = tokio::io::duplex(1 << 16);
+    let (up, mut down) = tokio::io::split(far);
+    let request = http::Request::post("/")
+        .version(http::Version::HTTP_2)
+        .body(StreamBody(up))
+        .unwrap();
+    let mut response = zmux_http::handle_request(
+        &listener,
+        request,
+        None,
+        None,
+        &zmux_http::PairField::default(),
+    )
+    .await
+    .ok()
+    .unwrap()
+    .into_body();
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let relay = tokio::spawn(async move {
+        loop {
+            let frame = tokio::select! {
+                _ = &mut stopped => break,
+                f = poll_fn(|cx| Pin::new(&mut response).poll_frame(cx)) => f,
+            };
+            let Some(Ok(frame)) = frame else { break };
+            if let Ok(mut chunks) = frame.into_data() {
+                let data = chunks.copy_to_bytes(chunks.remaining());
+                down.write_all(&data).await.unwrap();
+            }
+        }
+    });
+    let client = Session::connect(zmux::PipeIo::new(near), multipath())
+        .await
+        .unwrap();
+    let server = listener.accept().await.unwrap();
+    let (a, b) = tokio::io::duplex(1 << 16);
+    let (added, handled) = tokio::join!(
+        client.add_pipe(zmux::PipeIo::new(a), PipeOptions::default()),
+        listener.handle_pipe(zmux::PipeIo::new(b), zmux::PipeHint::default())
+    );
+    added.unwrap();
+    handled.unwrap();
+    listener.close();
+    stop.send(()).unwrap();
+    relay.await.unwrap();
+    transfer(&client, &server, 1, 4096).await;
+    server.close().await;
+    client.closed().await;
 }
 
 /// A response body as a byte stream.
@@ -539,6 +770,27 @@ fn a_fallback_request_reaches_the_handler_with_its_whole_body() {
         let (addr, _l) = serve_admitted(Options::default(), Some(admission())).await;
         let resp = post(&addr, "/zmux", fixed(BODY)).await.unwrap();
         assert_eq!(resp.status(), 404);
+    });
+}
+
+#[test]
+fn an_http_fallback_panic_ends_only_its_request() {
+    support::run(2, 20, || async {
+        let fallback = zmux_http::Fallback::new(|request, _| {
+            let path = request.uri().path().to_owned();
+            assert_ne!(path, "/call");
+            async move {
+                assert_ne!(path, "/poll");
+                http::Response::new(zmux_http::PipeBody::empty())
+            }
+        });
+        let (addr, _listener) = server_with(Options::default().with_fallback(fallback)).await;
+        for (path, expected) in [("/call", 500), ("/poll", 500), ("/ok", 200)] {
+            assert_eq!(
+                post(&addr, path, fixed(BODY)).await.unwrap().status(),
+                expected
+            );
+        }
     });
 }
 
@@ -788,14 +1040,15 @@ where
     sender.send_request(req).await
 }
 
-/// A request carrier decided on the start of its body with a fallback
-/// verdict goes to the listener's fallback as a carrier: answered 200 by
+/// On the same listener HTTP Fallback replays the request to its HTTP
+/// handler (404 without one). Takeover delivers the carrier, answered 200 by
 /// zmux, its pipe the request body (the decided bytes replayed) and the
 /// response body, full duplex, over HTTP/1.1 and HTTP/2. The host detaches
 /// it and serves it after the fallback's future; it ends the response
 /// first (half-close) and reads the request body on to its end.
 #[test]
-fn a_request_carrier_decided_on_its_body_is_taken_over() {
+// HS-13, HS-15, HS-19
+fn http_fallback_and_takeover_use_their_own_targets() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     support::run(2, 90, || async {
         for h2 in [false, true] {
@@ -820,11 +1073,14 @@ fn a_request_carrier_decided_on_its_body_is_taken_over() {
                 }
             });
             let admission = zmux::Admission::new(4, |_, p: &[u8]| {
-                if p == b"HELO" {
-                    zmux::AdmissionVerdict::fallback().with_value(Arc::new("echo"))
+                let verdict = if p == b"HELO" {
+                    zmux::AdmissionVerdict::takeover().with_value(Arc::new("echo"))
+                } else if p == b"0123" {
+                    zmux::AdmissionVerdict::fallback()
                 } else {
                     zmux::AdmissionVerdict::Close
-                }
+                };
+                verdict.labelled("route")
             });
             let mut limits = ListenerConfig::default();
             limits.admission = Some(admission);
@@ -832,7 +1088,43 @@ fn a_request_carrier_decided_on_its_body_is_taken_over() {
             let listener = Listener::new(Config::default(), limits).unwrap();
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = tcp.local_addr().unwrap().to_string();
-            tokio::spawn(zmux_http::serve(listener.clone(), tcp, Options::default()));
+            let fallback_calls = Arc::new(AtomicUsize::new(0));
+            let calls = fallback_calls.clone();
+            let http_handler = zmux_http::Fallback::new(move |req, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    http::Response::builder()
+                        .status(201)
+                        .body(zmux_http::PipeBody::full(collect(req.into_body()).await))
+                        .unwrap()
+                }
+            });
+            tokio::spawn(zmux_http::serve(
+                listener.clone(),
+                tcp,
+                Options::default().with_fallback(http_handler),
+            ));
+            let request = |addr: String| async move {
+                if h2 {
+                    post2(&addr, "/zmux", fixed(BODY)).await
+                } else {
+                    post(&addr, "/zmux", fixed(BODY)).await
+                }
+            };
+            let resp = request(addr.clone()).await.unwrap();
+            assert_eq!(resp.status(), 201);
+            assert_eq!(read_all(resp).await, BODY);
+            assert!(rx.try_recv().is_err());
+            let no_handler = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let missing = no_handler.local_addr().unwrap().to_string();
+            tokio::spawn(zmux_http::serve(
+                listener.clone(),
+                no_handler,
+                Options::default(),
+            ));
+            assert_eq!(request(missing).await.unwrap().status(), 404);
             let (mut ours, theirs) = tokio::io::duplex(1024);
             ours.write_all(b"HELOping").await.unwrap();
             let resp = tokio::time::timeout(Duration::from_secs(5), async {
@@ -863,7 +1155,18 @@ fn a_request_carrier_decided_on_its_body_is_taken_over() {
                 "h2 {h2}"
             );
             let a = listener.stats().admission;
-            assert_eq!((a.fallback, a.accepted), (1, 0));
+            assert_eq!(
+                (a.takeover, a.fallback, a.stalled, a.accepted),
+                (1, 1, 1, 0)
+            );
+            let v = listener.variant_stats().variants["route"];
+            assert_eq!(
+                (v.takeover, v.fallback, v.stalled, v.accepted),
+                (1, 1, 1, 0)
+            );
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+            assert!(rx.try_recv().is_err());
+            listener.close();
         }
     });
 }
@@ -896,7 +1199,7 @@ fn an_undetached_request_carrier_is_reset_when_the_fallback_returns() {
                 }
             });
             let admission =
-                zmux::Admission::new(4, |_, _: &[u8]| zmux::AdmissionVerdict::fallback());
+                zmux::Admission::new(4, |_, _: &[u8]| zmux::AdmissionVerdict::takeover());
             let mut limits = ListenerConfig::default();
             limits.admission = Some(admission);
             limits.fallback = Some(fallback);
@@ -932,4 +1235,564 @@ fn an_undetached_request_carrier_is_reset_when_the_fallback_returns() {
             drop(ours);
         }
     });
+}
+
+#[tokio::test]
+async fn http2_lane_response_ends_with_its_attachment() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
+    for hold_head in [true, false] {
+        let listener = Listener::new(multipath(), ListenerConfig::default()).unwrap();
+        let tcp = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let (entered, seen) = oneshot::channel();
+        let (release, gate) = tokio::io::duplex(16);
+        let (lifetime, ended) = oneshot::channel::<()>();
+        let gate = Arc::new(std::sync::Mutex::new(Some((entered, gate, lifetime))));
+        let l = listener.clone();
+        let service = tokio::spawn(async move {
+            let (io, peer) = tcp.accept().await.unwrap();
+            let route = l.clone();
+            let requests = AtomicUsize::new(0);
+            zmux_http::serve_connection_with(
+                &l,
+                io,
+                Some(peer),
+                &Options::default(),
+                move |req, peer, conn| {
+                    let gate = (requests.fetch_add(1, Ordering::Relaxed) == 1)
+                        .then(|| gate.lock().unwrap().take().unwrap());
+                    let l = route.clone();
+                    async move {
+                        let response = zmux_http::route_request(
+                            &l,
+                            req,
+                            peer,
+                            Some(conn),
+                            &Options::default(),
+                        )
+                        .await?;
+                        if let Some((entered, mut gate, lifetime)) = gate {
+                            entered.send(()).unwrap();
+                            if hold_head {
+                                let _lifetime = lifetime;
+                                let _ = tokio::io::AsyncReadExt::read(&mut gate, &mut [0]).await;
+                            } else {
+                                // Keep the routed body alive while its response FIN is gated.
+                                let (parts, original) = response.into_parts();
+                                let stream = StreamBody(GatedBody {
+                                    stream: gate,
+                                    _original: original,
+                                    _lifetime: lifetime,
+                                });
+                                return Ok(http::Response::from_parts(
+                                    parts,
+                                    zmux_http::PipeBody::new(stream),
+                                ));
+                            }
+                        }
+                        Ok(response)
+                    }
+                },
+            )
+            .await;
+        });
+        let conn = Http2Connection::connect(&addr.to_string(), Options::default().with_lanes(true))
+            .await
+            .unwrap();
+        let client = conn.connect_session(multipath()).await.unwrap();
+        let server = listener.accept().await.unwrap();
+        let pipe = client.pipe(zmux::PipeId::new(0)).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            transfer(&client, &server, 4, 512 << 10),
+        )
+        .await
+        .unwrap();
+        seen.await.unwrap();
+        if hold_head {
+            pipe.abort().unwrap();
+        } else {
+            client.close().await;
+            client.closed().await;
+            let pending = std::pin::pin!(pipe.closed())
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+            assert!(pending.is_pending());
+        }
+        if !hold_head {
+            drop(release);
+        }
+        tokio::time::timeout(Duration::from_secs(3), pipe.closed())
+            .await
+            .expect("attachment released")
+            .ok();
+        tokio::time::timeout(Duration::from_secs(3), ended)
+            .await
+            .expect("HTTP response dropped")
+            .unwrap_err();
+        service.abort();
+    }
+}
+
+struct GatedBody {
+    stream: tokio::io::DuplexStream,
+    _original: zmux_http::PipeBody,
+    _lifetime: tokio::sync::oneshot::Sender<()>,
+}
+impl tokio::io::AsyncRead for GatedBody {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        b: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, b)
+    }
+}
+
+/// The final wake of an uplink HTTP response can run host code. Keep it
+/// inside the attachment, including when the other half is already gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn split_completion_includes_the_empty_uplink_response() {
+    use http_body::Body;
+    use std::pin::{Pin, pin};
+    use std::sync::{Mutex, mpsc};
+    use std::task::{Context, Wake, Waker};
+    use zmux::{HandleError, PipeHint, PipeId, PipeIo};
+
+    struct ResponseWake {
+        entered: tokio::sync::Notify,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl Wake for ResponseWake {
+        fn wake(self: Arc<Self>) {
+            self.entered.notify_one();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+    }
+
+    let token = "AAECAwQFBgcICQoLDA0ODw";
+    let hint = || PipeHint::default().with_pair_header(token);
+    let mut config = ListenerConfig::default();
+    config.admission = Some(zmux::Admission::new(0, |_, _| {
+        zmux::AdmissionVerdict::accept(0)
+    }));
+    let listener = Listener::new(Config::default(), config).unwrap();
+    let (up, up_server) = tokio::io::duplex(1 << 16);
+    let (down, down_server) = tokio::io::duplex(1 << 16);
+    let request = http::Request::post("/zmux")
+        .version(http::Version::HTTP_2)
+        .header(zmux::adapter::PAIR_HEADER, token)
+        .body(StreamBody(up_server))
+        .unwrap();
+    let mut response = zmux_http::handle_request(
+        &listener,
+        request,
+        None,
+        None,
+        &zmux_http::PairField::default(),
+    )
+    .await
+    .ok()
+    .unwrap()
+    .into_body();
+    let (setup, client) = tokio::join!(
+        listener.handle_pipe(PipeIo::writer(down_server), hint()),
+        Session::connect(PipeIo::from_halves(down, up), Config::default())
+    );
+    setup.unwrap();
+    let _client = client.unwrap();
+    let server = listener.accept().await.unwrap();
+    let pipe = server.pipe(PipeId::new(0)).unwrap();
+    let (release, gate) = mpsc::channel();
+    let gate = Arc::new(ResponseWake {
+        entered: tokio::sync::Notify::new(),
+        release: Mutex::new(gate),
+    });
+    let waker = Waker::from(gate.clone());
+    assert!(
+        Pin::new(&mut response)
+            .poll_frame(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    server.close().await;
+    tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+        .await
+        .unwrap();
+    let mut closed = pin!(pipe.closed());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(closed.as_mut().poll(&mut cx).is_pending());
+    let retry = || listener.handle_pipe(PipeIo::reader(tokio::io::empty()), hint());
+    assert_eq!(
+        pin!(retry()).as_mut().poll(&mut cx),
+        std::task::Poll::Ready(Err(HandleError::Rejected))
+    );
+    release.send(()).unwrap();
+    let _ = closed.await;
+    assert!(pin!(retry()).as_mut().poll(&mut cx).is_pending());
+    assert!(matches!(
+        Pin::new(&mut response).poll_frame(&mut cx),
+        std::task::Poll::Ready(None)
+    ));
+}
+
+/// The transport, including flush, is controlled independently of Hyper
+/// accepting the service response and polling its body.
+#[tokio::test]
+// HS-15, HS-16, HS-19
+async fn takeover_waits_for_the_accepted_response_to_flush() {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    #[derive(Default)]
+    struct Gate {
+        armed: std::sync::atomic::AtomicBool,
+        blocked: tokio::sync::Notify,
+        result: std::sync::Mutex<(Option<bool>, Option<Waker>)>,
+    }
+    struct Transport(TcpStream, Arc<Gate>);
+    impl AsyncRead for Transport {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            b: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, b)
+        }
+    }
+    impl AsyncWrite for Transport {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            b: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, b)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.1.armed.load(Ordering::Acquire) {
+                let mut g = self.1.result.lock().unwrap();
+                match g.0 {
+                    Some(true) => {}
+                    Some(false) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+                    None => {
+                        g.1 = Some(cx.waker().clone());
+                        self.1.blocked.notify_one();
+                        return Poll::Pending;
+                    }
+                }
+            }
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(12), async {
+        #[cfg(feature = "websocket")]
+        let methods = ["http1", "http2", "connect"];
+        #[cfg(not(feature = "websocket"))]
+        let methods = ["http1", "http2"];
+        for method in methods {
+            for ending in ["flushed", "failed", "stopped"] {
+                let gate = Arc::new(Gate::default());
+                let g = gate.clone();
+                let (called, mut calls) = tokio::sync::mpsc::unbounded_channel();
+                let mut limits = ListenerConfig::default();
+                limits.admission = Some(zmux::Admission::new(0, move |_, _| {
+                    g.armed.store(true, Ordering::Release);
+                    zmux::AdmissionVerdict::takeover().labelled("relay")
+                }));
+                limits.fallback = Some(zmux::Fallback::new(move |_| {
+                    called.send(()).unwrap();
+                    async {}
+                }));
+                let listener = Listener::new(Config::default(), limits).unwrap();
+                let tcp = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .unwrap();
+                let addr = tcp.local_addr().unwrap().to_string();
+                let l = listener.clone();
+                let g = gate.clone();
+                let serving = tokio::spawn(async move {
+                    let (socket, peer) = tcp.accept().await.unwrap();
+                    let endpoint = zmux_http::Endpoint::new(l, Options::default());
+                    #[cfg(feature = "websocket")]
+                    let endpoint = endpoint.with_websocket(zmux_websocket::Options::default());
+                    endpoint
+                        .serve_connection(Transport(socket, g), Some(peer))
+                        .await;
+                });
+                let dial = tokio::spawn(async move {
+                    match method {
+                        "http1" => post(&addr, "/zmux", fixed(b"request")).await,
+                        "http2" => post2(&addr, "/zmux", fixed(b"request")).await,
+                        _ => {
+                            let tcp = TcpStream::connect(&addr).await.unwrap();
+                            let (mut tx, conn) = hyper::client::conn::http2::handshake(
+                                hyper_util::rt::TokioExecutor::new(),
+                                hyper_util::rt::TokioIo::new(tcp),
+                            )
+                            .await?;
+                            tokio::spawn(conn);
+                            let mut req = http::Request::connect(format!("http://{addr}/zmux"))
+                                .header("Sec-WebSocket-Version", "13")
+                                .header("Sec-WebSocket-Protocol", "qmux-02")
+                                .body(zmux_http::PipeBody::empty())
+                                .unwrap();
+                            req.extensions_mut()
+                                .insert(hyper::ext::Protocol::from_static("websocket"));
+                            tx.send_request(req).await
+                        }
+                    }
+                });
+                gate.blocked.notified().await;
+                assert_eq!(listener.stats().admission.takeover, 0);
+                assert!(listener.variant_stats().variants.is_empty());
+                assert!(calls.try_recv().is_err(), "{method} {ending}");
+                if ending == "stopped" {
+                    listener.close();
+                }
+                let waker = {
+                    let mut g = gate.result.lock().unwrap();
+                    g.0 = Some(ending != "failed");
+                    g.1.take().unwrap()
+                };
+                waker.wake();
+                if ending == "flushed" {
+                    calls.recv().await.unwrap();
+                }
+                drop(dial.await.unwrap());
+                serving.await.unwrap();
+                assert!(calls.try_recv().is_err(), "{method} {ending}");
+                let stats = listener.stats().admission;
+                assert_eq!(stats.fallback, 0);
+                assert_eq!(stats.takeover, u64::from(ending == "flushed"));
+                let variant = listener
+                    .variant_stats()
+                    .variants
+                    .get("relay")
+                    .copied()
+                    .unwrap_or_default();
+                assert_eq!((variant.takeover, variant.fallback), (stats.takeover, 0));
+                assert_eq!(
+                    stats.takeover + stats.handshake_failed + stats.peek_timed_out + stats.closed,
+                    1,
+                    "{method} {ending} {stats:?}"
+                );
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// HS-13. The last peek reaches trailers when the prefix is shorter than requested.
+#[tokio::test]
+// HS-13
+async fn fallback_replays_body_frames_and_original_headers() {
+    use http_body::{Body, Frame};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    struct Frames(std::collections::VecDeque<Frame<bytes::Bytes>>);
+    impl Body for Frames {
+        type Data = bytes::Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(self.0.pop_front().map(Ok))
+        }
+    }
+    for chunked in [true, false] {
+        for expect in [true, false] {
+            for declare in [true, false] {
+                let mut limits = ListenerConfig::default();
+                limits.admission = Some(zmux::Admission::new(9, |_, _| {
+                    zmux::AdmissionVerdict::fallback()
+                }));
+                let listener = Listener::new(Config::default(), limits).unwrap();
+                let mut head = http::Request::post("/").version(http::Version::HTTP_11);
+                head = if chunked {
+                    head.header("transfer-encoding", "chunked")
+                } else {
+                    head.header("content-length", "3")
+                };
+                if expect {
+                    head = head.header("expect", "100-continue");
+                }
+                if declare {
+                    head = head.header("trailer", "x-tail");
+                }
+                let mut frames = std::collections::VecDeque::from([Frame::data(
+                    bytes::Bytes::from_static(b"abc"),
+                )]);
+                if chunked {
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("x-tail", http::HeaderValue::from_static("visible"));
+                    frames.push_back(Frame::trailers(trailers));
+                }
+                let req = head.body(Frames(frames)).unwrap();
+                let original = req.headers().clone();
+                let Err(zmux_http::Unhandled::Fallback(request)) = zmux_http::handle_request(
+                    &listener,
+                    req,
+                    None,
+                    None,
+                    &zmux_http::PairField::default(),
+                )
+                .await
+                else {
+                    panic!("fallback must receive the request before a response");
+                };
+                assert_eq!(request.headers(), &original);
+                let mut replay = request.into_body();
+                let mut bytes = Vec::new();
+                let mut trailers = None;
+                while let Some(f) =
+                    std::future::poll_fn(|cx| Pin::new(&mut replay).poll_frame(cx)).await
+                {
+                    match f.unwrap().into_data() {
+                        Ok(d) => bytes.extend_from_slice(&d),
+                        Err(frame) => trailers = frame.into_trailers().ok(),
+                    }
+                }
+                assert_eq!(bytes, b"abc");
+                assert_eq!(
+                    trailers.as_ref().map(|h| &h["x-tail"]),
+                    chunked.then_some(&http::HeaderValue::from_static("visible"))
+                );
+            }
+        }
+    }
+}
+
+// HS-14. A silent request body has already reached the host's Next handler.
+#[tokio::test]
+// HS-14
+async fn closing_listener_ends_the_fallbacks_pending_body_read() {
+    use tokio::io::AsyncWriteExt;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let ended = Arc::new(tokio::sync::Notify::new());
+    let (start, done) = (entered.clone(), ended.clone());
+    let options = Options::default().with_fallback(zmux_http::Fallback::new(move |req, _| {
+        let (start, done) = (start.clone(), done.clone());
+        async move {
+            start.notify_one();
+            assert_eq!(collect(req.into_body()).await, b"");
+            done.notify_one();
+            http::Response::new(zmux_http::PipeBody::empty())
+        }
+    }));
+    let (addr, listener) = serve_admitted(
+        options,
+        Some(zmux::Admission::new(0, |_, _| {
+            zmux::AdmissionVerdict::fallback()
+        })),
+    )
+    .await;
+    let mut peer = TcpStream::connect(&addr).await.unwrap();
+    let head = format!("POST /zmux HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 99\r\n\r\n");
+    peer.write_all(head.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    listener.close();
+    tokio::time::timeout(Duration::from_secs(5), ended.notified())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+// HS-30
+async fn drained_http_split_preserves_the_protocol_close() {
+    let (addr, listener, serving) = server(Config::default()).await;
+    listener.drain(b"emptying");
+    let pipe = zmux_http::dial_http1_split(&addr, &Options::default())
+        .await
+        .unwrap();
+    let error = match Session::connect(pipe, Config::default()).await {
+        Ok(session) => session.closing().await,
+        Err(zmux::ConnectError::SessionLost(e)) => e,
+        Err(e) => panic!("unexpected dial error {e}"),
+    };
+    assert!(
+        matches!(error, SessionError::TransportClosed { code, reason, remote: true, .. } if code == zmux::proto::TransportErrorCode::CONNECTION_REFUSED && reason.as_ref() == b"emptying")
+    );
+    listener.close();
+    serving.await.unwrap();
+}
+
+// HS-16a. The foreign HTTP writer acknowledges cancellation on its own
+// executor, but a transport operation it submitted has not exited yet.
+#[tokio::test]
+async fn cancelled_response_head_owns_its_slot_until_the_writer_exits() {
+    for global_limit in [None, Some(2)] {
+        let mut limits = ListenerConfig::default();
+        limits.limits.max_pending = global_limit;
+        limits.limits.max_pending_per_source = 2;
+        limits.admission = Some(zmux::Admission::new(0, |_, _| {
+            zmux::AdmissionVerdict::takeover()
+        }));
+        let called = Arc::new(AtomicUsize::new(0));
+        let calls = called.clone();
+        limits.fallback = Some(zmux::Fallback::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {}
+        }));
+        let listener = Listener::new(Config::default(), limits).unwrap();
+        let peer = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+        let probe_peer = if global_limit.is_some() {
+            (std::net::Ipv6Addr::LOCALHOST, 0).into()
+        } else {
+            peer
+        };
+        let _occupied = listener.adapter().enter(peer, None).unwrap();
+        let req = http::Request::post("/zmux")
+            .header(http::header::TRANSFER_ENCODING, "chunked")
+            .body(fixed(b"request"))
+            .unwrap();
+        let mut response = zmux_http::handle_request(
+            &listener,
+            req,
+            Some(peer),
+            None,
+            &zmux_http::PairField::default(),
+        )
+        .await
+        .unwrap();
+        let mut write = response.body_mut().take_response_head().unwrap();
+        let (cancelled, observed) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let host = listener.clone();
+        let writer = tokio::spawn(async move {
+            write.cancelled().await;
+            // The host cancellation action re-enters the listener and returns.
+            assert!(host.adapter().enter(probe_peer, None).is_none());
+            cancelled.send(()).unwrap();
+            finishing.await.unwrap();
+            drop(write);
+        });
+        drop(response);
+        observed.await.unwrap();
+        assert!(listener.adapter().enter(probe_peer, None).is_none());
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        let stats = listener.stats().admission;
+        assert_eq!(
+            (stats.handshake_failed, stats.peek_timed_out, stats.closed),
+            (1, 0, 0)
+        );
+        finish.send(()).unwrap();
+        writer.await.unwrap();
+        assert!(listener.adapter().enter(probe_peer, None).is_some());
+    }
 }

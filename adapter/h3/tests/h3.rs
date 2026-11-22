@@ -5,51 +5,29 @@
 //! and a lost connection that is a failure of its pipes, never their clean
 //! end.
 
+#![cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Buf;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use zmux::{
     Admission, AdmissionVerdict, Config, Listener, ListenerConfig, PipeAuth, PipeFailure,
     PipeOptions, PrefixAuth, PrefixAuthVerifier, Session, SessionError,
 };
 use zmux_h3::{Carrier, Fallback, Options};
 
-/// A server endpoint with a fresh certificate and a client endpoint that
-/// trusts it, over loopback.
-fn endpoints(opts: &Options) -> (quinn::Endpoint, quinn::Endpoint, std::net::SocketAddr) {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = zmux_testcert::self_signed(vec!["127.0.0.1".into()]).unwrap();
-    let der = CertificateDer::from(cert.cert.der().to_vec());
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let tls = rustls::ServerConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![der.clone()], key)
-        .unwrap();
-    // The configuration helpers add `h3`.
-    let server_config = zmux_h3::server_config(tls, opts).unwrap();
-    let server = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = server.local_addr().unwrap();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(der).unwrap();
-    let tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let client_config = zmux_h3::client_config(tls, opts).unwrap();
-    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    client.set_default_client_config(client_config);
-    (server, client, addr)
+use net::endpoints;
+
+mod net {
+    include!("common/net.rs");
 }
 
 /// A served HTTP/3 endpoint and a client endpoint for it over loopback.
 struct H3 {
     client: quinn::Endpoint,
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     uri: http::Uri,
     listener: Listener,
     serving: tokio::task::JoinHandle<()>,
@@ -413,6 +391,65 @@ async fn a_request_without_a_token_goes_to_the_fallback_with_its_bytes() {
     h3.stop().await;
 }
 
+// HS-14
+#[tokio::test]
+async fn closing_listener_ends_only_the_fallback_request_body() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let ended = Arc::new(tokio::sync::Notify::new());
+    let (start, done) = (entered.clone(), ended.clone());
+    let opts = Options::default().with_fallback(Fallback::new(move |mut req| {
+        let (start, done) = (start.clone(), done.clone());
+        async move {
+            let mut read = std::pin::pin!(req.recv.recv_data());
+            let result = std::future::poll_fn(|cx| {
+                let result = Future::poll(read.as_mut(), cx);
+                if result.is_pending() {
+                    start.notify_one();
+                }
+                result
+            })
+            .await;
+            assert!(matches!(result, Ok(None)));
+            done.notify_one();
+            req.send
+                .send_response(http::Response::new(()))
+                .await
+                .unwrap();
+            req.send.finish().await.unwrap();
+        }
+    }));
+    let mut limits = ListenerConfig::default();
+    limits.handshake_timeout = Duration::MAX;
+    limits.admission = Some(Admission::new(0, |_, _| AdmissionVerdict::fallback()));
+    let h3 = H3::with_listener(Config::default(), limits, &opts);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let conn = h3
+            .client
+            .connect(h3.addr, "127.0.0.1")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
+            .await
+            .unwrap();
+        let drive =
+            tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+        let mut request = send
+            .send_request(http::Request::post(h3.uri.clone()).body(()).unwrap())
+            .await
+            .unwrap();
+        entered.notified().await;
+        h3.listener.close();
+        ended.notified().await;
+        assert!(request.recv_response().await.unwrap().status().is_success());
+        assert!(conn.close_reason().is_none());
+        drive.abort();
+    })
+    .await
+    .unwrap();
+    h3.stop().await;
+}
+
 /// A stalled request whose body stays open is not answered: it ends
 /// without a response once the stall is over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -678,7 +715,7 @@ async fn request_takeover(detach: bool) -> (Vec<u8>, Vec<u8>, bool, bool) {
     let mut go_tx = Some(go_tx);
     let admission = Admission::new(4, |_, p: &[u8]| {
         if p == b"HELO" {
-            AdmissionVerdict::fallback()
+            AdmissionVerdict::takeover()
         } else {
             AdmissionVerdict::Close
         }
@@ -782,4 +819,178 @@ async fn an_undetached_request_carrier_is_reset_when_the_fallback_returns() {
     assert!(b"pong".starts_with(&got), "{got:?}");
     assert!(failed, "the response is reset, not ended");
     assert!(stopped, "the request body is stopped");
+}
+
+#[tokio::test]
+// HS-05
+async fn request_cancellation_releases_an_admitted_setup() {
+    for stop_response in [true, false] {
+        for admission in [false, true] {
+            cancelled_setup(stop_response, admission).await;
+        }
+    }
+}
+
+async fn cancelled_setup(stop_response: bool, admission: bool) {
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(Admission::new(0, |_, _| AdmissionVerdict::accept(0)));
+    limits.limits.max_pending = Some(1);
+    limits.handshake_timeout = Duration::from_secs(60);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let started = entered.clone();
+    let (held, dropped) = tokio::sync::oneshot::channel::<()>();
+    let lifetime = std::sync::Mutex::new(Some(held));
+    if admission {
+        struct Pending(
+            Arc<tokio::sync::Notify>,
+            std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        );
+        impl zmux::Decide for Pending {
+            fn decide(
+                &self,
+                _: zmux::CarrierInfo,
+                _: &[u8],
+            ) -> zmux::Decision<zmux::AdmissionDecision> {
+                let guard = self.1.lock().unwrap().take();
+                self.0.notify_one();
+                zmux::Decision::later(async move {
+                    std::future::pending::<()>().await;
+                    drop(guard);
+                    AdmissionVerdict::Close.into()
+                })
+            }
+        }
+        limits.admission = Some(Admission::with_decider(0, Pending(started, lifetime)));
+    } else {
+        limits.inbound_transform = Some(zmux::InboundTransform::new(
+            move |io, _: &zmux::PipeHint| {
+                let guard = lifetime.lock().unwrap().take();
+                let started = started.clone();
+                async move {
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                    drop(guard);
+                    Ok(io)
+                }
+            },
+        ));
+    }
+    let h3 = H3::with_listener(Config::default(), limits, &Options::default());
+    let conn = h3
+        .client
+        .connect(h3.addr, &h3.addr.ip().to_string())
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut driver, mut requests) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
+        .await
+        .unwrap();
+    let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+    let request = http::Request::post(h3.uri.clone()).body(()).unwrap();
+    let mut stream = requests.send_request(request).await.unwrap();
+    if !admission {
+        assert!(stream.recv_response().await.unwrap().status().is_success());
+    }
+    entered.notified().await;
+    assert!(h3.listener.adapter().enter(h3.addr, None).is_none());
+    if stop_response {
+        stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    } else {
+        stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+    tokio::time::timeout(Duration::from_secs(2), dropped)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(h3.listener.adapter().enter(h3.addr, None).is_some());
+    drive.abort();
+    conn.close(0u32.into(), b"");
+    h3.stop().await;
+}
+
+/// Read only one byte of the response HEADERS frame, then withhold the
+/// remaining stream credit. The accepted head still belongs to setup.
+#[tokio::test]
+// HS-15, HS-16
+async fn a_flow_controlled_response_head_ends_with_setup() {
+    for takeover in [false, true] {
+        for stop in [false, true] {
+            tokio::time::timeout(Duration::from_secs(8), async {
+                let opts = Options::default()
+                    .with_windows(zmux_h3::LaneWindows::new().with_stream_window(1));
+                let mut config = ListenerConfig::default();
+                config.handshake_timeout = Duration::from_secs(3);
+                config.limits.max_pending = Some(1);
+                config.admission = Some(Admission::new(0, move |_, _| {
+                    if takeover {
+                        AdmissionVerdict::takeover()
+                    } else {
+                        AdmissionVerdict::accept(0)
+                    }
+                }));
+                let handed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = handed.clone();
+                config.fallback = Some(zmux::Fallback::new(move |_| {
+                    observed.store(true, std::sync::atomic::Ordering::Release);
+                    std::future::ready(())
+                }));
+                let h3 = H3::with_listener(Config::default(), config, &opts);
+                let conn = h3
+                    .client
+                    .connect(h3.addr, &h3.addr.ip().to_string())
+                    .unwrap()
+                    .await
+                    .unwrap();
+                // The peer consumes control streams normally, but never gives the
+                // response enough credit to finish its head.
+                let control = conn.clone();
+                let draining = tokio::spawn(async move {
+                    while let Ok(mut stream) = control.accept_uni().await {
+                        tokio::spawn(async move {
+                            let _ = stream.read_to_end(4096).await;
+                        });
+                    }
+                });
+                let (mut request, mut response) = conn.open_bi().await.unwrap();
+                request
+                    .write_all(&[
+                        1, 16, 0, 0, 0xd4, 0xd7, 0xc1, 0x50, 9, b'l', b'o', b'c', b'a', b'l', b'h',
+                        b'o', b's', b't',
+                    ])
+                    .await
+                    .unwrap();
+                let mut first = [0];
+                response.read_exact(&mut first).await.unwrap();
+                assert_eq!(first, [1]);
+                assert!(h3.listener.adapter().enter(h3.addr, None).is_none());
+                if stop {
+                    h3.listener.close();
+                } else {
+                    tokio::time::pause();
+                    tokio::time::advance(Duration::from_secs(3)).await;
+                    tokio::time::resume();
+                }
+                // The dropped request reader sends STOP without reading more
+                // response bytes or closing the shared QUIC connection.
+                request.stopped().await.unwrap();
+                assert!(conn.close_reason().is_none());
+                assert!(!handed.load(std::sync::atomic::Ordering::Acquire));
+                if takeover {
+                    let stats = h3.listener.stats().admission;
+                    assert_eq!(
+                        (stats.closed, stats.peek_timed_out, stats.handshake_failed),
+                        (u64::from(stop), u64::from(!stop), 0)
+                    );
+                }
+                if !stop {
+                    assert!(h3.listener.adapter().enter(h3.addr, None).is_some());
+                }
+                conn.close(0u32.into(), b"");
+                draining.await.unwrap();
+                h3.stop().await;
+            })
+            .await
+            .unwrap();
+        }
+    }
 }

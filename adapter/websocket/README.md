@@ -56,3 +56,8 @@ let session = zmux_websocket::connect("ws://example.com/zmux", &Default::default
 # Ok(())
 # }
 ```
+
+An HTTP/2 server embedding `accept_request` takes the optional
+`UpgradeFlush::take(&mut response)` receipt and sends it after flushing
+the successful extended CONNECT response headers. Dropping the receipt on
+error cancels the pending transfer. The HTTP endpoint does this internally.

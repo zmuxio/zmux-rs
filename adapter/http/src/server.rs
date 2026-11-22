@@ -83,7 +83,9 @@ impl Fallback {
         peer: Option<SocketAddr>,
     ) -> Response<PipeBody> {
         let handler = &self.0;
-        handler(req, peer).await
+        zmux::adapter::host_future(|| handler(req, peer))
+            .await
+            .unwrap_or_else(|| status(StatusCode::INTERNAL_SERVER_ERROR))
     }
 }
 
@@ -178,7 +180,8 @@ fn carrier_response(
 /// value per connection), `None` for HTTP/1.1. A bidirectional carrier
 /// declares the [`TlsBinding`] in the request's extensions,
 /// that of the TLS connection it arrived on. Must be called inside a
-/// tokio runtime; the carrier runs in a task of its own.
+/// tokio runtime; the carrier runs in a task of its own. A custom server
+/// acknowledges its successful header flush with [`PipeBody::response_head_flushed`].
 ///
 /// The carrier takes its source slot first ([`ListenerAdapter::enter`](zmux::adapter::ListenerAdapter::enter)):
 /// refused (the source has its share, or the listener is closed), the
@@ -195,7 +198,7 @@ fn carrier_response(
 ///   credential in a header field. `Accept(k)` returns the response at
 ///   once, the carrier having the prefix after `k` bytes in front, and the
 ///   request body is read on while the response flows (also on
-///   HTTP/1.1); `Fallback` on the start of the body, with a listener's
+///   HTTP/1.1); `Takeover`, with a listener's
 ///   fallback ([`zmux::ListenerConfig::fallback`]), hands the carrier to
 ///   it as a [`zmux::Takeover`]: the response is returned at once as for
 ///   an acceptance, and the takeover's pipe is the request body, every
@@ -203,8 +206,8 @@ fn carrier_response(
 ///   response ends once the host drops the request body) the response
 ///   body, full duplex, each half closed on its own; once the fallback's
 ///   future completed, a response the host did not end is reset, unless
-///   it detached the takeover ([`zmux::Takeover::detach`]). `Fallback` on
-///   the head (no body), or without a listener's fallback, returns
+///   it detached the takeover ([`zmux::Takeover::detach`]). Without a byte-stream
+///   target, `Takeover` stalls. `Fallback` returns
 ///   [`Unhandled::Fallback`] with every byte read given back in front of
 ///   the rest of the body; `Stall` reads and
 ///   discards the body for a stall's duration (or until it ends) and then
@@ -228,9 +231,13 @@ where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let version = parts.version;
     let binding = parts.extensions.get::<TlsBinding>().cloned();
+    let transport = parts
+        .extensions
+        .get::<std::sync::Weak<zmux_rustls::TcpReset>>()
+        .cloned();
     let Some(class @ (RequestClass::Bidirectional | RequestClass::Uplink | RequestClass::Downlink)) =
         classify(&parts, pair)
     else {
@@ -275,6 +282,7 @@ where
     let carrier = {
         let abort = abort.clone();
         move |reader: BodyReader<B>, writer: StartWriter, taken_over: bool| {
+            let (reader, probe) = zmux::adapter::SetupRead::new(body::SetupBody::new(reader));
             let (io, held) = match class {
                 // An uplink taken over: its empty response ends once the
                 // host is done with the request body.
@@ -309,17 +317,38 @@ where
                 Some(c) => io.with_carrier_conn(c),
                 None => io,
             };
-            (io, held)
+            (io, held, probe)
         }
     };
     let ending = abort.clone();
-    let handled = move |l: Listener, (io, held): (PipeIo, Option<StartWriter>), hint: PipeHint| async move {
-        let r = l.handle_pipe(io, hint).await;
-        if held.is_some() {
-            match r {
-                Ok(()) => ending.finish(),
-                Err(_) => ending.run(),
-            }
+    let on_setup = transport.clone();
+    let handled = move |l: Listener,
+                        (mut io, held, probe): (PipeIo, Option<StartWriter>, _),
+                        hint: PipeHint| async move {
+        // The uplink's empty response owns its writer until its carrier is released.
+        let (io, end) = if let Some(writer) = held {
+            let worker = io.worker_guard();
+            let (released, end) = tokio::sync::oneshot::channel();
+            (
+                io.with_close_code(move |_| {
+                    let _ = released.send(());
+                }),
+                Some((end, writer, worker)),
+            )
+        } else {
+            (io, None)
+        };
+        let absent = body::request_gone(probe, ending.dropped(), on_setup);
+        let Some(r) = l.adapter().setup_until(io, hint, absent).await else {
+            return Err(zmux::HandleError::Refused);
+        };
+        if let Some((end, writer, worker)) = end {
+            // A refused bootstrap still has a protocol close in flight on
+            // the downlink. Only the carrier owner can end this response.
+            let _ = end.await;
+            ending.finish();
+            drop(writer);
+            drop(worker);
         }
         r
     };
@@ -346,10 +375,10 @@ where
                     inner: writer,
                     started: None,
                 };
-                let (io, start) = carrier(reader, writer, false);
+                let (io, start, probe) = carrier(reader, writer, false);
                 tokio::spawn(handled(
                     listener.clone(),
-                    (io.with_prefix(rest), start),
+                    (io.with_prefix(rest), start, probe),
                     hint_of(entry),
                 ));
                 Ok(carrier_response(class, version, resp_body))
@@ -362,22 +391,52 @@ where
                     inner: writer,
                     started: None,
                 };
-                let (io, _) = carrier(reader, writer, true);
+                let (io, _, probe) = carrier(reader, writer, true);
                 // The request is closed with the call unless detached: a
                 // response the host did not end is reset.
+                let gone = body::request_gone(probe, abort.dropped(), transport);
                 let io = zmux::adapter::AdmitIo::pipe(io).with_on_return(move || abort.run());
-                tokio::spawn(async move { entry.take_over(io, prefix).await });
-                Ok(carrier_response(class, version, resp_body))
+                let (sent, head) = entry.response_head();
+                tokio::spawn(async move {
+                    let flushed = entry
+                        .takeover_head(async {
+                            tokio::select! {
+                                biased;
+                                () = gone => false,
+                                result = head => result.is_ok(),
+                            }
+                        })
+                        .await;
+                    if flushed {
+                        entry.take_over(io, prefix).await;
+                    }
+                });
+                Ok(carrier_response(class, version, resp_body.with_head(sent)))
             }
             Admit::Fallback(prefix) => {
-                let (rest, pending) = reader.into_parts();
-                let body = ReplayBody::new([prefix.into(), pending], Some(rest));
+                if parts
+                    .extensions
+                    .get::<zmux::adapter::TrackRequestFallback>()
+                    .is_some()
+                {
+                    if let Some(outcome) = entry.request_fallback() {
+                        parts.extensions.insert(outcome);
+                    }
+                } else {
+                    entry.complete_request_fallback(true);
+                }
+                let mut body = reader.replay(prefix.into());
+                body.stop_with(listener.clone());
                 Err(Unhandled::Fallback(Box::new(Request::from_parts(
                     parts, body,
                 ))))
             }
             Admit::Stall => {
-                entry.stall(Some(&mut reader)).await;
+                entry
+                    .stall_request(Some(reader), move |_| async move {
+                        drop((writer, resp_body));
+                    })
+                    .await;
                 Err(Unhandled::Abort)
             }
             _ => Err(Unhandled::Abort),
@@ -391,7 +450,7 @@ where
     let (started, mut start) = tokio::sync::watch::channel(false);
     let started = Arc::new(started);
     let on_taken = started.clone();
-    let (io, held) = carrier(
+    let (io, held, probe) = carrier(
         reader,
         StartWriter {
             inner: writer,
@@ -402,7 +461,7 @@ where
     let io = io.with_taken(move || {
         on_taken.send_replace(true);
     });
-    let mut done = tokio::spawn(handled(listener.clone(), (io, held), hint));
+    let mut done = tokio::spawn(handled(listener.clone(), (io, held, probe), hint));
     tokio::select! {
         biased;
         Ok(_) = start.wait_for(|s| *s) => return Ok(carrier_response(class, version, resp_body)),
@@ -677,10 +736,21 @@ pub async fn serve_connection_with<IO, H, HF>(
     let tag = Arc::new(ConnTag);
     let conn = CarrierConnId::new(&tag);
     let binding = binding_of(&io);
+    let Ok(transport) = zmux_rustls::TcpReset::observe(&io) else {
+        return;
+    };
+    let transport = transport.map(Arc::new);
     let used = Arc::new(AtomicBool::new(false));
     let activity = Arc::new(Activity::new());
     let (seen, l, act) = (used.clone(), listener.clone(), activity.clone());
+    let inbox = Arc::new(HeadInbox::default());
+    let heads = inbox.clone();
     let service = service_fn(move |mut req: Request<Incoming>| {
+        req.extensions_mut()
+            .insert(zmux::adapter::TrackRequestFallback);
+        if let Some(transport) = &transport {
+            req.extensions_mut().insert(Arc::downgrade(transport));
+        }
         if let Some(b) = &binding {
             req.extensions_mut().insert(b.clone());
         }
@@ -693,6 +763,7 @@ pub async fn serve_connection_with<IO, H, HF>(
         );
         // Active from now until the response body is dropped.
         let mut active = Active::new(act.clone());
+        let heads = heads.clone();
         async move {
             let source = request_source(&l, req.headers(), peer);
             // An HTTP/2 extended CONNECT whose tunnel outlives its response
@@ -702,11 +773,20 @@ pub async fn serve_connection_with<IO, H, HF>(
             // Routed to zmux while `route` has it: only such requests hold
             // a connection that carries no pipe past its setup end.
             active.route(true);
-            let req = match route(req, peer, conn).await {
+            let routed = zmux::adapter::host_future(|| route(req, peer, conn))
+                .await
+                .unwrap_or(Err(Unhandled::Abort));
+            let mut req = match routed {
                 Ok(resp) => {
                     seen.store(true, Ordering::Relaxed);
                     active.tunnel_opened(tunnel && resp.status().is_success());
-                    return Ok(resp.map(|body| Tracked {
+                    return Ok(resp.map(|mut body| Tracked {
+                        upgrade: if tunnel {
+                            body.take_response_head()
+                        } else {
+                            None
+                        },
+                        heads: Some(heads),
                         body,
                         _active: active,
                     }));
@@ -723,15 +803,27 @@ pub async fn serve_connection_with<IO, H, HF>(
                     ));
                 }
             };
+            req.extensions_mut()
+                .remove::<zmux::adapter::TrackRequestFallback>();
+            if let Some(outcome) = req
+                .extensions_mut()
+                .remove::<zmux::adapter::RequestFallback>()
+            {
+                outcome.complete(fallback.is_some());
+            }
             let resp = match &fallback {
                 Some(f) => {
                     seen.store(true, Ordering::Relaxed);
+                    let mut req = req;
+                    req.body_mut().stop_with(l.clone());
                     f.serve(req, source).await
                 }
                 None => status(StatusCode::NOT_FOUND),
             };
             active.tunnel_opened(tunnel && resp.status().is_success());
             Ok(resp.map(|body| Tracked {
+                upgrade: None,
+                heads: None,
                 body,
                 _active: active,
             }))
@@ -741,9 +833,19 @@ pub async fn serve_connection_with<IO, H, HF>(
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(limit);
+        .header_read_timeout(
+            zmux::adapter::handshake_deadline(tokio::time::Instant::now().into_std(), limit)
+                .map(|_| limit),
+        );
     builder.http2().enable_connect_protocol();
+    let flush = Arc::new(AtomicBool::new(false));
+    let io = FlushIo {
+        io,
+        flushed: flush.clone(),
+    };
     let served = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
+    let mut receipts = Vec::new();
+    let mut driver_waker: Option<std::task::Waker> = None;
     let mut served = std::pin::pin!(served);
     // A connection that carries no pipe within the limit is closed; one
     // that did, once it has been idle for the idle timeout. Only a request
@@ -751,7 +853,11 @@ pub async fn serve_connection_with<IO, H, HF>(
     // own deadlines (an exchange request's hold may outlast the setup limit
     // on a connection of its own, so no fixed cap applies); other requests
     // (a fallback 404 whose body the peer does not take) never do.
-    let setup_end = tokio::time::Instant::now() + limit;
+    let deadline = || {
+        zmux::adapter::handshake_deadline(tokio::time::Instant::now().into_std(), limit)
+            .map(tokio::time::Instant::from_std)
+    };
+    let setup_end = deadline();
     loop {
         // Before its first request is served, both ends are looked at:
         // the setup's, and the idle timeout's once it served one.
@@ -763,17 +869,35 @@ pub async fn serve_connection_with<IO, H, HF>(
         // end the connection is looked at again once the request ended.
         let busy = activity.routed.load(Ordering::Acquire) > 0;
         let wake = if used.load(Ordering::Relaxed) {
-            idle_end
+            Some(idle_end)
         } else if busy {
-            (tokio::time::Instant::now() + limit).max(setup_end)
+            setup_end
+                .zip(deadline())
+                .map(|(setup, routed)| setup.max(routed))
         } else if idle_end > tokio::time::Instant::now() {
-            setup_end.min(idle_end)
+            Some(setup_end.map_or(idle_end, |end| end.min(idle_end)))
         } else {
             setup_end
         };
         tokio::select! {
-            _ = served.as_mut() => break,
-            () = tokio::time::sleep_until(wake) => {}
+            _ = std::future::poll_fn(|cx| {
+                inbox.receive(cx, &mut driver_waker, &mut receipts);
+                if receipts.is_empty() {
+                    return served.as_mut().poll(cx);
+                }
+                // These bodies were already polled, so Hyper has submitted
+                // their heads. Drive a fresh connection poll: HTTP/2 drains
+                // its pending stream frames, HTTP/1 its buffered response.
+                flush.store(false, Ordering::Relaxed);
+                let result = served.as_mut().poll(cx);
+                if !matches!(result, Poll::Ready(Err(_))) && flush.load(Ordering::Relaxed) {
+                    for receipt in receipts.drain(..) {
+                        receipt.flushed();
+                    }
+                }
+                result
+            }) => break,
+            () = zmux::adapter::wait_deadline(wake) => {}
         }
         let now = tokio::time::Instant::now();
         let close = if used.load(Ordering::Relaxed) {
@@ -781,11 +905,12 @@ pub async fn serve_connection_with<IO, H, HF>(
                 .idle_timeout
                 .is_some_and(|idle| activity.idle_end(idle) <= now)
         } else {
-            now >= setup_end && activity.routed.load(Ordering::Acquire) == 0
+            setup_end.is_some_and(|end| now >= end) && activity.routed.load(Ordering::Acquire) == 0
         };
         if close {
             served.as_mut().graceful_shutdown();
-            let _ = tokio::time::timeout(limit, served).await;
+            let _ =
+                zmux::adapter::while_open(zmux::adapter::wait_deadline(deadline()), served).await;
             break;
         }
     }
@@ -822,10 +947,7 @@ pub async fn route_request(
     let req = Request::from_parts(parts, body);
     let exchange = options.exchange.as_ref().filter(|x| x.matches(&path));
     match (class, exchange) {
-        (Some(RequestClass::Exchange), Some(x)) => x
-            .handle(req, peer, &options.pair_field)
-            .await
-            .map_err(|req| Unhandled::Fallback(Box::new(req))),
+        (Some(RequestClass::Exchange), Some(x)) => x.handle(req, peer, &options.pair_field).await,
         (Some(RequestClass::Bidirectional | RequestClass::Uplink | RequestClass::Downlink), _)
             if path == options.path =>
         {
@@ -932,10 +1054,121 @@ impl Drop for Active {
     }
 }
 
+type Receipt = zmux::adapter::ResponseHead;
+
+/// Only a submitted takeover or a change of driver waker needs the mutex.
+#[derive(Default)]
+struct HeadInbox {
+    queued: AtomicBool,
+    pending: std::sync::Mutex<(Vec<Receipt>, Option<std::task::Waker>)>,
+}
+
+impl HeadInbox {
+    fn submit(&self, receipt: Receipt) {
+        let wake = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.0.push(receipt);
+            self.queued.store(true, Ordering::Release);
+            pending.1.clone()
+        };
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+
+    fn receive(
+        &self,
+        cx: &Context<'_>,
+        last: &mut Option<std::task::Waker>,
+        receipts: &mut Vec<Receipt>,
+    ) {
+        let changed = last.as_ref().is_none_or(|w| !w.will_wake(cx.waker()));
+        if changed || self.queued.load(Ordering::Acquire) {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if changed {
+                *last = Some(cx.waker().clone());
+                pending.1.clone_from(last);
+            }
+            receipts.append(&mut pending.0);
+            self.queued.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Observes a transport flush performed by the connection task. An incomplete
+/// write later in the same poll invalidates an earlier intermediate flush.
+struct FlushIo<I> {
+    io: I,
+    flushed: Arc<AtomicBool>,
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for FlushIo<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for FlushIo<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.flushed.store(false, Ordering::Relaxed);
+        Pin::new(&mut self.io).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.io).poll_flush(cx);
+        self.flushed
+            .store(matches!(result, Poll::Ready(Ok(()))), Ordering::Relaxed);
+        result
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.flushed.store(false, Ordering::Relaxed);
+        Pin::new(&mut self.io).poll_write_vectored(cx, bytes)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+}
+
 /// A response body that keeps its request in progress while it lives.
 struct Tracked {
+    // Hyper consumes a successful CONNECT response by giving out its
+    // tunnel and dropping the body, without polling that body for DATA.
+    upgrade: Option<Receipt>,
+    heads: Option<Arc<HeadInbox>>,
     body: PipeBody,
     _active: Active,
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        if let (Some(sent), Some(heads)) = (self.upgrade.take(), &self.heads) {
+            heads.submit(sent);
+        }
+    }
 }
 
 impl http_body::Body for Tracked {
@@ -946,6 +1179,11 @@ impl http_body::Body for Tracked {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(heads) = self.heads.take()
+            && let Some(sent) = self.body.take_response_head()
+        {
+            heads.submit(sent);
+        }
         Pin::new(&mut self.body).poll_frame(cx)
     }
 

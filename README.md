@@ -191,6 +191,18 @@ that, with the same application error code.
 
 ## Servers, carrier choice and shaping
 
+- **Carrier handoff.** Calling `Listener::handle_pipe` moves the carrier into
+  setup, even if the future is dropped before its first poll. Await it to
+  learn when a session reaches the accept queue, a join or lane attaches,
+  or the listener takes responsibility for rejection or completes fallback.
+  A fallback that returns normally completes setup successfully, including when it
+  leaves the carrier undetached. A callback failure returns a setup error.
+  A stalled carrier and an authenticated refusal keep their admission slots
+  while the listener finishes the stall or flushes the refusal reply.
+  The session drives attached I/O and its bounded close flush after setup
+  returns or serving stops. Rust's direct `handle_lane` returns when the lane
+  is routed. Use `Pipe::closed` to wait for the carrier, lanes and attachment
+  workers to finish, or `Session::closed` to wait for session termination.
 - **Admission.** `ListenerConfig::admission` (an `Admission`) decides on
   every carrier of a `Listener`, whatever adapter took it, before anything
   is sent on it: from its first bytes or first message and its metadata
@@ -199,10 +211,34 @@ that, with the same application error code.
   `Fallback` given a `Takeover`), stalls it, or closes it
   (`AdmissionVerdict`). An HTTP upgrade (WebSocket, WebTransport) is decided
   on its request head, which may defer the decision to the carrier's first
-  message or bytes (`AdmissionVerdict::Defer`). An HTTP request carrier
-  decided on the start of its body is taken over as a carrier, the
-  full-duplex pipe of its request and response bodies; one decided on its
-  head is taken over as a request by its adapter's HTTP fallback.
+  message or bytes (`AdmissionVerdict::Defer`). On HTTP, Fallback serves the request through the
+  adapter's HTTP handler with its prefix replayed. Takeover writes the accepted
+  response head or completes the upgrade, then hands the carrier to the byte-stream
+  target. The built-in HTTP server confirms the flush. Hosts driving the HTTP
+  transport themselves call `PipeBody::response_head_flushed` after the head
+  has flushed. Admission totals and variant statistics increment `takeover` when
+  the carrier reaches the host. Without that target the stall outcome counts.
+  `More { need }` reads a longer stream prefix up to `max_peek` using the
+  original peek deadline. Label a decision with `labelled` to group its
+  verdict in `Listener::variant_stats()`. With `with_fallback_on_peek_timeout(true)`,
+  an incomplete stream prefix is replayed to the byte-stream target or
+  stalled when none is configured. HTTP request bodies, message-framed
+  carriers and late decision callbacks still close on timeout. Quinn sends
+  its first bidirectional stream to `ListenerConfig::fallback` from either
+  serving entry point.
+- **Pipe removal.** `PipeError::is_gone()` and `JoinError::is_gone()` include a local
+  abort. Its specific reason remains `PipeFailure::Aborted` or `JoinError::PipeAborted`.
+- **Join outcomes.** Set `Config::join_outcome` to observe every authorized inbound
+  join and every outbound carrier given to a join. The callback receives the
+  session, pipe ID and an optional `JoinError`. Failures before ID allocation
+  report `PipeId::UNASSIGNED` (`1 << 62`). Successful joins
+  release their queued pipe events after the callback completes. An outbound
+  callback waits for peer attachment even with `return_on_reply`.
+- **Draining a listener.** `drain(reason)` refuses subsequent bootstrap handshakes
+  with transport `CONNECTION_REFUSED` and the reason bytes. A later drain
+  replaces the reason. `undrain()` resumes accepting new sessions. Joins,
+  resumptions and lanes remain available. Graceful shutdown drains permanently.
+
 - **Takeover.** The fallback's future runs on a task of its own and owns
   the carrier until it completes: what it did not take is dropped then,
   and the adapter closes what it holds of the carrier (a QUIC connection,

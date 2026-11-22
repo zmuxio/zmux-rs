@@ -259,7 +259,7 @@ fn multipath() -> Config {
 }
 
 /// With joins, the session is established on the exchange carrier and
-/// moves to the split kind (two pipes), which the half-duplex path passes;
+/// moves to the split kind (one pipe over two HTTP requests), which the half-duplex path passes;
 /// the exchange pipe is retired.
 #[test]
 fn auto_with_joins_moves_off_the_exchange() {
@@ -273,22 +273,13 @@ fn auto_with_joins_moves_off_the_exchange() {
                 .await
                 .unwrap();
             assert_eq!(client.stats().carrier, Some(CarrierKind::Exchange));
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            while client.stats().carrier != Some(CarrierKind::Split) {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "no switch: {:?}",
-                    tries(&client)
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            while client.pipes().len() != 2 {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "exchange not retired"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            let bootstrap = client.pipe(zmux::PipeId::new(0)).unwrap();
+            let _ = bootstrap.closed().await;
+            assert_eq!(client.stats().carrier, Some(CarrierKind::Split));
+            let pipes = client.pipe_stats();
+            assert_eq!(pipes.len(), 1, "{pipes:?}");
+            assert_eq!(pipes[0].carrier, Some(CarrierKind::Split));
+            assert!(pipes[0].peer_attached);
             works(&client).await;
             client.close().await;
         })

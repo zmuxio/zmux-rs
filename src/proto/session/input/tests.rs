@@ -490,3 +490,199 @@ fn a_granted_datagram_the_queue_refuses_is_refunded() {
     assert_eq!(c.stats.datagrams_dropped_recv, 1);
     assert_eq!(c.recv_datagram(c.now).unwrap(), None);
 }
+
+#[test]
+fn pipe_snapshot_keeps_epoch_and_distinguishes_missing_lane_positions() {
+    let (mut a, _, now) = pair();
+    let period = a.config.epoch_policy.period.unwrap();
+    let initial = a.pipe_info(PipeId(0)).unwrap();
+    assert_eq!(initial.epoch, Some(0));
+    assert_eq!(initial.replace_by, now.checked_add(period * 2));
+    assert_eq!(initial.lanes, []);
+    assert!(a.pipe_info(PipeId(99)).is_none());
+
+    let outbound = a.out_mut(0).unwrap();
+    let sent_lane = outbound.request_lane();
+    assert!(outbound.lane_attached(sent_lane, Framing::ByteStream, now));
+    let inbound_lane = (1 << 40) + 7;
+    a.inp_mut(0)
+        .unwrap()
+        .add_lane(inbound_lane, Framing::ByteStream, 65535, now)
+        .unwrap();
+    let snapshot = a.pipe_info(PipeId(0)).unwrap();
+    let sent = &snapshot.lanes[1];
+    assert_eq!(sent.lane.0, sent_lane);
+    assert_eq!(
+        (
+            sent.position_sent,
+            sent.position_acked,
+            sent.position_received
+        ),
+        (Some(0), Some(0), None)
+    );
+    let received = &snapshot.lanes[2];
+    assert_eq!(received.lane.0, inbound_lane);
+    assert_eq!(
+        (
+            received.position_sent,
+            received.position_acked,
+            received.position_received
+        ),
+        (None, None, Some(0))
+    );
+
+    let outbound = a.out_mut(0).unwrap();
+    let amount = 1 << 40;
+    outbound.batch_sent(sent_lane, amount, amount, None);
+    let no_ack = super::super::lanes::lane_infos(Some(outbound), None, false);
+    assert_eq!(no_ack[1].position_acked, None);
+    let later = a.pipe_info(PipeId(0)).unwrap();
+    assert_eq!(later.lanes[1].position_sent, Some(amount));
+    assert_eq!(later.bytes_sent - snapshot.bytes_sent, amount);
+    assert_eq!(later.records_sent - snapshot.records_sent, amount);
+}
+
+#[test]
+fn idle_timer_uses_the_configured_duration_and_never_fires_on_clock_overflow() {
+    let now = Instant::now();
+    let mut peer = config();
+    peer.max_idle_timeout = None;
+    for idle in [Duration::from_micros(1001), Duration::MAX] {
+        let mut local = config();
+        local.max_idle_timeout = Some(idle);
+        let mut a = SessionCore::new(local, Role::Client, None, now).unwrap();
+        let mut b = SessionCore::new(peer.clone(), Role::Server, None, now).unwrap();
+        a.attach_pipe(PipeId(0), Framing::ByteStream, now);
+        b.attach_pipe(PipeId(0), Framing::ByteStream, now);
+        pump(&mut a, &mut b, now);
+        assert_eq!(a.idle_timeout(), Some(idle));
+        assert_eq!(a.idle_deadline, now.checked_add(idle));
+        a.tick(now + Duration::from_secs(1));
+        if now.checked_add(idle).is_none() {
+            assert!(a.error().is_none());
+        }
+    }
+}
+
+#[test]
+fn session_errors_keep_close_data_and_concrete_pipe_sources() {
+    use crate::{DetailKey, PipeFailure, SessionError, proto::TransportErrorCode as Code};
+    use std::error::Error as _;
+
+    let (_, mut b, now) = pair();
+    b.on_connection_close(
+        crate::proto::frame::ConnectionClose {
+            application: false,
+            error_code: Code::PROTOCOL_VIOLATION.0,
+            frame_type: 1 << 40,
+            reason: b"broken\nlimit=1099511627776 offset=1",
+        },
+        now,
+    );
+    assert_eq!(
+        b.error(),
+        Some(&SessionError::TransportClosed {
+            code: Code::PROTOCOL_VIOLATION,
+            frame_type: 1 << 40,
+            reason: Bytes::from_static(b"broken"),
+            details: vec![(DetailKey::Limit, 1 << 40), (DetailKey::Offset, 1)],
+            remote: true,
+        })
+    );
+
+    let (_, mut b, now) = pair();
+    b.on_connection_close(
+        crate::proto::frame::ConnectionClose {
+            application: false,
+            error_code: Code::ZMUX_RESUME_FAILED.0,
+            frame_type: 0,
+            reason: b"resume mismatch",
+        },
+        now,
+    );
+    assert_eq!(
+        b.error(),
+        Some(&SessionError::ResumeFailed {
+            reason: Bytes::from_static(b"resume mismatch"),
+            remote: true,
+        })
+    );
+    let last = PipeFailure::JoinRefused;
+    for end in [
+        SessionError::ResumeTimeout { last: Some(last) },
+        SessionError::PipesLost { last: Some(last) },
+    ] {
+        assert_eq!(
+            end.source()
+                .and_then(|source| source.downcast_ref::<PipeFailure>()),
+            Some(&last)
+        );
+    }
+    assert!(SessionError::PipesLost { last: None }.source().is_none());
+}
+
+#[test]
+fn stream_reset_and_stop_preserve_their_codes_and_reliable_size() {
+    use crate::{StreamError, VarInt};
+    let (mut a, mut b, now) = pair();
+    let mut data = preamble();
+    let base = data.len() as u64;
+    data.extend_from_slice(b"abc");
+    b.on_stream(stream(0, &data), TY, now).unwrap();
+    b.on_reset(UNI, 42, base + 3, Some(base + 2), TY, now)
+        .unwrap();
+    let recv = key(&b, UNI);
+    let mut buf = [0; 3];
+    assert_eq!(b.read(recv, &mut buf).unwrap().unwrap().0, 2);
+    assert_eq!(
+        b.read(recv, &mut buf),
+        Err(StreamError::Reset {
+            code: VarInt::from_u32(42),
+            reliable_size: 2
+        })
+    );
+
+    let send = a.open(Dir::Uni).unwrap();
+    a.write(send, b"open").unwrap();
+    pump(&mut a, &mut b, now);
+    let id = a.stream_id(send).unwrap();
+    a.on_stop_sending(
+        crate::proto::frame::StopSending {
+            stream_id: id,
+            error_code: 43,
+        },
+        TY,
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        a.write(send, b"x"),
+        Err(StreamError::Stopped(VarInt::from_u32(43)))
+    );
+}
+
+#[test]
+fn resume_grace_uses_the_configured_duration_before_the_peer_cap() {
+    let now = Instant::now();
+    let mut local = config();
+    local.resume_timeout = Some(Duration::from_micros(1001));
+    let mut peer = config();
+    peer.locator = b"server".to_vec();
+    peer.resume_timeout = Some(Duration::MAX);
+    let mut a = SessionCore::new(local, Role::Client, None, now).unwrap();
+    let mut b = SessionCore::new(peer, Role::Server, None, now).unwrap();
+    a.attach_pipe(PipeId(0), Framing::ByteStream, now);
+    b.attach_pipe(PipeId(0), Framing::ByteStream, now);
+    pump(&mut a, &mut b, now);
+    assert!(a.features.resume && b.features.resume);
+    a.suspend(now);
+    b.suspend(now);
+    assert_eq!(
+        a.mp.as_ref().unwrap().suspension().deadline(),
+        now.checked_add(Duration::from_micros(1001))
+    );
+    assert_eq!(
+        b.mp.as_ref().unwrap().suspension().deadline(),
+        now.checked_add(Duration::from_millis(2))
+    );
+}

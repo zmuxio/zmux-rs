@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::Sleep;
 
+use super::attachment::Attachment;
 use super::engine::{self, Calls, Outbound, Progress};
 use super::handle::{self, CarrierInfo, Driver, Lock, Shared, State, Written};
 use super::lanes::{CarrierConnId, ConnClaim, LaneOpener, LaneWriter};
@@ -27,8 +28,7 @@ use super::stream_pipe::{StreamReader, StreamWriter, claim_carrier, release_carr
 use super::sync::TryMutexGuard;
 use super::tcp::{Probe, TcpSocket};
 use super::through::{Carrier, Outbox, Polled, ReadPath, WritePath};
-use super::unsent::{RetransmittedQuery, Unsent, UnsentQuery};
-use super::wait::PipeDone;
+use super::unsent::{Unsent, UnsentQuery};
 use super::{Event, IDLE_READ, IDLE_RELEASE, MAX_SLICES, READ_BUFFER};
 use crate::error::{ConnectError, ReadExactError, ReadToEndError};
 use crate::proto::VarInt;
@@ -377,9 +377,7 @@ pub struct PipeIo {
     pub(crate) socket: Option<TcpSocket>,
     /// The carrier's unsent count ([`PipeIo::with_unsent`]).
     pub(crate) unsent: Option<Unsent>,
-    /// The carrier's retransmission count ([`PipeIo::with_retransmitted`]).
-    /// Boxed twice to keep the carrier small.
-    pub(crate) retransmitted: Option<Box<Unsent>>,
+    carrier_stats: Option<Box<super::carrier_stats::Source>>,
     /// The padding of a handshake run on the carrier before this pipe
     /// ([`PipeIo::with_handshake_padding`]).
     pub(crate) handshake_padding: u64,
@@ -427,12 +425,13 @@ pub struct PipeIo {
     pub(crate) close_code: Option<TellCloseCode>,
     /// Run after the carrier's graceful end ([`PipeIo::with_drain`]).
     pub(crate) drain: Option<Box<Drain>>,
+    pub(crate) attachment: Option<Arc<Attachment>>,
 }
 
 /// How long a [`PipeIo::with_drain`] future may run at most when the
 /// adapter has no timeout of its own that fits: the upper bound of a
 /// session's linger timeout, which waits for the peer's close the same way.
-pub const DRAIN_LIMIT: Duration = Duration::from_secs(2);
+pub const DRAIN_LIMIT: Duration = super::DRAIN_LIMIT;
 
 /// The rounds a session task makes in one poll before it yields to the
 /// other tasks of its worker.
@@ -441,11 +440,12 @@ const TASK_ROUNDS: u32 = 64;
 /// Runs `drain` on the current tokio runtime for at most `limit`: dropped
 /// at the limit, or with the runtime when it shuts down earlier; dropped
 /// at once outside a runtime. What [`PipeIo::with_drain`] does with its
-/// future, for an adapter's own carrier that has no such hook (a lane).
+/// future. A lane uses its own registered drain.
 pub fn spawn_drain(drain: impl Future<Output = ()> + Send + 'static, limit: Duration) {
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
         rt.spawn(async move {
-            let _ = tokio::time::timeout(limit, drain).await;
+            let _ =
+                tokio::time::timeout(limit, crate::proto::decision::host_future(|| drain)).await;
         });
     }
 }
@@ -482,6 +482,27 @@ pub(crate) struct Drain {
 }
 
 impl Drain {
+    pub(crate) fn add(
+        slot: &mut Option<Box<Self>>,
+        future: DrainFuture,
+        limit: Duration,
+        lease: &Arc<Attachment>,
+    ) {
+        let worker = lease.worker();
+        let next = Self {
+            future: Some(Box::pin(async move {
+                let _worker = worker;
+                future.await;
+            })),
+            limit,
+            armed: false,
+        };
+        *slot = Some(Box::new(match slot.take() {
+            Some(first) => Self::join(*first, next),
+            None => next,
+        }));
+    }
+
     /// `a` and `b` together, each within its own limit.
     fn join(a: Drain, b: Drain) -> Drain {
         let limit = a.limit.max(b.limit);
@@ -552,7 +573,7 @@ impl TellCloseCode {
 impl Drop for TellCloseCode {
     fn drop(&mut self) {
         if let Some(f) = self.0.take() {
-            f(self.1);
+            crate::proto::decision::host(|| f(self.1));
         }
     }
 }
@@ -623,10 +644,6 @@ impl PipeIo {
         #[cfg(any(unix, windows))]
         {
             io.unsent = socket.as_ref().and_then(TcpSocket::unsent_query);
-            io.retransmitted = socket
-                .as_ref()
-                .and_then(TcpSocket::retransmitted_query)
-                .map(Box::new);
             io.socket = socket;
         }
         io.init_lowat();
@@ -666,12 +683,6 @@ impl PipeIo {
         if self.unsent.is_none() {
             self.unsent = socket.as_ref().and_then(TcpSocket::unsent_query);
         }
-        if self.retransmitted.is_none() {
-            self.retransmitted = socket
-                .as_ref()
-                .and_then(TcpSocket::retransmitted_query)
-                .map(Box::new);
-        }
         self.socket = socket;
         self.init_lowat();
         self
@@ -704,23 +715,29 @@ impl PipeIo {
         self
     }
 
-    /// The carrier's retransmission count, an optional capability:
-    /// `retransmitted` returns the bytes the carrier itself has
-    /// retransmitted so far (`tcpi_bytes_retrans`, a QUIC connection's
-    /// lost bytes), `None` while it cannot tell. The driver calls it on
-    /// the pipe's sending half at most once a second, outside the session
-    /// lock, so it must be cheap and must not block. For pipes that share
-    /// one carrier connection it is that connection's count. It feeds only
-    /// [`crate::PipeStats::bytes_retransmitted`] and
-    /// [`crate::PipeStats::loss_rate`]. [`PipeIo::from_tcp`] and
-    /// [`PipeIo::with_tcp_socket`] install the socket's query where the
-    /// platform has one (Linux, Android, Apple platforms, Windows).
+    /// Supplies the connection's paired counters for on-demand pipe statistics.
     #[must_use]
-    pub fn with_retransmitted(
+    pub fn with_carrier_counters(
         mut self,
-        retransmitted: impl Fn() -> Option<u64> + Send + Sync + 'static,
+        provider: crate::CarrierSource,
+        query: impl Fn() -> Option<crate::CarrierCounts> + Send + Sync + 'static,
     ) -> Self {
-        self.retransmitted = Some(Box::new(Box::new(retransmitted)));
+        self.carrier_stats = Some(Box::new(super::carrier_stats::Source::new(provider, query)));
+        self
+    }
+
+    /// Associates a counter source with a transport's connection ID. Its
+    /// owner must keep the connection live while it can supply counters.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_carrier_counter_identity<K: 'static>(
+        mut self,
+        key: usize,
+        owner: CarrierConnId,
+    ) -> Self {
+        if let Some(source) = &mut self.carrier_stats {
+            source.set_transport_identity::<K>(key, owner);
+        }
         self
     }
 
@@ -793,7 +810,7 @@ impl PipeIo {
             prefix: Vec::new(),
             socket: None,
             unsent: None,
-            retransmitted: None,
+            carrier_stats: None,
             write_overhead: 0,
             handshake_padding: 0,
             admitted: None,
@@ -807,6 +824,7 @@ impl PipeIo {
             split_bootstrap: false,
             close_code: None,
             drain: None,
+            attachment: None,
             max_record: None,
             secure: false,
             split: false,
@@ -878,7 +896,7 @@ impl PipeIo {
             prefix: Vec::new(),
             socket: None,
             unsent: None,
-            retransmitted: None,
+            carrier_stats: None,
             write_overhead: 0,
             handshake_padding: 0,
             admitted: None,
@@ -897,6 +915,7 @@ impl PipeIo {
             split_bootstrap: false,
             close_code: None,
             drain: None,
+            attachment: None,
             max_record: None,
             secure: false,
             split: false,
@@ -1150,14 +1169,20 @@ impl PipeIo {
 
     pub(crate) fn paired(mut up: PipeIo, mut down: PipeIo) -> PipeIo {
         up.split = true;
+        if let Some(other) = down.attachment.take() {
+            match &up.attachment {
+                Some(lease) => lease.adopt(Some(&other)),
+                None => up.attachment = Some(other),
+            }
+        }
         // Bound's contract holds for the carrier only if both halves declare it.
         up.secure &= down.secure;
         up.reports_failure &= down.reports_failure;
-        // The sending half's own: its overhead and retransmissions.
+        // The sending half's own: its overhead and unsent query.
         if up.writer.is_none() {
             up.write_overhead = down.write_overhead;
             up.handshake_padding += down.handshake_padding;
-            up.retransmitted = down.retransmitted.take();
+            up.carrier_stats = down.carrier_stats.take().or(up.carrier_stats);
             up.unsent = down.unsent.take();
             up.max_record = down.max_record;
         }
@@ -1513,15 +1538,12 @@ impl PipeIo {
         drain: impl Future<Output = ()> + Send + 'static,
         limit: Duration,
     ) -> Self {
-        let next = Drain {
-            future: Some(Box::pin(drain)),
+        Drain::add(
+            &mut self.drain,
+            Box::pin(drain),
             limit,
-            armed: false,
-        };
-        self.drain = Some(Box::new(match self.drain.take() {
-            Some(first) => Drain::join(*first, next),
-            None => next,
-        }));
+            self.attachment.get_or_insert_default(),
+        );
         self
     }
 
@@ -1635,14 +1657,13 @@ pub enum Tokio {}
     reason = "independent state flags of the session task"
 )]
 pub struct Io {
+    runtime: tokio::runtime::Handle,
     /// The session task, when it waits.
     task: Option<Waker>,
     /// Pipes for the session task to take over.
     new_pipes: Vec<PipeTask>,
     /// Carrier halves the core asked to close: pipe, half, abort.
     close_halves: Vec<(u64, PipeHalf, bool)>,
-    /// Resolves when the bootstrap pipe is closed.
-    bootstrap_done: Arc<PipeDone>,
     /// The session task polls its pipes again before it waits: an
     /// application read or write left a side to it (R4, W2 and H2 in
     /// `super::through`).
@@ -1727,6 +1748,7 @@ pub(crate) struct NewLane {
     partial: bool,
     read: Option<(Reader, Vec<u8>)>,
     write: Option<LaneWriter>,
+    attachment: Option<Arc<Attachment>>,
 }
 
 /// The bootstrap pipe's sides, for the application's fast paths. Weak: the
@@ -1852,6 +1874,24 @@ impl Driver for Tokio {
     type Timeout = ();
     type Dial = Dial;
 
+    fn join_session(s: Session) -> crate::JoinSession {
+        crate::JoinSession::Tokio(s)
+    }
+
+    fn spawn_join(shared: &Shared<Self>, f: impl Future<Output = ()> + Send + 'static) {
+        let runtime = shared.lock().io.runtime.clone();
+        runtime.spawn(f);
+    }
+
+    async fn join_callback(
+        call: impl FnOnce() -> crate::Decision<()> + Send + 'static,
+    ) -> Option<crate::Decision<()>> {
+        tokio::task::spawn_blocking(move || crate::Decision::catch(call))
+            .await
+            .ok()
+            .flatten()
+    }
+
     fn now() -> Instant {
         now()
     }
@@ -1882,6 +1922,7 @@ impl Driver for Tokio {
     }
 
     fn session_closed(state: &mut State<Self>) {
+        state.io.account = None;
         release_lanes(state);
     }
 
@@ -1984,6 +2025,7 @@ impl Driver for Tokio {
 
     fn carrier_info(carrier: &mut PipeIo) -> CarrierInfo {
         CarrierInfo {
+            attachment: carrier.attachment().clone(),
             inbound: carrier.reader.is_some().then_some(carrier.framing),
             outbound: carrier.writer.is_some().then_some(carrier.framing),
             // Also kept: pipe 0's reader reads it (`PipeTask::new`).
@@ -2003,6 +2045,10 @@ impl Driver for Tokio {
         }
     }
 
+    fn register_carrier_stats(carrier: &mut PipeIo) {
+        carrier.register_carrier_stats();
+    }
+
     fn check_carrier(shared: &Arc<Shared<Self>>, carrier: &PipeIo) -> Result<(), PipeError> {
         if carrier.split_bootstrap {
             // It makes pipe pair 0 only; a join takes `paired_join`.
@@ -2016,7 +2062,10 @@ impl Driver for Tokio {
 
     fn attach(shared: &Arc<Shared<Self>>, id: u64, carrier: PipeIo) -> Result<(), PipeError> {
         let rt = tokio::runtime::Handle::try_current().map_err(|_| PipeError::InvalidArgument)?;
-        rt.spawn(join_carrier(shared.clone(), PipeId(id), carrier));
+        rt.spawn(Attachment::during(
+            carrier.attachment.clone(),
+            join_carrier(shared.clone(), PipeId(id), carrier),
+        ));
         Ok(())
     }
 
@@ -2045,10 +2094,8 @@ impl Driver for Tokio {
                 })
                 .await
             };
-            drop(shared);
-            if let Some(Ok(Ok(pipe))) = pipe
-                && let Some(session) = session.upgrade()
-            {
+            if let Some(Ok(Ok(pipe))) = pipe {
+                let session = Session::after_dial(shared);
                 // Started only: waiting would keep the session in use, and
                 // a rejoin must not wait for a PIPE_ACK that only the
                 // direction it restores could carry. The core times the
@@ -2095,15 +2142,16 @@ impl Shared<Tokio> {
         mut io: PipeIo,
     ) -> LaneAccept {
         let mut st = self.lock();
-        let ours = st.io.lanes.as_ref().is_some_and(|l| {
+        let claim = st.io.lanes.as_ref().and_then(|l| {
             l.conns
                 .iter()
-                .any(|(p, c)| *p == at.pipe.0 && c.conn() == conn)
+                .find(|(p, c)| *p == at.pipe.0 && c.conn() == conn)
         });
-        if st.io.task_ended || !ours {
+        let Some((_, claim)) = claim.filter(|_| !st.io.task_ended) else {
             drop(st);
             return LaneAccept::Refused;
-        }
+        };
+        let lease = claim.attachment.clone();
         let framing = io.framing;
         let verdict = st.core.accept_lane(at, framing, now());
         if verdict == LaneAccept::Accepted
@@ -2113,6 +2161,7 @@ impl Shared<Tokio> {
             st.io.lanes.get_or_insert_default().new.push(NewLane {
                 at,
                 framing,
+                attachment: lease.clone(),
                 partial: io.partial_reads,
                 read: Some((reader, prefix)),
                 write: None,
@@ -2121,7 +2170,10 @@ impl Shared<Tokio> {
         st.after_command();
         drop(st);
         if verdict == LaneAccept::Accepted {
-            super::lanes::finish_reverse(io.writer.take());
+            if let Some(parent) = &lease {
+                io.adopt_attachment(parent.clone());
+            }
+            io.release_unused(true, false);
         }
         verdict
     }
@@ -2184,21 +2236,7 @@ async fn join_carrier(shared: Arc<Shared<Tokio>>, id: PipeId, mut pipe: PipeIo) 
         let Some((inbound, outbound)) = dial.limits(io.max_record, io.write_overhead) else {
             return;
         };
-        // Bounded on its own: the core's handshake timer ended with the
-        // Confirm.
-        let deadline = dial.deadline().map(tokio::time::Instant::from_std);
-        let ended = if let Some(d) = deadline {
-            tokio::time::timeout_at(d, io.end_unused(inbound, outbound))
-                .await
-                .is_ok()
-        } else {
-            io.end_unused(inbound, outbound).await;
-            true
-        };
-        if !ended {
-            dial.failed(io::ErrorKind::TimedOut);
-            return;
-        }
+        io.release_unused(inbound, outbound);
         if claim_carrier(shared_ref, id.0, io.outer.take()).is_err()
             || shared_ref.attach_task(id.0, io).is_err()
         {
@@ -2211,6 +2249,75 @@ async fn join_carrier(shared: Arc<Shared<Tokio>>, id: PipeId, mut pipe: PipeIo) 
 }
 
 impl PipeIo {
+    /// Registers a host worker of this carrier. Drop the returned guard after
+    /// the worker releases its transport, including on failure. The worker
+    /// must observe the carrier halves' release independently of pipe closure.
+    pub fn worker_guard(&mut self) -> impl Send + Sync + 'static + use<> {
+        self.attachment().worker()
+    }
+
+    pub(crate) fn adopt_attachment(&mut self, lease: Arc<Attachment>) {
+        lease.adopt(self.attachment.as_ref());
+        self.attachment = Some(lease);
+    }
+
+    pub(crate) fn register_carrier_stats(&mut self) {
+        let mut source = self
+            .carrier_stats
+            .take()
+            .map(|source| *source)
+            .or_else(|| self.socket.as_ref().map(TcpSocket::counter_source))
+            .unwrap_or_default();
+        source.dedicated |= self.socket.is_some();
+        source.set_connection(self.conn().cloned());
+        self.attachment().register_sample(source, now);
+    }
+
+    pub(crate) fn attachment(&mut self) -> &Arc<Attachment> {
+        self.attachment.get_or_insert_default()
+    }
+
+    /// A confirmed inbound join transfers its used directions immediately.
+    pub(crate) fn release_unused(&mut self, inbound: bool, outbound: bool) {
+        if !inbound {
+            self.prefix.clear();
+            if let Some(reader) = self.reader.take() {
+                let lease = self.attachment.clone();
+                tokio::task::spawn_blocking(move || {
+                    drop(reader);
+                    drop(lease);
+                });
+            }
+        }
+        if !outbound && let Some(mut writer) = self.writer.take() {
+            // The drain still belongs to the pipe. It runs after both its
+            // retirement and successful shutdown of the detached writer.
+            let flushed = self.drain.as_mut().and_then(|drain| {
+                let future = drain.future.take()?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                drain.armed = true;
+                drain.future = Some(Box::pin(async move {
+                    if rx.await.is_ok() {
+                        future.await;
+                    }
+                }));
+                Some(tx)
+            });
+            spawn_drain(
+                Attachment::during(self.attachment.clone(), async move {
+                    if std::future::poll_fn(|cx| writer.poll_shutdown(cx))
+                        .await
+                        .is_ok()
+                        && let Some(tx) = flushed
+                    {
+                        let _ = tx.send(());
+                    }
+                }),
+                DRAIN_LIMIT,
+            );
+        }
+    }
+
     /// Ends what the attachment's direction does not use after the handshake.
     pub(crate) async fn end_unused(&mut self, inbound: bool, outbound: bool) {
         if !inbound {
@@ -2239,35 +2346,19 @@ impl Shared<Tokio> {
         st.core.set_pipe_write_overhead(p, overhead);
         Ok(())
     }
-
-    /// Gives up a pipe whose carrier could not be attached (the session
-    /// is ending): it fails.
-    pub(crate) fn forget_pipe(&self, p: PipeId) {
-        let mut st = self.lock();
-        let _ = st.core.remove_pipe(p, false, now());
-        st.after_command();
-    }
-
-    /// Drops a pipe a join just attached, before it got its carrier, for a
-    /// carrier loop that formed meanwhile: `PIPE_ABANDON` with
-    /// `ZMUX_PIPE_RESOURCE_LIMIT`.
-    pub(crate) fn drop_pipe(&self, p: PipeId) {
-        let mut st = self.lock();
-        st.core.abandon_pipe_for_limit(p, now());
-        st.after_command();
-    }
 }
 
 impl Shared<Tokio> {
     /// Creates the core and spawns the session task for a bootstrap pipe.
-    pub(crate) fn create(
+    pub(super) fn create(
         mut pipe: PipeIo,
         config: Arc<Config>,
         role: Role,
         transport: Option<Role>,
         locator: Option<&[u8]>,
-        before_start: impl FnOnce(&Arc<Self>),
+        before_start: impl FnOnce(&Arc<Self>) -> Option<Weak<super::listen::ListenShared>>,
     ) -> Result<Arc<Self>, ConnectError> {
+        pipe.register_carrier_stats();
         let carrier = Tokio::carrier_info(&mut pipe);
         let low_water = pipe.low_water;
         let lanes = pipe.lanes_offered();
@@ -2289,10 +2380,11 @@ impl Shared<Tokio> {
         }
         let mut first = PipeTask::new(PipeId(0), pipe, super::NOTSENT_LOWAT_SINGLE);
         let io = Io {
+            runtime: tokio::runtime::Handle::current(),
             task: None,
             new_pipes: Vec::new(),
             close_halves: Vec::new(),
-            bootstrap_done: first.done.clone(),
+
             repoll: false,
             task_ended: false,
             released: false,
@@ -2301,7 +2393,7 @@ impl Shared<Tokio> {
             account: None,
             lanes: conn.clone().map(|c| {
                 Box::new(IoLanes {
-                    conns: vec![(0, ConnClaim::new(c))],
+                    conns: vec![(0, ConnClaim::new(c, Some(first.attachment.clone())))],
                     ..IoLanes::default()
                 })
             }),
@@ -2351,26 +2443,36 @@ impl Shared<Tokio> {
         let shared = Arc::new(Shared::new(state, through));
         // The session accepts the peer's lanes: the streams that carry them
         // find it by its Lane Key.
-        if let Some(key) = lane_key {
-            super::lanes::register(&shared, key);
-        }
+
         // A new session: no carrier can run over it yet.
         let _ = claim_carrier(&shared, 0, outer);
         // Publish listener routing and accounting before bootstrap parameters
         // can make the locator usable by a peer on another carrier.
-        before_start(&shared);
+        let listener = before_start(&shared);
+        if let Some(key) = lane_key {
+            super::lanes::register(&shared, key, listener);
+        }
         // Registered before the task writes the parameters that announce
         // the channel.
         if let Some(ch) = channel {
-            let receiving = super::channel::attach(&shared, PipeId(0), &ch);
+            let receiving =
+                super::channel::attach(&shared, PipeId(0), &ch, Some(first.attachment.clone()));
             super::channel::start(&shared, PipeId(0), ch, receiving);
         }
+        let early = early.map(|verdict| {
+            (
+                verdict,
+                first.attachment.clone(),
+                first.attachment.retirement().clone(),
+            )
+        });
         tokio::spawn(Task::new(shared.clone(), first));
-        if let Some((settled, done, applied)) = early {
+        if let Some(((settled, done, applied), lease, retiring)) = early {
             let weak = Arc::downgrade(&shared);
             let ended = shared.clone();
             tokio::spawn(async move {
                 // Dropped last, whichever way this ends: the first bytes go on.
+                let _lease = lease;
                 let _applied = applied;
                 let verdict = async move {
                     match (settled, done) {
@@ -2388,7 +2490,10 @@ impl Shared<Tokio> {
                     super::wait::List::State,
                     |st: &mut State<Tokio>| st.core.error().map(|_| ()),
                 );
-                let Some(Some(accepted)) = super::sealed::until(session_end, verdict).await else {
+                let stopped = async {
+                    let _ = super::hooks::first(session_end, retiring.wait()).await;
+                };
+                let Some(Some(accepted)) = super::sealed::until(stopped, verdict).await else {
                     return;
                 };
                 drop(ended);
@@ -2406,21 +2511,10 @@ impl Shared<Tokio> {
         Ok(shared)
     }
 
-    /// The handle that resolves when the bootstrap pipe is closed.
-    pub(crate) fn lock_pipe_done(&self, id: u64) -> Option<Arc<PipeDone>> {
-        (id == 0).then(|| self.lock().io.bootstrap_done.clone())
-    }
-
     /// Hands the carrier of an added pipe to the session task as pipe `id`
-    /// (`Done` resolves when the task has closed it). A session that is
-    /// CLOSING or CLOSED takes no new pipe: the core forgets the pipe, the
-    /// carrier is closed after the
-    /// lock and nothing of it is kept.
-    pub(crate) fn attach_task(
-        self: &Arc<Self>,
-        id: u64,
-        mut io: PipeIo,
-    ) -> Result<Arc<PipeDone>, PipeError> {
+    /// at handoff. A closing or closed session refuses the pipe and
+    /// releases the carrier outside the session lock.
+    pub(crate) fn attach_task(self: &Arc<Self>, id: u64, mut io: PipeIo) -> Result<(), PipeError> {
         // Pipes are added to multipath sessions only.
         if let Some(s) = &io.socket {
             s.set_notsent_lowat(super::NOTSENT_LOWAT_MULTIPATH);
@@ -2435,13 +2529,12 @@ impl Shared<Tokio> {
             .as_ref()
             .map(|c| (c.channel_id(), c.max_datagram_size()));
         let task = PipeTask::new(PipeId(id), io, super::NOTSENT_LOWAT_MULTIPATH);
-        let done = task.done.clone();
         // Registered before the pipe's task can announce the channel;
         // dropped with a refused pipe.
         let receiving = channel
             .as_ref()
             .filter(|_| self.lock().core.config().enable_datagrams)
-            .map(|ch| super::channel::attach(self, PipeId(id), ch));
+            .map(|ch| super::channel::attach(self, PipeId(id), ch, Some(task.attachment.clone())));
         let mut st = self.lock();
         // The session or the attachment may have ended while the handshake's last message
         // was written.
@@ -2456,7 +2549,7 @@ impl Shared<Tokio> {
                 .cloned()
                 .unwrap_or(SessionError::PipesLost { last: None });
             let s = &mut *st;
-            task.done.finish_into(&mut s.wakes);
+            task.attachment.retire(&mut s.wakes);
             s.deferred.push(task);
             s.after_command();
             drop(st);
@@ -2473,7 +2566,8 @@ impl Shared<Tokio> {
         if let Some(c) = conn {
             let l = st.io.lanes.get_or_insert_default();
             l.conns.retain(|(p, _)| *p != id);
-            l.conns.push((id, ConnClaim::new(c)));
+            l.conns
+                .push((id, ConnClaim::new(c, Some(task.attachment.clone()))));
         }
         st.io.through.push(Through {
             id: PipeId(id),
@@ -2486,7 +2580,7 @@ impl Shared<Tokio> {
         if let (Some(ch), Some(r)) = (channel, receiving) {
             super::channel::start(self, PipeId(id), ch, r);
         }
-        Ok(done)
+        Ok(())
     }
 }
 // ---- the session task ------------------------------------------------------------
@@ -2516,6 +2610,7 @@ pub(crate) struct WriteSide {
     needs_flush: bool,
     /// The last write found the carrier full (reported to the core).
     blocked: bool,
+    _lease: Option<Arc<Attachment>>,
 }
 
 impl WriteSide {
@@ -2693,6 +2788,7 @@ pub(crate) struct ReadSide {
     /// (messages, a stream's chunks, a TLS layer's records): after a read
     /// that returned data, only another read tells whether more is held.
     partial: bool,
+    lease: Option<Arc<Attachment>>,
 }
 
 /// Reads a round of a carrier whose reads may return less than it holds
@@ -2795,6 +2891,7 @@ impl ReadSide {
             streak: 0,
             filled: false,
             left_more: false,
+            lease: None,
             partial,
         }
     }
@@ -3193,7 +3290,6 @@ pub(crate) struct PipeTask {
     abort: Option<Box<dyn FnOnce() + Send>>,
     /// The last write.
     active: Instant,
-    done: Arc<PipeDone>,
     /// The read side was busy this round (H1 in `super::through`).
     read_skipped: bool,
     /// The write side was busy this round.
@@ -3216,16 +3312,16 @@ pub(crate) struct PipeTask {
     /// The carrier's [`PipeIo::with_drain`] future, armed by a graceful
     /// end of the sending half; dropped after the halves too.
     drain: Option<Box<Drain>>,
+    attachment: Arc<Attachment>,
     _live: Live,
 }
 
 /// The queries of a carrier that answers them (a TCP socket, a layer that
-/// counts its unsent or retransmitted bytes).
+/// counts its unsent bytes).
 #[derive(Default)]
 struct PipeQueries {
     probe: Option<Probe>,
     unsent: Option<UnsentQuery>,
-    retransmitted: Option<RetransmittedQuery>,
     /// The carrier has a low-water mark: a carrier that refuses bytes may
     /// hold up to the mark plus the last write unsent.
     low_water: bool,
@@ -3254,6 +3350,7 @@ struct LaneTask {
     /// The unused receiving part of an outbound lane's bidirectional
     /// stream, kept with it.
     keep: Option<StreamReader>,
+    drain: Option<Box<Drain>>,
     /// Its count among the lanes on an outer session, while it lives.
     _outer: Option<super::lanes::OuterLane>,
     progress: Progress,
@@ -3261,6 +3358,7 @@ struct LaneTask {
     failed: Option<io::ErrorKind>,
     /// The lane's unsent query.
     unsent: Option<UnsentQuery>,
+    _lease: Option<Arc<Attachment>>,
 }
 
 impl LaneTask {
@@ -3268,10 +3366,11 @@ impl LaneTask {
         let read = lane.read.map(|(reader, prefix)| {
             ReadSide::new(Some(reader), lane.framing, prefix, lane.partial)
         });
-        let (write, keep, outer, unsent) = match lane.write {
+        let (write, keep, outer, unsent, drain) = match lane.write {
             Some(w) => (
                 Some(WriteSide {
                     writer: Some(w.writer),
+                    _lease: None,
                     restart: None,
                     out: Outbound::new(lane.framing, Calls::NonBlocking),
                     cursor: PieceCursor::default(),
@@ -3281,11 +3380,14 @@ impl LaneTask {
                 w.keep,
                 w.outer,
                 w.unsent.map(|q| UnsentQuery::new(q, now())),
+                w.drain,
             ),
-            None => (None, None, None, None),
+            None => (None, None, None, None, None),
         };
         Self {
+            drain,
             lane: lane.at.lane.0,
+            _lease: lane.attachment,
             read,
             write,
             keep,
@@ -3356,7 +3458,10 @@ impl LaneTask {
                     return false;
                 };
                 return match w.poll_shutdown(cx) {
-                    Poll::Ready(_) => {
+                    Poll::Ready(result) => {
+                        if result.is_ok() {
+                            PipeIo::arm_drain(&mut self.drain);
+                        }
                         ws.writer = None;
                         ws.out.shutdown_done();
                         true
@@ -3416,7 +3521,13 @@ impl LaneTask {
     }
 
     /// Closes the lane's half (its pipe's closes; an abort resets it).
-    fn close(&mut self, half: PipeHalf) {
+    fn close(&mut self, half: PipeHalf, abort: bool) {
+        if abort
+            && half == PipeHalf::Outbound
+            && let Some(drain) = &mut self.drain
+        {
+            drain.armed = false;
+        }
         match half {
             PipeHalf::Inbound => {
                 if let Some(rs) = self.read.as_mut() {
@@ -3477,21 +3588,15 @@ impl PipeTask {
         let queries = PipeQueries {
             probe: io.socket.map(|s| Probe::new(s, lowat, now())),
             unsent: io.unsent.map(|q| UnsentQuery::new(q, now())),
-            retransmitted: io
-                .retransmitted
-                .filter(|_| io.writer.is_some())
-                .map(|q| RetransmittedQuery::new(*q, now())),
             low_water: io.low_water,
         };
-        let some = queries.probe.is_some()
-            || queries.unsent.is_some()
-            || queries.retransmitted.is_some()
-            || queries.low_water;
+        let some = queries.probe.is_some() || queries.unsent.is_some() || queries.low_water;
         Self {
             id,
             queries: some.then(|| Box::new(queries)),
             read: Arc::new(ReadPath::new({
                 let mut side = ReadSide::new(io.reader, io.framing, io.prefix, io.partial_reads);
+                side.lease.clone_from(&io.attachment);
                 let ready = io.exporter_ready.take();
                 side.late = late_exporter
                     .map(|exporter| Box::new(LateExporter::Unread { exporter, ready }));
@@ -3500,6 +3605,7 @@ impl PipeTask {
             write_closed: io.writer.is_none(),
             write: Arc::new(WritePath::new(WriteSide {
                 writer: io.writer,
+                _lease: io.attachment.clone(),
                 restart: None,
                 out: Outbound::new(io.framing, Calls::NonBlocking),
                 cursor: PieceCursor::default(),
@@ -3509,8 +3615,8 @@ impl PipeTask {
             abort: io.abort,
             close_code: io.close_code,
             drain: io.drain,
+            attachment: io.attachment.unwrap_or_default(),
             active: now(),
-            done: Arc::new(PipeDone::default()),
             read_skipped: false,
             write_skipped: false,
             close_deferred: [false; 2],
@@ -3563,12 +3669,9 @@ impl PipeTask {
     /// the core lock: whether any ran.
     fn query_unsent(&mut self, now: Instant) -> bool {
         let queries = self.queries.as_deref_mut();
-        let (unsent, retransmitted) = match queries {
-            Some(q) => (q.unsent.as_mut(), q.retransmitted.as_mut()),
-            None => (None, None),
-        };
-        let mut ran = unsent.is_some_and(|q| q.query(now));
-        ran |= retransmitted.is_some_and(|q| q.query(now));
+        let mut ran = queries
+            .and_then(|q| q.unsent.as_mut())
+            .is_some_and(|q| q.query(now));
         for l in self.lanes_mut() {
             ran |= l.unsent.as_mut().is_some_and(|q| q.query(now));
         }
@@ -3580,13 +3683,6 @@ impl PipeTask {
         let id = self.id;
         if let Some(q) = self.queries.as_deref_mut().and_then(|q| q.unsent.as_mut()) {
             q.feed(core, id.into(), now);
-        }
-        if let Some(q) = self
-            .queries
-            .as_deref_mut()
-            .and_then(|q| q.retransmitted.as_mut())
-        {
-            q.feed(core, id, now);
         }
         for l in self.lanes_mut() {
             if let Some(q) = &mut l.unsent {
@@ -3625,10 +3721,13 @@ impl PipeTask {
         let id = self.id;
         for l in self.lanes_mut() {
             let at = id.lane(l.lane);
-            if let Some(ws) = l.write.as_mut() {
-                ws.out.tell(&mut st.core, at, now);
-            }
-            if l.progress.report(&mut st.core, at, false, now) {
+            let written = l
+                .write
+                .as_mut()
+                .is_some_and(|ws| ws.out.tell(&mut st.core, at, now));
+            if l.progress.report(&mut st.core, at, false, now)
+                || written && st.core.state() >= CoreState::Closing
+            {
                 st.dispatch();
             }
             if let Some(kind) = l.failed.take() {
@@ -3786,11 +3885,14 @@ impl PipeTask {
     fn report(&mut self, st: &mut State<Tokio>, now: Instant) {
         let id = self.id;
         // A side an application writes through tells the core itself.
-        if let Some(mut ws) = self.write.try_side() {
-            ws.out.tell(&mut st.core, id, now);
-        }
+        let written = self
+            .write
+            .try_side()
+            .is_some_and(|mut ws| ws.out.tell(&mut st.core, id, now));
         let low_water = self.queries.as_deref().is_some_and(|q| q.low_water);
-        if self.progress.report(&mut st.core, id, low_water, now) {
+        if self.progress.report(&mut st.core, id, low_water, now)
+            || written && st.core.state() >= CoreState::Closing
+        {
             st.dispatch();
         }
         if let Some(kind) = self.failed.take() {
@@ -3934,7 +4036,7 @@ impl PipeTask {
     /// holds the side (tried again once it handed over).
     fn close(&mut self, half: PipeHalf, abort: bool) -> bool {
         for l in self.lanes_mut() {
-            l.close(half);
+            l.close(half, abort);
         }
         match half {
             PipeHalf::Inbound => {
@@ -4089,37 +4191,33 @@ fn lanes_after_lock(shared: &Arc<Shared<Tokio>>, pipes: &mut [PipeTask], work: &
     for at in requests.drain(..) {
         let opener = pipes.iter().find(|p| p.id == at.pipe).and_then(|p| {
             let l = p.lanes.as_deref()?;
-            Some((l.opener.clone()?, l.framing, p.done.clone()))
+            Some((
+                l.opener.clone()?,
+                l.framing,
+                p.attachment.retirement().clone(),
+                Some(p.attachment.clone()),
+            ))
         });
-        let Some((open, framing, done)) = opener else {
+        let Some((open, framing, done, lease)) = opener else {
             refusals.push(at);
             continue;
         };
         let shared = Arc::downgrade(shared);
-        let fut = open();
-        tokio::spawn(async move {
-            // Given up with its pipe: an opener that waits on its carrier
-            // (an outer session's stream credit) keeps nothing alive after.
-            let mut fut = fut;
-            let mut ended = std::pin::pin!(done.wait());
-            let r = std::future::poll_fn(|cx| {
-                if let Poll::Ready(r) = fut.as_mut().poll(cx) {
-                    return Poll::Ready(Some(r));
-                }
-                ended.as_mut().poll(cx).map(|()| None)
-            })
-            .await;
-            if let Some(r) = r {
-                lane_opened(&shared, at, framing, r);
+        tokio::spawn(Attachment::during(lease.clone(), async move {
+            let opening = crate::proto::decision::host_future(|| open());
+            if let Some(result) = super::setup::while_open(done.wait(), opening).await {
+                let result =
+                    result.unwrap_or_else(|| Err(io::Error::other("lane opener panicked")));
+                lane_opened(&shared, at, framing, result, lease);
             }
-        });
+        }));
     }
     for at in resets.drain(..) {
         if let Some(p) = pipes.iter_mut().find(|p| p.id == at.pipe)
             && let Some(l) = p.lanes_mut().iter_mut().find(|l| l.lane == at.lane.0)
         {
             // Dropping the stream resets it.
-            l.close(PipeHalf::Outbound);
+            l.close(PipeHalf::Outbound, true);
         }
     }
 }
@@ -4131,7 +4229,11 @@ fn lane_opened(
     at: LaneId,
     framing: Framing,
     r: io::Result<LaneWriter>,
+    lease: Option<Arc<Attachment>>,
 ) {
+    if let (Ok(writer), Some(lease)) = (&r, &lease) {
+        lease.adopt(writer.attachment.as_ref());
+    }
     let Some(shared) = shared.upgrade() else {
         return;
     };
@@ -4142,6 +4244,7 @@ fn lane_opened(
             st.io.lanes.get_or_insert_default().new.push(NewLane {
                 at,
                 framing,
+                attachment: lease,
                 partial: false,
                 read: None,
                 write: Some(w),
@@ -4207,14 +4310,12 @@ fn apply_closes(pipes: &mut [PipeTask], closes: &mut Vec<(u64, PipeHalf, bool)>)
 /// and the lanes of pipes that are gone after the lock.
 fn end(pipes: &mut Vec<PipeTask>, st: &mut State<Tokio>, shared: &Shared<Tokio>) {
     st.io.task_ended = true;
-    // Its charge leaves the listener's account.
-    st.io.account = None;
     release_carriers(shared, None);
     st.io.through.clear();
     pipes.append(&mut st.io.new_pipes);
     release_lanes(st);
     for p in pipes.iter_mut() {
-        p.done.finish_into(&mut st.wakes);
+        p.attachment.retire(&mut st.wakes);
         p.tell_close_code(st);
     }
 }
@@ -4271,6 +4372,19 @@ impl Drop for Task {
     }
 }
 
+#[cfg(feature = "test-hooks")]
+static MEASURE_POLLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "test-hooks")]
+static MEASURED_POLLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Enables or disables session-task poll counting and returns the previous count.
+#[cfg(feature = "test-hooks")]
+pub fn measure_session_polls(enabled: bool) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    MEASURE_POLLS.store(enabled, Relaxed);
+    MEASURED_POLLS.swap(0, Relaxed)
+}
+
 impl Future for Task {
     type Output = ();
 
@@ -4282,6 +4396,10 @@ impl Future for Task {
     /// decision made last round, new batches (W3) and sides skipped (H1),
     /// the next custom request, and the deadline when nothing is left.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        #[cfg(feature = "test-hooks")]
+        if MEASURE_POLLS.load(std::sync::atomic::Ordering::Relaxed) {
+            MEASURED_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let this = &mut *self;
         let shared = &*this.shared;
         let mut rounds = 0u32;
@@ -4382,7 +4500,7 @@ impl Future for Task {
             // and then their waits resolve.
             let s = &mut *st;
             for mut p in this.pipes.extract_if(.., |p| p.finished()) {
-                p.done.finish_into(&mut s.wakes);
+                p.attachment.retire(&mut s.wakes);
                 p.tell_close_code(s);
                 // Its stream carrier, if any, carries this session no more.
                 release_carriers(shared, Some(p.id.0));
@@ -4619,7 +4737,7 @@ impl Session {
         let config = config.into();
         pipe.resolve_exporter(Instant::now().checked_add(config.handshake_wait()))
             .await;
-        let session = Shared::create(pipe, config.clone(), role, transport, None, |_| {})?
+        let session = Shared::create(pipe, config.clone(), role, transport, None, |_| None)?
             .established()
             .await?;
         if let Some(dial) = config.redial.as_ref().and_then(crate::Redial::as_tokio)
@@ -4812,28 +4930,77 @@ impl Session {
     /// before it has loses the session unless it resumes.
     /// [`Session::begin_add_pipe`](Session#method.begin_add_pipe) starts
     /// the join without waiting.
-    pub async fn add_pipe(&self, pipe: PipeIo, opts: PipeOptions) -> Result<Pipe, PipeError> {
-        let deadline = tokio::time::Instant::now() + self.add_pipe_limit();
-        let no_wait = opts.return_on_reply;
-        pipe.resolve_exporter(Some(deadline.into_std())).await;
-        let p = self.begin_add_pipe(pipe, opts)?;
-        let guard = handle::AbortUnlessAdded(Some(&p));
-        let r = tokio::time::timeout_at(deadline, p.added_op(no_wait))
-            .await
-            .unwrap_or(Err(PipeError::Failed(crate::PipeFailure::JoinTimedOut)));
-        match r {
-            Ok(()) => guard.added(),
-            Err(e) => {
-                drop(guard);
-                return Err(e);
+    pub fn add_pipe(
+        &self,
+        pipe: PipeIo,
+        opts: PipeOptions,
+    ) -> impl Future<Output = Result<Pipe, PipeError>> + Send + 'static {
+        self.submitted_pipe(pipe, Ok(opts))
+    }
+
+    /// Submits a carrier from a foreign runtime and gives that caller a
+    /// synchronous cancellation receipt carrying its own error.
+    #[doc(hidden)]
+    pub fn add_pipe_cancellable(
+        &self,
+        mut pipe: PipeIo,
+        opts: Result<PipeOptions, PipeError>,
+    ) -> (
+        handle::JoinCancellation,
+        impl Future<Output = Result<Pipe, PipeError>> + Send + 'static,
+    ) {
+        let receipt = handle::JoinCancellation::new(
+            self.shared(),
+            pipe.attachment().outcome(),
+            opts.as_ref().is_ok_and(|opts| opts.return_on_reply),
+        );
+        (receipt, self.submitted_pipe(pipe, opts))
+    }
+
+    fn submitted_pipe(
+        &self,
+        mut pipe: PipeIo,
+        opts: Result<PipeOptions, PipeError>,
+    ) -> impl Future<Output = Result<Pipe, PipeError>> + Send + 'static {
+        let session = self.clone();
+        let end = pipe.attachment().outcome().clone();
+        let mut report = self.join_report();
+        if let Some(r) = &mut report {
+            r.observe(&end);
+        }
+        if let Err(e) = &opts {
+            let _ = end.join.set(Err(e.clone()));
+            if let Some(report) = report.take() {
+                report.complete(Some(e.clone().into()));
             }
         }
-        Ok(p)
+        let deadline = session.join_deadline();
+        async move {
+            let opts = opts?;
+            let no_wait = opts.return_on_reply;
+            let _ = super::setup::while_open(
+                handle::session_ended_wait(session.shared()),
+                pipe.resolve_exporter(deadline.map(crate::proto::session::JoinDeadline::at)),
+            )
+            .await;
+            let p = session.start_join(pipe, &opts, report, deadline)?;
+            let guard = handle::AbortUnlessAdded(Some(&p), no_wait);
+            let r = p.added_op(no_wait).await;
+            match r {
+                Ok(()) => guard.added(),
+                Err(e) => {
+                    drop(guard);
+                    return Err(e);
+                }
+            }
+            Ok(p)
+        }
     }
 
     /// Closes gracefully: GOAWAY, then `CONNECTION_CLOSE` once no stream
-    /// remains. Resolves when the session is closed: `Ok` when it closed
-    /// as requested, otherwise the error that ended it first. Cancelled
+    /// remains. Resolves after the close is handed to the usable carriers
+    /// or the hand-off deadline passes. Returns `Ok` for the requested
+    /// close, otherwise the error that ended the session first. Cancelled
     /// (the future dropped after its first poll, for example by
     /// `tokio::time::timeout`), it starts the close of
     /// [`Session::close`](Session#method.close) with the same code and
@@ -5049,7 +5216,8 @@ impl Pipe {
     /// (after [`Pipe::close`](Pipe#method.close) or the peer's
     /// graceful removal) or the session forgot it, [`PipeError::Failed`]
     /// when it failed, [`PipeError::SessionLost`] when the session ended
-    /// first. Cancel-safe.
+    /// first. Delivers that result after the carrier, its lanes, drains and
+    /// attachment workers have been released. Cancel-safe.
     pub async fn closed(&self) -> Result<(), PipeError> {
         self.closed_op().await
     }

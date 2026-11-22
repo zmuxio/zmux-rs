@@ -10,8 +10,12 @@
 //! stream is bounded by that and the stream window. DATA payloads pass
 //! through unread; non-control unidirectional streams (QPACK, unknown) too.
 
+use std::future::Future;
 use std::io;
+use std::pin::{Pin, pin};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
+use zmux::adapter::SetupRead;
 
 use bytes::{Buf, Bytes};
 use h3::quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf};
@@ -111,22 +115,96 @@ fn excessive() -> StreamErrorIncoming {
 
 /// A receiving half whose frames other than DATA are bounded to 64 KiB.
 pub struct RecvStream {
-    inner: h3_quinn::RecvStream,
+    inner: Receiver,
     scan: Scan,
+    fallback_stop: Option<FallbackStop>,
+    fallback_ended: bool,
+}
+
+enum Receiver {
+    H3(h3_quinn::RecvStream),
+    Request(SetupRead<quinn::RecvStream>, StreamId),
+}
+
+fn chunk(
+    recv: &mut quinn::RecvStream,
+    cx: &mut Context<'_>,
+) -> Poll<Result<Option<quinn::Chunk>, quinn::ReadError>> {
+    pin!(recv.read_chunk(usize::MAX, true)).poll(cx)
+}
+
+fn connection_error(error: quinn::ConnectionError) -> ConnectionErrorIncoming {
+    match error {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            ConnectionErrorIncoming::ApplicationClose {
+                error_code: close.error_code.into_inner(),
+            }
+        }
+        quinn::ConnectionError::TimedOut => ConnectionErrorIncoming::Timeout,
+        other => ConnectionErrorIncoming::Undefined(Arc::new(other)),
+    }
+}
+
+impl quic::RecvStream for Receiver {
+    type Buf = Bytes;
+
+    fn poll_data(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+        let result = match self {
+            Self::H3(stream) => return stream.poll_data(cx),
+            Self::Request(reader, _) => reader.poll(cx, chunk),
+        };
+        result
+            .map_ok(|chunk| chunk.map(|c| c.bytes))
+            .map_err(|error| match error {
+                quinn::ReadError::Reset(code) => StreamErrorIncoming::StreamTerminated {
+                    error_code: code.into_inner(),
+                },
+                quinn::ReadError::ConnectionLost(e) => {
+                    StreamErrorIncoming::ConnectionErrorIncoming {
+                        connection_error: connection_error(e),
+                    }
+                }
+                other => StreamErrorIncoming::Unknown(Box::new(other)),
+            })
+    }
+
+    fn stop_sending(&mut self, code: u64) {
+        let error = quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::MAX);
+        match self {
+            Self::H3(s) => s.stop_sending(code),
+            Self::Request(reader, _) => {
+                let _ = reader.with(|r| r.stop(error));
+            }
+        }
+    }
+
+    fn recv_id(&self) -> StreamId {
+        match self {
+            Self::H3(s) => s.recv_id(),
+            Self::Request(_, id) => *id,
+        }
+    }
 }
 
 impl RecvStream {
     fn request(inner: h3_quinn::RecvStream) -> Self {
         Self {
-            inner,
+            inner: Receiver::H3(inner),
             scan: Scan::varint(Part::FrameType),
+            fallback_stop: None,
+            fallback_ended: false,
         }
     }
 
     fn unidirectional(inner: h3_quinn::RecvStream) -> Self {
         Self {
-            inner,
+            inner: Receiver::H3(inner),
             scan: Scan::varint(Part::StreamType),
+            fallback_stop: None,
+            fallback_ended: false,
         }
     }
 }
@@ -144,6 +222,23 @@ impl quic::RecvStream for RecvStream {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+        if self.fallback_ended {
+            return Poll::Ready(Ok(None));
+        }
+        if let Some(stop) = self.fallback_stop.as_ref().and_then(|stop| stop.0.get())
+            && stop
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+                .poll(cx)
+                .is_ready()
+        {
+            self.fallback_ended = true;
+            self.fallback_stop = None;
+            self.inner
+                .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED.value());
+            return Poll::Ready(Ok(None));
+        }
         if matches!(self.scan, Scan::Over) {
             return Poll::Ready(Err(excessive()));
         }
@@ -166,9 +261,112 @@ impl quic::RecvStream for RecvStream {
     }
 }
 
+/// The sending half of a request, also used by a host fallback.
+pub struct SendStream<B: Buf>(Sender<B>);
+
+enum Sender<B: Buf> {
+    H3(h3_quinn::SendStream<B>),
+    Request(quinn::SendStream, Option<WriteBuf<B>>),
+}
+
+impl<B: Buf> SendStream<B> {
+    fn h3(s: h3_quinn::SendStream<B>) -> Self {
+        Self(Sender::H3(s))
+    }
+}
+
+fn write_error(error: quinn::WriteError) -> StreamErrorIncoming {
+    match error {
+        quinn::WriteError::Stopped(code) => StreamErrorIncoming::StreamTerminated {
+            error_code: code.into_inner(),
+        },
+        quinn::WriteError::ConnectionLost(e) => StreamErrorIncoming::ConnectionErrorIncoming {
+            connection_error: connection_error(e),
+        },
+        other => StreamErrorIncoming::Unknown(Box::new(other)),
+    }
+}
+
+fn poll_bytes(
+    stream: &mut quinn::SendStream,
+    cx: &mut Context<'_>,
+    buf: &mut impl Buf,
+) -> Poll<Result<usize, StreamErrorIncoming>> {
+    let n = std::task::ready!(Pin::new(stream).poll_write(cx, buf.chunk())).map_err(write_error)?;
+    buf.advance(n);
+    Poll::Ready(Ok(n))
+}
+
+impl<B: Buf> quic::SendStream<B> for SendStream<B> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        match &mut self.0 {
+            Sender::H3(s) => s.poll_ready(cx),
+            Sender::Request(s, pending) => {
+                if let Some(buf) = pending {
+                    while buf.has_remaining() {
+                        std::task::ready!(poll_bytes(s, cx, buf))?;
+                    }
+                }
+                *pending = None;
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+    fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
+        match &mut self.0 {
+            Sender::H3(s) => s.send_data(data),
+            Sender::Request(_, slot @ None) => {
+                *slot = Some(data.into());
+                Ok(())
+            }
+            Sender::Request(_, Some(_)) => Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: ConnectionErrorIncoming::InternalError(
+                    "request stream write already pending".into(),
+                ),
+            }),
+        }
+    }
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        match &mut self.0 {
+            Sender::H3(s) => s.poll_finish(cx),
+            Sender::Request(s, _) => Poll::Ready(
+                s.finish()
+                    .map_err(|e| StreamErrorIncoming::Unknown(Box::new(e))),
+            ),
+        }
+    }
+    fn reset(&mut self, code: u64) {
+        match &mut self.0 {
+            Sender::H3(s) => s.reset(code),
+            Sender::Request(s, _) => {
+                let _ = s.reset(quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::MAX));
+            }
+        }
+    }
+    fn send_id(&self) -> StreamId {
+        match &self.0 {
+            Sender::H3(s) => s.send_id(),
+            Sender::Request(s, _) => u64::from(s.id()).try_into().expect("QUIC stream ID"),
+        }
+    }
+}
+
+impl<B: Buf> quic::SendStreamUnframed<B> for SendStream<B> {
+    fn poll_send<D: Buf>(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut D,
+    ) -> Poll<Result<usize, StreamErrorIncoming>> {
+        match &mut self.0 {
+            Sender::H3(s) => s.poll_send(cx, buf),
+            Sender::Request(s, _) => poll_bytes(s, cx, buf),
+        }
+    }
+}
+
 /// A request stream with a bounded receiving half.
 pub(crate) struct BidiStream<B: Buf> {
-    send: h3_quinn::SendStream<B>,
+    send: SendStream<B>,
     recv: RecvStream,
 }
 
@@ -176,14 +374,14 @@ impl<B: Buf> BidiStream<B> {
     fn new(bidi: h3_quinn::BidiStream<B>) -> Self {
         let (send, recv) = quic::BidiStream::split(bidi);
         Self {
-            send,
+            send: SendStream::h3(send),
             recv: RecvStream::request(recv),
         }
     }
 }
 
 impl<B: Buf> quic::BidiStream<B> for BidiStream<B> {
-    type SendStream = h3_quinn::SendStream<B>;
+    type SendStream = SendStream<B>;
     type RecvStream = RecvStream;
 
     fn split(self) -> (Self::SendStream, Self::RecvStream) {
@@ -243,11 +441,58 @@ impl<B: Buf> quic::SendStreamUnframed<B> for BidiStream<B> {
 }
 
 /// h3-quinn's connection with bounded receiving halves.
-pub(crate) struct Connection(h3_quinn::Connection);
+pub(crate) struct Connection(h3_quinn::Connection, Option<Incoming>);
+
+pub(crate) type Stopped = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+
+type ListenerClosed = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Armed only when the request goes to the ordinary HTTP fallback.
+#[derive(Clone, Default)]
+pub(crate) struct FallbackStop(Arc<OnceLock<Mutex<ListenerClosed>>>);
+
+impl FallbackStop {
+    pub(crate) fn bind(&self, closed: impl Future<Output = ()> + Send + 'static) {
+        assert!(self.0.set(Mutex::new(Box::pin(closed))).is_ok());
+    }
+}
+type Accepted = Result<(quinn::SendStream, quinn::RecvStream), quinn::ConnectionError>;
+
+/// h3 accepts one request per poll. Hand its `STOP_SENDING` wait to the
+/// same request before polling accept again; unresolved heads own their wait.
+#[derive(Clone, Default)]
+pub(crate) struct RequestStop(Arc<Mutex<Option<(Stopped, FallbackStop)>>>);
+
+impl RequestStop {
+    pub(crate) fn take(&self) -> (Stopped, FallbackStop) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .expect("just accepted a request")
+    }
+}
+
+struct Incoming {
+    conn: quinn::Connection,
+    accept: Option<Pin<Box<dyn Future<Output = Accepted> + Send + Sync>>>,
+    stop: RequestStop,
+}
 
 impl Connection {
+    pub(crate) fn serving(conn: quinn::Connection, stop: RequestStop) -> Self {
+        Self(
+            h3_quinn::Connection::new(conn.clone()),
+            Some(Incoming {
+                conn,
+                accept: None,
+                stop,
+            }),
+        )
+    }
+
     pub(crate) fn new(conn: quinn::Connection) -> Self {
-        Self(h3_quinn::Connection::new(conn))
+        Self(h3_quinn::Connection::new(conn), None)
     }
 }
 
@@ -266,7 +511,57 @@ impl<B: Buf> quic::Connection<B> for Connection {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
-        quic::Connection::<B>::poll_accept_bidi(&mut self.0, cx).map_ok(BidiStream::new)
+        let Some(incoming) = &mut self.1 else {
+            return quic::Connection::<B>::poll_accept_bidi(&mut self.0, cx)
+                .map_ok(BidiStream::new);
+        };
+        let accept = incoming.accept.get_or_insert_with(|| {
+            let conn = incoming.conn.clone();
+            Box::pin(async move { conn.accept_bi().await })
+        });
+        let result = std::task::ready!(accept.as_mut().poll(cx));
+        incoming.accept = None;
+        let (send, recv) = result.map_err(connection_error)?;
+        let id = u64::from(recv.id()).try_into().expect("QUIC stream ID");
+        let (body, reading) = SetupRead::new(recv);
+        let stopped = send.stopped();
+        let cancel = async move {
+            let mut stopped = pin!(stopped);
+            let mut watch_reset = true;
+            std::future::poll_fn(|cx| {
+                if stopped.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                if watch_reset
+                    && let Some(result) =
+                        reading.poll(cx, |r, cx| pin!(r.received_reset()).poll(cx))
+                {
+                    match result {
+                        Poll::Ready(Ok(None)) => watch_reset = false, // ordinary request-body FIN
+                        Poll::Ready(_) => return Poll::Ready(()),
+                        Poll::Pending => {}
+                    }
+                }
+                Poll::Pending
+            })
+            .await;
+        };
+        let fallback_stop = FallbackStop::default();
+        *incoming
+            .stop
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((Box::pin(cancel), fallback_stop.clone()));
+        Poll::Ready(Ok(BidiStream {
+            send: SendStream(Sender::Request(send, None)),
+            recv: RecvStream {
+                inner: Receiver::Request(body, id),
+                scan: Scan::varint(Part::FrameType),
+                fallback_stop: Some(fallback_stop),
+                fallback_ended: false,
+            },
+        }))
     }
 
     fn opener(&self) -> Self::OpenStreams {
@@ -333,6 +628,48 @@ impl<B: Buf> quic::OpenStreams<B> for OpenStreams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "rustls-ring")]
+    mod net {
+        use crate as zmux_h3;
+        include!("../tests/common/net.rs");
+    }
+
+    #[cfg(feature = "rustls-ring")]
+    #[tokio::test]
+    async fn request_data_takes_the_direct_path_after_handoff() {
+        let (server, client, addr) = net::endpoints(&crate::Options::default());
+        let (peer, local) = tokio::join!(
+            client.connect(addr, &addr.ip().to_string()).unwrap(),
+            async { server.accept().await.unwrap().await }
+        );
+        let peer = peer.unwrap();
+        let stop = RequestStop::default();
+        let mut conn = Connection::serving(local.unwrap(), stop.clone());
+        let (mut send, _recv) = peer.open_bi().await.unwrap();
+        send.write_all(b"a").await.unwrap();
+        let mut stream =
+            std::future::poll_fn(|cx| quic::Connection::<Bytes>::poll_accept_bidi(&mut conn, cx))
+                .await
+                .unwrap();
+        let mut watcher = Some(stop.take().0);
+        let body = &mut stream.recv.inner;
+        for (index, expected) in b"abc".iter().copied().enumerate() {
+            let bytes = std::future::poll_fn(|cx| quic::RecvStream::poll_data(body, cx))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(bytes.as_ref(), &[expected]);
+            let Receiver::Request(reader, _) = body else {
+                panic!("request stream")
+            };
+            assert_eq!(reader.observing(), index == 0);
+            if index == 0 {
+                drop(watcher.take());
+            }
+            send.write_all(&[expected + 1]).await.unwrap();
+        }
+    }
 
     #[test]
     fn frames_other_than_data_are_bounded_before_they_are_read() {

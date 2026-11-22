@@ -116,7 +116,7 @@ enum Source {
 impl Source {
     fn fill(&self, label: &str, context: &[u8], out: &mut [u8]) -> bool {
         match self {
-            Self::Now(f) => f(label, context, out),
+            Self::Now(f) => super::decision::host(|| f(label, context, out)).unwrap_or(false),
             Self::Later { values, .. } => {
                 if !context.is_empty() || out.len() != VALUE_LEN {
                     return false;
@@ -139,7 +139,7 @@ impl Source {
         match self {
             Self::Now(f) => {
                 let mut out = vec![0; length];
-                f(label, context, &mut out).then_some(out)
+                super::decision::host(|| f(label, context, &mut out))?.then_some(out)
             }
             Self::Later { export, .. } => {
                 let request = ExportRequest {
@@ -230,7 +230,9 @@ impl CarrierExporter {
         let mut values: [Option<Secret>; ZMUX_LABELS.len()] = Default::default();
         for (v, label) in values.iter_mut().zip(ZMUX_LABELS) {
             let mut out = Secret::from(vec![0; VALUE_LEN]);
-            *v = export(label, b"", out.as_mut_slice()).then_some(out);
+            *v = super::decision::host(|| export(label, b"", out.as_mut_slice()))
+                .unwrap_or(false)
+                .then_some(out);
         }
         Self {
             first: Source::Later {

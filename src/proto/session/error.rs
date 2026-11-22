@@ -178,6 +178,8 @@ pub enum PipeFailure {
     /// The join was not confirmed within `join_timeout`: the peer
     /// refused it or never saw it.
     JoinTimedOut,
+    /// The explicit deadline of the caller that submitted the carrier elapsed.
+    CallerDeadline,
     /// The peer abandoned the pipe with this error code (`PIPE_ABANDON`).
     Abandoned(VarInt),
     #[cfg_attr(
@@ -206,6 +208,7 @@ impl fmt::Display for PipeFailure {
             Self::Carrier(kind) => write!(f, "carrier failed: {kind}"),
             Self::Stalled => f.write_str("pipe stalled"),
             Self::JoinTimedOut => f.write_str("join not confirmed in time"),
+            Self::CallerDeadline => f.write_str("caller deadline elapsed"),
             Self::Abandoned(code) => write!(f, "abandoned by the peer with code {code}"),
             Self::Aborted => f.write_str("aborted locally"),
             Self::Protocol => f.write_str("protocol violation on the carrier"),
@@ -277,6 +280,10 @@ impl SessionError {
     /// The [`io::ErrorKind`] of the termination.
     fn kind(&self) -> io::ErrorKind {
         match self {
+            Self::TransportClosed {
+                code: TransportErrorCode::CONNECTION_REFUSED,
+                ..
+            } => io::ErrorKind::ConnectionRefused,
             Self::ApplicationClosed { .. } | Self::TransportClosed { .. } => {
                 io::ErrorKind::ConnectionAborted
             }
@@ -702,6 +709,10 @@ impl fmt::Display for JoinMissing {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum PipeError {
+    /// The join was withdrawn. A caller that supplies its own error retains it.
+    CallerCancelled(Option<std::sync::Arc<io::Error>>),
+    /// Every wire pipe ID of the local endpoint's parity has been used.
+    IdExhausted,
     /// Multipath is not in use in this session.
     NotNegotiated,
     /// The session is not established yet.
@@ -742,6 +753,12 @@ pub enum PipeError {
 }
 
 impl PipeError {
+    /// Whether the pipe no longer exists, including an explicit local abort.
+    #[must_use]
+    pub const fn is_gone(&self) -> bool {
+        matches!(self, Self::UnknownPipe | Self::Failed(PipeFailure::Aborted))
+    }
+
     /// Whether the operation may succeed if retried: once the session is
     /// established ([`PipeError::NotEstablished`]), after the join backoff
     /// ([`PipeError::Deferred`]), once the join keys are in place
@@ -759,6 +776,9 @@ impl PipeError {
 impl fmt::Display for PipeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CallerCancelled(Some(error)) => error.fmt(f),
+            Self::CallerCancelled(None) => f.write_str("join cancelled"),
+            Self::IdExhausted => f.write_str("pipe ID space exhausted"),
             Self::NotNegotiated => f.write_str("multipath not in use"),
             Self::JoinPending(m) => write!(f, "join pending: {m}"),
             Self::JoinSecretSet => f.write_str("join secret already set"),
@@ -780,7 +800,7 @@ impl std::error::Error for PipeError {
         match self {
             Self::SessionLost(e) => Some(e),
             Self::InvalidOptions(e) => Some(e),
-            Self::Io(e) => Some(&**e),
+            Self::Io(e) | Self::CallerCancelled(Some(e)) => Some(&**e),
             _ => None,
         }
     }
@@ -789,6 +809,11 @@ impl std::error::Error for PipeError {
 impl From<PipeError> for io::Error {
     fn from(e: PipeError) -> Self {
         let kind = match &e {
+            PipeError::CallerCancelled(None) => io::ErrorKind::Interrupted,
+            PipeError::Failed(PipeFailure::CallerDeadline | PipeFailure::JoinTimedOut) => {
+                io::ErrorKind::TimedOut
+            }
+            PipeError::IdExhausted => io::ErrorKind::QuotaExceeded,
             PipeError::NotNegotiated => io::ErrorKind::Unsupported,
             PipeError::NotEstablished => io::ErrorKind::NotConnected,
             PipeError::Deferred | PipeError::JoinPending(_) => io::ErrorKind::WouldBlock,
@@ -800,7 +825,7 @@ impl From<PipeError> for io::Error {
             PipeError::Failed(PipeFailure::JoinRefused) => io::ErrorKind::ConnectionRefused,
             PipeError::Failed(_) => io::ErrorKind::ConnectionReset,
             PipeError::SessionLost(s) => s.kind(),
-            PipeError::Io(e) => e.kind(),
+            PipeError::Io(e) | PipeError::CallerCancelled(Some(e)) => e.kind(),
         };
         io::Error::new(kind, e)
     }

@@ -1139,3 +1139,130 @@ async fn a_refused_request_over_tls_keeps_its_capabilities() {
     listener.close();
     serving.abort();
 }
+
+#[tokio::test]
+async fn stopping_an_upgrade_interrupts_its_partial_response_head() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut cfg = ListenerConfig::default();
+    let (called, mut calls) = tokio::sync::mpsc::unbounded_channel();
+    cfg.admission = Some(zmux::Admission::new(0, |_, _| {
+        zmux::AdmissionVerdict::takeover()
+    }));
+    cfg.fallback = Some(zmux::Fallback::new(move |_| {
+        called.send(()).unwrap();
+        async {}
+    }));
+    let listener = Listener::new(Config::default(), cfg).unwrap();
+    let peer = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+    let entry = listener.adapter().enter(peer, None).unwrap();
+    let (io, mut other) = tokio::io::duplex(1);
+    let l = listener.clone();
+    let handler = tokio::spawn(async move {
+        zmux_websocket::accept(
+            io,
+            entry,
+            |_| zmux::CarrierInfo::new(),
+            &l,
+            &zmux_websocket::Options::default(),
+        )
+        .await
+        .unwrap()
+    });
+    other
+        .write_all(&upgrade_request(Some("qmux-02")))
+        .await
+        .unwrap();
+    assert_eq!(other.read_u8().await.unwrap(), b'H');
+    listener.close();
+    assert!(matches!(
+        handler.await.unwrap(),
+        zmux_websocket::Upgrade::Ended
+    ));
+    assert!(calls.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_upgrade_uses_the_peek_deadline_for_write_and_flush() {
+    use std::io::{Cursor, Result};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncWrite, ReadBuf};
+
+    struct Response {
+        head: Cursor<Vec<u8>>,
+        block_write: bool,
+        written: Vec<u8>,
+    }
+    impl tokio::io::AsyncRead for Response {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<()>> {
+            Pin::new(&mut self.head).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for Response {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize>> {
+            if self.block_write {
+                return Poll::Pending;
+            }
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+            assert!(self.written.starts_with(b"HTTP/1.1 101 "));
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct Deferred;
+    impl zmux::Decide for Deferred {
+        fn decide(
+            &self,
+            _: zmux::CarrierInfo,
+            _: &[u8],
+        ) -> zmux::Decision<zmux::AdmissionDecision> {
+            zmux::Decision::later(async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                zmux::AdmissionVerdict::Defer.into()
+            })
+        }
+    }
+
+    for block_write in [true, false] {
+        let peek = Duration::from_secs(2);
+        let mut config = ListenerConfig::default();
+        config.admission = Some(zmux::Admission::with_decider(1, Deferred).with_peek_timeout(peek));
+        let listener = Listener::new(Config::default(), config).unwrap();
+        let entry = listener
+            .adapter()
+            .enter("127.0.0.1:1234".parse().unwrap(), None)
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let result = zmux_websocket::accept(
+            Response {
+                head: Cursor::new(upgrade_request(Some("qmux-02"))),
+                block_write,
+                written: Vec::new(),
+            },
+            entry,
+            |_| zmux::CarrierInfo::new(),
+            &listener,
+            &zmux_websocket::Options::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, zmux_websocket::Upgrade::Ended));
+        assert_eq!(start.elapsed(), peek);
+        let stats = listener.stats().admission;
+        assert_eq!((stats.peek_timed_out, stats.closed), (1, 0));
+    }
+}

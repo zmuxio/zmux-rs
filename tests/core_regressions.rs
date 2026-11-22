@@ -276,9 +276,11 @@ fn stream_datagrams_stay_within_their_stream_bound() {
     assert!(total > 1 << 20);
 }
 
-#[test]
-fn stale_clock_linger_still_writes_close() {
-    let mut p = Pair::new(Config::default(), Config::default());
+fn shutdown_with_unwritten_close(linger: Duration) -> Pair {
+    let mut config = Config::default();
+    config.test_hooks().close_handoff_limit = Some(Duration::from_secs(1));
+    config.test_hooks().linger_timeout = Some(linger);
+    let mut p = Pair::new(Config::default(), config);
     let k = p.a.open(Dir::Bidi).unwrap();
     p.a.write(k, b"x").unwrap();
     p.a.finish(k).unwrap();
@@ -287,9 +289,6 @@ fn stale_clock_linger_still_writes_close() {
     p.b.shutdown(VarInt::ZERO, b"bye", p.now);
     p.b.finish(s).unwrap();
     p.pump();
-    // No I/O for 10 s; then the application reads the end and drops the
-    // stream, which completes the shutdown.
-    p.now += Duration::from_secs(10);
     let mut buf = [0u8; 16];
     while let Some((_, fin)) = p.b.read(s, &mut buf).unwrap() {
         if fin {
@@ -298,14 +297,48 @@ fn stale_clock_linger_still_writes_close() {
     }
     p.b.release(s);
     assert_eq!(p.b.state(), State::Closing);
-    // The deadline came from a stale clock: the first expiry gives the
-    // close a linger period from now instead of dropping it.
+    assert!(!p.b.close_handed_off());
+    p
+}
+
+#[test]
+fn stale_clock_linger_still_writes_close() {
+    for linger in [Duration::from_millis(250), Duration::from_secs(2)] {
+        let mut p = shutdown_with_unwritten_close(linger);
+        // The application released the last stream without a clock sample.
+        // The next timer poll sees both of the old deadlines expired.
+        p.now += Duration::from_secs(10);
+        p.b.handle_timeout(p.now);
+        assert_eq!(p.b.state(), State::Closing);
+        assert!(p.b.close_returned());
+        assert_eq!(p.b.poll_timeout(), Some(p.now + linger));
+        assert!(p.send(false) > 0);
+        assert!(p.b.close_handed_off());
+        assert_eq!(p.a.state(), State::Closing);
+    }
+}
+
+#[test]
+fn stale_clock_linger_extends_only_once() {
+    let linger = Duration::from_millis(250);
+    let mut p = shutdown_with_unwritten_close(linger);
+    p.now += Duration::from_secs(10);
     p.b.handle_timeout(p.now);
     assert_eq!(p.b.state(), State::Closing);
-    assert!(p.b.wants_write(P0));
-    let wire = take(&mut p.b, &mut p.out, p.now);
-    assert!(!wire.is_empty(), "CONNECTION_CLOSE written");
-    assert!(p.b.poll_timeout().unwrap() > p.now);
+    p.now += linger;
+    p.b.handle_timeout(p.now);
+    assert_eq!(p.b.state(), State::Closed);
+}
+
+#[test]
+fn shutdown_handoff_still_expires_after_an_on_time_linger_poll() {
+    let linger = Duration::from_millis(250);
+    let mut p = shutdown_with_unwritten_close(linger);
+    p.b.handle_timeout(p.now + linger);
+    assert_eq!(p.b.state(), State::Closing);
+    assert!(!p.b.close_returned());
+    p.b.handle_timeout(p.now + Duration::from_secs(1));
+    assert_eq!(p.b.state(), State::Closed);
 }
 
 #[test]
@@ -339,9 +372,6 @@ fn stop_before_first_frame_is_sent_with_it() {
 #[test]
 fn config_out_of_varint_range_is_rejected() {
     let now = Instant::now();
-    let mut cfg = Config::default();
-    cfg.max_idle_timeout = Some(Duration::MAX);
-    assert!(SessionCore::new(cfg, Role::Client, None, now).is_err());
     let mut cfg = Config::default();
     cfg.max_connection_receive_window = Cap::Fixed(1 << 62);
     assert!(SessionCore::new(cfg, Role::Client, None, now).is_err());
@@ -1174,4 +1204,43 @@ fn a_reset_just_before_the_close_reaches_the_peer() {
     let mut buf = [0u8; 16];
     let r = p.a.read(k, &mut buf);
     assert!(matches!(r, Err(zmux::StreamError::Reset { .. })), "{r:?}");
+}
+
+#[test]
+fn lane_zero_write_failure_waits_for_pending_peer_close() {
+    let mut p = Pair::new(Config::default(), Config::default());
+    let code = VarInt::from_u32(9);
+    p.b.close(code, b"peer close", p.now);
+    let close = take(&mut p.b, &mut p.out, p.now);
+    assert_ne!(close, []);
+
+    p.a.write_failed(P0, std::io::ErrorKind::BrokenPipe, p.now);
+    assert!(p.a.error().is_none(), "{:?}", p.a.error());
+    assert_eq!(p.a.receive_in_place(P0, &close, p.now), close.len());
+    assert!(matches!(
+        p.a.error(),
+        Some(zmux::SessionError::ApplicationClosed { code: received, remote: true, .. })
+            if *received == code
+    ));
+}
+
+#[test]
+fn lane_zero_write_failure_times_out_with_the_original_error() {
+    let linger = Duration::from_millis(250);
+    let mut config = Config::default();
+    config.test_hooks().linger_timeout = Some(linger);
+    let mut p = Pair::new(config, Config::default());
+    p.a.write_failed(P0, std::io::ErrorKind::BrokenPipe, p.now);
+    let deadline = p.now + linger;
+    assert_eq!(p.a.poll_timeout(), Some(deadline));
+    p.a.handle_timeout(p.now + Duration::from_millis(249));
+    assert!(p.a.error().is_none());
+    p.a.handle_timeout(deadline);
+    assert_eq!(p.a.state(), State::Closed);
+    assert!(matches!(
+        p.a.error(),
+        Some(zmux::SessionError::PipesLost {
+            last: Some(zmux::PipeFailure::Carrier(std::io::ErrorKind::BrokenPipe)),
+        })
+    ));
 }

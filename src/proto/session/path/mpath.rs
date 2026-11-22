@@ -5,8 +5,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::proto::session::PipeError;
 use crate::proto::session::config::Change;
+use crate::proto::session::{JoinDeadline, PipeError};
 
 use crate::proto::keys;
 use crate::proto::params::{Locator, Role, TransportParameters};
@@ -116,6 +116,144 @@ pub enum Multipath {
     /// matched (for example one offers only a PSK and the other only the
     /// TLS exporter).
     JoinSecurityUnavailable,
+}
+
+/// Process-local identity of a carrier connection.
+#[derive(Clone)]
+pub struct CarrierConnId {
+    key: u64,
+    // Transport identities retain the allocation, without retaining its value.
+    owner: Option<std::sync::Weak<dyn std::any::Any + Send + Sync>>,
+}
+
+impl CarrierConnId {
+    /// Identifies the connection shared by an adapter's streams.
+    #[must_use]
+    pub fn new<T: std::any::Any + Send + Sync>(owner: &Arc<T>) -> Self {
+        Self {
+            key: Arc::as_ptr(owner).cast::<()>() as usize as u64,
+            owner: Some(Arc::downgrade(owner) as _),
+        }
+    }
+
+    /// Opaque process-local numeric value for a published sample.
+    #[must_use]
+    pub const fn get(&self) -> u64 {
+        self.key
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn sampled() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self::from_sampled(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) const fn from_sampled(key: u64) -> Self {
+        Self { key, owner: None }
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn is_live(&self) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| owner.strong_count() != 0)
+    }
+}
+
+impl PartialEq for CarrierConnId {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.owner.is_some() == other.owner.is_some()
+    }
+}
+
+impl Eq for CarrierConnId {}
+
+impl std::hash::Hash for CarrierConnId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
+        self.owner.is_some().hash(state);
+    }
+}
+
+impl std::fmt::Debug for CarrierConnId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CarrierConnId").field(&self.key).finish()
+    }
+}
+
+/// The provider of a carrier connection's statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CarrierSource {
+    /// No provider is known.
+    Unknown,
+    /// Linux `TCP_INFO`.
+    LinuxTcpInfo,
+    /// Darwin `TCP_CONNECTION_INFO`.
+    DarwinTcpConnectionInfo,
+    /// Windows `SIO_TCP_INFO`. The pair is unavailable in this release.
+    WindowsSioTcpInfo,
+    /// Quinn connection statistics.
+    Quinn,
+}
+
+impl CarrierSource {
+    /// The provider name used in statistics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::LinuxTcpInfo => "linux_tcp_info",
+            Self::DarwinTcpConnectionInfo => "darwin_tcp_connection_info",
+            Self::WindowsSioTcpInfo => "windows_sio_tcp_info",
+            Self::Quinn => "quinn",
+        }
+    }
+}
+
+/// The paired counts from one observation of a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarrierCounts {
+    /// TCP data segments and total retransmitted segments.
+    TcpSegments {
+        /// Data segments sent.
+        data_segs_out: u64,
+        /// Total retransmitted segments.
+        total_retrans: u64,
+    },
+    /// TCP packets sent and retransmitted.
+    TcpPackets {
+        /// Packets transmitted.
+        packets_sent: u64,
+        /// Packets retransmitted.
+        packets_retransmitted: u64,
+    },
+    /// QUIC packets sent and declared lost.
+    Quic {
+        /// Packets sent.
+        packets_sent: u64,
+        /// Packets declared lost by the provider.
+        packets_lost: u64,
+    },
+}
+
+/// One observation of a carrier connection, shared by its pipes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarrierSample {
+    /// Process-local identity of the carrier connection.
+    pub carrier_id: CarrierConnId,
+    /// Counter epoch within the connection, starting at zero.
+    pub generation: u64,
+    /// The direction measured by the counters, from this endpoint.
+    pub direction: PipeDirection,
+    /// The underlying provider, even when the pair is unavailable.
+    pub source: CarrierSource,
+    /// Monotonic time of the observation. A cached read keeps this time.
+    pub sampled_at: Instant,
+    /// The pair, when the carrier supplies it.
+    pub counts: Option<CarrierCounts>,
 }
 
 /// The halves of a pipe from the local endpoint's view.
@@ -310,7 +448,7 @@ impl PipeOptions {
         self
     }
 
-    /// The outbound direction's weight.
+    /// Gauge: the outbound direction's weight.
     #[must_use]
     pub fn with_weight(mut self, weight: u64) -> Self {
         self.weight = Change::Set(weight);
@@ -529,7 +667,7 @@ pub struct PipeStats {
     pub inbound: Option<InboundState>,
     /// The outbound pipe's state, if the attachment has one.
     pub outbound: Option<OutboundState>,
-    /// How long the attachment has existed.
+    /// Gauge: how long the attachment has existed.
     pub attached_for: Duration,
     /// The session epoch the attachment joined in (0 for pipe 0).
     pub epoch: Option<u64>,
@@ -567,7 +705,7 @@ pub struct PipeStats {
     pub request_seq: u64,
     /// The peer's latest request for the outbound direction.
     pub peer_request: Option<PipeRequest>,
-    /// The outbound direction's weight.
+    /// Gauge: the outbound direction's weight.
     pub weight: u64,
     /// The end of the outbound pipe's probation;
     /// `None` outside probation, or for a configured base so large that it
@@ -634,18 +772,8 @@ pub struct PipeStats {
     /// An estimate of `bytes_lost` in records: `bytes_lost` x
     /// `records_sent` / `bytes_sent`, rounded up.
     pub records_lost: Option<u64>,
-    /// The bytes the carrier itself retransmitted, as its adapter reports
-    /// them (`PipeIo::with_retransmitted`), queried at most once a second;
-    /// for pipes that share one carrier connection (streams of one QUIC
-    /// connection), that connection's count, the same on each. `None`
-    /// where the adapter reports none.
-    pub bytes_retransmitted: Option<u64>,
-    /// The smoothed carrier loss rate (estimate): an exponentially
-    /// weighted average (gain 1/8) of the increase of
-    /// `bytes_retransmitted` over the increase of `bytes_sent`, sampled at
-    /// most once a second; `None` without a retransmission count and
-    /// before the first sample.
-    pub loss_rate: Option<f64>,
+    /// The cached statistics of an identified outbound connection, once available.
+    pub carrier_sample: Option<CarrierSample>,
     /// Duplicate stream bytes received on the inbound pipe.
     pub bytes_duplicate_received: u64,
     /// Opportunistic copies sent on the outbound pipe.
@@ -656,17 +784,17 @@ pub struct PipeStats {
     pub pings_sent: u64,
     /// `PIPE_PING` frames answered.
     pub pings_answered: u64,
-    /// Since the outbound pipe's acknowledged position last advanced.
+    /// Gauge: time since the outbound pipe's acknowledged position last advanced.
     pub since_last_ack: Option<Duration>,
-    /// Since the inbound pipe last completed a record.
+    /// Gauge: time since the inbound pipe last completed a record.
     pub since_last_receive: Option<Duration>,
-    /// Since a record carrying a traffic frame (STREAM, `RESET_STREAM`,
+    /// Gauge: time since a record carrying a traffic frame (STREAM, `RESET_STREAM`,
     /// `RESET_STREAM_AT`, `STOP_SENDING` or DATAGRAM) was last sent or
     /// received on the pipe, or since it was attached when none was;
     /// probes, acknowledgements, other control frames and padding do not
     /// count. `None` while neither direction is live.
     pub since_last_traffic: Option<Duration>,
-    /// The lanes of the outbound and of the inbound direction, lane 0
+    /// Gauges: the lanes of the outbound and of the inbound direction, lane 0
     /// included.
     pub lanes_out: u64,
     /// See `lanes_out`.
@@ -688,7 +816,7 @@ pub struct LaneStats {
     pub lane: crate::proto::session::Lane,
     /// Bytes written on the outbound lane, its first record included.
     pub position_sent: Option<u64>,
-    /// The position the peer acknowledged on it.
+    /// The position the peer acknowledged on it, if acknowledgements are in use.
     pub position_acked: Option<u64>,
     /// The position of the inbound lane.
     pub position_received: Option<u64>,
@@ -1198,11 +1326,17 @@ impl SessionCore {
             self.end_to_end_known(),
         );
         let resume = self.features.resume;
-        let grace = [local.zmux_resume, peer.zmux_resume]
+        let local_grace = local.zmux_resume.map(Duration::from_millis);
+        let local_grace = if self.config.hooks.transport_parameters.is_some() {
+            local_grace
+        } else {
+            self.config.resume_timeout
+        };
+        let grace = [local_grace, peer.zmux_resume.map(Duration::from_millis)]
             .into_iter()
             .flatten()
             .min()
-            .unwrap_or(0);
+            .unwrap_or_default();
         let local_mad = Duration::from_millis(self.local_tp().max_ack_delay());
         let threshold = self.local_tp().ack_threshold();
         let mp = Mp {
@@ -1246,9 +1380,7 @@ impl SessionCore {
             affinity: crate::proto::session::sched::Affinity::default(),
             tiers: crate::proto::session::tier::Tiers::default(),
             blocked: crate::proto::session::opp::CreditBlocked::default(),
-            suspension: crate::proto::session::resume::Suspension::new(Duration::from_millis(
-                grace,
-            )),
+            suspension: crate::proto::session::resume::Suspension::new(grace),
             busy_until: now + BUSY_WINDOW,
         };
         self.mp = Some(Box::new(mp));
@@ -1551,8 +1683,29 @@ impl SessionCore {
         binding: Option<&[u8]>,
         now: Instant,
     ) -> Result<PipeId, PipeError> {
-        opts.validate()?;
+        let deadline = self
+            .join_clock(now)
+            .checked_add(self.config.join_wait())
+            .map(JoinDeadline::Protocol);
+        self.add_pipe_with_deadline((inbound, outbound), opts, mode, binding, deadline)
+    }
+
+    /// The join deadline and failure checks use the core's monotonic clock.
+    pub(crate) fn join_clock(&mut self, now: Instant) -> Instant {
         self.tick(now);
+        self.now
+    }
+
+    pub(crate) fn add_pipe_with_deadline(
+        &mut self,
+        (inbound, outbound): (Option<Framing>, Option<Framing>),
+        opts: &PipeOptions,
+        mode: RecordMode,
+        binding: Option<&[u8]>,
+        deadline: Option<JoinDeadline>,
+    ) -> Result<PipeId, PipeError> {
+        opts.validate()?;
+        let now = self.now;
         if let Some(e) = self.lost() {
             return Err(PipeError::SessionLost(e));
         }
@@ -1575,14 +1728,10 @@ impl SessionCore {
         if (mode == RecordMode::Bound) != binding.is_some() {
             return Err(PipeError::InvalidArgument);
         }
-        let id = {
-            let mp = self.mp_mut();
-            let id = mp.next_id;
-            mp.next_id += 2;
-            id
-        };
+        let id = PipeId::allocate(&mut self.mp_mut().next_id)?.get();
         let seq = self.next_att_seq();
         let mut att = Attachment::new(id, true, opts.fate_group, seq);
+        att.set_attach_by(deadline);
         // The directions of the carrier are the pipe's direction, fixed.
         att.set_options(&PipeOptions {
             direction: match (inbound.is_some(), outbound.is_some()) {
@@ -2034,7 +2183,7 @@ impl SessionCore {
         if a.failed() || a.unattached() {
             return Ok(());
         }
-        if a.deferred() {
+        if graceful && a.deferred() {
             if let Some(i) = self.att_index(pipe.0) {
                 self.drop_deferred(i);
             }
@@ -2089,6 +2238,9 @@ impl SessionCore {
             return;
         };
         if self.atts.at(i).deferred() {
+            let pending = self.atts.at_mut(i);
+            pending.fail();
+            pending.set_failure(cause);
             self.drop_deferred(i);
             return;
         }
@@ -2554,12 +2706,16 @@ impl SessionCore {
             && self.is_retired(pipe.0)
     }
 
+    fn listed(a: &Attachment) -> bool {
+        !a.unattached() && a.join_failure().is_none()
+    }
+
     /// The attachments and their pipes, with their quality.
     pub fn pipes(&self) -> Vec<PipeStats> {
         let gate = self.path_gate();
         self.atts
             .iter()
-            .filter(|a| !a.unattached())
+            .filter(|a| Self::listed(a))
             .map(|a| self.info_of(a, gate))
             .collect()
     }
@@ -2568,7 +2724,7 @@ impl SessionCore {
     pub fn pipe_ids(&self) -> Vec<PipeId> {
         self.atts
             .iter()
-            .filter(|a| !a.unattached())
+            .filter(|a| Self::listed(a))
             .map(|a| PipeId(a.id()))
             .collect()
     }
@@ -2648,6 +2804,18 @@ impl SessionCore {
                 a.failure().unwrap_or(PipeFailure::Aborted),
             ))
         })
+    }
+
+    pub(crate) fn expire_join(&mut self, id: u64, now: Instant) -> Option<PipeFailure> {
+        let now = self.join_clock(now);
+        let deadline = self.att(id)?.attach_by()?;
+        if now < deadline.at() {
+            return None;
+        }
+        let cause = deadline.cause();
+        self.fail_attachment(id, cause, now);
+        self.after_pipe_change(now);
+        Some(cause)
     }
 
     /// Whether the pipe ended: `Ok` once none of its halves is live any
@@ -2862,8 +3030,7 @@ impl SessionCore {
                         .unwrap_or(u64::MAX)
                 }
             }),
-            bytes_retransmitted: o.and_then(OutPipe::retransmitted),
-            loss_rate: o.and_then(OutPipe::loss_rate),
+            carrier_sample: None,
             bytes_duplicate_received: i.map_or(0, InPipe::dup_bytes),
             bytes_opportunistic: q.bytes_opportunistic,
             bytes_redundant: q.bytes_redundant,
@@ -2878,7 +3045,7 @@ impl SessionCore {
             lanes_out: o.map_or(0, OutPipe::lane_count),
             lanes_in: i.map_or(0, InPipe::lane_count),
             lanes_refused: o.and_then(OutPipe::lanes).map_or(0, OutLanes::refused),
-            lanes: crate::proto::session::lanes::lane_infos(o, i),
+            lanes: crate::proto::session::lanes::lane_infos(o, i, acked.is_some()),
         }
     }
 
@@ -2930,17 +3097,6 @@ impl SessionCore {
         }
     }
 
-    /// The bytes pipe `pipe`'s carrier itself has retransmitted, when the adapter
-    /// can report them (an optional capability):
-    /// [`PipeStats::bytes_retransmitted`], and a sample of
-    /// [`PipeStats::loss_rate`] at most once a second. Drivers query it on the
-    /// pipe's sending half, without the core lock.
-    pub fn set_pipe_retransmitted(&mut self, pipe: PipeId, bytes: u64, now: Instant) {
-        if let Some(o) = self.out_mut(pipe.0) {
-            o.set_retransmitted(bytes, now);
-        }
-    }
-
     /// The carrier's unsent bytes (for example `tcpi_notsent_bytes`), when
     /// the adapter can report them: reporting them
     /// declares the capability, and the carrier queue limiter no longer
@@ -2972,9 +3128,14 @@ impl SessionCore {
         self.settle_pipe(at.pipe.0, now);
         // The linger runs from the delivery of CONNECTION_CLOSE to the
         // carriers, not from its queueing.
-        if self.state == State::Closing && !self.linger_from_delivery && self.close_handed_off() {
-            self.linger_from_delivery = true;
-            self.linger_deadline = Some(self.now + self.linger_timeout());
+        if self.state == State::Closing && self.close_handed_off() {
+            if !self.linger_from_delivery {
+                self.linger_from_delivery = true;
+                self.linger_deadline = Some(self.now + self.linger_timeout());
+            }
+            // The peer may already have ended its input while the final
+            // write was pending. Its EOF alone cannot retire this carrier.
+            self.maybe_closed(now);
         }
     }
 
@@ -3098,9 +3259,6 @@ impl SessionCore {
         };
         if let Some(o) = a.out().filter(|o| o.is_live()) {
             let (t_suspect, t_fail, d) = self.limits(o);
-            if !o.confirmed() {
-                at(o.joined_at().checked_add(self.config.join_wait()));
-            }
             if let Some(from) = self.stall_from(a.id(), o, inbound_live) {
                 match o.state() {
                     OutState::Active => at(from.checked_add(t_suspect)),
@@ -3142,13 +3300,11 @@ impl SessionCore {
         }
         if let Some(p) = a.inp() {
             at(p.linger_until().filter(|_| p.is_live()));
-            if p.state() == InState::Joining {
-                at(p.opened_at().checked_add(self.config.join_wait()));
-            }
             if let Some(limit) = self.silence_limit(a) {
                 at(p.last_progress().checked_add(limit));
             }
         }
+        at(a.attach_by().map(JoinDeadline::at));
         at(a.retire_at());
         next
     }
@@ -3504,6 +3660,9 @@ impl SessionCore {
 
     /// Applies the time-driven transitions of one attachment.
     fn check_pipe(&mut self, id: u64, now: Instant) {
+        if self.expire_join(id, now).is_some() {
+            return;
+        }
         let inbound_live = self.atts.any_in_live();
         let Some(a) = self.att(id) else {
             return;
@@ -3511,15 +3670,6 @@ impl SessionCore {
         // Outbound.
         if let Some(o) = a.out().filter(|o| o.is_live()) {
             let (t_suspect, t_fail, d) = self.limits(o);
-            if !o.confirmed()
-                && o.joined_at()
-                    .checked_add(self.config.join_wait())
-                    .is_some_and(|t| now >= t)
-            {
-                self.fail_attachment(id, PipeFailure::JoinTimedOut, now);
-                self.after_pipe_change(now);
-                return;
-            }
             if let Some(from) = self.stall_from(id, o, inbound_live) {
                 let stalled = now.saturating_duration_since(from);
                 match o.state() {
@@ -3579,15 +3729,6 @@ impl SessionCore {
                     });
                 }
                 self.try_retire(now);
-                self.after_pipe_change(now);
-                return;
-            }
-            if p.state() == InState::Joining
-                && p.opened_at()
-                    .checked_add(self.config.join_wait())
-                    .is_some_and(|t| now >= t)
-            {
-                self.fail_attachment(id, PipeFailure::JoinTimedOut, now);
                 self.after_pipe_change(now);
                 return;
             }
@@ -3654,6 +3795,23 @@ pub(in crate::proto::session) fn dead_timeout_of(
 mod tests {
     use super::displacement_rank;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn neither_endpoint_can_allocate_the_unassigned_pipe_id() {
+        use crate::{PipeError, PipeId, VarInt};
+
+        assert_eq!(PipeId::UNASSIGNED.get(), 1 << 62);
+        for last in [VarInt::MAX.into_inner() - 1, VarInt::MAX.into_inner()] {
+            let mut next = last;
+            assert_eq!(PipeId::allocate(&mut next).unwrap().get(), last);
+            for _ in 0..2 {
+                assert!(matches!(
+                    PipeId::allocate(&mut next),
+                    Err(PipeError::IdExhausted)
+                ));
+            }
+        }
+    }
 
     #[test]
     fn displacement_takes_acknowledged_failures_then_unacknowledged_then_live() {

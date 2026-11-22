@@ -910,17 +910,54 @@ pub async fn serve_connection(
 async fn serve_entered(
     conn: Connection,
     handshake: Option<tokio::sync::watch::Receiver<bool>>,
-    entry: Entry,
+    mut entry: Entry,
     listener: Listener,
     options: &Options,
 ) {
-    if listener.adapter().admission().is_some() {
-        admit(conn, entry, listener, options).await;
+    // The carrier is made once the first stream is accepted, for its
+    // first pipe; the rest of its streams reach the listener after that.
+    let made = Arc::new(Mutex::new(None::<Carrier>));
+    let first = {
+        let (conn, made, l, options) = (
+            conn.clone(),
+            made.clone(),
+            listener.clone(),
+            options.clone(),
+        );
+        async move {
+            let (send, recv) = conn.accept_bi().await.map_err(io::Error::other)?;
+            let c = conn.clone();
+            let io = AdmitIo::stream(tokio::io::join(recv, send), move |streams| {
+                let (recv, send) = streams.into_inner();
+                let carrier = Carrier::make(&c, Some(&l), &options, handshake);
+                let pipe = carrier.inner.pipe(
+                    Send::new(QuinnSend::new(send)),
+                    Recv::new(QuinnRecv::new(recv)),
+                );
+                *made.lock().unwrap_or_else(PoisonError::into_inner) = Some(carrier);
+                pipe
+            });
+            // Closed once a fallback's future returned it, also when this
+            // admission is dropped meanwhile.
+            let closing = conn.clone();
+            Ok(io
+                .with_connection(Arc::new(conn))
+                .with_on_return(move || closing.close(VarInt::from_u32(0), b"")))
+        }
+    };
+    let info = Handshake::of(&conn).carrier_info(&conn);
+    let accepted = entry.admit_first(info, first).await;
+    let carrier = made.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let (Some(first), Some(carrier)) = (accepted, carrier) else {
+        entry.end_unclaimed_connection(|| conn.close(VarInt::from_u32(0), b""));
         return;
-    }
-    // Without an admission: accepted, its streams enter one by one.
-    entry.release();
-    let carrier = Carrier::start(&conn, Some(listener), options, handshake);
+    };
+    let admitted = entry.admitted();
+    let hint = PipeHint::from_entry(entry);
+    let l = listener.clone();
+    tokio::spawn(async move { l.handle_pipe(first, hint).await });
+    // The other streams from here on.
+    carrier.inner.listen(Some(listener), admitted);
     delivering(carrier, &conn).await;
 }
 
@@ -941,60 +978,6 @@ impl Drop for StopDelivery {
             t.abort();
         }
     }
-}
-
-/// The admission of one connection whose handshake completed ([`serve`]).
-async fn admit(conn: Connection, mut entry: Entry, listener: Listener, options: &Options) {
-    // The carrier is made once the first stream is accepted, for its
-    // first pipe; the rest of its streams reach the listener after that.
-    let made = Arc::new(Mutex::new(None::<Carrier>));
-    let first = {
-        let (conn, made, l, options) = (
-            conn.clone(),
-            made.clone(),
-            listener.clone(),
-            options.clone(),
-        );
-        async move {
-            let (send, recv) = conn.accept_bi().await.map_err(io::Error::other)?;
-            let c = conn.clone();
-            let io = AdmitIo::stream(tokio::io::join(recv, send), move |streams| {
-                let (recv, send) = streams.into_inner();
-                let carrier = Carrier::make(&c, Some(&l), &options, None);
-                let pipe = carrier.inner.pipe(
-                    Send::new(QuinnSend::new(send)),
-                    Recv::new(QuinnRecv::new(recv)),
-                );
-                *made.lock().unwrap_or_else(PoisonError::into_inner) = Some(carrier);
-                pipe
-            });
-            // Closed once a fallback's future returned it, also when this
-            // admission is dropped meanwhile.
-            let closing = conn.clone();
-            Ok(io
-                .with_connection(Arc::new(conn))
-                .with_on_return(move || closing.close(VarInt::from_u32(0), b"")))
-        }
-    };
-    let info = Handshake::of(&conn).carrier_info(&conn);
-    let accepted = entry.admit_first(info, first).await;
-    let carrier = made.lock().unwrap_or_else(PoisonError::into_inner).take();
-    let (Some(first), Some(carrier)) = (accepted, carrier) else {
-        // Not accepted, the verdict acted on (a fallback has completed):
-        // closed before the streams are dropped, nothing sent on them;
-        // a carrier the host detached leaves its connection to the host.
-        if !entry.is_detached() {
-            conn.close(VarInt::from_u32(0), b"");
-        }
-        return;
-    };
-    let admitted = entry.admitted();
-    let hint = PipeHint::from_entry(entry);
-    let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(first, hint).await });
-    // The other streams from here on.
-    carrier.inner.listen(Some(listener), admitted);
-    delivering(carrier, &conn).await;
 }
 
 /// The QUIC connection of a stream the listener's fallback took over
@@ -1245,20 +1228,20 @@ impl Inner {
         let opener = self.clone();
         // Does not keep the connection: gives no value once it is gone.
         let exporter = Arc::downgrade(self);
-        // The connection's lost bytes: what it retransmits, the same for
-        // every pipe of the connection.
-        let conn = self.conn.clone();
-        let io = parts::pipe(send, recv, self.clone())
-            .with_carrier(zmux::CarrierKind::Quic)
-            .with_retransmitted(move || Some(conn.stats().path.lost_bytes))
-            .with_carrier_conn(self.id())
-            .with_connection_memory(self.own_charge)
-            .with_datagram_channel(channel)
-            .with_close_code(move |code| {
-                closer
-                    .close_code
-                    .store(code.into_inner(), std::sync::atomic::Ordering::Relaxed);
-            });
+        // The handshake notification task can lag a stream accepted in 1-RTT.
+        let early_stream = recv.get_ref().stream.is_0rtt();
+        let io = with_packet_counters(parts::pipe(send, recv, self.clone()), self, |inner| {
+            &inner.conn
+        })
+        .with_carrier(zmux::CarrierKind::Quic)
+        .with_carrier_conn(self.id())
+        .with_connection_memory(self.own_charge)
+        .with_datagram_channel(channel)
+        .with_close_code(move |code| {
+            closer
+                .close_code
+                .store(code.into_inner(), std::sync::atomic::Ordering::Relaxed);
+        });
         let done = self.handshake.clone();
         let state = zmux::TlsState::new(self.alpn.clone().map(String::into_bytes), None);
         let io = io.with_terminated_tls(move || {
@@ -1271,7 +1254,11 @@ impl Inner {
             Some(a) => io.with_protocol(a.clone()),
             None => io,
         };
-        let io = match self.handshake.clone().filter(|h| !*h.borrow()) {
+        let io = match self
+            .handshake
+            .clone()
+            .filter(|h| early_stream && !*h.borrow())
+        {
             // Opened in 0-RTT: replayable until the handshake completes.
             Some(h) => io.with_early_data_in(move || {
                 let mut h = h.clone();
@@ -1398,6 +1385,28 @@ impl parts::CarrierState<QuinnSend, QuinnRecv> for Inner {
     fn accepted(&self) -> &parts::AcceptQueue<(Send, Recv)> {
         &self.accepted
     }
+}
+
+/// Installs on-demand packet counters from the Quinn connection.
+#[doc(hidden)]
+#[must_use]
+pub fn with_packet_counters<T: std::marker::Send + Sync + 'static>(
+    io: PipeIo,
+    owner: &Arc<T>,
+    connection: fn(&T) -> &Connection,
+) -> PipeIo {
+    let key = connection(owner).stable_id();
+    let identity = CarrierConnId::new(owner);
+    let owner = Arc::downgrade(owner);
+    io.with_carrier_counters(zmux::CarrierSource::Quinn, move || {
+        let owner = owner.upgrade()?;
+        let path = connection(&owner).stats().path;
+        Some(zmux::CarrierCounts::Quic {
+            packets_sent: path.sent_packets,
+            packets_lost: path.lost_packets,
+        })
+    })
+    .with_carrier_counter_identity::<Connection>(key, identity)
 }
 
 /// The QUIC datagrams of a connection as the datagram channels of its

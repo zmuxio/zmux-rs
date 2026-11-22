@@ -12,7 +12,59 @@ use std::fmt;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
+
+/// The unwind boundary for a host invocation or one poll of its future.
+pub(crate) fn host<T>(call: impl FnOnce() -> T) -> Option<T> {
+    protected(call).ok()
+}
+
+fn protected<T>(call: impl FnOnce() -> T) -> std::thread::Result<T> {
+    crate::lock_scope::assert_none();
+    catch_unwind(AssertUnwindSafe(call))
+}
+
+pub(crate) async fn host_future<F: Future>(call: impl FnOnce() -> F) -> Option<F::Output> {
+    host_result(call).await.ok()
+}
+
+/// Preserve the panic until the owner decides how its API reports it.
+pub(crate) async fn host_result<F: Future>(
+    call: impl FnOnce() -> F,
+) -> std::thread::Result<F::Output> {
+    struct HostFuture<F>(Option<Pin<Box<F>>>);
+    impl<F> HostFuture<F> {
+        fn finish(&mut self) -> std::thread::Result<()> {
+            let f = self.0.take();
+            protected(|| drop(f))
+        }
+    }
+    impl<F> Drop for HostFuture<F> {
+        fn drop(&mut self) {
+            if self.0.is_some() {
+                let _ = self.finish();
+            }
+        }
+    }
+    let mut future = HostFuture(Some(Box::pin(protected(call)?)));
+    let result = std::future::poll_fn(|cx| {
+        match protected(|| {
+            future
+                .0
+                .as_mut()
+                .expect("running host future")
+                .as_mut()
+                .poll(cx)
+        }) {
+            Ok(p) => p.map(Ok),
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    })
+    .await;
+    let cleanup = future.finish();
+    let output = result?;
+    cleanup.map(|()| output)
+}
 
 /// The future of a [`Decision::Later`].
 pub type LaterFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -39,7 +91,7 @@ impl<T> Decision<T> {
     /// polled is caught by [`Decision::settle`]). The one place a hook's
     /// call is guarded, for adapters and bindings as for zmux.
     pub fn catch(f: impl FnOnce() -> Self) -> Option<Self> {
-        catch_unwind(AssertUnwindSafe(f)).ok()
+        host(f)
     }
 
     /// Whether the answer is given now.
@@ -65,7 +117,7 @@ impl<T> Decision<T> {
     pub async fn settle(self) -> Option<T> {
         match self {
             Self::Now(v) => Some(v),
-            Self::Later(fut) => Caught(fut).await,
+            Self::Later(fut) => host_future(|| fut).await,
         }
     }
 }
@@ -85,22 +137,6 @@ impl<T: fmt::Debug> fmt::Debug for Decision<T> {
     }
 }
 
-/// Polls a later answer, a panic giving `None`.
-struct Caught<T>(LaterFuture<T>);
-
-impl<T> Future for Caught<T> {
-    type Output = Option<T>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        let fut = &mut self.0;
-        match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
-            Ok(Poll::Ready(v)) => Poll::Ready(Some(v)),
-            Ok(Poll::Pending) => Poll::Pending,
-            Err(_) => Poll::Ready(None),
-        }
-    }
-}
-
 /// Calls a synchronous hook, a panic giving `None`.
 pub(crate) fn call<T>(f: impl FnOnce() -> Decision<T>) -> Decision<Option<T>>
 where
@@ -116,11 +152,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::task::Context;
 
     fn poll_once<F: Future>(f: F) -> Poll<F::Output> {
         let mut f = std::pin::pin!(f);
         f.as_mut()
             .poll(&mut Context::from_waker(std::task::Waker::noop()))
+    }
+
+    #[test]
+    // HS-07
+    fn host_future_destructor_panic_is_contained_on_return_and_cancellation() {
+        struct Host(bool);
+        impl Drop for Host {
+            fn drop(&mut self) {
+                panic!("host cleanup");
+            }
+        }
+        impl Future for Host {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                if self.0 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        assert_eq!(poll_once(host_future(|| Host(true))), Poll::Ready(None));
+        assert_eq!(poll_once(host_future(|| Host(false))), Poll::Pending);
     }
 
     #[test]

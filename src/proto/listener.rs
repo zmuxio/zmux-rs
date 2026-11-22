@@ -200,23 +200,13 @@ pub struct ListenerConfig {
     /// for new sessions): read its prefix, decide, act on the decision
     /// (none by default: every carrier is accepted).
     pub admission: Option<super::admission::Admission>,
-    /// Takes over every carrier that the admission hands back
-    /// ([`crate::AdmissionVerdict::Fallback`], or a late prefix with
-    /// [`crate::Admission::with_fallback_on_peek_timeout`]), whatever entry
-    /// took it: byte streams (TCP, TLS, Unix, any carrier given to
-    /// [`crate::Listener::handle_pipe`]), message-framed carriers (a
-    /// WebSocket decided on its first message), and the first stream of a
-    /// QUIC connection or a WebTransport session, as a [`crate::Takeover`]
-    /// with what was read replayed, and an HTTP request carrier decided on
-    /// the start of its body, as the full-duplex pipe of its request and
-    /// response bodies. Without one such a carrier is stalled (a request
-    /// carrier goes to its adapter's HTTP fallback). An HTTP request
-    /// decided on its head (a request without a body, an upgrade refused on
-    /// its head, an exchange request) is taken over as a request, by its
-    /// adapter's HTTP fallback. Its future runs on a task of its own and
-    /// owns the carrier until it completes, unless the host detaches it
-    /// ([`crate::Takeover`]). It never decides whether the admission
-    /// runs.
+    /// The byte-stream target of [`crate::AdmissionVerdict::Takeover`] for
+    /// every carrier, including an accepted HTTP request body and its
+    /// response writer. Without a target the listener stalls the carrier.
+    /// [`crate::AdmissionVerdict::Fallback`] selects this target on a byte
+    /// carrier and the adapter's normal HTTP handler on a request.
+    /// The target receives the original prefix in a [`crate::Takeover`]
+    /// and owns it until its callback returns or explicitly detaches.
     #[cfg(all(feature = "tokio", not(loom)))]
     pub fallback: Option<crate::driver::admission::Fallback>,
     /// The inbound transform every carrier passes through after its
@@ -248,11 +238,25 @@ pub struct RejectInfo {
     pub record_mode: Option<crate::proto::seal::RecordMode>,
     /// The reason: a secure-carrier error class, or `unknown_locator`.
     pub reason: &'static str,
+    /// The refusal error, including its original cause when available.
+    pub error: RejectError,
     /// The carrier's source.
     pub source: Option<std::net::SocketAddr>,
 }
 
 impl RejectInfo {
+    /// Projects a transform's refusal into the host policy.
+    #[must_use]
+    pub fn from_error(error: RejectError, source: Option<std::net::SocketAddr>) -> Self {
+        Self {
+            profile: error.profile,
+            record_mode: error.record_mode,
+            reason: error.reason,
+            error,
+            source,
+        }
+    }
+
     /// A refusal for `reason`.
     #[must_use]
     pub fn new(
@@ -265,6 +269,7 @@ impl RejectInfo {
             profile,
             record_mode,
             reason,
+            error: RejectError::new(profile, record_mode, reason),
             source,
         }
     }
@@ -683,6 +688,39 @@ struct SlotState {
     stall: Option<u64>,
 }
 
+/// Admission of future bootstrap carriers. Shutdown permanently seals the gate.
+#[cfg(any(feature = "blocking", feature = "tokio"))]
+pub(crate) enum BootstrapRefusal {
+    Capacity(&'static str),
+    Drain(bytes::Bytes),
+}
+
+#[cfg(any(feature = "blocking", feature = "tokio"))]
+impl BootstrapRefusal {
+    pub(crate) fn reason(self) -> bytes::Bytes {
+        match self {
+            Self::Capacity(reason) => reason.into(),
+            Self::Drain(reason) => reason,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+enum BootstrapGate {
+    #[default]
+    Open,
+    Drained(bytes::Bytes),
+    Shutdown(bytes::Bytes),
+}
+
+/// Only a waiting half is eligible to pair. The token remains leased after
+/// withdrawal, expiry or pairing until all resources of that generation exit.
+#[derive(Debug)]
+struct PairEntry {
+    owner: CarrierId,
+    waiting: Option<(bool, Instant)>,
+}
+
 /// A sans-IO listener.
 #[derive(Debug)]
 pub struct ListenerCore {
@@ -691,7 +729,8 @@ pub struct ListenerCore {
     /// Pending carriers, oldest first.
     pending: VecDeque<Pending>,
     /// Split-bootstrap pairing: token -> (carrier, inbound half?, opened).
-    pairs: HashMap<[u8; PAIRING_TOKEN_LEN], (CarrierId, bool, Instant, bool)>,
+    pairs: HashMap<[u8; PAIRING_TOKEN_LEN], PairEntry>,
+    pair_expiry: BTreeMap<(Instant, CarrierId), [u8; PAIRING_TOKEN_LEN]>,
     /// The slots held ([`ListenerCore::enter`]).
     slots: HashMap<Slot, SlotState>,
     /// Slots held per source.
@@ -708,6 +747,7 @@ pub struct ListenerCore {
     unconfirmed_seq: u64,
     /// New sessions not accepted yet ([`ListenerCore::reserve_unaccepted`]).
     unaccepted: usize,
+    bootstrap: BootstrapGate,
 }
 
 impl ListenerConfig {
@@ -815,6 +855,7 @@ impl ListenerCore {
             next: 1,
             pending: VecDeque::new(),
             pairs: HashMap::new(),
+            pair_expiry: BTreeMap::new(),
             slots: HashMap::new(),
             by_source: HashMap::new(),
             stalled_by: HashMap::new(),
@@ -823,6 +864,43 @@ impl ListenerCore {
             next_slot: 1,
             unconfirmed_seq: 0,
             unaccepted: 0,
+            bootstrap: BootstrapGate::Open,
+        }
+    }
+
+    /// Refuses subsequently classified new sessions with this reason.
+    pub fn drain(&mut self, reason: &[u8]) {
+        if !self.shutting_down() {
+            self.bootstrap = BootstrapGate::Drained(bytes::Bytes::copy_from_slice(reason));
+        }
+    }
+
+    /// Reopens bootstrap admission unless graceful shutdown has started.
+    pub fn undrain(&mut self) {
+        if !self.shutting_down() {
+            self.bootstrap = BootstrapGate::Open;
+        }
+    }
+
+    /// Permanently refuses new sessions from graceful shutdown onward.
+    pub fn begin_shutdown(&mut self, reason: &[u8]) {
+        if !self.shutting_down() {
+            self.bootstrap = BootstrapGate::Shutdown(bytes::Bytes::copy_from_slice(reason));
+        }
+    }
+
+    /// Whether graceful shutdown has started.
+    pub fn shutting_down(&self) -> bool {
+        matches!(self.bootstrap, BootstrapGate::Shutdown(_))
+    }
+
+    /// Snapshots the decision for one classified bootstrap, including a paired split.
+    pub fn bootstrap_refusal(&self) -> Option<bytes::Bytes> {
+        match &self.bootstrap {
+            BootstrapGate::Open => None,
+            BootstrapGate::Drained(reason) | BootstrapGate::Shutdown(reason) => {
+                Some(reason.clone())
+            }
         }
     }
 
@@ -843,6 +921,25 @@ impl ListenerCore {
         } else {
             Err("accept queue full")
         }
+    }
+
+    /// Decide this bootstrap once, before any locator or join becomes visible.
+    #[cfg(any(feature = "blocking", feature = "tokio"))]
+    pub(crate) fn bootstrap_admission(
+        &mut self,
+        closing: bool,
+        pressure: bool,
+    ) -> Result<(), BootstrapRefusal> {
+        if let Some(reason) = self.bootstrap_refusal() {
+            return Err(BootstrapRefusal::Drain(reason));
+        }
+        self.admit_session(closing, pressure)
+            .map_err(BootstrapRefusal::Capacity)
+    }
+
+    /// Whether the reservation is still held, including after a capacity eviction.
+    pub fn holds_slot(&self, slot: Slot) -> bool {
+        self.slots.contains_key(&slot)
     }
 
     /// Takes a place for a new session until the application accepts it or
@@ -1269,7 +1366,8 @@ impl ListenerCore {
     }
 
     /// Pairs a split-bootstrap carrier by its token; `inbound` is the half the carrier gives the
-    /// local endpoint.
+    /// local endpoint. A completed pair reserves its token until the owner calls
+    /// [`Self::unpair`] with the first carrier ID after attachment cleanup.
     pub fn pair(
         &mut self,
         token: [u8; PAIRING_TOKEN_LEN],
@@ -1277,29 +1375,63 @@ impl ListenerCore {
         inbound: bool,
         now: Instant,
     ) -> Paired {
-        // Entries older than the handshake timeout are gone: their halves
-        // gave up.
-        let limit = self.config.handshake_timeout;
-        self.pairs
-            .retain(|_, v| now.saturating_duration_since(v.2) < limit);
-        match self.pairs.get_mut(&token) {
-            // The halves waiting hold slots, which bound the table.
-            None => {
-                self.pairs.insert(token, (id, inbound, now, false));
+        self.expire_pairs(now);
+        match self.pairs.entry(token) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                self.pair_expiry.insert((now, id), token);
+                slot.insert(PairEntry {
+                    owner: id,
+                    waiting: Some((inbound, now)),
+                });
                 Paired::Waiting
             }
-            Some(entry) if !entry.3 && entry.1 != inbound => {
-                entry.3 = true;
-                Paired::Complete(entry.0)
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let entry = slot.get_mut();
+                if let Some((direction, since)) = entry.waiting
+                    && direction != inbound
+                {
+                    self.pair_expiry.remove(&(since, entry.owner));
+                    entry.waiting = None;
+                    Paired::Complete(entry.owner)
+                } else {
+                    Paired::Reject
+                }
             }
-            Some(_) => Paired::Reject,
         }
     }
 
-    /// Forgets the pairing of `token` the half `id` began: the half gave up, so the token
-    /// starts a new pairing.
+    fn expire_pairs(&mut self, now: Instant) {
+        while let Some((&(opened, _), _)) = self.pair_expiry.first_key_value() {
+            if now.saturating_duration_since(opened) < self.config.handshake_timeout {
+                break;
+            }
+            let ((_, id), token) = self
+                .pair_expiry
+                .pop_first()
+                .expect("observed first deadline");
+            if let Some(entry) = self.pairs.get_mut(&token)
+                && entry.owner == id
+                && entry.waiting.is_some_and(|(_, since)| since == opened)
+            {
+                entry.waiting = None;
+            }
+        }
+    }
+
+    /// Removes matching eligibility while retaining the token for the old attachment.
+    pub fn withdraw_pair(&mut self, token: &[u8; PAIRING_TOKEN_LEN], id: CarrierId) {
+        if let Some(entry) = self.pairs.get_mut(token)
+            && entry.owner == id
+            && let Some((_, since)) = entry.waiting.take()
+        {
+            self.pair_expiry.remove(&(since, id));
+        }
+    }
+
+    /// Releases the token of this generation after attachment cleanup.
     pub fn unpair(&mut self, token: &[u8; PAIRING_TOKEN_LEN], id: CarrierId) {
-        if self.pairs.get(token).is_some_and(|v| v.0 == id) {
+        self.withdraw_pair(token, id);
+        if self.pairs.get(token).is_some_and(|v| v.owner == id) {
             self.pairs.remove(token);
         }
     }
@@ -1335,9 +1467,7 @@ impl ListenerCore {
                 i += 1;
             }
         }
-        let pairs_limit = handshake;
-        self.pairs
-            .retain(|_, v| now.saturating_duration_since(v.2) < pairs_limit);
+        self.expire_pairs(now);
         out
     }
 }
@@ -1488,34 +1618,34 @@ pub struct AdmissionStats {
     /// Decided with [`crate::AdmissionVerdict::Accept`]; each then counts once more as a
     /// pipe input in the other fields of [`ListenerStats`].
     pub accepted: u64,
-    /// Decided with [`crate::AdmissionVerdict::Fallback`] (stalled without a fallback
-    /// target, still counted here), or taken to the fallback by a peek
-    /// timeout ([`crate::Admission::with_fallback_on_peek_timeout`], also
-    /// counted in `peek_timed_out`).
+    /// Fallback handoffs to a host, including those routed there after a peek timeout.
     pub fallback: u64,
-    /// Decided with [`crate::AdmissionVerdict::Stall`], counted when the stall starts.
+    /// Carriers handed to the byte-stream target by [`crate::AdmissionVerdict::Takeover`],
+    /// counted when the host callback begins. Without a target the stall outcome counts.
+    pub takeover: u64,
+    /// Stalls that began, including targetless fallback and takeover, and
+    /// targetless HTTP fallbacks answered not found.
     pub stalled: u64,
     /// Decided with [`crate::AdmissionVerdict::Close`] or a verdict that is
     /// one where it was taken (an `Accept` beyond the prefix, a misplaced
     /// `More` or `Defer`), a decision that panicked, a carrier the
     /// listener's close interrupted, a message-framed carrier without a
-    /// first message to decide on, or a deferred decision whose carrier
-    /// ended first.
+    /// first message to decide on, an oversized first message on an ordinary
+    /// carrier, or a deferred decision whose carrier ended first.
     pub closed: u64,
-    /// A Stall, decided by the admission or by [`ListenerConfig::on_reject`], that the
-    /// listener could not carry out: its source already stalled
+    /// An admission stall the listener could not carry out: its source already stalled
     /// `max_pending_per_source - 1` carriers
     /// ([`ListenerLimits::max_pending_per_source`]), the listener's stalls held half of
     /// [`ListenerLimits::max_pending`], or the listener closed meanwhile. Closed at once.
     pub stall_overflow: u64,
-    /// The first message of a message-framed carrier was longer than
-    /// [`crate::Admission::with_max_message`]: closed without a decision.
+    /// After an upgrade deferred the decision, the first message was longer
+    /// than [`crate::Admission::with_max_message`]: closed without a decision.
     pub too_large: u64,
-    /// The prefix, the carrier a deferred decision waited for, or the
-    /// decision did not come before the end of the peek timeout.
+    /// Admission that ended when its peek deadline elapsed.
     pub peek_timed_out: u64,
     /// The outer handshake (TLS, an HTTP upgrade, QUIC) failed or timed
-    /// out: never decided on. Not counted in
+    /// out, or writing an accepted takeover response head failed.
+    /// Not counted in
     /// [`ListenerStats::setup_failures`].
     pub handshake_failed: u64,
 }
@@ -1548,7 +1678,7 @@ pub struct ListenerStats {
         not(feature = "tokio"),
         doc = " Sessions started: bootstraps offered to `Listener::accept`, a"
     )]
-    /// split bootstrap once.
+    /// split bootstrap once. A later rejection leaves this count intact.
     pub sessions: u64,
     /// Joins accepted into existing sessions, and lanes accepted into
     /// their pipes.
@@ -1594,10 +1724,24 @@ pub struct ListenerStats {
     pub admission: AdmissionStats,
 }
 
+/// A shared failure from the host's fallback.
+#[derive(Debug, Clone)]
+pub struct FallbackError(pub std::sync::Arc<std::io::Error>);
+
+impl PartialEq for FallbackError {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FallbackError {}
+
 /// Why a carrier was not used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HandleError {
+    /// The fallback failed. Its host error is available through `Error::source`.
+    Fallback(FallbackError),
     /// Closed without a distinguishable reason: unknown, unauthenticated
     /// or replayed, a lane that names no pipe, or not zmux at all.
     Rejected,
@@ -1611,8 +1755,7 @@ pub enum HandleError {
     /// sent in carrier early data waits for failed or timed out. Counted
     /// as a setup failure ([`ListenerStats::setup_failures`]) only.
     SetupFailed,
-    /// The listener's admission did not accept the carrier: it was
-    /// closed, stalled or handed to a fallback. Counted in
+    /// The listener closed or stalled the carrier under its admission policy. Counted in
     /// [`ListenerStats::admission`] only.
     NotAdmitted,
 }
@@ -1620,6 +1763,7 @@ pub enum HandleError {
 impl std::fmt::Display for HandleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::Fallback(error) => return std::fmt::Display::fmt(&error.0, f),
             Self::Rejected => "carrier rejected",
             Self::Refused => "carrier refused",
             Self::SetupFailed => "carrier setup failed",
@@ -1629,7 +1773,15 @@ impl std::fmt::Display for HandleError {
     }
 }
 
-impl std::error::Error for HandleError {}
+impl std::error::Error for HandleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if let Self::Fallback(e) = self {
+            Some(e.0.as_ref())
+        } else {
+            None
+        }
+    }
+}
 
 /// A 16-byte session locator: `prefix`, then random bytes.
 #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
@@ -1648,6 +1800,53 @@ mod tests {
         match e {
             Entered::Taken { slot, evicted } => (slot, evicted),
             other => panic!("not taken: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orphan_pair_expiry_is_consumed() {
+        let config = ListenerConfig::default();
+        let limit = config.handshake_timeout;
+        let mut core = ListenerCore::new(config);
+        let now = Instant::now();
+        core.pair_expiry
+            .insert((now, CarrierId(9)), [0; PAIRING_TOKEN_LEN]);
+        core.expire_pairs(now + limit);
+        assert!(core.pair_expiry.is_empty());
+    }
+
+    #[test]
+    fn expiry_index_contains_only_eligible_split_halves() {
+        for active in [0, 1, 128] {
+            let config = ListenerConfig::default();
+            let limit = config.handshake_timeout;
+            let mut core = ListenerCore::new(config);
+            let now = Instant::now();
+            for i in 0..active {
+                let token = [i; PAIRING_TOKEN_LEN];
+                let owner = CarrierId(u64::from(i) * 2);
+                assert_eq!(core.pair(token, owner, true, now), Paired::Waiting);
+                assert_eq!(
+                    core.pair(token, CarrierId(owner.0 + 1), false, now),
+                    Paired::Complete(owner)
+                );
+            }
+            let token = [255; PAIRING_TOKEN_LEN];
+            let owner = CarrierId(1000);
+            assert_eq!(core.pair(token, owner, true, now), Paired::Waiting);
+            assert_eq!(core.pair_expiry.len(), 1);
+            core.expire_pairs(now + limit);
+            assert!(core.pair_expiry.is_empty());
+            assert_eq!(core.pairs.len(), usize::from(active) + 1);
+            assert_eq!(
+                core.pair(token, CarrierId(1001), false, now + limit),
+                Paired::Reject
+            );
+            core.unpair(&token, owner);
+            assert_eq!(
+                core.pair(token, CarrierId(1001), false, now + limit),
+                Paired::Waiting
+            );
         }
     }
 

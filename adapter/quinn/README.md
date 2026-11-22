@@ -58,11 +58,11 @@ of the connection's first bidirectional stream, within the peek timeout from
 the end of the handshake. Only once that
 stream is accepted does it become the connection's first pipe, the rest of
 its prefix in front, and do the connection's other streams reach the
-listener. A first stream that is not accepted goes to the listener's
-fallback (`ListenerConfig::fallback`, a `zmux::Takeover` of the stream with
+listener. Both `serve` and `serve_connection` dispatch a first-stream
+`Fallback` or `Takeover` to the listener's byte-stream target (`ListenerConfig::fallback`, a `zmux::Takeover` of the stream with
 every byte read replayed; `takeover_connection` gives its connection), and
 the connection is closed once the fallback completed; without one it is
-closed after a stall, or at once. Admitted connections
+stalled with its stream. An explicit `Close` ends it immediately. Admitted connections
 never take 0-RTT data: the server configuration must refuse early data. A
 client presents a `zmux::CarrierCredential` (such as `zmux::PrefixAuth`) with
 `Options::with_carrier_credential`: `dial` and `connect` write its prefix on the

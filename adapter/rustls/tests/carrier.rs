@@ -800,3 +800,101 @@ async fn a_close_is_delivered_with_its_code_over_tcp_and_tls() {
         serving.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn tcp_reset_is_observable_with_unread_bytes() {
+    use tokio::io::AsyncWriteExt;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let reset = zmux_rustls::TcpReset::observe(&server).unwrap().unwrap();
+        client.write_all(b"x").await.unwrap();
+        let mut byte = [0];
+        assert_eq!(server.peek(&mut byte).await.unwrap(), 1);
+        assert_eq!(&byte, b"x");
+        client.set_zero_linger().unwrap();
+        drop(client);
+        reset.failed().await;
+        // Other requests on the connection can see the same failure.
+        reset.failed().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn tcp_reset_observer_accepts_a_peer_write_half_close() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let reset = zmux_rustls::TcpReset::observe(&server).unwrap().unwrap();
+
+        let exchange = async {
+            client.write_all(b"x").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut body = Vec::new();
+            server.read_to_end(&mut body).await.unwrap();
+            assert_eq!(body, b"x");
+            server.write_all(b"y").await.unwrap();
+            assert_eq!(client.read_u8().await.unwrap(), b'y');
+        };
+        tokio::select! {
+            biased;
+            () = reset.failed() => panic!("a peer FIN is not a reset"),
+            () = exchange => {}
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn tcp_reset_wait_does_not_wake_on_an_idle_socket() {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let reset = zmux_rustls::TcpReset::observe(&server).unwrap().unwrap();
+
+    let counter = Arc::new(WakeCount::default());
+    let waker = Waker::from(counter.clone());
+    let mut waiting = std::pin::pin!(reset.failed());
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    // Let the reactor report ordinary readiness, then advance well past
+    // the Windows sampling interval while the peer keeps the socket open.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+    drop(client);
+}

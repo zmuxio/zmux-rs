@@ -135,6 +135,12 @@ fn merge(old: &mut SessionEvent, new: SessionEvent) {
     }
 }
 
+#[derive(Default, Debug)]
+struct HeldKey {
+    observers: usize,
+    retired: Option<bool>,
+}
+
 const NIL: usize = usize::MAX;
 
 /// A node of the list: a queued event, or a free slot.
@@ -157,6 +163,13 @@ pub(crate) struct EventQueue {
     tail: usize,
     /// The session is closed: nothing more is queued.
     frozen: bool,
+    // Allocated only while callbacks hold pipe keys. Retirement of a held
+    // pipe is folded into the summary once its last callback returns.
+    #[allow(
+        clippy::box_collection,
+        reason = "sessions without a join observer need only a pointer"
+    )]
+    held: Option<Box<HashMap<u64, HeldKey>>>,
     /// The pipes of which the application read a terminal event
     /// (`PipeFailed` or `PipeClosed`), until they are retired.
     read_terminal: std::collections::HashSet<u64>,
@@ -171,8 +184,36 @@ impl EventQueue {
             head: NIL,
             tail: NIL,
             frozen: false,
+            held: None,
             read_terminal: std::collections::HashSet::new(),
         }
+    }
+
+    pub(super) fn hold(&mut self, pipe: u64) {
+        self.held
+            .get_or_insert_default()
+            .entry(pipe)
+            .or_default()
+            .observers += 1;
+    }
+
+    pub(super) fn release_hold(&mut self, pipe: u64) {
+        let held = self.held.as_mut().expect("held pipe keys");
+        let entry = held.get_mut(&pipe).expect("held pipe");
+        entry.observers -= 1;
+        if entry.observers == 0 {
+            let retirement = held.remove(&pipe).and_then(|key| key.retired);
+            if held.is_empty() {
+                self.held = None;
+            }
+            if let Some(failed) = retirement {
+                self.fold_retired(pipe, failed);
+            }
+        }
+    }
+
+    pub(super) fn holding(&self) -> bool {
+        self.held.is_some()
     }
 
     /// Unread events.
@@ -218,6 +259,14 @@ impl EventQueue {
         if self.frozen {
             return;
         }
+        if let Some(entry) = self.held.as_mut().and_then(|h| h.get_mut(&pipe)) {
+            entry.retired = Some(failed);
+            return;
+        }
+        self.fold_retired(pipe, failed);
+    }
+
+    fn fold_retired(&mut self, pipe: u64, failed: bool) {
         for key in Key::of_pipe(pipe) {
             self.remove(&key);
         }
@@ -259,7 +308,19 @@ impl EventQueue {
 
     /// The next event, the one whose key occurred longest ago.
     pub(crate) fn pop(&mut self) -> Option<SessionEvent> {
-        let i = self.head;
+        let mut i = self.head;
+        if let Some(held) = &self.held {
+            while i != NIL
+                && self.nodes[i]
+                    .entry
+                    .as_ref()?
+                    .1
+                    .pipe()
+                    .is_some_and(|id| held.contains_key(&id.0))
+            {
+                i = self.nodes[i].next;
+            }
+        }
         if i == NIL {
             return None;
         }
@@ -586,6 +647,21 @@ mod tests {
         assert_eq!(q.pop(), None);
         q.push(SessionEvent::ResumeUnattended);
         assert_eq!(q.pop(), Some(SessionEvent::ResumeUnattended));
+    }
+
+    #[test]
+    fn held_keys_do_not_hide_other_pipes_or_leak_a_retirement() {
+        let mut queue = EventQueue::new();
+        queue.hold(7);
+        queue.push(quality(7, 10));
+        queue.push(quality(8, 11));
+        assert_eq!(queue.pop(), Some(quality(8, 11)));
+        queue.retire(7, true);
+        queue.freeze();
+        assert_eq!(queue.pop(), None);
+        queue.release_hold(7);
+        assert_eq!(queue.pop(), Some(retired(1, 1, 0, &[7])));
+        assert_eq!(queue.pop(), None);
     }
 
     #[test]

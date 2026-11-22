@@ -761,7 +761,10 @@ async fn listener_shutdown(accept_some: bool) {
     }
     for c in &clients {
         let e = watchdog(10, "unaccepted session closed", c.closing()).await;
-        assert!(matches!(e, SessionError::ApplicationClosed { .. }), "{e:?}");
+        assert!(
+            matches!(e, SessionError::ApplicationClosed { code, .. } if code == zmux::VarInt::ZERO),
+            "{e:?}"
+        );
     }
     let _ = watchdog(10, "late session", late).await.unwrap();
     drop(silent);

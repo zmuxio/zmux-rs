@@ -240,6 +240,7 @@ impl ChannelDemux {
 pub(crate) struct Receiving {
     _registration: ChannelRegistration,
     _task: AbortOnDrop,
+    lease: Option<Arc<super::attachment::Attachment>>,
 }
 
 /// Registers the receiver of pipe `pipe`'s channel. Dropped (a pipe the
@@ -248,17 +249,22 @@ pub(crate) fn attach(
     shared: &Arc<Shared<Tokio>>,
     pipe: PipeId,
     ch: &Arc<dyn DatagramChannel>,
+    lease: Option<Arc<super::attachment::Attachment>>,
 ) -> Receiving {
     // The carrier's receive loop, which may serve several sessions, never
     // waits for this session's lock: it queues, and a task of the pipe
     // hands the queue to the session.
     let inbox = Arc::new(Inbox::default());
-    let task = tokio::spawn(receive(Arc::downgrade(shared), pipe, inbox.clone()));
+    let task = tokio::spawn(super::attachment::Attachment::during(
+        lease.clone(),
+        receive(Arc::downgrade(shared), pipe, inbox.clone()),
+    ));
     let task = AbortOnDrop(task.abort_handle());
     let registration = ch.receive(ChannelReceiver::new(move |frame| inbox.push(frame)));
     Receiving {
         _registration: registration,
         _task: task,
+        lease,
     }
 }
 
@@ -271,7 +277,10 @@ pub(crate) fn start(
     ch: Arc<dyn DatagramChannel>,
     receiving: Receiving,
 ) {
-    tokio::spawn(run(shared.clone(), pipe, ch, receiving));
+    tokio::spawn(super::attachment::Attachment::during(
+        receiving.lease.clone(),
+        run(shared.clone(), pipe, ch, receiving),
+    ));
 }
 
 /// The task of a pipe's datagram channel: sends what the core puts on the

@@ -230,6 +230,16 @@ impl Dialer {
     }
 }
 
+fn report_joins(config: &mut Config) -> tokio::sync::mpsc::UnboundedReceiver<zmux::PipeId> {
+    let (send, recv) = tokio::sync::mpsc::unbounded_channel();
+    config.join_outcome = Some(zmux::JoinOutcome::new(move |_, id, error| {
+        assert!(error.is_none(), "{error:?}");
+        let _ = send.send(id);
+        zmux::Decision::Now(())
+    }));
+    recv
+}
+
 async fn setup() -> (Session, Session, Dialer) {
     let listener =
         Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
@@ -336,17 +346,36 @@ async fn until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
+// HS-21
 async fn keeps_count_pipes_and_redials_failures() {
-    let (client, _server, dialer) = setup().await;
+    let listener = Listener::new(config(), ListenerConfig::default()).unwrap();
+    let dialer = Dialer::new(&listener);
+    let mut client_config = config();
+    let mut reports = report_joins(&mut client_config);
+    let client = Session::connect(dialer.carrier(), client_config)
+        .await
+        .unwrap();
+    let _server = listener.accept().await.unwrap();
     let handle = zmux::helpers::maintain_pipes(&client, dialer.pool(2)).expect("valid pool");
-    until("two usable pipes", 10, || usable(&client) == 2).await;
-    // Kill one pool carrier (index 0 is the bootstrap's).
-    let kill = dialer.kills.lock().unwrap()[1].clone();
-    kill.kill();
-    until("a redial", 10, || dialer.dials.load(Ordering::SeqCst) >= 3).await;
-    until("two usable pipes again", 10, || usable(&client) == 2).await;
+    let mut attached = std::collections::HashSet::new();
+    for n in 0..3 {
+        if n == 2 {
+            // Both members have attached. Only this carrier can trigger the redial.
+            assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
+            let kill = dialer.kills.lock().unwrap()[1].clone();
+            kill.kill();
+        }
+        let id = tokio::time::timeout(Duration::from_secs(10), reports.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(id != zmux::PipeId::UNASSIGNED && attached.insert(id));
+    }
+    // The fake clock advances through the pool's configured probation interval.
+    until("replacement usable", 5, || usable(&client) == 2).await;
     assert_eq!(dialer.dials.load(Ordering::SeqCst), 3);
+    assert!(reports.try_recv().is_err());
     handle.stop();
     until("stopped", 5, || handle.is_finished()).await;
     client.close().await;
@@ -1471,6 +1500,7 @@ async fn attached_waits_for_the_acceptor() {
 /// `replace_pipes` advances the epoch and replaces every pipe, make before break, with
 /// one dialled through the redial hook and joined in the new epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// HS-21
 async fn replace_pipes_replaces_every_pipe() {
     // No exchange of the policy's own, so the advance starts at Stable(0).
     let manual = || {
@@ -1483,6 +1513,7 @@ async fn replace_pipes_replaces_every_pipe() {
     let dialer = Dialer::new(&listener);
     let dials = Arc::new(AtomicUsize::new(0));
     let mut cc = manual();
+    let mut reports = report_joins(&mut cc);
     let (l, d) = (listener.clone(), dials.clone());
     cc.redial = Some(zmux::Redial::new(move |_req| {
         let l = l.clone();
@@ -1504,17 +1535,28 @@ async fn replace_pipes_replaces_every_pipe() {
     let server = listener.accept().await.unwrap();
     assert_eq!(client.epoch(), Some(0));
     // The exchange runs over a pipe joined Sealed or Bound.
-    client
+    let explicit = client
         .add_pipe(dialer.carrier(), zmux::PipeOptions::new())
         .await
         .expect("joined");
+    assert_eq!(reports.recv().await, Some(explicit.id()));
     let before: Vec<_> = client.pipes().iter().map(zmux::Pipe::id).collect();
     tokio::time::timeout(Duration::from_secs(20), client.replace_pipes())
         .await
         .expect("replaced in time")
         .expect("replaced");
     assert_eq!(client.epoch(), Some(1));
-    assert!(dials.load(Ordering::SeqCst) >= before.len());
+    let returned = dials.load(Ordering::SeqCst);
+    assert!(returned >= before.len());
+    let mut replacements = std::collections::HashSet::new();
+    for _ in 0..returned {
+        let id = tokio::time::timeout(Duration::from_secs(3), reports.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(id != zmux::PipeId::UNASSIGNED && replacements.insert(id));
+    }
+    assert!(reports.try_recv().is_err());
     let live: Vec<_> = client
         .pipe_stats()
         .into_iter()

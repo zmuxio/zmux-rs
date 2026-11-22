@@ -587,6 +587,7 @@ fn an_aborted_pipe_is_never_shut_down_gracefully() {
 }
 
 #[test]
+// HS-56
 fn resume_after_losing_every_pipe() {
     let mut n = net(Scheduler::SpreadEta, true);
     n.open_and_write(20_000, false);
@@ -597,8 +598,14 @@ fn resume_after_losing_every_pipe() {
     let id = n.add_pipe(&PipeOptions::default()).unwrap();
     let _ = id;
     n.settle();
+    // HS-56. Deliver the pending pressure eviction after the selected
+    // suspended session has resumed, precisely before the next data write.
+    assert!(n.ends[A].suspended_since().is_none());
+    n.ends[A].close_suspended(n.now);
+    n.write_more(0, 1);
+    n.settle();
     n.check_prefix();
-    assert_eq!(n.s.recv[&0].len(), 30_000);
+    assert_eq!(n.s.recv[&0].len(), 30_001);
     assert!(
         n.ends[A].state() < State::Closing,
         "{:?}",

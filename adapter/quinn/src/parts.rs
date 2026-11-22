@@ -24,7 +24,7 @@ use tokio::sync::{Notify, oneshot};
 use zmux::PipeIo;
 use zmux::adapter::{
     ChannelDemux, ChannelReceiver, ChannelRegistration, ChunkWrite, DRAIN_LIMIT, DatagramChannel,
-    Lane, spawn_drain,
+    Lane,
 };
 
 /// What a carrier's streams keep alive: the state of their connection,
@@ -69,12 +69,12 @@ type Stopped = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// A stream's sending part as a carrier's: ended gracefully by
 /// `poll_shutdown` (FIN), reset with `ZMUX_CARRIER_FAILED` when dropped
-/// otherwise. A finished one keeps the connection until the peer
+/// otherwise. A sender registered by [`pipe`] or [`lane`] keeps the connection until the peer
 /// acknowledged all of it, within [`DRAIN_LIMIT`]: QUIC closes a
 /// connection whose last handle is dropped, and discards the data still in
 /// flight, so a carrier's last records (a `CONNECTION_CLOSE`) would be lost
 /// with it. A pipe's does so as the pipe's drain ([`pipe`]), a lane's
-/// on its own.
+/// as the lane's drain.
 pub struct QuicSend<S: SendPart> {
     stream: S,
     finished: bool,
@@ -92,6 +92,19 @@ impl<S: SendPart> QuicSend<S> {
             finished: false,
             keep: None,
             drain: None,
+        }
+    }
+
+    /// Both a pipe and each of its lanes register this wait with the driver.
+    fn drain(&mut self, keep: Keep) -> impl Future<Output = ()> + Send + 'static + use<S> {
+        let (drain, stopped) = oneshot::channel::<Stopped>();
+        self.keep = Some(keep.clone());
+        self.drain = Some(drain);
+        async move {
+            if let Ok(stopped) = stopped.await {
+                stopped.await;
+            }
+            drop(keep);
         }
     }
 
@@ -146,18 +159,8 @@ impl<S: SendPart> Drop for QuicSend<S> {
             self.stream.reset();
             return;
         }
-        let stopped = self.stream.stopped();
         if let Some(drain) = self.drain.take() {
-            let _ = drain.send(Box::pin(stopped));
-        } else {
-            let keep = self.keep.take();
-            spawn_drain(
-                async move {
-                    stopped.await;
-                    drop(keep);
-                },
-                DRAIN_LIMIT,
-            );
+            let _ = drain.send(Box::pin(self.stream.stopped()));
         }
     }
 }
@@ -218,19 +221,9 @@ pub fn pipe<S: SendPart, R: RecvPart>(
     mut recv: QuicRecv<R>,
     keep: Keep,
 ) -> PipeIo {
-    let (drain, stopped) = oneshot::channel::<Stopped>();
-    send.keep = Some(keep.clone());
-    send.drain = Some(drain);
     recv.keep = Some(keep.clone());
-    PipeIo::from_chunk_halves(recv, send).with_drain(
-        async move {
-            if let Ok(stopped) = stopped.await {
-                stopped.await;
-            }
-            drop(keep);
-        },
-        DRAIN_LIMIT,
-    )
+    let drain = send.drain(keep);
+    PipeIo::from_chunk_halves(recv, send).with_drain(drain, DRAIN_LIMIT)
 }
 
 /// A lane on the unidirectional stream `send`, which keeps `keep` while it
@@ -238,8 +231,8 @@ pub fn pipe<S: SendPart, R: RecvPart>(
 /// [`DRAIN_LIMIT`].
 pub fn lane<S: SendPart>(send: S, keep: Keep) -> Lane {
     let mut send = QuicSend::new(send);
-    send.keep = Some(keep);
-    Lane::from_chunks(send)
+    let drain = send.drain(keep);
+    Lane::from_chunks(send).with_drain(drain, DRAIN_LIMIT)
 }
 
 /// The pipes the peer opened that nobody took yet, on a carrier without a

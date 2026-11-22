@@ -198,7 +198,7 @@ impl Logger {
     #[cfg(all(not(loom), any(feature = "tokio", feature = "blocking")))]
     pub(crate) fn log(&self, level: LogLevel, message: &str) {
         let f = &self.0;
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(level, message)));
+        decision::host(|| f(level, message));
     }
 }
 
@@ -764,7 +764,8 @@ pub struct Config {
     pub join_timeout: Duration,
     /// `max_idle_timeout` (default [`DEFAULT_MAX_IDLE_TIMEOUT`], 30 s; `None`
     /// is no local limit and announces none). A set duration is at least
-    /// 1 ms, the unit of the transport parameter, whose 0 means none.
+    /// 1 ms and rounds up to the next whole millisecond for the transport
+    /// parameter. The wire value saturates at 2^62 - 1.
     pub max_idle_timeout: Option<Duration>,
     /// The liveness settings of the session and the defaults of its pipes
     /// (default [`Liveness::default`]): keep-alive, the suspicion floor, the
@@ -896,6 +897,9 @@ pub struct Config {
     pub allow_record_mode: Option<AllowRecordMode>,
     /// An acceptor's further check of a join; unset passes all.
     pub authorize_join: Option<AuthorizeJoin>,
+    /// Observes every authorized inbound and carrier-backed outbound join.
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub join_outcome: Option<crate::JoinOutcome>,
     /// The replay window W, a parameter of `max_pipes`, in pipe IDs of the
     /// peer's parity; [`Cap::Auto`] (the default) is max(64, 2 x (`max_pipes` +
     /// H)), and a fixed value is at least `max_pipes` + H.
@@ -908,7 +912,8 @@ pub struct Config {
     /// Resume grace period; `None` (the default) disables resume. A set
     /// period is at least 1 ms: `Some(Duration::ZERO)` is a configuration
     /// error, and a fraction of a millisecond is rounded up to the
-    /// millisecond the transport parameter carries. It needs a secret
+    /// millisecond the transport parameter carries. The wire value saturates at
+    /// 2^62 - 1. Resume needs a secret
     /// source, and a session that accepts needs a listener; a dialling
     /// session should have a redial source
     /// ([`redial`](Config#structfield.redial) or a pipe pool).
@@ -952,7 +957,7 @@ pub struct Config {
     /// bootstrap pipe of an accepted session and joined pipes included, is
     /// shaped from its first record. `set_shaper` replaces it.
     pub shaper: Option<Arc<dyn super::shaping::Factory>>,
-    /// The `spread-eta` chunk size (default 16 KiB).
+    /// The `spread-eta` chunk size (default 16 KiB), from 1 to 2^31 - 1 bytes.
     pub spread_chunk: usize,
     /// The base of the probation of pipes that join or return from
     /// suspicion, a parameter of `scheduler` (default `Some(Cap::Auto)`: 4 x
@@ -1248,6 +1253,8 @@ impl Default for Config {
             handshake_shaper: None,
             allow_record_mode: None,
             authorize_join: None,
+            #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+            join_outcome: None,
             replay_window: Cap::Auto,
             max_lanes: crate::proto::params::DEFAULT_MAX_LANES,
             resume_timeout: None,
@@ -1447,9 +1454,7 @@ impl Config {
         let idle = self.idle_millis();
         let window = self.initial_stream_receive_window;
         let mp = self.offers_multipath();
-        let resume = self
-            .resume_timeout
-            .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX).max(1));
+        let resume = self.resume_timeout.map(Self::wire_millis);
         TransportParameters {
             zmux_multipath: mp.then(|| MultipathParameter {
                 secret_flags: self.pipe_auth.flags(),
@@ -1520,8 +1525,14 @@ impl Config {
     /// The `max_idle_timeout` this endpoint announces, in milliseconds
     /// (0: none).
     pub(crate) fn idle_millis(&self) -> u64 {
-        self.max_idle_timeout
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        self.max_idle_timeout.map_or(0, Self::wire_millis)
+    }
+
+    fn wire_millis(duration: Duration) -> u64 {
+        duration
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min((1u128 << 62) - 1) as u64
     }
 
     /// The keep-alive period in effect; `None` when off.
@@ -1623,7 +1634,6 @@ impl Config {
                 "initial_connection_receive_window",
                 self.initial_connection_receive_window,
             ),
-            ("max_idle_timeout", self.idle_millis()),
         ] {
             if v > varint_max {
                 return Err(crate::InvalidConfig::new(field, too_large));
@@ -1679,10 +1689,10 @@ impl Config {
             ));
         }
         self.shaping_limits.validate()?;
-        if !(1024..=65535).contains(&self.spread_chunk) {
+        if !(1..=2_147_483_647).contains(&self.spread_chunk) {
             return Err(crate::InvalidConfig::new(
                 "spread_chunk",
-                "outside 1024..=65535",
+                "outside 1..=2_147_483_647",
             ));
         }
         let a = &self.pipe_auth;
@@ -1712,8 +1722,11 @@ impl Config {
                 "below max_pipes + pipe_headroom",
             ));
         }
-        if self.resume_timeout.is_some_and(|t| t.is_zero()) {
-            return Err(crate::InvalidConfig::new("resume_timeout", "zero"));
+        if self
+            .resume_timeout
+            .is_some_and(|t| t < Duration::from_millis(1))
+        {
+            return Err(crate::InvalidConfig::new("resume_timeout", "below 1 ms"));
         }
         if self
             .protocols
@@ -1780,8 +1793,70 @@ pub(crate) fn grease_ref(g: &(u64, Vec<u8>)) -> Grease<'_> {
 }
 
 #[cfg(test)]
-mod locator_tests {
-    use super::Config;
+mod tests {
+    use super::{Config, Duration};
+
+    #[test]
+    fn wire_timeouts_round_up_and_saturate() {
+        let mut c = Config::default();
+        c.pipe_auth.psk = Some(super::JoinSecret(vec![42; 32]));
+        let max = (1u64 << 62) - 1;
+        for (duration, expected) in [
+            (Duration::from_nanos(1), None),
+            (Duration::from_millis(1), Some(1)),
+            (Duration::from_micros(1001), Some(2)),
+            (Duration::from_millis(max), Some(max)),
+            (
+                Duration::from_millis(max) + Duration::from_nanos(1),
+                Some(max),
+            ),
+            (Duration::MAX, Some(max)),
+        ] {
+            c.max_idle_timeout = Some(duration);
+            c.resume_timeout = None;
+            assert_eq!(
+                c.validate().is_ok(),
+                expected.is_some(),
+                "idle {duration:?}"
+            );
+            if let Some(ms) = expected {
+                assert_eq!(c.idle_millis(), ms);
+            }
+            c.max_idle_timeout = None;
+            c.resume_timeout = Some(duration);
+            assert_eq!(
+                c.validate().is_ok(),
+                expected.is_some(),
+                "resume {duration:?}"
+            );
+            if let Some(ms) = expected {
+                assert_eq!(
+                    c.transport_parameters(None, [0; 16], [0; 16]).zmux_resume,
+                    Some(ms)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spread_chunk_uses_positive_signed_32_bit_range() {
+        for (spread_chunk, valid) in [
+            (0, false),
+            (1, true),
+            (2_147_483_647, true),
+            (2_147_483_648, false),
+        ] {
+            let c = Config {
+                spread_chunk,
+                ..Config::default()
+            };
+            if valid {
+                assert_eq!(c.validate(), Ok(()));
+            } else {
+                assert_eq!(c.validate().unwrap_err().field(), "spread_chunk");
+            }
+        }
+    }
 
     /// A Locator its length field cannot hold is an error, not an empty one.
     #[test]

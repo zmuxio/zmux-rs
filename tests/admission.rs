@@ -159,7 +159,7 @@ async fn fallback_without_a_target_stalls() {
     let st = listener.stats();
     assert_eq!(
         (st.admission.fallback, st.admission.stalled, st.rejected),
-        (1, 0, 0)
+        (0, 1, 0)
     );
     listener.close();
 }
@@ -298,7 +298,7 @@ async fn a_late_prefix_is_closed_or_falls_back() {
         .unwrap();
     assert_eq!(got, b"abcdef");
     let a = listener.stats().admission;
-    assert_eq!((a.peek_timed_out, a.fallback, a.closed), (1, 1, 0));
+    assert_eq!((a.peek_timed_out, a.fallback, a.closed), (0, 1, 0));
     listener.close();
 }
 
@@ -386,7 +386,7 @@ async fn stall_duration_is_a_function_of_the_source() {
 
 #[tokio::test(start_paused = true)]
 async fn a_source_stalls_at_most_its_share_less_one() {
-    let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall)
+    let admission = Admission::new(0, |_, _| AdmissionVerdict::Stall.labelled("wait"))
         .with_stall_interval(Duration::from_secs(1), Duration::from_secs(1));
     let mut config = limits(admission, None);
     config.limits.max_pending_per_source = 3;
@@ -409,6 +409,7 @@ async fn a_source_stalls_at_most_its_share_less_one() {
     let mut c = enter("[2001:db8::3]:3");
     assert!(matches!(admit(&mut c).await, Admit::Close));
     assert_eq!(counts(), (2, 1));
+    assert_eq!(listener.variant_stats().variants["wait"].stalled, 3);
     // A stall after a fallback without target returns at once too.
     let start = tokio::time::Instant::now();
     c.stall(none()).await;
@@ -829,4 +830,392 @@ async fn a_bound_token_with_a_later_exporter_is_admitted() {
     assert!(admitted.is_some());
     assert_eq!(listener.stats().admission.accepted, 1);
     listener.close();
+}
+
+#[tokio::test(start_paused = true)]
+// HS-18
+async fn handle_pipe_returns_when_admission_owns_the_stall() {
+    for verdict in [AdmissionVerdict::Stall, AdmissionVerdict::takeover()] {
+        let duration = Duration::from_secs(30);
+        let admission = Admission::new(0, move |_, _| verdict.clone().labelled("wait"))
+            .with_stall_interval(duration, duration);
+        let mut config = limits(admission, None);
+        config.limits.max_pending_per_source = 2;
+        let listener = Listener::new(Config::default(), config).unwrap();
+        let peer = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+        let (io, mut far) = tokio::io::duplex(64);
+        let before = tokio::time::Instant::now();
+        assert_eq!(
+            listener
+                .handle_pipe(zmux::PipeIo::new(io), zmux::PipeHint::from_peer(peer))
+                .await,
+            Err(zmux::HandleError::NotAdmitted)
+        );
+        assert_eq!(before.elapsed(), Duration::ZERO);
+        let totals = listener.stats().admission;
+        let variant = listener.variant_stats().variants["wait"];
+        assert_eq!((totals.stalled, totals.takeover), (1, 0));
+        assert_eq!((variant.stalled, variant.takeover), (1, 0));
+        let _other = listener.adapter().enter(peer, None).unwrap();
+        assert!(listener.adapter().enter(peer, None).is_none());
+        assert_eq!(far.read(&mut [0]).await.unwrap(), 0);
+        assert_eq!(before.elapsed(), duration);
+        assert!(listener.adapter().enter(peer, None).is_some());
+    }
+}
+
+#[tokio::test]
+// HS-07
+async fn a_panicking_adapter_callback_settles_its_entry_once() {
+    let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+    let peer = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+    let mut entry = listener.adapter().enter(peer, None).unwrap();
+    let failures = listener.stats().setup_failures;
+    let result: Option<()> = entry.host(|| {
+        let _ = listener.stats();
+        panic!("request metadata unavailable")
+    });
+    assert!(result.is_none());
+    drop(entry);
+    assert_eq!(listener.stats().setup_failures, failures + 1);
+    assert!(listener.adapter().enter(peer, None).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_a_stall_observer_keeps_the_slot_until_request_cleanup() {
+    let duration = Duration::from_secs(60);
+    let admission =
+        Admission::new(0, |_, _| AdmissionVerdict::Stall).with_stall_interval(duration, duration);
+    let mut config = limits(admission, None);
+    config.limits.max_pending_per_source = 2;
+    let listener = Listener::new(Config::default(), config).unwrap();
+    let peer = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+    let enter = || listener.adapter().enter(peer, None);
+    let mut entry = enter().unwrap();
+    assert!(matches!(
+        entry.decide_upgrade(CarrierInfo::new()).await,
+        Admit::Stall
+    ));
+    let (io, mut far) = tokio::io::duplex(64);
+    let (started, closing) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let before = tokio::time::Instant::now();
+    let observer = entry.stall_request(Some(io), |io| async move {
+        started.send(()).unwrap();
+        gate.await.unwrap();
+        drop(io);
+    });
+    drop((entry, observer));
+    closing.await.unwrap();
+    assert_eq!(before.elapsed(), Duration::ZERO);
+    let _other = enter().unwrap();
+    assert!(enter().is_none());
+    release.send(()).unwrap();
+    assert_eq!(far.read(&mut [0]).await.unwrap(), 0);
+    assert!(enter().is_some());
+    assert_eq!(before.elapsed(), Duration::ZERO);
+}
+
+/// A foreign event loop's cancellation linearizes even if its request to
+/// drop the Rust future is delayed until after setup runs again.
+#[tokio::test]
+async fn withdrawal_arbitrates_publication_without_dropping_the_future() {
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut limits = ListenerConfig::default();
+    limits.inbound_transform = Some(zmux::InboundTransform::new({
+        let arrived = arrived.clone();
+        let release = release.clone();
+        move |io, _: &PipeHint| {
+            let release = release.clone();
+            arrived.notify_one();
+            async move {
+                release.notified().await;
+                Ok(io)
+            }
+        }
+    }));
+    let listener = Listener::new(Config::default(), limits).unwrap();
+    let (client, server) = tokio::io::duplex(8192);
+    let (gate, setup) = listener.adapter().cancellable_setup(
+        PipeIo::new(server),
+        (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+        None,
+    );
+    let handling = tokio::spawn(setup);
+    let client = tokio::spawn(Session::connect(PipeIo::new(client), Config::default()));
+    tokio::time::timeout(LIMIT, async {
+        arrived.notified().await;
+        // HS-02a. Withdrawal wins before publication.
+        assert!(gate.cancel());
+        release.notify_one();
+        assert_eq!(handling.await.unwrap(), Err(HandleError::Refused));
+        assert_eq!(listener.stats().sessions, 0);
+        drop(client.await.unwrap());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+// HS-10, HS-11
+async fn fallback_completion_is_the_setup_result() {
+    for panics in [false, true] {
+        let callback = Fallback::new(move |_| async move {
+            assert!(!panics, "fallback failed");
+        });
+        let config = limits(
+            Admission::new(0, |_, _| AdmissionVerdict::fallback()),
+            Some(callback),
+        );
+        let listener = Listener::new(Config::default(), config).unwrap();
+        let (carrier, mut peer) = tokio::io::duplex(64);
+        let outcome = listener
+            .handle_pipe(PipeIo::new(carrier), PipeHint::default())
+            .await;
+        if panics {
+            let error = outcome.unwrap_err();
+            assert_eq!(
+                std::error::Error::source(&error).unwrap().to_string(),
+                "fallback failed"
+            );
+        } else {
+            outcome.unwrap();
+        }
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+// HS-03
+async fn stop_before_fallback_claim() {
+    for fallback in [true, false] {
+        let owner = Arc::new(std::sync::OnceLock::<Listener>::new());
+        let from_hook = owner.clone();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let from_fallback = called.clone();
+        let config = limits(
+            Admission::new(0, move |_, _| {
+                from_hook.get().unwrap().close();
+                if fallback {
+                    AdmissionVerdict::fallback()
+                } else {
+                    AdmissionVerdict::accept(0)
+                }
+            }),
+            Some(Fallback::new(move |_| {
+                let called = from_fallback.clone();
+                async move {
+                    called.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })),
+        );
+        let listener = Listener::new(Config::default(), config).unwrap();
+        owner.set(listener.clone()).unwrap();
+        let (carrier, _peer) = tokio::io::duplex(64);
+        let result = listener
+            .handle_pipe(PipeIo::new(carrier), PipeHint::default())
+            .await;
+        assert!(
+            !called.load(std::sync::atomic::Ordering::Relaxed),
+            "fallback ran after listener closed: {result:?}"
+        );
+        assert_eq!(result, Err(HandleError::Refused));
+        assert_eq!(listener.stats().sessions, 0);
+    }
+}
+
+#[tokio::test]
+// HS-17
+async fn a_refused_outer_upgrade_cannot_hand_off_to_a_stopped_listener() {
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = called.clone();
+    let cfg = limits(
+        Admission::new(0, |_, _| AdmissionVerdict::fallback()),
+        Some(Fallback::new(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            async {}
+        })),
+    );
+    let listener = Listener::new(Config::default(), cfg).unwrap();
+    listener.close();
+    let (io, mut peer) = tokio::io::duplex(64);
+    assert!(
+        !listener
+            .adapter()
+            .take_over(
+                zmux::CarrierInfo::new(),
+                zmux::adapter::AdmitIo::pipe(PipeIo::new(io)),
+                Vec::new(),
+            )
+            .await
+    );
+    assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+}
+
+// HS-55. An external admission worker can still be unwinding after its
+// answer times out. It owns the same reservation until its actual exit.
+#[tokio::test(start_paused = true)]
+// HS-55
+async fn timed_out_decision_keeps_capacity_until_its_worker_exits() {
+    struct External(tokio::sync::mpsc::UnboundedSender<Box<dyn Send + Sync>>);
+    impl zmux::Decide for External {
+        fn decide(&self, _: CarrierInfo, _: &[u8]) -> zmux::Decision<zmux::AdmissionDecision> {
+            unreachable!("listener provides a worker scope")
+        }
+        fn decide_with_worker(
+            &self,
+            _: CarrierInfo,
+            _: &[u8],
+            work: &mut dyn FnMut() -> Box<dyn Send + Sync>,
+        ) -> zmux::Decision<zmux::AdmissionDecision> {
+            self.0.send(work()).unwrap();
+            zmux::Decision::later(std::future::pending())
+        }
+    }
+    let (started, mut workers) = tokio::sync::mpsc::unbounded_channel();
+    let peek = Duration::from_secs(5);
+    let mut cfg = limits(
+        Admission::with_decider(0, External(started)).with_peek_timeout(peek),
+        None,
+    );
+    cfg.limits.max_pending_per_source = 2;
+    let listener = Listener::new(Config::default(), cfg).unwrap();
+    let source = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+    let _other = listener.adapter().enter(source, None).unwrap();
+    let entry = listener.adapter().enter(source, None).unwrap();
+    let task = tokio::spawn(async move {
+        let mut entry = entry;
+        entry.decide_upgrade(CarrierInfo::new()).await
+    });
+    let worker = workers.recv().await.unwrap();
+    tokio::time::advance(peek).await;
+    assert!(matches!(task.await.unwrap(), zmux::adapter::Admit::Close));
+    assert!(listener.adapter().enter(source, None).is_none());
+    drop(worker);
+    assert!(listener.adapter().enter(source, None).is_some());
+    assert_eq!(listener.stats().admission.peek_timed_out, 1);
+}
+
+/// Both QUIC serve entry points own the outer connection while `admit_first`
+/// decides its first stream. The adapter may close it only after a stall ends.
+#[tokio::test(start_paused = true)]
+async fn outer_connection_outlives_a_labelled_longer_prefix_stall() {
+    let timeout = Duration::from_secs(2);
+    let stall = Duration::from_secs(30);
+    let admission = Admission::new(1, |_, prefix| {
+        assert_eq!(prefix, b"a");
+        AdmissionVerdict::More { need: 4 }.labelled("probe")
+    })
+    .with_max_peek(4)
+    .with_peek_timeout(timeout)
+    .with_fallback_on_peek_timeout(true)
+    .with_stall_interval(stall, stall);
+    let listener = Listener::new(Config::default(), limits(admission, None)).unwrap();
+    let source = (std::net::Ipv4Addr::LOCALHOST, 1).into();
+    let mut entry = listener.adapter().enter(source, None).unwrap();
+    let (carrier, mut peer) = tokio::io::duplex(64);
+    peer.write_all(b"ab").await.unwrap();
+    let mut first = Box::pin(entry.admit_first(CarrierInfo::new(), async {
+        Ok(zmux::adapter::AdmitIo::pipe(PipeIo::new(carrier)))
+    }));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    tokio::time::advance(timeout).await;
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    let stats = listener.stats().admission;
+    assert_eq!(
+        (stats.peek_timed_out, stats.fallback, stats.stalled),
+        (0, 0, 1)
+    );
+    assert_eq!(listener.variant_stats().variants["probe"].stalled, 1);
+    let mut byte = [0];
+    let mut eof = Box::pin(peer.read(&mut byte));
+    assert!(eof.as_mut().poll(&mut cx).is_pending());
+    listener.close();
+    assert!(first.await.is_none());
+    assert_eq!(eof.await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn outer_connection_close_uses_the_fallback_receipt_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for (take, detach) in [(false, false), (true, false), (true, true)] {
+        let ends = Arc::new(AtomicUsize::new(0));
+        let admission = Admission::new(0, move |_, _| {
+            if take {
+                AdmissionVerdict::fallback()
+            } else {
+                AdmissionVerdict::Close
+            }
+        });
+        let fallback = Fallback::new(move |host| async move {
+            if detach {
+                host.detach().unwrap();
+            }
+        });
+        let listener = Listener::new(Config::default(), limits(admission, Some(fallback))).unwrap();
+        let mut entry = listener
+            .adapter()
+            .enter((std::net::Ipv4Addr::LOCALHOST, 0).into(), None)
+            .unwrap();
+        let (carrier, _peer) = tokio::io::duplex(64);
+        let returned = ends.clone();
+        let arrival =
+            zmux::adapter::AdmitIo::pipe(PipeIo::new(carrier)).with_on_return(move || {
+                returned.fetch_add(1, Ordering::SeqCst);
+            });
+        assert!(
+            entry
+                .admit_first(CarrierInfo::new(), async { Ok(arrival) })
+                .await
+                .is_none()
+        );
+        entry.end_unclaimed_connection(|| {
+            ends.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(ends.load(Ordering::SeqCst), usize::from(!detach));
+        listener.close();
+    }
+}
+
+// HS-08. A host-provided handshake factory can unwind before it returns a future.
+#[tokio::test]
+async fn a_failed_handshake_factory_releases_only_its_connection() {
+    let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+    let tcp = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let host = listener.clone();
+    let serving = tokio::spawn(async move {
+        host.serve_streams(
+            || tcp.accept(),
+            move |conn| {
+                assert!(
+                    !first.swap(false, std::sync::atomic::Ordering::SeqCst),
+                    "handshake factory failed"
+                );
+                std::future::ready(Ok(conn))
+            },
+            |_| CarrierInfo::new(),
+            PipeIo::from_tcp,
+        )
+        .await;
+    });
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(first.read(&mut [0]).await.unwrap(), 0);
+    let second = TcpStream::connect(addr).await.unwrap();
+    let (client, server) = tokio::join!(
+        Session::connect(PipeIo::from_tcp(second), Config::default()),
+        listener.accept()
+    );
+    let client = client.unwrap();
+    let _server = server.unwrap();
+    client.ping().await.unwrap();
+    assert_eq!(listener.stats().setup_failures, 1);
+    listener.close();
+    serving.await.unwrap();
 }

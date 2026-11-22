@@ -47,3 +47,13 @@ client offers the one Profile. The node's static key is 32 bytes of `0x5a`, whic
 the client pins; Handle and pre-shared key derive from the test PSK above with
 domain `interop`. The client prints `PROFILE <n>`; both print `KEYS <hex>` as the
 TLS modes do.
+
+The secure-carrier matrix checks graceful process exit after a Bound join
+or an epoch replacement. Run both a Rust server and a Go server with the
+Rust client. Each server must see the remote application close with code 0.
+
+```sh
+ZMUX_MATRIX_RS=/path/to/zmux-interop-peer ZMUX_MATRIX_GO=/path/to/seal-go-peer \
+  python /path/to/zmux-spec/interop/seal-matrix/matrix.py \
+    --only rs:rs,go:rs --scenarios join,epoch --direct
+```

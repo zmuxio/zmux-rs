@@ -8,6 +8,7 @@
     clippy::many_single_char_names,
     reason = "c, s, l and o name the client and server connection, listener and options throughout"
 )]
+#![cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 
 use std::sync::Arc;
 use std::time::Duration;

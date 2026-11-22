@@ -804,19 +804,26 @@ async fn refused_joins_stall_for_the_listeners_join_timeout() {
     let stalled = |far: PipeIo| {
         let l = listener.clone();
         let start = tokio::time::Instant::now();
-        tokio::spawn(async move {
-            let r = l.handle_pipe(far, zmux::PipeHint::default()).await;
-            (r.is_err(), start.elapsed())
-        })
+        let (hold, closed) = tokio::sync::oneshot::channel::<()>();
+        let far = far.with_unsent(move || {
+            let _ = &hold;
+            None
+        });
+        let setup =
+            tokio::spawn(async move { l.handle_pipe(far, zmux::PipeHint::default()).await });
+        async move {
+            assert!(setup.await.unwrap().is_err());
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            assert!(closed.await.is_err());
+            assert_eq!(start.elapsed(), Duration::from_secs(3));
+        }
     };
-    let in_range = |d: Duration| d >= Duration::from_secs(3) && d < Duration::from_secs(4);
     // A message that is a Join by its first byte but no Hello: its Suite is no shortest
     // varint.
     let (mut near, far) = duplex(1 << 16);
     let task = stalled(PipeIo::new(far).records());
     near.write_all(&[2, 0x40, 0x01]).await.unwrap();
-    let (failed, took) = task.await.unwrap();
-    assert!(failed && in_range(took), "{took:?}");
+    task.await;
     // A known Locator: Bound without a Binding at the acceptor.
     let (near, far) = duplex(1 << 16);
     let task = stalled(PipeIo::new(far));
@@ -829,8 +836,7 @@ async fn refused_joins_stall_for_the_listeners_join_timeout() {
     let _join = client
         .begin_add_pipe(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
         .unwrap();
-    let (failed, took) = task.await.unwrap();
-    assert!(failed && in_range(took), "{took:?}");
+    task.await;
     assert_eq!(*reasons.lock().unwrap(), ["malformed", "auth"]);
 }
 
@@ -916,4 +922,151 @@ async fn the_listener_refuses_a_suite_outside_the_session_as_unknown_suite() {
     lnear.write_all(&hello).await.unwrap();
     assert!(task.await.unwrap().is_err());
     assert_eq!(*reasons.lock().unwrap(), ["unknown_suite"]);
+}
+
+/// Deliver the first ACK for bytes already sent on a locally installed join.
+/// The timer need not have run when the packet is taken off the healthy pipe.
+#[test]
+// HS-22, HS-23
+fn a_late_ack_cannot_attach_an_expired_installed_pipe() {
+    use zmux::proto::frame::{Frame, PipeAck, PipeAckEntry};
+    use zmux::proto::session::{ConfirmedJoin, JoinStep, PipeError, PipeFailure};
+
+    for (on_time, timer_ran) in [(true, false), (false, false), (false, true)] {
+        let mut cfg = config();
+        cfg.join_timeout = Duration::from_secs(3);
+        let mut p = pair(cfg.clone(), cfg.clone());
+        let now = p.now;
+        let (id, hello) = trusted_hello(&mut p.a, now);
+        let OpenedHello::Verified(mut join) = open(&mut p.b, &hello, &[], now) else {
+            panic!("authenticated Hello");
+        };
+        let plan = UnitPlan::default();
+        let ClaimedHello::Accept(reply) = p.b.claim_hello(&mut join, carrier(), &plan, now) else {
+            panic!("accepted Hello");
+        };
+        assert!(matches!(
+            p.a.verify_reply(id, &reply, now),
+            JoinStep::Verified { .. }
+        ));
+        let done = p.a.join_finish(id, &plan, now).unwrap();
+        assert!(join.read_confirm(&done.confirm).unwrap().is_some());
+        assert!(matches!(
+            p.b.confirm_join(*join, carrier(), now),
+            ConfirmedJoin::Attached { .. }
+        ));
+        assert!(matches!(p.a.pipe_joined(id), Some(Ok(()))));
+        assert!(p.a.pipe_attached(id).is_none());
+
+        // The peer acknowledges the actual probation probe on the new pipe.
+        p.a.poll_transmit(id, now, &mut p.out);
+        let sent = p.out.len() as u64;
+        assert!(sent > 0);
+        p.a.pipe_written(id, sent, now);
+        let entries = [PipeAckEntry {
+            pipe_id: id.get(),
+            lane: 0,
+            position: sent,
+            ack_delay: 0,
+        }];
+        let mut ack = [0u8; 64];
+        let n = Frame::PipeAck(PipeAck::new(&entries))
+            .encode(&mut ack)
+            .unwrap();
+        let ack = framed(&ack[..n]);
+        let deadline = now + cfg.join_timeout;
+        let arrival = if on_time {
+            deadline.checked_sub(Duration::from_nanos(1)).unwrap()
+        } else {
+            deadline
+        };
+        if timer_ran {
+            p.a.handle_timeout(arrival);
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                p.a.receive_in_place(core_pair::P0, &ack, arrival),
+                ack.len()
+            );
+        }
+        let result = p.a.pipe_attached(id);
+        if on_time {
+            assert!(matches!(result, Some(Ok(()))), "{result:?}");
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Some(Err(PipeError::Failed(PipeFailure::JoinTimedOut)))
+                ),
+                "{result:?}"
+            );
+        }
+        let mut attached_events = 0;
+        while let Some(event) = p.a.poll_event() {
+            if matches!(event, CoreEvent::PipeAttached { pipe } if pipe == id) {
+                attached_events += 1;
+            }
+        }
+        assert_eq!(attached_events, usize::from(on_time));
+        let listed = p.a.pipes().into_iter().find(|s| s.pipe == id);
+        assert_eq!(listed.map(|s| s.peer_attached), on_time.then_some(true));
+    }
+}
+
+#[test]
+// HS-28
+fn a_deferred_join_keeps_its_abort_after_immediate_retirement() {
+    let mut cfg = config();
+    cfg.max_pipes = 2;
+    let mut p = pair(cfg.clone(), cfg.clone());
+    let f = Some(Framing::ByteStream);
+    let id = (0..=cfg.max_pipes + cfg.pipe_headroom)
+        .find_map(|_| {
+            let id =
+                p.a.add_pipe(f, f, &PipeOptions::new(), RecordMode::Trusted, None, p.now)
+                    .unwrap();
+            p.a.join_deferred(id).then_some(id)
+        })
+        .expect("the cap held the new join");
+    let snapshot = p.a.pipe_final(id).unwrap();
+    p.a.remove_pipe(id, false, p.now).unwrap();
+    assert!(!p.a.has_pipe(id));
+    let error = snapshot.get().unwrap().closed.as_ref().unwrap_err();
+    assert!(matches!(
+        error,
+        zmux::PipeError::Failed(zmux::PipeFailure::Aborted)
+    ));
+    assert!(error.is_gone());
+    assert!(std::iter::from_fn(|| p.a.poll_event()).any(|e| matches!(
+        e, CoreEvent::PipeRetired {pipe, join_failure: Some(zmux::PipeFailure::Aborted), failed: true} if pipe == id
+    )));
+}
+
+#[test]
+// HS-24a
+fn a_carrier_error_uses_the_cores_advanced_join_clock() {
+    use zmux::{PipeError, PipeFailure};
+
+    for expired in [false, true] {
+        let cfg = config();
+        let mut p = pair(cfg.clone(), cfg.clone());
+        let (id, _) = trusted_hello(&mut p.a, p.now);
+        if expired {
+            // Advance only the core. The I/O error still carries the older
+            // driver timestamp and the timer handler has not run.
+            p.a.set_pipe_unsent(core_pair::P0, 0, p.now + cfg.join_timeout);
+        }
+        let kind = std::io::ErrorKind::UnexpectedEof;
+        p.a.join_carrier_failed(id, kind, p.now);
+        let cause = if expired {
+            PipeFailure::JoinTimedOut
+        } else {
+            PipeFailure::Carrier(kind)
+        };
+        assert!(
+            matches!(p.a.pipe_joined(id), Some(Err(PipeError::Failed(actual))) if actual == cause),
+            "{:?}",
+            p.a.pipe_joined(id)
+        );
+    }
 }

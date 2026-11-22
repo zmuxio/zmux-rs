@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -186,17 +187,31 @@ pub fn dial_exchange_split(
     let down_http = http(down, o.down_requests);
     let mut token = [0u8; 8];
     zmux::proto::seal::fill_random(&mut token).map_err(io::Error::other)?;
+    let credential = o
+        .carrier_credential
+        .as_ref()
+        .map(|c| {
+            let info = zmux::CarrierInfo::new().with_stage(zmux::AdmissionStage::Head);
+            let (name, value) = c.header(&info)?;
+            Ok::<_, io::Error>(CreationHeader {
+                name: name
+                    .parse()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+                value: value
+                    .parse()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+                created: AtomicBool::new(false),
+            })
+        })
+        .transpose()?;
     let ctx = Arc::new(Ctx {
+        credential,
         key: Key::new(psk, &cid),
         cid,
         instance: hex(&token),
         options: o.clone(),
     });
     let shared = Arc::new(Halves::default());
-    if let Some(c) = &o.carrier_credential {
-        let prefix = c.prefix(&zmux::CarrierInfo::new())?;
-        shared.lock().up.extend_from_slice(&prefix);
-    }
     let driver = Driver {
         halves: shared.clone(),
         ctx,
@@ -213,16 +228,19 @@ pub fn dial_exchange_split(
         down: HashMap::new(),
         down_limit: o.down_requests.max(1),
     };
-    tokio::spawn(driver.run());
     let abort = shared.clone();
-    Ok(
-        PipeIo::from_halves(Reader(shared.clone()), Writer(shared, o.up_piece_size()))
-            .with_abort(move || {
-                abort.lock().aborted = true;
-                abort.driver.notify_one();
-            })
-            .with_carrier(zmux::CarrierKind::Exchange),
-    )
+    let mut io = PipeIo::from_halves(Reader(shared.clone()), Writer(shared, o.up_piece_size()))
+        .with_abort(move || {
+            abort.lock().aborted = true;
+            abort.driver.notify_one();
+        })
+        .with_carrier(zmux::CarrierKind::Exchange);
+    let worker = io.worker_guard();
+    tokio::spawn(async move {
+        let _worker = worker;
+        driver.run().await;
+    });
+    Ok(io)
 }
 
 /// Establishes a session over an exchange carrier to `addr`
@@ -422,6 +440,7 @@ impl Http {
         limit: usize,
         https: bool,
         max: usize,
+        credential: Option<&CreationHeader>,
     ) -> io::Result<Bytes> {
         let scheme = if https { "https" } else { "http" };
         let mut url = format!("{scheme}://{}{target}", self.authority);
@@ -429,12 +448,16 @@ impl Http {
         let mut hops = 0;
         loop {
             let mut sender = self.sender().await?;
-            let req = Request::builder()
+            let mut req = Request::builder()
                 .method(Method::POST)
                 .uri(path.as_str())
                 .header(header::HOST, self.authority.as_str())
                 .header(header::CACHE_CONTROL, "no-store")
-                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CONTENT_TYPE, "application/octet-stream");
+            if let Some(h) = credential.filter(|h| !h.created.load(Ordering::Relaxed)) {
+                req = req.header(&h.name, &h.value);
+            }
+            let req = req
                 .body(PipeBody::fixed(body.clone()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             let resp = sender.send_request(req).await.map_err(io::Error::other)?;
@@ -514,8 +537,17 @@ impl Http {
 
 // ---- the driver ------------------------------------------------------------------------
 
+/// UP and DOWN race to create the carrier. Either may present its single
+/// credential until a verified response proves the carrier already exists.
+struct CreationHeader {
+    name: header::HeaderName,
+    value: header::HeaderValue,
+    created: AtomicBool,
+}
+
 /// What every request of the carrier uses.
 struct Ctx {
+    credential: Option<CreationHeader>,
     cid: CarrierId,
     /// The carrier's `{instance}` token.
     instance: String,
@@ -574,7 +606,14 @@ async fn attempt(
     };
     let sent = tokio::time::timeout(
         bound,
-        http.send(&target, body, limit, o.https, o.max_redirects),
+        http.send(
+            &target,
+            body,
+            limit,
+            o.https,
+            o.max_redirects,
+            ctx.credential.as_ref(),
+        ),
     )
     .await;
     let body = match sent {
@@ -598,6 +637,11 @@ async fn attempt(
     }
     if !resp.valid_for(kind) {
         return Outcome::Invalid;
+    }
+    if resp.flags & (BUSY | GONE) == 0
+        && let Some(h) = &ctx.credential
+    {
+        h.created.store(true, Ordering::Relaxed);
     }
     Outcome::Answer(resp.flags, resp.data)
 }
@@ -669,10 +713,10 @@ impl Driver {
                 }
             }
         };
-        self.tasks.abort_all();
+        self.tasks.shutdown().await;
         if let End::Complete = end {
             // Tells the server that the Down Ack passed the downlink FIN.
-            self.send_close();
+            self.send_close().await;
         }
         if let End::Failed { close } = end {
             let wakers = {
@@ -686,28 +730,26 @@ impl Driver {
             }
             if close {
                 // The server may still hold state: abort it there.
-                self.send_close();
+                self.send_close().await;
             }
         }
     }
 
     /// Sends one CLOSE with the current Down Ack; nothing waits for its
     /// result.
-    fn send_close(&self) {
+    async fn send_close(&self) {
         let (http, ctx, ack) = (self.up_http.clone(), self.ctx.clone(), self.ack);
-        tokio::spawn(async move {
-            attempt(
-                http,
-                ctx,
-                Kind::Close,
-                0,
-                0,
-                ack,
-                Bytes::new(),
-                Duration::ZERO,
-            )
-            .await;
-        });
+        attempt(
+            http,
+            ctx,
+            Kind::Close,
+            0,
+            0,
+            ack,
+            Bytes::new(),
+            Duration::ZERO,
+        )
+        .await;
     }
 
     fn spawn(

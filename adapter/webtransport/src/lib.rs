@@ -324,13 +324,12 @@ pub async fn serve(listener: Listener, endpoint: quinn::Endpoint, options: Optio
 ///   first bidirectional stream ([`Entry::admit_first`]): its first
 ///   [`zmux::Admission::peek`] bytes, with the same metadata; the stream
 ///   arrives and its prefix is read within what remains of the peek
-///   timeout, and nothing else of the session (no further stream, no
-///   lane) reaches the listener before. Accepted, the stream is the
-///   session's first pipe and the session a [`Carrier`] of `listener`; on
-///   `Fallback` the listener's fallback takes the stream over, every byte
-///   read replayed ([`Takeover::into_stream`], [`takeover_session`]); the
-///   session is closed once the fallback completed, or when the stream
-///   was stalled or closed;
+///   timeout. A timeout closes the session. Further streams and lanes
+///   reach the listener once it accepts the first stream as a pipe.
+///   `Fallback` and `Takeover` give the host the first stream with every
+///   byte read replayed ([`Takeover::into_stream`], [`takeover_session`]).
+///   Without a host target, either verdict stalls the session. The adapter
+///   closes the session when the stall ends or the host returns it;
 /// - `Fallback`: the request is answered with 404 (a request, which this
 ///   adapter has no HTTP handler for: a server that serves other requests
 ///   routes them before [`admit`]);
@@ -370,33 +369,31 @@ pub async fn admit(request: wt::Request, mut entry: Entry, listener: &Listener, 
     match decided {
         Admit::Accept(_) => {
             let admitted = listener.adapter().admission().and(entry.admitted());
-            drop(entry);
-            let Ok(session) = request.ok().await else {
+            let Some(Ok(session)) = entry.setup_step(request.ok()).await else {
                 return;
             };
+            if entry.hand_off_connection().is_err() {
+                return;
+            }
             let carrier =
                 Carrier::start(session.clone(), Some(listener.clone()), options, admitted);
             // Held while the session is open: its accept loop serves it.
             session.closed().await;
             drop(carrier);
         }
-        Admit::Defer => admit_first_stream(request, entry, listener, options).await,
+        Admit::Defer | Admit::TakeOver(_) => {
+            admit_first_stream(request, entry, listener, options).await;
+        }
         Admit::Fallback(_) => {
+            entry.complete_request_fallback(false);
             drop(entry);
             refuse(request, wt::http::StatusCode::NOT_FOUND, listener).await;
         }
         Admit::Stall => {
-            let mut closed = pin!(conn.closed());
-            let mut stall = pin!(entry.stall(None::<&mut tokio::io::Empty>));
-            poll_fn(|cx| {
-                if closed.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(());
-                }
-                stall.as_mut().poll(cx)
-            })
-            .await;
-            drop(request);
-            conn.close(VarInt::from_u32(0), b"");
+            let stall = entry.stall_request(None::<tokio::io::Empty>, move |_| async move {
+                request.conn().close(VarInt::from_u32(0), b"");
+            });
+            zmux::adapter::while_open(conn.closed(), stall).await;
         }
         _ => conn.close(VarInt::from_u32(0), b""),
     }
@@ -425,6 +422,7 @@ async fn admit_first_stream(
             let session = request.ok().await.map_err(io::Error::other)?;
             let (send, recv) = session.accept_bi().await.map_err(io::Error::other)?;
             let s = session.clone();
+            let stalled = session.clone();
             let io = AdmitIo::stream(tokio::io::join(recv, send), move |streams| {
                 let (recv, send) = streams.into_inner();
                 let carrier = Carrier::make(s.clone(), Some(&l), &options);
@@ -440,20 +438,20 @@ async fn admit_first_stream(
             // admission is dropped meanwhile.
             Ok(io
                 .with_connection(Arc::new(session))
+                .with_stall_until(async move {
+                    let _ = stalled.closed().await;
+                })
                 .with_on_return(move || closing.close(VarInt::from_u32(0), b"")))
         }
     };
-    let accepted = entry.admit_first(CarrierInfo::new(), first).await;
+    // Keep the first-stream setup state out of the session admission future.
+    let accepted = Box::pin(entry.admit_first(CarrierInfo::new(), first)).await;
     let made = made
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     let (Some(first), Some((carrier, session))) = (accepted, made) else {
-        // Not accepted, the verdict acted on (a fallback has completed);
-        // a carrier the host detached leaves its session to the host.
-        if !entry.is_detached() {
-            conn.close(VarInt::from_u32(0), b"");
-        }
+        entry.end_unclaimed_connection(|| conn.close(VarInt::from_u32(0), b""));
         return;
     };
     let admitted = entry.admitted();
@@ -700,6 +698,17 @@ impl Carrier {
 }
 
 impl Inner {
+    fn with_lanes(self: &Arc<Self>, io: PipeIo) -> PipeIo {
+        let opener = self.clone();
+        io.with_lane_opener(move || {
+            let inner = opener.clone();
+            async move {
+                let send = inner.conn.open_uni().await.map_err(io::Error::other)?;
+                Ok(parts::lane(WtSend(send), inner))
+            }
+        })
+    }
+
     fn id(&self) -> CarrierConnId {
         self.id.get().expect("set at creation").clone()
     }
@@ -711,39 +720,36 @@ impl Inner {
         // Holds the session until the zmux session is done with the pipe,
         // and gives the session's close its code.
         let closer = self.clone();
-        let opener = self.clone();
         // Does not keep the connection: gives no value once it is gone.
         let exporter = Arc::downgrade(self);
         let channel = self.datagrams.channel(recv.get_ref().0.quic_id().into());
-        let io = parts::pipe(send, recv, self.clone())
-            .with_carrier(zmux::CarrierKind::WebTransport)
-            .with_carrier_conn(self.id())
-            .with_connection_memory(self.own_charge)
-            .with_datagram_channel(channel)
-            .with_close_code(move |code| {
-                closer
-                    .close_code
-                    .store(code.into_inner(), std::sync::atomic::Ordering::Relaxed);
-            });
-        io.with_lane_opener(move || {
-            let inner = opener.clone();
-            async move {
-                let send = inner.conn.open_uni().await.map_err(io::Error::other)?;
-                Ok(parts::lane(WtSend(send), inner))
-            }
-        })
-        // HTTP/3 runs over ALPN `h3`, as the other QUIC carriers report theirs.
-        .with_terminated_tls(|| Some(zmux::TlsState::new(Some(b"h3".to_vec()), None)))
-        // QUIC protects the records; the Binding is the connection's, not the stream's.
-        .with_carrier_secure()
-        .with_exporter(move |label, context, out| {
-            exporter.upgrade().is_some_and(|inner| {
-                inner
-                    .conn
-                    .export_keying_material(out, label.as_bytes(), context)
-                    .is_ok()
+        let io = zmux_quinn::with_packet_counters(
+            parts::pipe(send, recv, self.clone()),
+            self,
+            |inner| &inner.conn,
+        )
+        .with_carrier(zmux::CarrierKind::WebTransport)
+        .with_carrier_conn(self.id())
+        .with_connection_memory(self.own_charge)
+        .with_datagram_channel(channel)
+        .with_close_code(move |code| {
+            closer
+                .close_code
+                .store(code.into_inner(), std::sync::atomic::Ordering::Relaxed);
+        });
+        self.with_lanes(io)
+            // HTTP/3 runs over ALPN `h3`, as the other QUIC carriers report theirs.
+            .with_terminated_tls(|| Some(zmux::TlsState::new(Some(b"h3".to_vec()), None)))
+            // QUIC protects the records; the Binding is the connection's, not the stream's.
+            .with_carrier_secure()
+            .with_exporter(move |label, context, out| {
+                exporter.upgrade().is_some_and(|inner| {
+                    inner
+                        .conn
+                        .export_keying_material(out, label.as_bytes(), context)
+                        .is_ok()
+                })
             })
-        })
     }
 }
 
@@ -899,3 +905,6 @@ pub fn candidate(client: wt::Client, url: Url, options: &Options) -> zmux::Candi
         async move { dial(&client, url, &options).await }
     })
 }
+
+#[cfg(test)]
+mod tests;

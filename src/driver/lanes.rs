@@ -8,10 +8,8 @@
 //! of its pipe's lane 0. The table is a leaf lock, taken when a session
 //! starts or ends and when a lane arrives, never on the I/O paths.
 
-use std::any::Any;
 use std::fmt;
 use std::future::Future;
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -21,56 +19,14 @@ use tokio::io::{AsyncReadExt, AsyncWrite};
 
 use super::handle::Shared;
 use super::listen::HandleError;
-use super::stream_pipe::{StreamReader, StreamWriter};
+use super::stream_pipe::StreamReader;
 use super::tokio::{ChunkWrite, PipeIo, Tokio, Writer};
 use crate::proto::keys::lane_key_eq;
 use crate::proto::listener::{Classified, LaneProbe};
 use crate::proto::record::ZMUX_MAX_RECORD_SIZE;
 use crate::proto::session::{LaneAccept, LaneId, PipeId};
 
-/// The identity of a multi-stream carrier connection:
-/// equal for two carriers exactly when they are streams of the same
-/// connection. It is the stack's connection object, compared by identity,
-/// never its addresses.
-#[derive(Clone)]
-pub struct CarrierConnId {
-    ptr: usize,
-    /// Keeps the object's allocation, so that no other connection takes
-    /// its address while the identity is held.
-    _keep: Weak<dyn Any + Send + Sync>,
-}
-
-impl CarrierConnId {
-    /// The identity of the connection `conn` (the QUIC connection, the
-    /// HTTP/2 connection, the session whose streams carry pipes).
-    pub fn new<T: Any + Send + Sync>(conn: &Arc<T>) -> Self {
-        let weak: Weak<dyn Any + Send + Sync> = Arc::downgrade(conn) as _;
-        Self {
-            ptr: Arc::as_ptr(conn).cast::<()>() as usize,
-            _keep: weak,
-        }
-    }
-}
-
-impl PartialEq for CarrierConnId {
-    fn eq(&self, other: &Self) -> bool {
-        self.ptr == other.ptr
-    }
-}
-
-impl Eq for CarrierConnId {}
-
-impl Hash for CarrierConnId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.ptr.hash(state);
-    }
-}
-
-impl fmt::Debug for CarrierConnId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CarrierConnId({:#x})", self.ptr)
-    }
-}
+pub use crate::CarrierConnId;
 
 /// What a connection carries for this process's sessions: the pipes with
 /// their lane 0 on it, and the new streams on it that wait for their first
@@ -109,11 +65,19 @@ fn prune(t: &mut std::collections::HashMap<CarrierConnId, Carried>, conn: &Carri
 pub(crate) struct ConnClaim {
     conn: CarrierConnId,
     open: bool,
+    pub(crate) attachment: Option<Arc<super::attachment::Attachment>>,
 }
 
 impl ConnClaim {
-    pub(crate) fn new(conn: CarrierConnId) -> Self {
-        Self { conn, open: false }
+    pub(crate) fn new(
+        conn: CarrierConnId,
+        attachment: Option<Arc<super::attachment::Attachment>>,
+    ) -> Self {
+        Self {
+            conn,
+            open: false,
+            attachment,
+        }
     }
 
     pub(crate) fn conn(&self) -> &CarrierConnId {
@@ -181,6 +145,8 @@ impl Drop for Exempt {
 pub(crate) struct LaneWriter {
     pub(crate) writer: Writer,
     pub(crate) keep: Option<StreamReader>,
+    pub(crate) drain: Option<Box<super::tokio::Drain>>,
+    pub(crate) attachment: Option<Arc<super::attachment::Attachment>>,
     pub(crate) outer: Option<OuterLane>,
     /// The lane's unsent query ([`PipeIo::with_unsent`]).
     pub(crate) unsent: Option<super::unsent::Unsent>,
@@ -230,9 +196,33 @@ impl Lane {
         Self(LaneWriter {
             writer,
             keep: None,
+            drain: None,
+            attachment: None,
             outer: None,
             unsent: None,
         })
+    }
+
+    /// Registers work belonging to this lane, including work started by its opener.
+    pub fn worker_guard(&mut self) -> impl Send + Sync + 'static + use<> {
+        self.0.attachment.get_or_insert_default().worker()
+    }
+
+    /// Runs a bounded drain after graceful shutdown, retaining the owning
+    /// pipe until the drain completes or reaches its deadline.
+    #[must_use]
+    pub fn with_drain(
+        mut self,
+        drain: impl Future<Output = ()> + Send + 'static,
+        limit: Duration,
+    ) -> Self {
+        super::tokio::Drain::add(
+            &mut self.0.drain,
+            Box::pin(drain),
+            limit,
+            self.0.attachment.get_or_insert_default(),
+        );
+        self
     }
 
     /// A lane written by byte slices.
@@ -305,7 +295,9 @@ pub(crate) fn stream_opener(outer: Weak<Shared<Tokio>>, preamble: crate::Preambl
 }
 
 /// A session of the routing table.
+#[derive(Clone)]
 struct Entry {
+    listener: Option<Weak<super::listen::ListenShared>>,
     key: [u8; 16],
     session: Weak<Shared<Tokio>>,
 }
@@ -318,10 +310,15 @@ fn table() -> std::sync::MutexGuard<'static, Vec<Entry>> {
 
 /// Adds a session that accepts lanes (its own Max Lanes above 1) under its
 /// Lane Key; ended sessions leave the table here too.
-pub(crate) fn register(session: &Arc<Shared<Tokio>>, key: [u8; 16]) {
+pub(super) fn register(
+    session: &Arc<Shared<Tokio>>,
+    key: [u8; 16],
+    listener: Option<Weak<super::listen::ListenShared>>,
+) {
     let mut t = table();
     t.retain(|e| e.session.strong_count() > 0);
     t.push(Entry {
+        listener,
         key,
         session: Arc::downgrade(session),
     });
@@ -341,15 +338,15 @@ pub(crate) fn registered() -> Vec<[u8; 16]> {
 
 /// The session whose Lane Key is `key`, compared in constant time with
 /// every entry.
-fn lookup(key: &[u8; 16]) -> Option<Arc<Shared<Tokio>>> {
+fn lookup(key: &[u8; 16]) -> Option<Entry> {
     let t = table();
     let mut found = None;
     for e in t.iter() {
         if lane_key_eq(&e.key, key) && found.is_none() {
-            found = Some(e.session.clone());
+            found = Some(e.clone());
         }
     }
-    found?.upgrade()
+    found
 }
 
 /// How long a stream may take to bring its first record (the first-record timeout).
@@ -370,54 +367,103 @@ const FIRST_RECORD: Duration = crate::proto::listener::DEFAULT_FIRST_RECORD_TIME
 /// [`HandleError::TimedOut`] without a first record within the first-record
 /// timeout; [`HandleError::Rejected`] when the stream names no such pipe or
 /// its first record is not a lane's.
-pub async fn handle_lane(mut io: PipeIo) -> Result<(), HandleError> {
+pub async fn handle_lane(io: PipeIo) -> Result<(), HandleError> {
+    let mut setup = super::setup::Setup::new(super::setup::Authority::direct(), io);
+    let (_, io) = setup.parts();
     let framing = io.framing;
     let mut probe = LaneProbe::new(ZMUX_MAX_RECORD_SIZE, framing);
-    let first = async {
-        let Some(reader) = io.reader.as_mut() else {
-            return Classified::Reject;
-        };
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => return Classified::Reject,
-                Ok(n) => n,
-            };
-            let c = probe.data(&buf[..n]);
-            if c != Classified::NeedMore {
-                return c;
-            }
-        }
-    };
+    let first = first_record(io, |_, bytes| probe.data(bytes));
     match tokio::time::timeout(FIRST_RECORD, first).await {
         Ok(Classified::Lane {
             lane_key,
             pipe,
             lane,
             bytes,
-        }) => route(io, &lane_key, PipeId(pipe).lane(lane), bytes),
+        }) => {
+            let entry = lookup(&lane_key).ok_or(HandleError::Rejected)?;
+            let at = PipeId(pipe).lane(lane);
+            match entry.listener {
+                Some(w) => {
+                    let owner = w.upgrade().ok_or(HandleError::Refused)?;
+                    install(setup.at_listener(&owner), &entry.session, at, bytes)
+                }
+                None => install(setup, &entry.session, at, bytes),
+            }
+        }
         Ok(_) => Err(HandleError::Rejected),
         Err(_) => Err(HandleError::TimedOut),
     }
 }
 
+pub(super) async fn first_record(
+    pipe: &mut PipeIo,
+    mut consume: impl FnMut(crate::proto::record::Framing, &[u8]) -> Classified,
+) -> Classified {
+    let framing = pipe.framing;
+    if !pipe.prefix.is_empty() {
+        let c = consume(framing, &std::mem::take(&mut pipe.prefix));
+        if c != Classified::NeedMore {
+            return c;
+        }
+    }
+    let Some(reader) = pipe.reader.as_mut() else {
+        return Classified::Reject;
+    };
+    let room = if framing == crate::proto::record::Framing::Records {
+        crate::util::usize_sat(ZMUX_MAX_RECORD_SIZE) + 1
+    } else {
+        16 * 1024
+    };
+    let mut buf = vec![0; room];
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => return Classified::Reject,
+            Ok(n) => n,
+        };
+        let c = consume(framing, &buf[..n]);
+        if c != Classified::NeedMore {
+            return c;
+        }
+    }
+}
+
 /// Offers the stream `io`, whose first bytes `prefix` begin with a
 /// `PIPE_LANE` carrying `key` for lane `at`, to the session with that key.
-pub(crate) fn route(
-    mut io: PipeIo,
+pub(super) fn route<T: super::setup::Owner>(
+    setup: super::setup::Setup<T, PipeIo>,
+    listener: &Arc<super::listen::ListenShared>,
     key: &[u8; 16],
     at: LaneId,
     prefix: Vec<u8>,
 ) -> Result<(), HandleError> {
-    let (Some(conn), Some(session)) = (io.conn().cloned(), lookup(key)) else {
-        // Dropping the stream aborts it.
+    let entry = lookup(key).ok_or(HandleError::Rejected)?;
+    if !entry
+        .listener
+        .as_ref()
+        .is_some_and(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(listener)))
+    {
         return Err(HandleError::Rejected);
-    };
-    io.prefix = prefix;
-    match session.accept_lane(at, &conn, io) {
-        LaneAccept::Accepted => Ok(()),
-        _ => Err(HandleError::Rejected),
     }
+    install(setup, &entry.session, at, prefix)
+}
+
+fn install<T: super::setup::Owner>(
+    setup: super::setup::Setup<T, PipeIo>,
+    session: &Weak<Shared<Tokio>>,
+    at: LaneId,
+    prefix: Vec<u8>,
+) -> Result<(), HandleError> {
+    setup.publish(|mut io| {
+        let (Some(conn), Some(session)) = (io.conn().cloned(), session.upgrade()) else {
+            // Dropping the stream aborts it.
+            return Err(HandleError::Rejected);
+        };
+        io.prefix = prefix;
+        match session.accept_lane(at, &conn, io) {
+            LaneAccept::Accepted => Ok(()),
+            _ => Err(HandleError::Rejected),
+        }
+    })
 }
 
 impl PipeIo {
@@ -432,31 +478,12 @@ impl PipeIo {
         Some(LaneWriter {
             writer,
             keep,
+            drain: self.drain.take(),
+            attachment: self.attachment.take(),
             outer: None,
             unsent: self.unsent.take(),
         })
     }
-}
-
-/// Ends the unused sending half of an accepted lane at once and
-/// gracefully.
-pub(crate) fn finish_reverse(writer: Option<Writer>) {
-    match writer {
-        Some(Writer::Stream(w)) => finish_stream(w),
-        // Bounded as every graceful end the peer may never answer.
-        Some(mut w) => super::tokio::spawn_drain(
-            async move {
-                let _ = std::future::poll_fn(|cx| w.poll_shutdown(cx)).await;
-            },
-            super::tokio::DRAIN_LIMIT,
-        ),
-        None => {}
-    }
-}
-
-fn finish_stream(mut w: StreamWriter) {
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    let _ = AsyncWrite::poll_shutdown(Pin::new(&mut w), &mut cx);
 }
 
 /// Shows no state: it may hold keys or locks.

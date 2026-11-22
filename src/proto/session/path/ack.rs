@@ -136,8 +136,10 @@ pub(in crate::proto::session) fn snapshot_of(
 
 impl SessionCore {
     /// Reports one of our joins that was not attached before, once it is.
-    fn note_attached(&mut self, id: u64) {
-        if self.att(id).is_some_and(Attachment::peer_attached) {
+    fn note_attached(&mut self, id: u64, now: Instant) {
+        if self.expire_join(id, now).is_none()
+            && self.att_mut(id).is_some_and(Attachment::confirm_peer)
+        {
             self.push_event(CoreEvent::PipeAttached { pipe: PipeId(id) });
         }
     }
@@ -161,7 +163,7 @@ impl SessionCore {
             self.push_event(CoreEvent::PipeReceiving { pipe: PipeId(id) });
         }
         if !attached {
-            self.note_attached(id);
+            self.note_attached(id, now);
         }
         // The answer to a PIPE_PING in the first record of a newly attached
         // pipe is a complete snapshot.
@@ -532,7 +534,7 @@ impl SessionCore {
             let attached = self.att(e.pipe_id).is_none_or(Attachment::peer_attached);
             self.process_ack(e.pipe_id, e.lane, e.position, delay, now);
             if !attached {
-                self.note_attached(e.pipe_id);
+                self.note_attached(e.pipe_id, now);
             }
         }
         Ok(())

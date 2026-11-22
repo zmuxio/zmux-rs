@@ -173,9 +173,6 @@ pub(crate) struct OutPipe {
     /// The position after the last ack-eliciting batch: what follows it
     /// (records of `PIPE_ACK` alone) the peer need not acknowledge.
     eliciting_end: u64,
-    /// Lane 0's position after its last ack-eliciting batch (the pipe's
-    /// position without lanes): what a close waits to see acknowledged.
-    eliciting_zero: u64,
     /// Carrier bytes not yet transmitted, as the adapter reports them.
     carrier_unsent: u64,
     /// The carrier's own RTT estimate, as the adapter reports it.
@@ -204,28 +201,9 @@ pub(crate) struct OutPipe {
     lanes: Option<Box<OutLanes>>,
     /// The carrier's datagram channel, as the driver last reported it.
     channel: Option<Channel>,
-    /// The carrier's retransmissions, once the adapter reported a count.
-    loss: Option<Box<CarrierLoss>>,
     /// Bytes sent and not acknowledged when the pipe failed.
     lost: u64,
 }
-
-/// A carrier's own retransmissions as its adapter reports them, and the
-/// smoothed loss rate sampled from them.
-#[derive(Debug, Clone, Copy)]
-struct CarrierLoss {
-    /// The latest count.
-    retransmitted: u64,
-    /// The smoothed rate, after the first sample.
-    rate: Option<f64>,
-    /// The last sample: when, the bytes sent and the count then.
-    at: Instant,
-    sent: u64,
-    count: u64,
-}
-
-/// The shortest time between two samples of a pipe's loss rate.
-const LOSS_SAMPLE_GAP: Duration = Duration::from_secs(1);
 
 /// A pipe carrier's datagram channel as the core uses it to decide where a
 /// DATAGRAM frame goes.
@@ -480,7 +458,6 @@ impl OutPipe {
             writing: 0,
             unsent_reported: false,
             eliciting_end: 0,
-            eliciting_zero: 0,
             carrier_unsent: 0,
             carrier_rtt: None,
             bottleneck_epoch: 0,
@@ -491,48 +468,8 @@ impl OutPipe {
             lanes_offered: false,
             lanes: None,
             channel: None,
-            loss: None,
             lost: 0,
         }
-    }
-
-    /// The carrier's retransmitted bytes, as its adapter reports them, and
-    /// a sample of the smoothed loss rate: an EWMA with gain 1/8 of the
-    /// retransmitted bytes per byte sent between samples at least
-    /// [`LOSS_SAMPLE_GAP`] apart. A count that moves back counts as no
-    /// retransmission.
-    pub(crate) fn set_retransmitted(&mut self, count: u64, now: Instant) {
-        let sent = self.bytes_written();
-        let Some(l) = self.loss.as_deref_mut() else {
-            self.loss = Some(Box::new(CarrierLoss {
-                retransmitted: count,
-                rate: None,
-                at: now,
-                sent,
-                count,
-            }));
-            return;
-        };
-        l.retransmitted = count;
-        if now.saturating_duration_since(l.at) < LOSS_SAMPLE_GAP || sent <= l.sent {
-            return;
-        }
-        let x = f64_of(count.saturating_sub(l.count)) / f64_of(sent - l.sent);
-        l.rate = Some(match l.rate {
-            Some(r) => r + (x - r) / 8.0,
-            None => x,
-        });
-        (l.at, l.sent, l.count) = (now, sent, count);
-    }
-
-    /// The carrier's retransmitted bytes, once reported.
-    pub(crate) fn retransmitted(&self) -> Option<u64> {
-        self.loss.as_deref().map(|l| l.retransmitted)
-    }
-
-    /// The smoothed carrier loss rate, after its first sample.
-    pub(crate) fn loss_rate(&self) -> Option<f64> {
-        self.loss.as_deref().and_then(|l| l.rate)
     }
 
     /// Bytes sent and not acknowledged when the pipe failed (0 before).
@@ -984,13 +921,6 @@ impl OutPipe {
         !self.out_closed && !self.abort_reported && !self.shutdown_reported
     }
 
-    /// The handshake deadline of a join that is not confirmed, and the
-    /// moment it was sent.
-    #[inline]
-    pub(crate) fn joined_at(&self) -> Instant {
-        self.mp().joined_at
-    }
-
     /// The last progress: the last acknowledgement advance, or the join.
     #[inline]
     pub(crate) fn last_progress(&self) -> Instant {
@@ -1111,12 +1041,12 @@ impl OutPipe {
         eliciting: Option<u64>,
     ) {
         let base = self.sent;
-        if lane == 0
-            && let Some(end) = eliciting
-        {
-            self.eliciting_zero = self.sent_on(0) + end;
-        }
         if let Some(l) = self.lanes.as_deref_mut() {
+            if lane == 0
+                && let Some(end) = eliciting
+            {
+                l.eliciting_zero = l.tx(0).expect("lane zero").sent() + end;
+            }
             l.wrote(lane, base, total);
         }
         // The lane's previous batch is written: a driver takes the next one
@@ -1211,7 +1141,11 @@ impl OutPipe {
     /// need no acknowledgement.
     #[inline]
     pub(crate) fn zero_covered(&self) -> bool {
-        self.acked_on(0) >= self.eliciting_zero
+        self.acked_on(0)
+            >= self
+                .lanes
+                .as_ref()
+                .map_or(self.eliciting_end, |l| l.eliciting_zero)
     }
 
     /// The position after the last ack-eliciting batch.
@@ -1952,7 +1886,7 @@ impl OutPipe {
     pub(crate) fn request_lane(&mut self) -> u64 {
         let (sent, acked, unsent) = (self.sent, self.acked, self.carrier_unsent);
         self.lanes
-            .get_or_insert_with(|| Box::new(OutLanes::new(sent, acked, unsent)))
+            .get_or_insert_with(|| Box::new(OutLanes::new(sent, acked, unsent, self.eliciting_end)))
             .request()
     }
 
@@ -2642,25 +2576,6 @@ mod tests {
         assert_eq!(o.lost(), 0);
         o.fail();
         assert_eq!(o.lost(), 600);
-    }
-
-    /// The loss rate: no sample before a second has passed or before bytes
-    /// were sent; then an EWMA with gain 1/8, and a count that moves back
-    /// counts as no retransmission.
-    #[test]
-    fn the_loss_rate_is_sampled_once_a_second() {
-        let t = Instant::now();
-        let mut o = pipe(t);
-        o.set_retransmitted(0, t);
-        assert_eq!((o.retransmitted(), o.loss_rate()), (Some(0), None));
-        o.sent = 1000;
-        o.set_retransmitted(10, t + MS * 500);
-        assert_eq!((o.retransmitted(), o.loss_rate()), (Some(10), None));
-        o.set_retransmitted(10, t + MS * 1000);
-        assert_eq!(o.loss_rate(), Some(0.01));
-        o.sent = 2000;
-        o.set_retransmitted(5, t + MS * 2000);
-        assert_eq!(o.loss_rate(), Some(0.01 * 7.0 / 8.0));
     }
 
     /// Each `PIPE_PING` counts as answered once, when the acknowledged

@@ -297,7 +297,7 @@ async fn a_first_message_is_bounded_by_max_message() {
         assert!(enter(&l).admit(CarrierInfo::new(), carrier).await.is_none());
     }
     assert_eq!(calls.lock().unwrap().len(), 1, "the longer one undecided");
-    assert_eq!(counts(&l), [0, 0, 0, 1, 0, 1, 0, 0]);
+    assert_eq!(counts(&l), [0, 0, 0, 2, 0, 0, 0, 0]);
 
     // A bound of the host's; max_peek bounds byte streams only.
     let (adm, calls) = recorded(1, |_, _| AdmissionVerdict::Close);
@@ -308,7 +308,22 @@ async fn a_first_message_is_bounded_by_max_message() {
     }
     assert_eq!(calls.lock().unwrap()[0].4.len(), 8);
     assert_eq!(calls.lock().unwrap().len(), 1);
-    assert_eq!(counts(&l), [0, 0, 0, 1, 0, 2, 0, 0]);
+    assert_eq!(counts(&l), [0, 0, 0, 3, 0, 0, 0, 0]);
+
+    let (adm, calls) = recorded(0, defer_then(b"ok"));
+    let l = listener(adm.with_max_message(8), None);
+    let mut entry = enter(&l);
+    assert_eq!(entry.decide_upgrade(CarrierInfo::new()).await, Admit::Defer);
+    let carrier = messages(vec![msg(b"too large")]);
+    assert!(
+        entry
+            .admit_first(CarrierInfo::new(), now(carrier))
+            .await
+            .is_none()
+    );
+    drop(entry);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(counts(&l), [0, 0, 0, 0, 0, 1, 0, 0]);
 
     // Above the largest record: an invalid configuration.
     let mut limits = ListenerConfig::default();
@@ -507,4 +522,109 @@ async fn a_stalled_message_carrier_discards_its_messages() {
     let stalled = tokio::time::timeout(LIMIT, e.admit(CarrierInfo::new(), carrier)).await;
     assert!(stalled.unwrap().is_none());
     assert_eq!(counts(&l), [0, 0, 1, 0, 0, 0, 0, 0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn targetless_deferred_handoffs_and_setup_outcomes_reconcile() {
+    for verdict in [AdmissionVerdict::fallback(), AdmissionVerdict::takeover()] {
+        let adm = Admission::new(0, move |info: CarrierInfo, _| {
+            if info.upgrade && info.is_head() {
+                AdmissionVerdict::Defer
+            } else if info.upgrade {
+                verdict.clone()
+            } else {
+                AdmissionVerdict::Stall
+            }
+            .labelled("route")
+        });
+        let l = listener(adm, None);
+        let mut held = enter(&l);
+        assert_eq!(
+            held.decide_request(CarrierInfo::new(), None::<&mut tokio::io::Empty>)
+                .await,
+            Admit::Stall
+        );
+        for _ in 0..2 {
+            let mut entry = enter(&l);
+            assert_eq!(entry.decide_upgrade(CarrierInfo::new()).await, Admit::Defer);
+            assert!(
+                entry
+                    .admit_first(CarrierInfo::new(), now(messages(vec![msg(b"ok")])))
+                    .await
+                    .is_none()
+            );
+            drop(entry);
+        }
+        drop(held);
+        assert_eq!(counts(&l), [0, 0, 1, 0, 2, 0, 0, 0]);
+        assert_eq!(l.stats().admission.takeover, 0);
+        assert_eq!(l.variant_stats().variants["route"].stalled, 3);
+    }
+
+    let (adm, _) = recorded(0, defer_then(b"ok"));
+    let l = listener(adm, None);
+    for expired in [false, true] {
+        let mut entry = enter(&l);
+        assert_eq!(entry.decide_upgrade(CarrierInfo::new()).await, Admit::Defer);
+        if expired {
+            assert!(
+                entry
+                    .admit_first(CarrierInfo::new(), std::future::pending())
+                    .await
+                    .is_none()
+            );
+        } else {
+            assert!(
+                entry
+                    .admit_first(
+                        CarrierInfo::new(),
+                        std::future::ready(Err(io::Error::other("upgrade failed")))
+                    )
+                    .await
+                    .is_none()
+            );
+        }
+    }
+    let mut entry = enter(&l);
+    assert_eq!(entry.decide_upgrade(CarrierInfo::new()).await, Admit::Defer);
+    drop(entry);
+    assert_eq!(counts(&l), [0, 0, 0, 1, 0, 0, 1, 1]);
+    assert_eq!(l.stats().setup_failures, 0);
+    assert_eq!(l.stats().rejected, 0);
+}
+
+#[tokio::test]
+async fn labelled_admission_outcomes_reconcile_with_variant_overflow() {
+    let adm = Admission::new(1, |_, prefix| {
+        AdmissionVerdict::Close.labelled(format!("variant-{}", prefix[0]))
+    });
+    let l = listener(adm, None);
+    for i in 0..70u8 {
+        let carrier = messages(vec![Ok(vec![i])]);
+        assert!(enter(&l).admit(CarrierInfo::new(), carrier).await.is_none());
+    }
+    let variants = l.variant_stats();
+    assert_eq!(variants.variants.len(), 64);
+    assert_eq!(variants.overflow.closed, 6);
+    let dedicated: u64 = variants.variants.values().map(|v| v.closed).sum();
+    assert_eq!(
+        dedicated + variants.overflow.closed,
+        l.stats().admission.closed
+    );
+    assert_eq!(counts(&l), [0, 0, 0, 70, 0, 0, 0, 0]);
+}
+
+#[tokio::test]
+async fn closing_a_pending_handshake_counts_as_cancellation() {
+    let (adm, calls) = recorded(0, |_, _| AdmissionVerdict::accept(0));
+    let l = listener(adm, None);
+    drop(enter(&l));
+    assert_eq!(counts(&l), [0, 0, 0, 0, 0, 0, 0, 1]);
+
+    let cancelled = enter(&l);
+    l.close();
+    drop(cancelled);
+    assert_eq!(counts(&l), [0, 0, 0, 1, 0, 0, 0, 1]);
+    assert_eq!(*calls.lock().unwrap(), []);
+    assert_eq!(l.stats().setup_failures, 0);
 }

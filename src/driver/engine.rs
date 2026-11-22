@@ -498,27 +498,35 @@ impl Outbound {
     /// The last byte of a batch that ends with a shutdown is told once the
     /// shutdown is done: a close counts as handed off only when the
     /// carrier's write side is shut, so a process that exits then leaves no
-    /// half-written carrier behind.
-    pub(crate) fn tell(&mut self, core: &mut Core, id: impl Into<LaneId>, now: Instant) {
+    /// half-written carrier behind. Returns whether the core recorded progress.
+    pub(crate) fn tell(&mut self, core: &mut Core, id: impl Into<LaneId>, now: Instant) -> bool {
         let held = u64::from(self.shutdown && self.pos >= self.out.len() && self.untold > 0);
         let n = self.untold - held;
         self.untold = held;
         if n > 0 {
             core.pipe_written(id, n, now);
         }
+        n != 0
     }
 
     /// A write call took `n` bytes; returns whether the batch is done.
     pub(crate) fn written(&mut self, n: usize) -> bool {
         self.pos += n;
-        self.untold += n as u64;
-        if self.pos >= self.out.len() {
+        let done = self.pos >= self.out.len();
+        self.untold += if self.framing == Framing::Records && n > 0 {
+            // The core accounts in byte-stream form. A carrier takes whole
+            // messages without their Size fields, either one or the batch.
+            let ends = self.out.record_ends();
+            let start = self.msg_index.checked_sub(1).map_or(0, |i| ends[i]);
+            self.msg_index = if done { ends.len() } else { self.msg_index + 1 };
+            ends[self.msg_index - 1] - start
+        } else {
+            n as u64
+        };
+        if done {
             self.out.clear();
             self.restart();
             return true;
-        }
-        if n > 0 && self.framing == Framing::Records {
-            self.msg_index += 1;
         }
         while self.owned.get(self.owned_head).is_some_and(Bytes::is_empty) {
             self.owned_head += 1;
@@ -609,6 +617,7 @@ mod tests {
     fn messages_are_whole_and_borrowed_when_one_piece() {
         let (b, payloads) = records(Framing::Records, 3, true);
         let lens = b.message_lens().to_vec();
+        let stream_len = b.stream_len();
         let mut o = Outbound::new(Framing::Records, Calls::NonBlocking);
         o.out = b;
         // Slices: the first message borrowed from its payload.
@@ -625,6 +634,12 @@ mod tests {
             o2.written(*len);
         }
         assert!(o2.is_empty());
+        assert_eq!(o2.untold, stream_len);
+        let (batch, _) = records(Framing::Records, 3, true);
+        o2.untold = 0;
+        o2.out = batch;
+        assert!(o2.written(lens.iter().sum()));
+        assert_eq!(o2.untold, stream_len);
         // Owned buffers: the first message is the payload itself.
         for (i, len) in lens.iter().enumerate() {
             let chunks = o.chunks(1);

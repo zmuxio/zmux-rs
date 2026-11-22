@@ -737,6 +737,9 @@ impl SessionCore {
     /// unprocessed. Anything else fails only the attachment.
     pub fn verify_reply(&mut self, pipe: PipeId, input: &[u8], now: Instant) -> JoinStep {
         self.tick(now);
+        if self.expire_join(pipe.0, now).is_some() {
+            return JoinStep::Failed;
+        }
         let id = pipe.0;
         let Some(i) = self
             .mp
@@ -820,6 +823,9 @@ impl SessionCore {
         now: Instant,
     ) -> Result<JoinFinished, PipeError> {
         self.tick(now);
+        if let Some(cause) = self.expire_join(pipe.0, now) {
+            return Err(PipeError::Failed(cause));
+        }
         let id = pipe.0;
         if self.state >= State::Closing {
             return Err(PipeError::NotEstablished);
@@ -1336,9 +1342,11 @@ impl SessionCore {
 
     /// The carrier of a JOINING attachment failed.
     pub fn join_carrier_failed(&mut self, pipe: PipeId, kind: std::io::ErrorKind, now: Instant) {
-        self.tick(now);
-        self.fail_attachment(pipe.0, PipeFailure::Carrier(kind), now);
-        self.after_pipe_change(now);
+        let now = self.join_clock(now);
+        if self.expire_join(pipe.0, now).is_none() {
+            self.fail_attachment(pipe.0, PipeFailure::Carrier(kind), now);
+            self.after_pipe_change(now);
+        }
     }
 
     /// The largest record plaintext of a pipe, local and applied beside the peer's

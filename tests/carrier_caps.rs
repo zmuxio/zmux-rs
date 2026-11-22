@@ -1,6 +1,5 @@
 //! Optional carrier capabilities passed through to the core: the write
-//! overhead a shaper factory sees, and the carrier's retransmission count
-//! behind a pipe's loss statistics.
+//! overhead a shaper factory sees and the carrier's connection counters.
 
 #![allow(
     clippy::many_single_char_names,
@@ -65,44 +64,100 @@ async fn the_write_overhead_reaches_the_shaper_factory() {
     .unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn pipe_stats_seed_at_attachment_and_return_the_cache() {
+    use zmux::{CarrierCounts, CarrierSource, PipeDirection};
+
+    let (a, b) = tokio::io::duplex(1 << 16);
+    let calls = Arc::new(AtomicU64::new(0));
+    let count = calls.clone();
+    let owner = Arc::new(());
+    let io = PipeIo::new(a)
+        .with_carrier_conn(zmux::CarrierConnId::new(&owner))
+        .with_carrier_counters(CarrierSource::Quinn, move || {
+            Some(CarrierCounts::Quic {
+                packets_sent: count.fetch_add(1, Relaxed),
+                packets_lost: 0,
+            })
+        });
+    let (client, server) = tokio::join!(
+        Session::connect(io, Config::default()),
+        Session::accept(PipeIo::new(b), Config::default()),
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+    assert_eq!(calls.load(Relaxed), 1);
+    assert!(server.pipe_stats().remove(0).carrier_sample.is_none());
+
+    let pipe = client.pipes().remove(0);
+    let initial = pipe.stats().unwrap().carrier_sample.unwrap();
+    assert_eq!(initial.direction, PipeDirection::Out);
+    assert_eq!(initial.generation, 0);
+    assert_eq!(
+        initial.counts,
+        Some(CarrierCounts::Quic {
+            packets_sent: 0,
+            packets_lost: 0,
+        })
+    );
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert_eq!(client.pipe_stats().remove(0).carrier_sample, Some(initial));
+    assert_eq!(calls.load(Relaxed), 1);
+}
+
 #[tokio::test]
-async fn bytes_retransmitted_come_from_the_carrier() {
+async fn receive_only_pipes_never_register_or_query() {
+    use zmux::{
+        CarrierSource, Listener, ListenerConfig, PipeAuth, PipeDirection, PipeHint, PipeOptions,
+    };
+
     tokio::time::timeout(LIMIT, async {
-        let (a, b) = tokio::io::duplex(1 << 16);
-        let server = tokio::spawn(Session::accept(PipeIo::new(b), Config::default()));
-        let retrans = Arc::new(AtomicU64::new(0));
-        let r = retrans.clone();
-        let client = Session::connect(
-            PipeIo::new(a).with_retransmitted(move || Some(r.load(Relaxed))),
-            Config::default(),
-        )
-        .await
-        .unwrap();
-        let server = server.await.unwrap().unwrap();
-        // The server's carrier reports none.
-        assert_eq!(server.pipes()[0].stats().unwrap().bytes_retransmitted, None);
-        let stats = || client.pipes()[0].stats().unwrap();
-        // Queried at most once a second, on the session's write path.
-        retrans.store(1000, Relaxed);
-        let mut seen = None;
-        for _ in 0..40 {
-            client.send_datagram(bytes::Bytes::from_static(b"x")).ok();
-            let (mut send, _r) = client.open_bi().await.unwrap();
-            send.write_all(&[1; 10_000]).await.unwrap();
-            send.finish().unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let s = stats();
-            if s.loss_rate.is_some() {
-                seen = Some(s);
-                break;
+        let mut cfg = Config::default();
+        cfg.max_pipes = 4;
+        cfg.pipe_auth = PipeAuth::psk([7; 32]).with_end_to_end();
+        let listener = Listener::new(cfg.clone(), ListenerConfig::default()).unwrap();
+        let (a, b) = tokio::io::duplex(65536);
+        let (client, setup) = tokio::join!(
+            Session::connect(PipeIo::new(a), cfg),
+            listener.handle_pipe(PipeIo::new(b), PipeHint::default()),
+        );
+        setup.unwrap();
+        let client = client.unwrap();
+        let server = listener.accept().await.unwrap();
+        for direction in [PipeDirection::In, PipeDirection::Out] {
+            let receive_calls = Arc::new(AtomicU64::new(0));
+            let count = receive_calls.clone();
+            let owner = Arc::new(());
+            let identify = |io| PipeIo::new(io).with_carrier_conn(zmux::CarrierConnId::new(&owner));
+            let (a, b) = tokio::io::duplex(65536);
+            let (mut near, mut far) = (identify(a), identify(b));
+            let query = move || {
+                count.fetch_add(1, Relaxed);
+                None
+            };
+            if direction == PipeDirection::In {
+                near = near.with_carrier_counters(CarrierSource::Quinn, query);
+            } else {
+                far = far.with_carrier_counters(CarrierSource::Quinn, query);
             }
+            let mut options = PipeOptions::default();
+            options.direction = direction;
+            let (added, setup) = tokio::join!(
+                client.add_pipe(near, options),
+                listener.handle_pipe(far, PipeHint::default()),
+            );
+            setup.unwrap();
+            let added = added.unwrap();
+            let receive = if direction == PipeDirection::In {
+                added
+            } else {
+                server.pipe(added.id()).unwrap()
+            };
+            let stats = receive.stats().unwrap();
+            assert!(stats.outbound.is_none());
+            assert!(stats.carrier_sample.is_none());
+            assert_eq!(receive_calls.load(Relaxed), 0);
         }
-        let s = seen.expect("a loss-rate sample within 4 s");
-        assert_eq!(s.bytes_retransmitted, Some(1000));
-        assert!(s.loss_rate.unwrap() >= 0.0);
-        // A live pipe has lost nothing.
-        assert!(s.bytes_lost.is_none_or(|n| n == 0));
-        drop(server);
     })
     .await
     .unwrap();

@@ -43,6 +43,12 @@ pub(crate) struct JoinCarrier {
 }
 
 /// What the listener does next.
+#[derive(Clone, Copy)]
+pub(crate) enum Check {
+    Authorization,
+    Mode,
+}
+
 pub(crate) enum AcceptStep {
     /// Refused before authentication: the reject policy (stall or close)
     /// for `reason`; counted as rejected.
@@ -54,7 +60,7 @@ pub(crate) enum AcceptStep {
     WaitKeys,
     /// Settle the session's checks within the deadline, then
     /// [`JoinAccept::allowed`].
-    Ask(crate::Decision<bool>),
+    Ask(Check, crate::Decision<bool>),
     /// Wait `0` (the Reply's plan), within the deadline and while the
     /// session lives, then [`JoinAccept::delayed`].
     Delay(Duration),
@@ -67,11 +73,62 @@ pub(crate) enum AcceptStep {
 }
 
 /// A confirmed join's pipe.
-pub(crate) struct Attached {
-    pub(crate) pipe: PipeId,
+pub(crate) struct Attached<D: Driver> {
+    pub(crate) install: Installation<D>,
     pub(crate) records: JoinRecords,
     pub(crate) want_in: bool,
     pub(crate) want_out: bool,
+}
+
+/// Exclusive obligation to install a confirmed pipe or roll it back.
+pub(crate) struct Installation<D: Driver> {
+    session: Arc<Shared<D>>,
+    pipe: PipeId,
+    outcome: Arc<super::attachment::PipeOutcome>,
+    committed: bool,
+    limited: bool,
+}
+
+impl<D: Driver> Installation<D> {
+    pub(crate) fn id(&self) -> PipeId {
+        self.pipe
+    }
+
+    pub(crate) fn resource_limit(&mut self) -> HandleError {
+        self.limited = true;
+        HandleError::Refused
+    }
+
+    pub(crate) fn installed(mut self) -> Result<(), crate::PipeError> {
+        let mut st = self.session.lock();
+        self.outcome
+            .join
+            .get_or_init(|| {
+                st.core
+                    .pipe_attached(self.pipe)
+                    .unwrap_or(Err(crate::PipeError::UnknownPipe))
+            })
+            .clone()?;
+        self.committed = true;
+        let st = &mut *st;
+        st.waiters
+            .wake_list(super::wait::List::Pipes, &mut st.wakes);
+        Ok(())
+    }
+}
+
+impl<D: Driver> Drop for Installation<D> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut st = self.session.lock();
+            if self.limited {
+                st.core.abandon_pipe_for_limit(self.pipe, D::now());
+            } else {
+                let _ = st.core.remove_pipe(self.pipe, false, D::now());
+            }
+            st.after_command();
+        }
+    }
 }
 
 /// The acceptor's steps of one join.
@@ -82,6 +139,8 @@ pub(crate) struct JoinAccept<D: Driver> {
     deadline: Option<Instant>,
     mode: Option<RecordMode>,
     join: Option<Box<PeerJoin>>,
+    report: Option<handle::JoinReport<D>>,
+    failure: Option<crate::JoinError>,
     peer: Option<PeerCarrier>,
     plan: Option<crate::shaping::UnitPlan>,
 }
@@ -96,16 +155,24 @@ impl<D: Driver> JoinAccept<D> {
         hello: &[u8],
         carrier: JoinCarrier,
     ) -> Self {
-        let timeout = session.as_ref().map_or(listener_join_timeout, |s| {
-            s.lock().core.config().join_timeout
-        });
+        let deadline = session.as_ref().map_or_else(
+            || D::now().checked_add(listener_join_timeout),
+            |session| {
+                let mut st = session.lock();
+                st.core
+                    .join_clock(D::now())
+                    .checked_add(st.core.config().join_wait())
+            },
+        );
         Self {
             session,
             hello: hello.to_vec(),
             carrier,
-            deadline: D::now().checked_add(timeout),
+            deadline,
             mode: None,
             join: None,
+            report: None,
+            failure: None,
             peer: None,
             plan: None,
         }
@@ -171,14 +238,15 @@ impl<D: Driver> JoinAccept<D> {
         };
         match opened {
             OpenedHello::Verified(join) => {
-                let info = RecordPolicyInput {
-                    has_exporter: self.carrier.has_exporter,
-                    secure: self.carrier.secure,
-                    ..RecordPolicyInput::default()
-                };
-                let ask = session.join_allowed(&info, &join, self.carrier.admitted.as_ref());
+                let authorize = session.lock().core.config().authorize_join.clone();
+                let id = PipeId(join.pipe().id);
                 self.join = Some(join);
-                AcceptStep::Ask(ask)
+                match authorize {
+                    Some(f) => {
+                        AcceptStep::Ask(Check::Authorization, f.allows(id).map(|v| v == Some(true)))
+                    }
+                    None => self.allowed(Check::Authorization, true),
+                }
             }
             OpenedHello::AuthFailed => AcceptStep::Reject("auth", self.mode),
             OpenedHello::UnknownSuite => AcceptStep::Reject("unknown_suite", self.mode),
@@ -192,15 +260,34 @@ impl<D: Driver> JoinAccept<D> {
 
     /// After [`AcceptStep::Ask`]: the checks' answer (a missed deadline or a
     /// panic is `false`).
-    pub(crate) fn allowed(&mut self, allowed: bool) -> AcceptStep {
+    pub(crate) fn allowed(&mut self, check: Check, allowed: bool) -> AcceptStep {
         // Step 7: a Mode or authorization that local policy refuses leaves the Pipe ID's
         // bit clear and is counted.
         if !allowed {
+            self.failure = Some(crate::JoinError::Refused);
             return AcceptStep::End(HandleError::Rejected);
         }
         let (Some(session), Some(join)) = (&self.session, &self.join) else {
             return AcceptStep::End(HandleError::Rejected);
         };
+        if matches!(check, Check::Authorization) {
+            self.report = handle::JoinReport::new(session, Some(PipeId(join.pipe().id)));
+            let policy = session.lock().core.config().allow_record_mode.clone();
+            let mode = join.mode();
+            let info = RecordPolicyInput {
+                has_exporter: self.carrier.has_exporter,
+                secure: self.carrier.secure,
+                ..RecordPolicyInput::default()
+            };
+            let allowed = policy.map_or_else(
+                || crate::Decision::Now(mode == RecordMode::Sealed),
+                |f| {
+                    f.allows(&info, mode, self.carrier.admitted.as_ref())
+                        .map(|v| v == Some(true))
+                },
+            );
+            return AcceptStep::Ask(Check::Mode, allowed);
+        }
         // A carrier limit the Sealed overhead takes below the record floor refuses the
         // join, as it does an added pipe.
         let c = &self.carrier;
@@ -222,6 +309,89 @@ impl<D: Driver> JoinAccept<D> {
             let delay = plan.delay;
             self.plan = Some(plan);
             AcceptStep::Delay(delay)
+        }
+    }
+
+    /// An authenticated refusal has been handed to its reply owner. A
+    /// subsequent stop or eviction cannot change its reported outcome.
+    pub(crate) fn refused(&mut self) {
+        if let Some(report) = self.report.take() {
+            report.complete(Some(crate::JoinError::Refused));
+        }
+    }
+
+    pub(crate) fn failed(&mut self, error: crate::JoinError) -> HandleError {
+        let result = if matches!(error, crate::JoinError::Timeout) {
+            HandleError::TimedOut
+        } else {
+            HandleError::Refused
+        };
+        self.failure = Some(error);
+        result
+    }
+
+    pub(crate) fn carrier_failed(&mut self, kind: std::io::ErrorKind) -> HandleError {
+        if self.deadline_elapsed() || kind == std::io::ErrorKind::TimedOut {
+            return self.failed(crate::JoinError::Timeout);
+        }
+        self.failure = Some(match kind {
+            std::io::ErrorKind::InvalidData => crate::JoinError::Handshake(
+                crate::PipeError::Failed(crate::PipeFailure::JoinFailed),
+            ),
+            _ => crate::JoinError::PipeGone,
+        });
+        HandleError::Rejected
+    }
+
+    pub(crate) fn commit_failed(&mut self, error: super::setup::CommitError) -> HandleError {
+        use super::setup::CommitError;
+        self.failure = Some(match error {
+            CommitError::ListenerClosed => crate::JoinError::ListenerClosed,
+            CommitError::Evicted => crate::JoinError::Evicted,
+            CommitError::Withdrawn => crate::JoinError::Cancelled,
+            CommitError::Refused => crate::JoinError::Refused,
+        });
+        HandleError::Refused
+    }
+
+    /// Classify an interrupted wait while the setup still owns its registration.
+    pub(crate) fn stopped(&mut self, check: Result<(), super::setup::CommitError>) -> HandleError {
+        if let Err(reason) = check {
+            return self.commit_failed(reason);
+        }
+        if let Some(error) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.lock().core.error().cloned())
+        {
+            self.failure = Some(crate::JoinError::SessionLost(error));
+            return HandleError::Refused;
+        }
+        if self.deadline_elapsed() {
+            return HandleError::TimedOut;
+        }
+        HandleError::Rejected
+    }
+
+    fn deadline_elapsed(&self) -> bool {
+        self.deadline.is_some_and(|deadline| {
+            let now = D::now();
+            self.session
+                .as_ref()
+                .map_or(now, |session| session.lock().core.join_clock(now))
+                >= deadline
+        })
+    }
+
+    pub(crate) fn finish(&mut self, error: Option<&HandleError>) {
+        if let Some(report) = self.report.take() {
+            report.complete(error.map(|error| {
+                if *error == HandleError::TimedOut {
+                    crate::JoinError::Timeout
+                } else {
+                    self.failure.take().unwrap_or(crate::JoinError::Refused)
+                }
+            }));
         }
     }
 
@@ -274,8 +444,17 @@ impl<D: Driver> JoinAccept<D> {
         }
     }
 
+    pub(super) fn sends_on_pipe(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_some_and(|join| join.pipe().direction != 0)
+    }
+
     /// The join confirmed: the pipe attached, or the outcome.
-    pub(crate) fn attach(&mut self) -> Result<Attached, HandleError> {
+    pub(crate) fn attach(
+        &mut self,
+        outcome: &Arc<super::attachment::PipeOutcome>,
+    ) -> Result<Attached<D>, HandleError> {
         let (Some(session), Some(join), Some(peer)) = (&self.session, self.join.take(), self.peer)
         else {
             return Err(HandleError::Rejected);
@@ -283,9 +462,19 @@ impl<D: Driver> JoinAccept<D> {
         let (want_in, want_out) = (join.pipe().direction != 1, join.pipe().direction != 0);
         let c = &self.carrier;
         let meta = (c.kind, c.overhead, c.admitted.clone(), c.reports_failure);
-        match session.confirm_join(*join, peer, meta) {
+        let session = session.clone();
+        let confirmed = session
+            .confirm_join(*join, peer, outcome, self.deadline, meta)
+            .map_err(|e| self.failed(e))?;
+        match confirmed {
             ConfirmedJoin::Attached { pipe, records } => Ok(Attached {
-                pipe,
+                install: Installation {
+                    session,
+                    pipe,
+                    outcome: outcome.clone(),
+                    committed: false,
+                    limited: false,
+                },
                 records,
                 want_in,
                 want_out,
@@ -349,9 +538,6 @@ pub(crate) struct JoinDial<D: Driver> {
     kind: Option<crate::CarrierKind>,
     overhead: u16,
     state: Dialing,
-    /// The std driver ends the unused directions without waiting.
-    #[cfg(feature = "tokio")]
-    deadline: Option<Instant>,
 }
 
 impl<D: Driver> JoinDial<D> {
@@ -362,8 +548,6 @@ impl<D: Driver> JoinDial<D> {
         kind: Option<crate::CarrierKind>,
         overhead: u16,
     ) -> Self {
-        #[cfg(feature = "tokio")]
-        let deadline = D::now().checked_add(shared.lock().core.config().join_timeout);
         Self {
             shared,
             id,
@@ -371,16 +555,7 @@ impl<D: Driver> JoinDial<D> {
             kind,
             overhead,
             state: Dialing::Prepare,
-            #[cfg(feature = "tokio")]
-            deadline,
         }
-    }
-
-    /// The bound of the steps after the handshake (the session's join
-    /// timeout from the start), which the core's own timer does not cover.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.deadline
     }
 
     /// The first step.
@@ -591,5 +766,48 @@ impl<D: Driver> Drop for JoinDial<D> {
                 .join_carrier_failed(self.id, std::io::ErrorKind::BrokenPipe, D::now());
             st.after_command();
         }
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod tests {
+    use super::*;
+    use crate::{Config, PipeIo, Session};
+
+    #[tokio::test(start_paused = true)]
+    async fn acceptor_reports_timeout_when_only_the_core_clock_advanced() {
+        let (a, b) = tokio::io::duplex(65536);
+        let (client, server) = tokio::join!(
+            Session::connect(PipeIo::new(a), Config::default()),
+            Session::accept(PipeIo::new(b), Config::default()),
+        );
+        let _client = client.unwrap();
+        let server = server.unwrap();
+        let mut accept = JoinAccept::new(
+            Some(server.shared().clone()),
+            Duration::from_secs(1),
+            &[],
+            JoinCarrier {
+                framing: Framing::ByteStream,
+                binding: None,
+                has_exporter: false,
+                secure: false,
+                admitted: None,
+                inbound: true,
+                outbound: true,
+                looped: false,
+                overhead: 0,
+                max_record: None,
+                kind: None,
+                reports_failure: false,
+            },
+        );
+        let deadline = accept.deadline().unwrap();
+        let io_error = std::io::ErrorKind::UnexpectedEof;
+        assert_eq!(accept.carrier_failed(io_error), HandleError::Rejected);
+        assert!(matches!(accept.failure, Some(crate::JoinError::PipeGone)));
+        server.shared().lock().core.join_clock(deadline);
+        assert_eq!(accept.carrier_failed(io_error), HandleError::TimedOut);
+        assert!(matches!(accept.failure, Some(crate::JoinError::Timeout)));
     }
 }

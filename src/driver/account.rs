@@ -348,6 +348,7 @@ impl<S> Account<S> {
     reason = "independent state of the link, not one state machine"
 )]
 pub(crate) struct AccountLink<S> {
+    _registration: Option<super::setup::SessionRegistration<S>>,
     account: Arc<Account<S>>,
     /// What this session last added to the sum.
     charge: u64,
@@ -364,8 +365,12 @@ pub(crate) struct AccountLink<S> {
 }
 
 impl<S> AccountLink<S> {
-    pub(crate) fn new(account: Arc<Account<S>>) -> Self {
+    pub(super) fn new(
+        account: Arc<Account<S>>,
+        registration: Option<super::setup::SessionRegistration<S>>,
+    ) -> Self {
         Self {
+            _registration: registration,
             account,
             charge: 0,
             growing: false,
@@ -506,7 +511,7 @@ mod tests {
         let mut core = Core::new(Config::default(), Role::Client, None, t0).unwrap();
         let account = Account::<()>::new(Some(1 << 20), None, HookContext::Task).expect("no hook");
         let me = Arc::new(());
-        let mut link = AccountLink::new(account.clone());
+        let mut link = AccountLink::new(account.clone(), None);
         let mut close = Evictions::new();
         link.report(&mut core, &me, t0, &mut close);
         assert!(link.due().is_none());

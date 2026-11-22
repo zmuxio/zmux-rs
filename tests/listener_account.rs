@@ -29,6 +29,34 @@ fn dial(
     (a, ca, handled)
 }
 
+/// Refusal is a setup result even when the peer cannot yet read its close.
+#[tokio::test]
+async fn backlog_refusal_returns_before_close_flush() {
+    let mut limits = ListenerConfig::default();
+    limits.max_unaccepted = Some(0);
+    let listener = Listener::new(Config::default(), limits).unwrap();
+    let ((client, _), (server, writes)) = duplex(65536);
+    writes.stall(true);
+    let dialer = tokio::spawn(Session::connect(client, Config::default()));
+    let result = watchdog(
+        2,
+        "backlog refusal",
+        listener.handle_pipe(server, PipeHint::default()),
+    )
+    .await;
+    assert_eq!(result, Err(HandleError::Refused));
+    writes.stall(false);
+    let error = match watchdog(2, "refusal delivered", dialer).await.unwrap() {
+        Ok(session) => watchdog(2, "peer close", session.closing()).await,
+        Err(zmux::ConnectError::SessionLost(error)) => error,
+        Err(e) => panic!("unexpected connect error: {e}"),
+    };
+    assert!(
+        matches!(error, zmux::SessionError::TransportClosed { code, remote: true, .. }
+        if code == zmux::proto::TransportErrorCode::CONNECTION_REFUSED)
+    );
+}
+
 /// Sessions over the budget refuse new sessions; once their charges leave
 /// (the session ended), new sessions are accepted again. The
 /// `on_memory_pressure` hook is told when pressure starts and ends.
@@ -265,4 +293,22 @@ async fn a_budget_set_while_running_applies_at_once() {
         *seen.lock().unwrap() == [true, false]
     })
     .await;
+}
+
+#[tokio::test]
+async fn closing_an_offered_bootstrap_keeps_the_session_count() {
+    let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+    let (io, _, handled) = dial(&listener);
+    let client = Session::connect(io, Config::default()).await.unwrap();
+    handled.await.unwrap().unwrap();
+    let offered = listener.stats();
+    assert_eq!(offered.sessions, 1);
+    listener.close();
+    assert!(listener.accept().await.is_none());
+    client.closing().await;
+    let closed = listener.stats();
+    assert_eq!(
+        (closed.sessions, closed.rejected, closed.refused),
+        (1, offered.rejected, offered.refused)
+    );
 }
