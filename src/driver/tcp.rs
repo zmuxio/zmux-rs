@@ -98,6 +98,13 @@ impl TcpSocket {
 
     /// The socket's send buffer (`SO_SNDBUF`), where the low-water mark is
     /// supported.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        allow(
+            clippy::unused_self,
+            reason = "the socket is read only where the option exists"
+        )
+    )]
     pub(crate) fn send_buffer(&self) -> Option<u64> {
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         {
@@ -164,6 +171,13 @@ impl TcpSocket {
 
     /// Limits the unsent bytes the kernel queues for the socket: it is
     /// writable only below `bytes`. Whether it was set.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        allow(
+            clippy::unused_self,
+            reason = "the socket is read only where the option exists"
+        )
+    )]
     pub(crate) fn set_notsent_lowat(&self, bytes: u64) -> bool {
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         {
@@ -438,7 +452,12 @@ mod windows {
         // SAFETY: `socket` is an open socket handle (the caller holds the
         // socket); a null OVERLAPPED cancels every request on the handle,
         // and the call touches no memory of ours.
-        let _ = unsafe { CancelIoEx(socket as usize as *mut c_void, std::ptr::null_mut()) };
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a SOCKET is pointer-sized; RawSocket only widens it to u64"
+        )]
+        let handle = socket as usize as *mut c_void;
+        let _ = unsafe { CancelIoEx(handle, std::ptr::null_mut()) };
     }
 
     #[link(name = "ws2_32")]

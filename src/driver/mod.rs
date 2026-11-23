@@ -45,7 +45,7 @@ mod account;
 pub(crate) mod admission;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 mod attachment;
-#[cfg(all(feature = "test-hooks", feature = "tokio"))]
+#[cfg(all(feature = "test-hooks", feature = "tokio", not(loom)))]
 pub(crate) use attachment::attachment_footprint;
 #[cfg(all(feature = "blocking", not(loom)))]
 pub(crate) mod blocking;

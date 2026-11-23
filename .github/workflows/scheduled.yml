@@ -171,7 +171,16 @@ jobs:
             | sed 's|.*refs/tags/||' | sort -V | tail -n 1)
           test -n "$tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          git clone --depth 1 --branch "$tag" https://github.com/zmuxio/zmux-go.git "$RUNNER_TEMP/zmux-go"
+          # A zmux-go release tags its submodules after the root, on the commit whose submodule go.mod files
+          # require the new root; check that commit out, so the root and the submodules match.
+          ref=$tag
+          for m in zmuxh3 zmuxquic seal zmuxws; do
+            if git ls-remote --exit-code --tags --refs https://github.com/zmuxio/zmux-go.git "refs/tags/$m/$tag" > /dev/null; then
+              ref=$m/$tag
+              break
+            fi
+          done
+          git clone --depth 1 --branch "$ref" https://github.com/zmuxio/zmux-go.git "$RUNNER_TEMP/zmux-go"
       # Its interoperability tests start the Rust peers as child processes:
       # the scripted peer, the shaping peer and the QUIC datagram-channel peer
       # (a test that needs one is named `...Interop...` and reads its path
