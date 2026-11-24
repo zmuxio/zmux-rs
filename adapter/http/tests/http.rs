@@ -67,10 +67,17 @@ async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
     for w in writers {
         drop(w.await.unwrap());
     }
-    tokio::time::timeout(Duration::from_secs(20), receiver)
-        .await
-        .expect("transfer in time")
-        .unwrap();
+    let Ok(outcome) = tokio::time::timeout(Duration::from_secs(20), receiver).await else {
+        // A stalled transfer: leave the state of both ends in the log.
+        for (side, s) in [("sender", from), ("receiver", to)] {
+            eprintln!("{side} session: {:?}", s.stats());
+            for p in s.pipes() {
+                eprintln!("{side} pipe: {:?}", p.stats());
+            }
+        }
+        panic!("transfer of {n} x {len} bytes did not finish in time");
+    };
+    outcome.unwrap();
 }
 
 /// Both directions, then a close the peer sees.
