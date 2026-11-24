@@ -150,7 +150,9 @@ async fn join(
 ) -> bool {
     let (c, s) = tls.pair().await;
     let l = listener.clone();
-    let handled = tokio::spawn(async move { l.handle_pipe(server(s), PipeHint::default()).await });
+    let mut handled = Some(tokio::spawn(async move {
+        l.handle_pipe(server(s), PipeHint::default()).await
+    }));
     let pipe = session
         .begin_add_pipe(
             client(c),
@@ -163,7 +165,16 @@ async fn join(
         if state == Some(OutboundState::Active) {
             return true;
         }
-        if handled.is_finished() || tokio::time::Instant::now() >= deadline {
+        // The server may finish admitting the pipe before the client sees
+        // it active: only a refused or failed admission ends the wait early.
+        if handled
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+            && handled.take().unwrap().await.map_or(true, |r| r.is_err())
+        {
+            return false;
+        }
+        if tokio::time::Instant::now() >= deadline {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
