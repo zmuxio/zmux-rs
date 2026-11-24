@@ -3049,7 +3049,7 @@ mod tests {
             let mut byte = 0;
             let buffer = WSABUF {
                 len: 1,
-                buf: &mut byte,
+                buf: &raw mut byte,
             };
             let (mut bytes, mut flags) = (0, 0);
             // SAFETY: The socket, event and operation storage stay live until
@@ -3064,11 +3064,11 @@ mod tests {
                 };
                 let result = WSARecv(
                     id,
-                    &buffer,
+                    &raw const buffer,
                     1,
                     std::ptr::null_mut(),
-                    &mut flags,
-                    &mut op,
+                    &raw mut flags,
+                    &raw mut op,
                     None,
                 );
                 if result != SOCKET_ERROR || WSAGetLastError() != WSA_IO_PENDING {
@@ -3076,7 +3076,8 @@ mod tests {
                     panic!("WSARecv did not pend");
                 }
                 let _ = started.send(());
-                let result = WSAGetOverlappedResult(id, &op, &mut bytes, 1, &mut flags);
+                let result =
+                    WSAGetOverlappedResult(id, &raw const op, &raw mut bytes, 1, &raw mut flags);
                 let error = if result == 0 { WSAGetLastError() } else { 0 };
                 WSACloseEvent(event);
                 error
