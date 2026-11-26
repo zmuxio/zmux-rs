@@ -1724,10 +1724,8 @@ impl SessionCore {
 
     // ---- events and timers ---------------------------------------------
 
-    /// Frees the storage of the empty queues of a session that has been
-    /// idle for a while (a second in the tokio driver): the events and
-    /// every pipe's batches in flight. The next use takes it again, so a
-    /// busy session never does.
+    /// Frees unused event and batch queue storage once the session has
+    /// been idle for a second. Active queues keep their storage.
     #[cfg(feature = "tokio")]
     pub(crate) fn release_idle(&mut self) {
         if self.events.is_empty() {

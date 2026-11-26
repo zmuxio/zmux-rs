@@ -34,9 +34,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{self as core, PipeId, Role};
+use zmux::proto::varint;
 use zmux::sched::Scheduler;
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
@@ -159,7 +161,7 @@ const STREAM: Row = Row {
 const PAIR_MEMORY: Row = Row {
     name: "idle session pair, in-memory pipe",
     bound: 17_408.0,
-    baseline: base(16_920.0, 16_483.0, 16_533.0),
+    baseline: base(16_920.0, 16_483.0, 15_930.0),
     noise: 0.005,
 };
 
@@ -170,7 +172,7 @@ const PAIR_MEMORY: Row = Row {
 const PAIR_TCP: Row = Row {
     name: "idle session pair, loopback TCP",
     bound: 17_408.0,
-    baseline: base(17_010.0, 16_231.0, 16_565.0),
+    baseline: base(17_010.0, 16_231.0, 15_802.0),
     noise: 0.01,
 };
 
@@ -257,6 +259,65 @@ fn core_rows() {
         accepted.push(k);
     }
     STREAM.check((live() - before) as f64 / (opened.len() + accepted.len()) as f64);
+}
+
+/// Reads one complete byte-stream record, leaving its size prefix intact.
+async fn wire_record(wire: &mut DuplexStream) -> Vec<u8> {
+    let mut prefix = [0; 8];
+    prefix[0] = wire.read_u8().await.unwrap();
+    let width = varint::width(prefix[0]);
+    wire.read_exact(&mut prefix[1..width]).await.unwrap();
+    let (len, _) = varint::decode(&prefix[..width]).unwrap();
+    let mut record = prefix[..width].to_vec();
+    record.resize(width + usize::try_from(len).unwrap(), 0);
+    wire.read_exact(&mut record[width..]).await.unwrap();
+    record
+}
+
+/// Drive each handshake over two detached duplex carriers so the relay
+/// controls when each first record and acknowledgement reaches its peer.
+fn bootstrap_idle_memory(crossed: bool) -> usize {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = (*config()).clone();
+        // Fix the bootstrap bytes and omit the optional RTT probe so only
+        // parameters and their acknowledgements go through the relay.
+        c.test_hooks().grease_tp = Some((27, vec![0]));
+        c.test_hooks().no_first_ping = true;
+        let c = Arc::new(c);
+        let (a, mut client_wire) = tokio::io::duplex(4096);
+        let (b, mut server_wire) = tokio::io::duplex(4096);
+        let client = tokio::spawn(Session::connect(PipeIo::new(a), c.clone()));
+        let client_tp = wire_record(&mut client_wire).await;
+        if !crossed {
+            server_wire.write_all(&client_tp).await.unwrap();
+        }
+        let server = tokio::spawn(Session::accept(PipeIo::new(b), c));
+        let server_tp = wire_record(&mut server_wire).await;
+        if crossed {
+            server_wire.write_all(&client_tp).await.unwrap();
+        }
+        client_wire.write_all(&server_tp).await.unwrap();
+        let client_ack = wire_record(&mut client_wire).await;
+        if crossed {
+            // Both ACKs must be on the wire before delivering either one.
+            let server_ack = wire_record(&mut server_wire).await;
+            client_wire.write_all(&server_ack).await.unwrap();
+        }
+        server_wire.write_all(&client_ack).await.unwrap();
+
+        let client = client.await.unwrap().unwrap();
+        let server = server.await.unwrap().unwrap();
+        assert!(client.pipe_ack_in_use() && server.pipe_ack_in_use());
+        // The paused runtime advances through the driver's idle release
+        // before waking this task.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        client.debug_tables().memory_usage + server.debug_tables().memory_usage
+    })
 }
 
 async fn tcp_pair(l: &tokio::net::TcpListener) -> (PipeIo, PipeIo) {
@@ -394,6 +455,10 @@ async fn mp_pairs(
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release builds only")]
 fn idle_footprint_stays_within_its_bounds_and_baselines() {
+    let sequential = bootstrap_idle_memory(false);
+    let crossed = bootstrap_idle_memory(true);
+    println!("BOOTSTRAP idle core bytes sequential={sequential} crossed={crossed}");
+    assert_eq!(sequential, crossed);
     let sizes = zmux::test_hooks::attachment_footprint(|| LIVE.load(Relaxed));
     println!(
         "ATTACHMENT bytes idle={} worker={} split_adopt={}",

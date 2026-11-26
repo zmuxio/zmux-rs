@@ -3853,6 +3853,62 @@ mod registration_tests {
         assert!(listener.shared.lock().live.accepted().is_empty());
     }
 
+    #[tokio::test]
+    async fn client_connect_order_can_differ_from_listener_accept_order() {
+        use std::future::poll_fn;
+        use std::pin::pin;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+            let (client, server) = tokio::io::duplex(65536);
+            let mut first_setup = pin!(listener.handle_pipe(
+                PipeIo::new(server).with_protocol("first"),
+                PipeHint::default(),
+            ));
+            let mut first_client = pin!(Session::connect(PipeIo::new(client), Config::default()));
+            let first_client = poll_fn(|cx| {
+                // Once the server driver can do the handshake, hold its setup
+                // future so it cannot publish the session to the accept queue.
+                if listener.shared.lock().live.establishing().is_empty() {
+                    assert!(first_setup.as_mut().poll(cx).is_pending());
+                }
+                first_client.as_mut().poll(cx)
+            })
+            .await
+            .unwrap();
+            assert_eq!(listener.stats().sessions, 0);
+
+            let (client, server) = tokio::io::duplex(65536);
+            let (second_client, second_setup) = tokio::join!(
+                Session::connect(PipeIo::new(client), Config::default()),
+                listener.handle_pipe(
+                    PipeIo::new(server).with_protocol("second"),
+                    PipeHint::default()
+                ),
+            );
+            let _second_client = second_client.unwrap();
+            second_setup.unwrap();
+            first_setup.await.unwrap();
+
+            let second_server = listener.accept().await.unwrap();
+            let first_server = listener.accept().await.unwrap();
+            assert_eq!(second_server.protocol().as_deref(), Some("second"));
+            assert_eq!(first_server.protocol().as_deref(), Some("first"));
+
+            let mut send = first_client.open_uni().await.unwrap();
+            send.write_chunk(bytes::Bytes::from_static(b"first"))
+                .await
+                .unwrap();
+            send.finish().unwrap();
+            let mut recv = first_server.accept_uni().await.unwrap();
+            assert_eq!(recv.read_to_end(5).await.unwrap(), b"first");
+            let mut mismatched = pin!(second_server.accept_uni());
+            assert!(poll_fn(|cx| Poll::Ready(mismatched.as_mut().poll(cx).is_pending())).await);
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registration_and_accounting_precede_bootstrap_io() {
         tokio::time::timeout(Duration::from_secs(5), async {

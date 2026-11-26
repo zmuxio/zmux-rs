@@ -885,14 +885,15 @@ fn a_client_writes_its_token_first_on_the_request_body() {
         let admission = zmux::Admission::prefix_auth(verifier);
         let (addr, listener) = serve_admitted(Options::default(), Some(admission)).await;
         let client_opts = Options::default().with_carrier_credential(Arc::new(auth));
-        for client in [
-            zmux_http::connect_http1(&addr, &client_opts, Config::default())
-                .await
-                .unwrap(),
-            zmux_http::connect_http2(&addr, &client_opts, Config::default())
-                .await
-                .unwrap(),
-        ] {
+        for http2 in [false, true] {
+            // The listener queues sessions independently of when clients connect.
+            // Dial only one at a time so accept returns that client's peer.
+            let client = if http2 {
+                zmux_http::connect_http2(&addr, &client_opts, Config::default()).await
+            } else {
+                zmux_http::connect_http1(&addr, &client_opts, Config::default()).await
+            }
+            .unwrap();
             let server = listener.accept().await.unwrap();
             transfer(&client, &server, 1, 64 << 10).await;
             transfer(&server, &client, 1, 64 << 10).await;

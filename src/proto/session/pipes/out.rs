@@ -1269,12 +1269,17 @@ impl OutPipe {
         }
     }
 
-    /// Frees the storage of an empty batch list: an idle pipe holds none
-    /// until it sends again.
+    /// Frees the batch storage of an idle pipe when it has no samples to keep.
     #[cfg(feature = "tokio")]
     pub(crate) fn release_idle(&mut self) {
-        if self.batches.is_empty() {
-            self.batches = VecDeque::new();
+        // On a single pipe, trailing ACK-only or padding batches can give
+        // an RTT sample only while an earlier ack-eliciting batch is still
+        // in flight. Multipath also uses the timestamp of an ACK-only batch
+        // to judge the timing of a subsequent probe.
+        if self.batches.is_empty()
+            || (self.mp.is_none() && self.batches.iter().all(|b| !b.eliciting))
+        {
+            self.forget_batches();
         }
     }
 
@@ -2727,6 +2732,44 @@ mod tests {
             o.mp_acked(c, Duration::ZERO, MS * 25, false, |_| true, now);
         }
         cum
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn idle_release_keeps_ack_only_batches_until_they_cannot_sample_rtt() {
+        let now = Instant::now();
+        let mut o = OutPipe::new(Framing::ByteStream, OutState::Active, MS * 100, now);
+        let mad = MS * 25;
+        let entries = crate::proto::session::pipe_ack::SAMPLE_ENTRIES;
+        let sample = |o: &mut OutPipe, pos, at| {
+            assert_eq!(o.ack_lane(0, pos, at), (true, Some(pos)));
+            o.sample_ack(
+                pos,
+                Duration::ZERO,
+                mad,
+                true,
+                false,
+                |_| true,
+                |_| true,
+                at,
+            )
+        };
+
+        o.batch_sent(0, 100, 1, Some(100));
+        o.record_single_batch(0, true, entries, mad, now);
+        o.batch_sent(0, 20, 1, None);
+        o.record_single_batch(0, false, entries, mad, now + MS * 5);
+        o.release_idle();
+        let ack = sample(&mut o, 120, now + MS * 20);
+        assert_eq!(ack.rtt.unwrap().latest, MS * 15);
+
+        o.batch_sent(0, 20, 1, None);
+        o.record_single_batch(0, false, entries, mad, now + MS * 25);
+        o.release_idle();
+        assert_eq!(o.batches.capacity(), 0);
+        let ack = sample(&mut o, 140, now + MS * 40);
+        assert!(ack.rtt.is_none() && ack.rate.is_none());
+        assert_eq!(o.acked(), 140);
     }
 
     /// A slow path of 20 kB/s and 20 ms behind a deep carrier buffer: a
