@@ -337,6 +337,25 @@ pub struct AttemptResult {
     pub tickets: Vec<AccountingTicket>,
 }
 
+impl AttemptReason {
+    /// Whether the attempt itself failed to deliver. Recovery pacing advances
+    /// on every such failure; attribution decides only the candidate charge.
+    pub(crate) const fn is_failure(self) -> bool {
+        match self {
+            Self::DialFailed
+            | Self::HookFailed
+            | Self::Deadline
+            | Self::JoinRefused
+            | Self::ConfirmationFailed => true,
+            Self::Cancelled
+            | Self::NoLongerNeeded
+            | Self::DialAfter
+            | Self::SessionClosed
+            | Self::Confirmed => false,
+        }
+    }
+}
+
 impl AttemptResult {
     pub(crate) fn candidate_failed(&self) -> bool {
         Self::attributed(self.reason, self.error.as_ref())
@@ -1011,6 +1030,7 @@ impl Submission {
         at: Instant,
     ) -> Option<super::cache::AttemptStart> {
         state.refresh_controller_demand();
+        let outage = state.outage_log();
         let changes = &mut state.control.as_mut()?.changes;
         let stamp = changes.controller;
         let batch = changes.batches.get_mut(&self.batch)?;
@@ -1036,9 +1056,10 @@ impl Submission {
         if let Some(feedback) = &attempt.feedback
             && let Err(start) = feedback.permit.commit_cadence(
                 reason,
-                AttemptResult::attributed(reason, error.as_ref()),
+                reason.is_failure(),
                 at,
                 sample,
+                outage.as_ref(),
             )
         {
             return Some(start);
@@ -1082,7 +1103,10 @@ impl Submission {
         };
         drop(snapshot);
         if let Some(feedback) = feedback {
-            feedback.permit.settle(&result, at);
+            feedback.permit.settle(&result, at, outage.as_ref());
+            if confirmed && let Some(outage) = &outage {
+                outage.connected();
+            }
             if confirmed {
                 for slot in feedback.cleanup {
                     super::controller::domain::confirm(&slot);
@@ -2317,6 +2341,9 @@ async fn run_attempt<D: Driver>(
             } else {
                 (AttemptReason::HookFailed, None, None)
             };
+            // A failed sampler still schedules the next recovery: it draws
+            // the full nominal wait.
+            let sample = sample.or(Some(1.0));
             submission.settle(state, reason, error, open_error, sample, state.now());
         });
     }

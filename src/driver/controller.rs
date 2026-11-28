@@ -405,6 +405,7 @@ impl DialSchedule {
         DialGate {
             schedule: self.clone(),
             candidate: candidate.clone(),
+            recovery_cutoff: None,
         }
     }
 
@@ -422,11 +423,23 @@ impl DialSchedule {
 pub(super) struct DialGate {
     schedule: DialSchedule,
     candidate: CandidateId,
+    recovery_cutoff: Option<Instant>,
 }
 
 impl DialGate {
     pub(super) fn blocked(&self, now: Instant) -> Option<Instant> {
         self.schedule.blocked(&self.candidate, now)
+    }
+
+    /// The latest recovery start that still leaves a full attempt before a
+    /// suspended session's grace expires. It caps the shared cadence wait.
+    pub(super) const fn recovery_cutoff(&self) -> Option<Instant> {
+        self.recovery_cutoff
+    }
+
+    const fn with_recovery_cutoff(mut self, cutoff: Option<Instant>) -> Self {
+        self.recovery_cutoff = cutoff;
+        self
     }
 }
 
@@ -801,14 +814,21 @@ impl<D: Driver> SessionController<D> {
                     .transfer(&owner.starts, &demand.held, same_target);
             }
             state.control.as_mut().expect("installed control").demand = Some(demand);
+            let outage = super::cache::OutageLog::new(self.0.cache.clone());
             let next = ControllerFeedback {
                 sources: self
                     .0
                     .by_id
                     .iter()
-                    .map(|(id, &index)| (id.clone(), self.0.source.feedback(index)))
+                    .map(|(id, &index)| {
+                        (
+                            id.clone(),
+                            self.0.source.feedback(index).with_outage(&outage),
+                        )
+                    })
                     .collect(),
                 members: BTreeMap::new(),
+                outage,
             };
             state.transfer_controller_feedback(Some(next));
             if let Some(old) = previous {
@@ -870,6 +890,8 @@ impl<D: Driver> SessionController<D> {
             done: watch::Sender::new(false),
             snapshot: watch::Sender::new(snapshot),
             install: Mutex::new(()),
+            #[cfg(test)]
+            passes: std::sync::atomic::AtomicU64::new(0),
         });
         D::spawn_join(session.shared(), reconcile(state.clone()));
         Ok(SessionControl(state))
@@ -926,6 +948,9 @@ struct Binding<D: Driver> {
     done: watch::Sender<bool>,
     snapshot: watch::Sender<ControllerSnapshot>,
     install: Mutex<()>,
+    /// Passes of the reconcile loop, for tests that bound its wakeups.
+    #[cfg(test)]
+    passes: std::sync::atomic::AtomicU64,
 }
 
 /// The optional controller binding of an established session.
@@ -1232,6 +1257,9 @@ impl<D: Driver> Controller<D> {
         let mut best = None;
         let mut selection = CandidateSelection::default();
         let policy = session.session_policy();
+        let cutoff = recovery
+            .then(|| recovery_cutoff(session, self.timeout))
+            .flatten();
         for path in eligible {
             let index = self.by_id[&path.id];
             let candidate = &self.candidates[index];
@@ -1245,10 +1273,13 @@ impl<D: Driver> Controller<D> {
                 continue;
             }
             let gate = schedule.blocked(self.id(index), at);
-            let key_retry = self
-                .cache
-                .next_candidate_retry(self.key(index), candidate, recovery);
-            let recovery_due = !recovery || self.cache.recovery_due(self.key(index), candidate, at);
+            let key_retry =
+                self.cache
+                    .next_candidate_retry(self.key(index), candidate, recovery, cutoff);
+            let recovery_due = !recovery
+                || self
+                    .cache
+                    .recovery_due(self.key(index), candidate, at, cutoff);
             if !policy.allows_candidate(self.id(index), expected) {
                 if recovery_due {
                     selection.suppressed.push(BlockedStart {
@@ -1280,9 +1311,9 @@ impl<D: Driver> Controller<D> {
                     path.send
                 },
             );
-            let admission = self
-                .cache
-                .candidate_admission(self.key(index), candidate, recovery);
+            let admission =
+                self.cache
+                    .candidate_admission(self.key(index), candidate, recovery, cutoff);
             let cooling = match admission {
                 Ok(cooling) => cooling,
                 Err(reason) => {
@@ -1916,7 +1947,8 @@ impl<D: Driver> Recovery<D> {
                 if result.reason == AttemptReason::DialAfter {
                     self.launched.remove(&dial.index);
                 }
-                self.retry_round |= result.candidate_failed();
+                // Every failure drew a recovery retry; the next round waits for it.
+                self.retry_round |= result.reason.is_failure();
                 failed |= result.reason != AttemptReason::Confirmed;
                 *last_attempt = Some(result);
                 false
@@ -1960,11 +1992,37 @@ impl<D: Driver> Recovery<D> {
     }
 }
 
+/// The latest recovery start that leaves a full attempt before the session's
+/// resume grace expires, while it is suspended.
+fn recovery_cutoff<D: Driver>(session: &Session<D>, attempt_timeout: Duration) -> Option<Instant> {
+    grace_cutoff(
+        session.shared().lock().core.recovery_grace_deadline(),
+        attempt_timeout,
+    )
+}
+
+/// Without a known grace deadline there is no cap.
+fn grace_cutoff(grace: Option<Instant>, attempt_timeout: Duration) -> Option<Instant> {
+    grace.and_then(|grace| grace.checked_sub(attempt_timeout))
+}
+
 fn overlaps(first: Directions, second: Directions) -> bool {
     first.difference(second) != first
 }
 
 impl<D: Driver> Binding<D> {
+    /// Counts a reconcile pass for tests that bound the loop's wakeups.
+    #[cfg(test)]
+    fn count_pass(&self) {
+        self.passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    const fn count_pass(&self) {
+        let _ = self;
+    }
+
     fn suppress_stale(&self, target: &SessionTarget, members: &[MemberSnapshot]) {
         for input in target.replace.iter().flat_map(|intent| &intent.evidence) {
             if let Some(index) = members
@@ -2022,6 +2080,16 @@ impl<D: Driver> Binding<D> {
             Some(
                 ControllerBlock::Execution | ControllerBlock::Cleanup | ControllerBlock::QueueFull,
             ) => {}
+            // Work in progress waits for its commit, not for domain permits:
+            // withdraw the demand a renewed target queued so arbitration
+            // does not keep waking this binding.
+            Some(
+                ControllerBlock::Stability
+                | ControllerBlock::Coverage
+                | ControllerBlock::StaleDecision,
+            ) if active => {
+                self.owner.withdraw();
+            }
             None if active
                 || (plan.dial.is_none()
                     && plan.drain.is_empty()
@@ -2126,6 +2194,7 @@ async fn reconcile<D: Driver>(binding: Arc<Binding<D>>) {
     let mut last_attempt = None;
     let mut last_pool: Option<String> = None;
     loop {
+        binding.count_pass();
         if *stopped.borrow() || *closed.borrow() {
             break;
         }
@@ -2396,7 +2465,13 @@ fn apply_plan<D: Driver>(
             .suppress_due(owner, index, cause == AttemptCause::Recovery, reason);
         blocked(&error)
     };
-    let gate = binding.dial_after.gate(controller.id(index));
+    let cutoff = (cause == AttemptCause::Recovery)
+        .then(|| recovery_cutoff(session, controller.timeout))
+        .flatten();
+    let gate = binding
+        .dial_after
+        .gate(controller.id(index))
+        .with_recovery_cutoff(cutoff);
     request.add.push(controller.member_spec(index));
     if admission
         .as_ref()
@@ -2572,6 +2647,7 @@ pub(super) struct MemberOrigin {
 pub(super) struct ControllerFeedback {
     pub(super) sources: BTreeMap<CandidateId, FeedbackSource>,
     pub(super) members: BTreeMap<MemberId, Arc<MemberFaults>>,
+    pub(super) outage: super::cache::OutageLog,
 }
 
 impl<D: Driver> Controller<D> {
@@ -2590,12 +2666,39 @@ impl<D: Driver> Controller<D> {
 }
 
 impl<D: Driver> State<D> {
+    /// The binding's outage journal, after recording the current coverage.
+    pub(super) fn outage_log(&self) -> Option<super::cache::OutageLog> {
+        let log = self.control.as_ref()?.feedback.as_ref()?.outage.clone();
+        log.observe(self.connected());
+        Some(log)
+    }
+
+    fn connected(&self) -> bool {
+        let (send, receive) = self.core.service_directions(&[]);
+        send || receive
+    }
+
+    /// Coverage changes reach the binding through dispatch. A pipe that
+    /// carries again ends an outage as a success.
+    pub(super) fn observe_outage(&self) {
+        if let Some(feedback) = self
+            .control
+            .as_ref()
+            .and_then(|pool| pool.feedback.as_ref())
+        {
+            feedback.outage.observe(self.connected());
+        }
+    }
+
     pub(super) fn transfer_controller_feedback(&mut self, mut next: Option<ControllerFeedback>) {
         let at = self.now();
         let Some(pool) = self.control.as_mut() else {
             return;
         };
         if let Some(old) = pool.feedback.take() {
+            if let Some(next) = &next {
+                next.outage.adopt(&old.outage);
+            }
             let paths = self.control_paths();
             let members = self.core.members();
             for (id, observer) in old.members {
@@ -2872,7 +2975,7 @@ pub(super) mod owner_tests {
             let at = cache.clock_domain().now();
             assert!(
                 permit
-                    .commit_cadence(AttemptReason::DialFailed, true, at, Some(1.0))
+                    .commit_cadence(AttemptReason::DialFailed, true, at, Some(1.0), None)
                     .is_ok()
             );
             assert!(
@@ -2891,6 +2994,193 @@ pub(super) mod owner_tests {
                     .recovery_retry_at,
                 None
             );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn no_grace_deadline_means_no_recovery_cap() {
+        let at = crate::ClockDomain::default().now();
+        assert_eq!(grace_cutoff(None, Duration::from_secs(10)), None);
+        assert_eq!(
+            grace_cutoff(Some(at + Duration::from_secs(30)), Duration::from_secs(10)),
+            Some(at + Duration::from_secs(20))
+        );
+    }
+
+    fn host_opener_bug() -> std::io::Result<crate::PipeIo> {
+        panic!("host opener bug")
+    }
+
+    /// A host opener failure (here a panic, reported as `hook_failed`) is no
+    /// evidence against the carrier. The next attempt must still follow the
+    /// recovery cadence instead of waiting for an unrelated change.
+    #[tokio::test(start_paused = true)]
+    async fn unattributed_recovery_failure_schedules_the_next_attempt() {
+        tokio::time::timeout(Duration::from_secs(100), async {
+            let (session, _peer, _listener) = session().await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let candidate = crate::Candidate::new(crate::CarrierKind::Streaming, {
+                let calls = calls.clone();
+                move || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async move { host_opener_bug() }
+                }
+            })
+            .with_identity("hook", "hook");
+            let mut config = crate::CarrierCacheConfig::default();
+            config.recovery_sample = || 1.0;
+            let cache = CarrierCache::new(config).unwrap();
+            let mut opts = ControllerOptions::new("unattributed-recovery", vec![candidate]);
+            opts.cache = Some(cache.clone());
+            let ctl = SessionController::new(opts).unwrap();
+            session.pipe(PipeId(0)).unwrap().abort().unwrap();
+            let handle = ctl.manage(&session, SessionTarget::default()).unwrap();
+            // Cadence 1 s, 2 s, 4 s: four starts within 8 s.
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            let calls = calls.load(std::sync::atomic::Ordering::Relaxed);
+            let metrics = cache.retry_metrics("hook", crate::CarrierKind::Streaming, "");
+            assert!(calls >= 4, "starts {calls}, {metrics:?}");
+            let score = cache.score("hook", crate::CarrierKind::Streaming, "");
+            assert_eq!(
+                score.cooldown_level, 0,
+                "an unattributed failure is not charged"
+            );
+            // The failed candidates leave no member behind.
+            let members = session.members();
+            assert!(
+                members
+                    .iter()
+                    .all(|member| member.candidate.as_ref().is_none_or(|id| &*id.0 != "hook")),
+                "{members:?}"
+            );
+            handle.release().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A clock that never advances: a confirmed replacement stays unsettled.
+    struct Frozen(Instant);
+
+    impl crate::MonotonicClock for Frozen {
+        fn now(&self) -> Instant {
+            self.0
+        }
+
+        fn sleep_until(
+            &self,
+            _: Instant,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Renewing a replacement's evidence while its batch waits for Settle
+    /// keeps the batch under the new revision. The binding must withdraw the
+    /// demand that `set_target` queued and park, not keep waking.
+    #[tokio::test]
+    async fn renewed_replacement_waits_for_settle_without_spinning() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let clock = ClockDomain::with_source(Frozen(Instant::now()));
+            let mut cfg = Config {
+                pipe_auth: crate::PipeAuth::psk([42; 32]).with_end_to_end(),
+                resume_timeout: Some(Duration::from_secs(120)),
+                max_idle_timeout: None,
+                clock_domain: clock.clone(),
+                ..Config::default()
+            };
+            cfg.session_policy.limits.steady_attachments = 6;
+            let listener =
+                crate::Listener::new(cfg.clone(), crate::ListenerConfig::default()).unwrap();
+            let (a, b) = tokio::io::duplex(64 * 1024);
+            let peer = listener.clone();
+            tokio::spawn(async move {
+                let _ = peer
+                    .handle_pipe(crate::PipeIo::new(b), crate::PipeHint::default())
+                    .await;
+            });
+            let session = crate::Session::connect(
+                crate::PipeIo::new(a).with_carrier(crate::CarrierKind::Streaming),
+                cfg,
+            )
+            .await
+            .unwrap();
+            let _peer = listener.accept().await.unwrap();
+            let joins = listener.clone();
+            let candidate = crate::Candidate::new(crate::CarrierKind::Streaming, move || {
+                let (near, far) = tokio::io::duplex(64 * 1024);
+                let joins = joins.clone();
+                tokio::spawn(async move {
+                    let _ = joins
+                        .handle_pipe(crate::PipeIo::new(far), crate::PipeHint::default())
+                        .await;
+                });
+                async move { Ok(crate::PipeIo::new(near)) }
+            })
+            .with_identity("next", "next");
+            let mut cache_config = crate::CarrierCacheConfig::default();
+            cache_config.clock_domain = clock.clone();
+            let mut opts = ControllerOptions::new("renewed-replacement", vec![candidate]);
+            opts.clock_domain = clock.clone();
+            opts.cache = Some(CarrierCache::new(cache_config).unwrap());
+            let ctl = SessionController::new(opts).unwrap();
+            let base = session.members()[0].id;
+            let target = |revision| SessionTarget {
+                revision,
+                groups: vec![GroupTarget {
+                    id: "main".into(),
+                    quotas: vec![MemberQuota {
+                        id: "member".into(),
+                        count: 1,
+                        directions: Directions::BOTH,
+                        candidates: vec![TargetCandidate {
+                            id: "next".into(),
+                            send: None,
+                            receive: None,
+                        }],
+                    }],
+                    rotation: RotationPolicy::default(),
+                }],
+                replace: vec![ReplaceIntent {
+                    id: "replace".into(),
+                    members: vec![base],
+                    min_epoch: 0,
+                    evidence: Vec::new(),
+                }],
+            };
+            let handle = ctl.manage(&session, target(1)).unwrap();
+            let mut view = handle.subscribe();
+            view.wait_for(|s| s.blocked == Some(ControllerBlock::Stability))
+                .await
+                .unwrap();
+            for revision in 2..6 {
+                handle.set_target(target(revision)).unwrap();
+                view.wait_for(|s| {
+                    s.revision == revision && s.blocked == Some(ControllerBlock::Stability)
+                })
+                .await
+                .unwrap();
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                let before = handle.0.passes.load(std::sync::atomic::Ordering::Relaxed);
+                for _ in 0..256 {
+                    tokio::task::yield_now().await;
+                }
+                let after = handle.0.passes.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    after - before <= 2,
+                    "revision {revision}: {} passes while parked",
+                    after - before
+                );
+                assert!(
+                    !handle.0.owner.is_pending(),
+                    "revision {revision}: demand left queued"
+                );
+            }
+            handle.release().unwrap();
         })
         .await
         .unwrap();

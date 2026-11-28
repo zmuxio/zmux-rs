@@ -23,6 +23,25 @@ const VERSION: i64 = 2;
 
 pub(super) type Key = (String, CarrierKind, String);
 
+/// How one observation is committed, beyond its outcome and sample.
+struct Write<'a> {
+    target: Option<&'a crate::HttpTarget>,
+    clock: Option<Clock>,
+    start_cooling: bool,
+    journal: Option<&'a mut OutageJournal>,
+}
+
+impl Write<'_> {
+    const fn new(start_cooling: bool) -> Self {
+        Self {
+            target: None,
+            clock: None,
+            start_cooling,
+            journal: None,
+        }
+    }
+}
+
 /// Settings shared by every user of a carrier cache.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -277,6 +296,20 @@ pub enum CooldownEvent {
         sampled_wait: Duration,
         /// Ordinary local retry deadline.
         retry_at: Instant,
+    },
+    /// A round committed while its session had no usable pipe was withdrawn
+    /// because the session reconnected.
+    Retracted {
+        /// Shared candidate key.
+        key: CarrierCacheKey,
+        /// The withdrawn local fault episode.
+        episode: u64,
+        /// Restored cooldown level.
+        level: u64,
+        /// Restored ordinary retry deadline, if still in the future.
+        retry_at: Option<Instant>,
+        /// Monotonic retraction commit time.
+        retracted_at: Instant,
     },
     /// Continuous health cleared the cooldown sequence.
     Reset {
@@ -1082,7 +1115,15 @@ impl CarrierCache {
             return Ok(false);
         }
         observation.source = CarrierMeasurementSource::HostReport;
-        self.update(&source.key, outcome, observation, None, Some(now), true)?;
+        self.update(
+            &source.key,
+            outcome,
+            observation,
+            Write {
+                clock: Some(now),
+                ..Write::new(true)
+            },
+        )?;
         Ok(true)
     }
 
@@ -1103,10 +1144,27 @@ impl CarrierCache {
             &(key.to_owned(), kind, variant.to_owned()),
             outcome,
             observation,
-            None,
-            None,
-            true,
+            Write::new(true),
         )
+    }
+
+    /// Records a member observation into a session's outage journal.
+    pub(super) fn report_journaled(
+        &self,
+        key: &Key,
+        outcome: CacheOutcome,
+        observation: CarrierObservation,
+        journal: Option<&mut OutageJournal>,
+    ) {
+        let _ = self.update(
+            key,
+            outcome,
+            observation,
+            Write {
+                journal,
+                ..Write::new(true)
+            },
+        );
     }
 
     pub(super) fn record<D: Driver>(
@@ -1120,10 +1178,32 @@ impl CarrierCache {
             &candidate_key(key, candidate),
             outcome,
             CarrierObservation::default(),
-            candidate.target().map(AsRef::as_ref),
-            None,
-            start_cooling,
+            Write {
+                target: candidate.target().map(AsRef::as_ref),
+                ..Write::new(start_cooling)
+            },
         );
+    }
+
+    fn cool_journaled(
+        &self,
+        key: &Key,
+        entry: &mut Entry,
+        reason: CooldownReason,
+        now: Clock,
+        at: Instant,
+        journal: Option<&mut OutageJournal>,
+    ) {
+        match journal {
+            Some(journal) => {
+                if !journal.defers(key, reason) {
+                    journal.before_cool(key, entry);
+                    self.cool(key, entry, reason, now, at);
+                    journal.after_cool(key, entry, reason);
+                }
+            }
+            None => self.cool(key, entry, reason, now, at),
+        }
     }
 
     fn cool(&self, key: &Key, entry: &mut Entry, reason: CooldownReason, now: Clock, at: Instant) {
@@ -1172,10 +1252,14 @@ impl CarrierCache {
         key: &Key,
         outcome: CacheOutcome,
         observation: CarrierObservation,
-        target: Option<&crate::HttpTarget>,
-        clock: Option<Clock>,
-        start_cooling: bool,
+        write: Write<'_>,
     ) -> Result<(), CarrierCacheError> {
+        let Write {
+            target,
+            clock,
+            start_cooling,
+            mut journal,
+        } = write;
         let redirected = target.and_then(|target| match outcome {
             CacheOutcome::Usable => {
                 let url = target.url();
@@ -1202,14 +1286,25 @@ impl CarrierCache {
                 .is_none_or(|failure| entry.physical_failure(&failure));
         let age = now.mono - at;
         let weight = decay(age, config.half_life);
+        if let Some(journal) = journal.as_deref_mut()
+            && matches!(
+                outcome,
+                CacheOutcome::Failed
+                    | CacheOutcome::Rejected
+                    | CacheOutcome::ShortDrop
+                    | CacheOutcome::LateDrop
+            )
+        {
+            journal.history(key, outcome, weight, now.mono, config.half_life);
+        }
         let h = &mut entry.history;
         if !matches!(outcome, CacheOutcome::Performance | CacheOutcome::Recovered) {
             h.decay(decay(h.point.age(now.mono), config.half_life));
             h.point = Point::new(now, now.mono);
         }
-        let cool = |entry: &mut Entry, reason| {
+        let mut cool = |entry: &mut Entry, reason| {
             if start_cooling {
-                self.cool(key, entry, reason, now, at);
+                self.cool_journaled(key, entry, reason, now, at, journal.as_deref_mut());
             }
         };
         match outcome {
@@ -1273,17 +1368,7 @@ impl CarrierCache {
                 if observation.duration >= config.health_reset
                     && entry.cooling.point.age(now.mono) >= age.saturating_add(observation.duration)
                 {
-                    let previous = std::mem::take(&mut entry.cooling);
-                    entry.cooling.point = Point::new(now, now.mono);
-                    if (previous.level != 0 || !previous.nominal().is_zero())
-                        && self.0.cooldown_events.receiver_count() != 0
-                    {
-                        let _ = self.0.cooldown_events.send(CooldownEvent::Reset {
-                            key: key.into(),
-                            episode: previous.local.map(|local| local.episode),
-                            reset_at: now.mono,
-                        });
-                    }
+                    self.reset_cooling(key, entry, now);
                 }
             }
         }
@@ -1305,18 +1390,21 @@ impl CarrierCache {
         }
     }
 
+    /// `cutoff` is the session's latest useful recovery start, which caps the
+    /// shared cadence wait.
     pub(super) fn candidate_admission<D: Driver>(
         &self,
         key: &str,
         candidate: &Candidate<D>,
         recover_direction: bool,
+        cutoff: Option<Instant>,
     ) -> Result<bool, RetryAdmission> {
         let entries = self.entries();
         let now = self.clock_domain().now();
         entries
             .get(&candidate_key(key, candidate))
             .map_or(Ok(false), |entry| {
-                Self::admission(entry, now, recover_direction)
+                Self::admission(entry, now, recover_direction, cutoff)
             })
     }
 
@@ -1325,10 +1413,11 @@ impl CarrierCache {
         key: &str,
         candidate: &Candidate<D>,
         now: Instant,
+        cutoff: Option<Instant>,
     ) -> bool {
         self.entries()
             .get(&candidate_key(key, candidate))
-            .and_then(|entry| entry.recovery.retry_at)
+            .and_then(|entry| recovery_gate(&entry.recovery, cutoff))
             .is_none_or(|at| now >= at)
     }
 
@@ -1337,19 +1426,81 @@ impl CarrierCache {
         key: &str,
         candidate: &Candidate<D>,
         recovery: bool,
+        cutoff: Option<Instant>,
     ) -> Option<Instant> {
         let now = self.clock_domain().now();
         let entries = self.entries();
         let entry = entries.get(&candidate_key(key, candidate))?;
         if recovery {
-            entry
-                .recovery
-                .retry_at
+            recovery_gate(&entry.recovery, cutoff)
                 .max(entry.hard_retry)
                 .filter(|&due| due > now)
         } else {
             entry.retry_at(now)
         }
+    }
+
+    fn reset_cooling(&self, key: &Key, entry: &mut Entry, now: Clock) -> bool {
+        let previous = std::mem::take(&mut entry.cooling);
+        entry.cooling.point = Point::new(now, now.mono);
+        let committed = previous.level != 0 || !previous.nominal().is_zero();
+        if committed && self.0.cooldown_events.receiver_count() != 0 {
+            let _ = self.0.cooldown_events.send(CooldownEvent::Reset {
+                key: key.into(),
+                episode: previous.local.map(|local| local.episode),
+                reset_at: now.mono,
+            });
+        }
+        committed
+    }
+
+    fn clear_cooldown(&self, key: &Key, entry: &mut Entry, now: Clock) -> bool {
+        let mut cleared = false;
+        if entry.cooling.level != 0 || !entry.cooling.nominal().is_zero() {
+            cleared = self.reset_cooling(key, entry, now);
+        }
+        if entry.recovery != RecoveryCadence::default() {
+            entry.recovery = RecoveryCadence::default();
+            cleared = true;
+        }
+        cleared
+    }
+
+    /// Clears one key's ordinary cooldown (level, backoff, retry time and
+    /// short-drop marks) and recovery cadence at once, as a health reset does.
+    /// Scoring history, peer retry deadlines and an in-flight attempt are
+    /// kept. Hosts call it when the network changes. Returns whether any state
+    /// was cleared.
+    #[must_use = "reports whether any state was cleared"]
+    pub fn reset_cooldown(&self, key: &str, kind: CarrierKind, variant: &str) -> bool {
+        let now = self.owner_clock();
+        let mut entries = self.entries();
+        let key = (key.to_owned(), kind, variant.to_owned());
+        let cleared = entries
+            .get_mut(&key)
+            .is_some_and(|entry| self.clear_cooldown(&key, entry, now));
+        drop(entries);
+        if cleared {
+            self.notify();
+        }
+        cleared
+    }
+
+    /// Applies [`Self::reset_cooldown`] to every key and returns how many had
+    /// state to clear.
+    #[must_use = "reports how many keys were cleared"]
+    pub fn reset_cooldowns(&self) -> usize {
+        let now = self.owner_clock();
+        let mut entries = self.entries();
+        let mut cleared = 0;
+        for (key, entry) in entries.iter_mut() {
+            cleared += usize::from(self.clear_cooldown(key, entry, now));
+        }
+        drop(entries);
+        if cleared != 0 {
+            self.notify();
+        }
+        cleared
     }
 
     /// Reads retry admission for a candidate's cache key.
@@ -1370,7 +1521,7 @@ impl CarrierCache {
         self.entries()
             .get(&(key.to_owned(), kind, variant.to_owned()))
             .map_or(Ok(()), |entry| {
-                Self::admission(entry, now, false).map(|_| ())
+                Self::admission(entry, now, false, None).map(|_| ())
             })
     }
 
@@ -1378,6 +1529,7 @@ impl CarrierCache {
         entry: &Entry,
         now: Instant,
         recover_direction: bool,
+        cutoff: Option<Instant>,
     ) -> Result<bool, RetryAdmission> {
         if entry.in_flight.is_some() {
             return Err(RetryAdmission::AlreadyInFlight);
@@ -1385,11 +1537,16 @@ impl CarrierCache {
         if entry.hard_retry.is_some_and(|retry_at| retry_at > now) {
             return Err(RetryAdmission::RetryAfter);
         }
-        Self::time_admission(entry, now, recover_direction)
+        Self::time_admission(entry, now, recover_direction, cutoff)
     }
 
-    fn time_admission(entry: &Entry, now: Instant, recovery: bool) -> Result<bool, RetryAdmission> {
-        if recovery && entry.recovery.retry_at.is_some_and(|due| now < due) {
+    fn time_admission(
+        entry: &Entry,
+        now: Instant,
+        recovery: bool,
+        cutoff: Option<Instant>,
+    ) -> Result<bool, RetryAdmission> {
+        if recovery && recovery_gate(&entry.recovery, cutoff).is_some_and(|due| now < due) {
             return Err(RetryAdmission::RecoveryWait);
         }
         let cooling = entry.cooling.active(now).is_some();
@@ -1429,7 +1586,13 @@ impl CarrierCache {
         {
             Err(RetryAdmission::DialAfter)
         } else {
-            Self::admission(entry, now, recover_direction)
+            Self::admission(
+                entry,
+                now,
+                recover_direction,
+                dial.as_ref()
+                    .and_then(super::controller::DialGate::recovery_cutoff),
+            )
         };
         admission?;
         let ticket = Arc::new(AttemptTicket {
@@ -1525,6 +1688,18 @@ impl CarrierCache {
     }
 }
 
+/// The recovery time gate capped at the session's cutoff.
+/// The cap applies only to a wait drawn before the cutoff, so the session
+/// gets one start at the cutoff and later failures keep the cadence.
+fn recovery_gate(recovery: &RecoveryCadence, cutoff: Option<Instant>) -> Option<Instant> {
+    let retry = recovery.retry_at?;
+    let drawn = retry.checked_sub(recovery.sampled);
+    Some(match cutoff {
+        Some(cutoff) if cutoff < retry && drawn.is_some_and(|at| at < cutoff) => cutoff,
+        _ => retry,
+    })
+}
+
 pub(super) fn candidate_key<D: Driver>(key: &str, candidate: &Candidate<D>) -> Key {
     (
         key.to_owned(),
@@ -1617,6 +1792,15 @@ pub(super) struct AttemptStart {
 
 impl AttemptStart {
     pub(super) fn handshake(&self, outcome: CacheOutcome, at: Option<Instant>) {
+        self.handshake_journaled(outcome, at, None);
+    }
+
+    fn handshake_journaled(
+        &self,
+        outcome: CacheOutcome,
+        at: Option<Instant>,
+        journal: Option<&mut OutageJournal>,
+    ) {
         if !self.ticket.handshake_recorded.swap(true, Ordering::Relaxed) {
             let _ = self.cache.update(
                 &self.ticket.key,
@@ -1625,9 +1809,11 @@ impl AttemptStart {
                     at,
                     ..CarrierObservation::default()
                 },
-                self.target.as_deref(),
-                None,
-                true,
+                Write {
+                    target: self.target.as_deref(),
+                    journal,
+                    ..Write::new(true)
+                },
             );
         }
     }
@@ -1670,7 +1856,15 @@ impl AttemptStart {
         if entry.hard_retry.is_some_and(|at| at > now) {
             return Err(RetryAdmission::RetryAfter);
         }
-        CarrierCache::time_admission(entry, now, self.ticket.recovery).map(|_| ())
+        CarrierCache::time_admission(
+            entry,
+            now,
+            self.ticket.recovery,
+            self.dial
+                .as_ref()
+                .and_then(super::controller::DialGate::recovery_cutoff),
+        )
+        .map(|_| ())
     }
 
     fn count_suppression(&self) -> bool {
@@ -1774,24 +1968,36 @@ impl AttemptPermit {
         failed: bool,
         at: Instant,
         sample: Option<f64>,
+        outage: Option<&OutageLog>,
     ) -> Result<(), AttemptStart> {
         let start = &self.0;
         if !start.ticket.started.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let mut entries = start.cache.entries();
-        let Some(entry) = entries.get_mut(&start.ticket.key) else {
-            return Ok(());
-        };
-        if reason == crate::AttemptReason::Confirmed {
-            entry.recovery = RecoveryCadence::default();
-        } else if failed && start.ticket.recovery && entry.demand != 0 {
-            let Some(sample) = sample else {
-                return Err(start.clone());
+        // Lock order: the outage journal before the cache entries.
+        let commit = |journal: Option<&mut OutageJournal>| {
+            let mut entries = start.cache.entries();
+            let Some(entry) = entries.get_mut(&start.ticket.key) else {
+                return Ok(());
             };
-            entry.recovery.advance(at, sample);
+            if reason == crate::AttemptReason::Confirmed {
+                entry.recovery = RecoveryCadence::default();
+            } else if failed && start.ticket.recovery && entry.demand != 0 {
+                let Some(sample) = sample else {
+                    return Err(start.clone());
+                };
+                let before = entry.recovery;
+                entry.recovery.advance(at, sample);
+                if let Some(journal) = journal {
+                    journal.recovery(&start.ticket.key, before, entry.recovery);
+                }
+            }
+            Ok(())
+        };
+        match outage {
+            Some(outage) => outage.with(false, commit),
+            None => commit(None),
         }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -1799,7 +2005,26 @@ impl AttemptPermit {
         self.0.record_refusal(error);
     }
 
-    pub(super) fn settle(self, result: &crate::AttemptResult, at: Instant) {
+    pub(super) fn settle(
+        self,
+        result: &crate::AttemptResult,
+        at: Instant,
+        outage: Option<&OutageLog>,
+    ) {
+        match outage {
+            Some(outage) => {
+                outage.with(false, |journal| self.settle_journaled(result, at, journal));
+            }
+            None => self.settle_journaled(result, at, None),
+        }
+    }
+
+    fn settle_journaled(
+        &self,
+        result: &crate::AttemptResult,
+        at: Instant,
+        journal: Option<&mut OutageJournal>,
+    ) {
         let start = &self.0;
         if !start.ticket.started.load(Ordering::Relaxed) {
             return;
@@ -1812,12 +2037,17 @@ impl AttemptPermit {
             if start.ticket.handshake_recorded.load(Ordering::Relaxed) {
                 let mut entries = start.cache.entries();
                 if let Some(entry) = entries.get_mut(&start.ticket.key) {
-                    start
-                        .cache
-                        .cool(&start.ticket.key, entry, CooldownReason::Attempt, now, at);
+                    start.cache.cool_journaled(
+                        &start.ticket.key,
+                        entry,
+                        CooldownReason::Attempt,
+                        now,
+                        at,
+                        journal,
+                    );
                 }
             } else {
-                start.handshake(CacheOutcome::Failed, Some(at));
+                start.handshake_journaled(CacheOutcome::Failed, Some(at), journal);
             }
             start.cache.notify();
         }
@@ -1867,6 +2097,9 @@ impl AttemptStart {
         self.cache.notify();
     }
 }
+
+mod outage;
+pub(super) use outage::{OutageJournal, OutageLog};
 
 #[cfg(test)]
 mod vectors;

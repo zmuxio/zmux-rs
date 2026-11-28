@@ -765,6 +765,7 @@ impl MemberFaults {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.advance(&mut state, change.at);
+        let was_stable = state.stable();
         if let Some(part) = state
             .needed
             .iter_mut()
@@ -780,6 +781,14 @@ impl MemberFaults {
             state.service_since = None;
         }
         let settled = recovered && state.needed.iter().all(|part| part.settled);
+        // The member became stable in all its directions: a pipe gain, which
+        // makes the earlier drops final or ends an outage.
+        if settled
+            && !was_stable
+            && let Some(source) = &state.source
+        {
+            source.regained();
+        }
         if !settled {
             state.close_exposure(change.at);
         }
@@ -888,6 +897,14 @@ impl MemberFaults {
 }
 
 impl MemberFaultState {
+    fn stable(&self) -> bool {
+        !self.needed.is_empty()
+            && self
+                .needed
+                .iter()
+                .all(|part| part.recovered && part.settled)
+    }
+
     fn observation(&self, outcome: CacheOutcome, observation: CarrierObservation) {
         if let Some(source) = &self.source {
             source.observation(outcome, observation);
@@ -1027,8 +1044,12 @@ impl<D: Driver> ChoiceSource<D> {
                     self.dial_after
                         .blocked(candidate.id.as_ref()?, now)
                         .or_else(|| {
-                            self.cache
-                                .next_candidate_retry(Self::key(candidate), candidate, false)
+                            self.cache.next_candidate_retry(
+                                Self::key(candidate),
+                                candidate,
+                                false,
+                                None,
+                            )
                         })
                 })
                 .min()
@@ -1244,7 +1265,8 @@ impl<D: Driver> ChoiceSource<D> {
         if let Err(reason) = if gate.blocked(at).is_some() {
             Err(crate::RetryAdmission::DialAfter)
         } else {
-            self.cache.candidate_admission(key, candidate, recovery)
+            self.cache
+                .candidate_admission(key, candidate, recovery, gate.recovery_cutoff())
         } {
             owner.blocked();
             return Err(suppress(reason));
@@ -1302,6 +1324,7 @@ impl<D: Driver> ChoiceSource<D> {
         FeedbackSource {
             cache: self.cache.clone(),
             key: super::cache::candidate_key(Self::key(candidate), candidate),
+            outage: None,
         }
     }
 }
@@ -1310,12 +1333,37 @@ impl<D: Driver> ChoiceSource<D> {
 pub(super) struct FeedbackSource {
     cache: CarrierCache,
     key: super::cache::Key,
+    outage: Option<super::cache::OutageLog>,
 }
 
 impl FeedbackSource {
+    pub(super) fn with_outage(mut self, outage: &super::cache::OutageLog) -> Self {
+        if self.cache.shares_history(outage.cache()) {
+            self.outage = Some(outage.clone());
+        }
+        self
+    }
+
     fn observation(&self, outcome: CacheOutcome, sample: CarrierObservation) {
-        let (key, kind, variant) = &self.key;
-        let _ = self.cache.report(key, *kind, variant, outcome, sample);
+        match &self.outage {
+            Some(outage) if matches!(outcome, CacheOutcome::ShortDrop | CacheOutcome::LateDrop) => {
+                // A drop stays retractable until the session regains a pipe.
+                outage.with(true, |journal| {
+                    self.cache
+                        .report_journaled(&self.key, outcome, sample, journal);
+                });
+            }
+            _ => {
+                let (key, kind, variant) = &self.key;
+                let _ = self.cache.report(key, *kind, variant, outcome, sample);
+            }
+        }
+    }
+
+    fn regained(&self) {
+        if let Some(outage) = &self.outage {
+            outage.connected();
+        }
     }
 }
 
@@ -1347,6 +1395,7 @@ fn feedback_transfer_keeps_original_window_and_closes_exposure() {
             source: Some(FeedbackSource {
                 cache: old.clone(),
                 key: key.clone(),
+                outage: None,
             }),
             needed: vec![MemberDirection {
                 pipe: PipeId(0),
@@ -1366,6 +1415,7 @@ fn feedback_transfer_keeps_original_window_and_closes_exposure() {
         Some(FeedbackSource {
             cache: next.clone(),
             key,
+            outage: None,
         }),
         joined + Duration::from_secs(2),
     );

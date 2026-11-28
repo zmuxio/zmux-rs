@@ -153,6 +153,14 @@ pub(in crate::driver) struct Owner {
 }
 
 impl Owner {
+    #[cfg(test)]
+    pub(in crate::driver) fn is_pending(&self) -> bool {
+        lock(&self.domain.state)
+            .pending
+            .iter()
+            .any(|(id, _)| *id == self.id)
+    }
+
     pub(in crate::driver) fn usage(&self) -> (usize, usize) {
         let _state = lock(&self.domain.state);
         (

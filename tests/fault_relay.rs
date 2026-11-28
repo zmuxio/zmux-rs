@@ -1210,7 +1210,9 @@ async fn controller_panicking_sampler_finishes_the_attempt_as_hook_failed() {
         );
         let metrics = cache.retry_metrics("sampler", CarrierKind::Streaming, "");
         assert_eq!(metrics.faults, 0);
-        assert!(metrics.recovery_retry_at.is_none());
+        // The failed draw falls back to the full nominal wait, so the
+        // session still has a next recovery opportunity.
+        assert_eq!(metrics.recovery_sampled, Duration::from_secs(1));
     })
     .await
     .unwrap();

@@ -934,6 +934,7 @@ impl<D: Driver> State<D> {
     /// Drains the core's events and wakes the operations they concern.
     pub(crate) fn dispatch(&mut self) {
         self.dispatch_events();
+        self.observe_outage();
         self.refresh_controller_demand();
         // A close's hand-off follows the carriers' writes, which raise no
         // event.

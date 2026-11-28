@@ -8,7 +8,7 @@ const SHORT_WINDOW: Duration = Duration::from_mins(10);
 pub(super) const DROP_WINDOW: Duration = Duration::from_mins(1);
 pub(super) const HEALTH_RESET: Duration = Duration::from_mins(10);
 /// One sampled recovery opportunity, independent of ordinary scoring history.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct RecoveryCadence {
     pub(super) nominal: Duration,
     pub(super) sampled: Duration,

@@ -131,6 +131,15 @@ impl SessionCore {
         }
     }
 
+    /// The resume grace deadline while suspended, when one is known.
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn recovery_grace_deadline(&self) -> Option<Instant> {
+        if self.state != State::Suspended {
+            return None;
+        }
+        self.mp.as_deref().and_then(|mp| mp.suspension().deadline())
+    }
+
     /// The last representable instant strictly inside an active recovery grace.
     #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
     pub(crate) fn attempt_grace_cutoff(&self, now: Instant) -> Option<Instant> {

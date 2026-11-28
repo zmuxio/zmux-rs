@@ -87,9 +87,10 @@ fn exposure_is_independent_of_observation_intervals() {
                     duration: Duration::from_secs(span),
                     ..CarrierObservation::default()
                 },
-                None,
-                Some(clock),
-                true,
+                super::Write {
+                    clock: Some(clock),
+                    ..super::Write::new(true)
+                },
             )
             .unwrap();
     }
@@ -131,7 +132,8 @@ fn late_attempt_uses_the_remaining_key_demand() {
                 crate::AttemptReason::DialFailed,
                 true,
                 cache.clock_domain().now(),
-                Some(start.sample())
+                Some(start.sample()),
+                None
             )
             .is_ok()
     );
@@ -164,7 +166,8 @@ fn recovery_cadence_uses_one_sample_per_failure_and_waits_for_the_host() {
                     crate::AttemptReason::DialFailed,
                     true,
                     cache.clock_domain().now(),
-                    Some(start.sample())
+                    Some(start.sample()),
+                    None
                 )
                 .is_ok()
         );
@@ -466,12 +469,12 @@ fn recovery_cadence_uses_terminal_time_and_current_demand() {
     cache.recovery_demand(&key, true);
     assert!(
         permit
-            .commit_cadence(crate::AttemptReason::DialFailed, true, at, None)
+            .commit_cadence(crate::AttemptReason::DialFailed, true, at, None, None)
             .is_err()
     );
     assert!(
         permit
-            .commit_cadence(crate::AttemptReason::DialFailed, true, at, Some(1.0))
+            .commit_cadence(crate::AttemptReason::DialFailed, true, at, Some(1.0), None)
             .is_ok()
     );
     clock.advance(Duration::from_millis(200));
@@ -516,10 +519,334 @@ fn attributed_failure_after_verified_reply_cools_without_a_second_handshake() {
             tickets: Vec::new(),
         },
         at,
+        None,
     );
     let score = cache.score("post-reply", candidate.kind(), "");
     assert_eq!(score.success_weight, 1.0);
     assert_eq!(score.attempts, 1);
     assert_eq!(score.cooldown_level, 1);
     drop(host);
+}
+
+fn outage_failure(cache: &CarrierCache, name: &str, candidate: &Candidate, log: &OutageLog) {
+    let permit = cache.begin(name, candidate, true, None).unwrap();
+    let start = permit.start_handle();
+    let host = OpenerLifetime(&start);
+    start.start().unwrap();
+    let at = cache.clock_domain().now();
+    assert!(
+        permit
+            .commit_cadence(
+                crate::AttemptReason::DialFailed,
+                true,
+                at,
+                Some(start.sample()),
+                Some(log)
+            )
+            .is_ok()
+    );
+    permit.settle(
+        &crate::AttemptResult {
+            id: crate::AttemptId(1),
+            generation: Some(1),
+            batch: 1,
+            reason: crate::AttemptReason::DialFailed,
+            error: None,
+            open_error: None,
+            member: None,
+            pipes: Vec::new(),
+            tickets: Vec::new(),
+        },
+        at,
+        Some(log),
+    );
+    drop(host);
+}
+
+fn outage_cache() -> (CarrierCache, cache_vectors::VectorClock, Candidate) {
+    let (mut config, clock, candidate) = retry_cache();
+    config.recovery_sample = || 1.0;
+    let cache = CarrierCache::new(config).unwrap();
+    for name in ["a", "b"] {
+        cache.recovery_demand(&candidate_key(name, &candidate), true);
+    }
+    (cache, clock, candidate)
+}
+
+#[test]
+fn outage_success_retracts_provisional_failures() {
+    let (cache, _, candidate) = outage_cache();
+    let mut events = cache.subscribe_cooldown();
+    let log = OutageLog::new(cache.clone());
+    log.observe(false);
+    outage_failure(&cache, "a", &candidate, &log);
+    outage_failure(&cache, "b", &candidate, &log);
+    // History takes the failure; ordinary cooldown does not rise.
+    let during = cache.score("b", candidate.kind(), "");
+    assert_eq!((during.cooldown_level, during.attempts), (0, 1));
+    assert!(during.cooldown.is_none());
+    // One candidate reconnects: the other is immediately admissible.
+    log.connected();
+    for name in ["a", "b"] {
+        let score = cache.score(name, candidate.kind(), "");
+        assert_eq!(score.cooldown_level, 0, "{name}");
+        assert_eq!(score.attempts, 0, "{name}");
+        assert!(score.cooldown.is_none(), "{name}");
+        let metrics = cache.retry_metrics(name, candidate.kind(), "");
+        assert_eq!(metrics.recovery_retry_at, None, "{name}");
+    }
+    assert!(cache.begin("b", &candidate, false, None).is_ok());
+    let mut retracted = 0;
+    while let Ok(event) = events.try_recv() {
+        retracted += usize::from(matches!(event, CooldownEvent::Retracted { .. }));
+    }
+    assert_eq!(retracted, 0);
+}
+
+#[test]
+fn failure_with_a_pipe_cools_normally() {
+    let (cache, _, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    log.observe(true);
+    outage_failure(&cache, "b", &candidate, &log);
+    log.connected();
+    assert_eq!(cache.score("b", candidate.kind(), "").cooldown_level, 1);
+    assert!(matches!(
+        cache.begin("b", &candidate, false, None),
+        Err(RetryAdmission::Cooling)
+    ));
+}
+
+#[test]
+fn outage_without_success_commits_deferred_rounds() {
+    let (cache, _, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    log.observe(false);
+    outage_failure(&cache, "b", &candidate, &log);
+    assert_eq!(cache.score("b", candidate.kind(), "").cooldown_level, 0);
+    drop(log);
+    let score = cache.score("b", candidate.kind(), "");
+    assert_eq!(score.cooldown_level, 1);
+    assert!(score.cooldown.is_some());
+}
+
+#[test]
+fn outage_retries_follow_recovery_cadence() {
+    let (cache, clock, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    log.observe(false);
+    for seconds in [1, 2, 4, 8] {
+        outage_failure(&cache, "a", &candidate, &log);
+        assert!(cache.score("a", candidate.kind(), "").cooldown.is_none());
+        assert!(matches!(
+            cache.begin("a", &candidate, true, None),
+            Err(RetryAdmission::RecoveryWait)
+        ));
+        clock.advance(Duration::from_secs(seconds));
+        drop(cache.begin("a", &candidate, true, None).unwrap());
+    }
+}
+
+#[test]
+fn outage_onset_drop_is_retracted() {
+    let (cache, _, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    let key = candidate_key("a", &candidate);
+    log.with(true, |journal| {
+        cache.report_journaled(
+            &key,
+            CacheOutcome::ShortDrop,
+            CarrierObservation::default(),
+            journal,
+        );
+    });
+    assert_eq!(cache.score("a", candidate.kind(), "").cooldown_level, 1);
+    log.observe(false);
+    // The outage began: the onset round is withdrawn.
+    assert_eq!(cache.score("a", candidate.kind(), "").cooldown_level, 0);
+    log.observe(true);
+    let score = cache.score("a", candidate.kind(), "");
+    assert_eq!(score.cooldown_level, 0);
+    assert_eq!(score.short_drops, 0.0);
+}
+
+#[test]
+fn reset_cooldown_clears_level_and_cadence() {
+    let (cache, _, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    log.observe(true);
+    outage_failure(&cache, "b", &candidate, &log);
+    let metrics = cache.retry_metrics("b", candidate.kind(), "");
+    assert!(metrics.recovery_retry_at.is_some());
+    assert_eq!(cache.score("b", candidate.kind(), "").cooldown_level, 1);
+    assert!(cache.reset_cooldown("b", candidate.kind(), ""));
+    let score = cache.score("b", candidate.kind(), "");
+    assert_eq!((score.cooldown_level, score.attempts), (0, 1));
+    assert!(score.cooldown.is_none());
+    assert_eq!(
+        cache
+            .retry_metrics("b", candidate.kind(), "")
+            .recovery_retry_at,
+        None
+    );
+    assert!(cache.begin("b", &candidate, false, None).is_ok());
+    assert!(!cache.reset_cooldown("b", candidate.kind(), ""));
+    assert_eq!(cache.reset_cooldowns(), 0);
+}
+
+#[test]
+fn recovery_wait_is_capped_at_the_session_cutoff() {
+    let (cache, clock, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    for seconds in [1, 2, 4, 8, 16, 32] {
+        outage_failure(&cache, "a", &candidate, &log);
+        clock.advance(Duration::from_secs(seconds));
+    }
+    outage_failure(&cache, "a", &candidate, &log);
+    let now = cache.clock_domain().now();
+    let retry = cache
+        .retry_metrics("a", candidate.kind(), "")
+        .recovery_retry_at
+        .unwrap();
+    let cutoff = now + Duration::from_secs(5);
+    assert!(cutoff < retry);
+    assert_eq!(
+        cache.next_candidate_retry("a", &candidate, true, Some(cutoff)),
+        Some(cutoff)
+    );
+    clock.advance(Duration::from_secs(5));
+    assert!(
+        cache
+            .candidate_admission("a", &candidate, true, Some(cutoff))
+            .is_ok()
+    );
+    assert!(matches!(
+        cache.candidate_admission("a", &candidate, true, None),
+        Err(RetryAdmission::RecoveryWait)
+    ));
+}
+
+#[test]
+fn outage_retraction_keeps_another_sessions_later_state() {
+    let (cache, clock, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    log.observe(false);
+    outage_failure(&cache, "b", &candidate, &log);
+    clock.advance(Duration::from_secs(1));
+    // Another session with a usable pipe fails the same key normally.
+    let other = OutageLog::new(cache.clone());
+    other.observe(true);
+    outage_failure(&cache, "b", &candidate, &other);
+    let later = cache.retry_metrics("b", candidate.kind(), "");
+    assert_eq!(cache.score("b", candidate.kind(), "").cooldown_level, 1);
+    log.connected();
+    let score = cache.score("b", candidate.kind(), "");
+    assert_eq!((score.cooldown_level, score.attempts), (1, 1));
+    let metrics = cache.retry_metrics("b", candidate.kind(), "");
+    assert_eq!(metrics.recovery_retry_at, later.recovery_retry_at);
+    assert_eq!(metrics.recovery_nominal, later.recovery_nominal);
+}
+
+#[test]
+fn reset_cooldown_during_an_outage_survives_the_retraction() {
+    let (cache, _, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    log.observe(false);
+    outage_failure(&cache, "b", &candidate, &log);
+    assert!(cache.reset_cooldown("b", candidate.kind(), ""));
+    log.connected();
+    let score = cache.score("b", candidate.kind(), "");
+    assert_eq!((score.cooldown_level, score.attempts), (0, 0));
+    assert_eq!(
+        cache
+            .retry_metrics("b", candidate.kind(), "")
+            .recovery_retry_at,
+        None
+    );
+}
+
+#[test]
+fn an_outage_commits_at_most_one_round_per_key() {
+    let (cache, clock, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    log.observe(false);
+    for seconds in [1, 2, 4] {
+        outage_failure(&cache, "b", &candidate, &log);
+        clock.advance(Duration::from_secs(seconds));
+    }
+    drop(log);
+    assert_eq!(cache.score("b", candidate.kind(), "").cooldown_level, 1);
+}
+
+#[test]
+fn recovery_gate_ignores_a_cutoff_that_had_passed() {
+    let at = crate::ClockDomain::default().now();
+    let recovery = RecoveryCadence {
+        nominal: Duration::from_mins(1),
+        sampled: Duration::from_mins(1),
+        retry_at: Some(at + Duration::from_mins(1)),
+    };
+    let retry = recovery.retry_at;
+    for (cutoff, want) in [
+        (None, retry),
+        (
+            Some(at + Duration::from_secs(10)),
+            Some(at + Duration::from_secs(10)),
+        ),
+        (Some(at), retry),
+        (at.checked_sub(Duration::from_secs(1)), retry),
+        (Some(at + Duration::from_mins(2)), retry),
+    ] {
+        assert_eq!(super::recovery_gate(&recovery, cutoff), want, "{cutoff:?}");
+    }
+}
+
+#[test]
+fn the_deferred_round_keeps_a_rejection() {
+    let (cache, clock, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    let key = candidate_key("b", &candidate);
+    log.observe(false);
+    outage_failure(&cache, "b", &candidate, &log);
+    clock.advance(Duration::from_secs(1));
+    log.with(false, |journal| {
+        cache.report_journaled(
+            &key,
+            CacheOutcome::Rejected,
+            CarrierObservation::default(),
+            journal,
+        );
+    });
+    clock.advance(Duration::from_secs(2));
+    outage_failure(&cache, "b", &candidate, &log);
+    assert_eq!(cache.score("b", candidate.kind(), "").cooldown_level, 0);
+    drop(log);
+    let score = cache.score("b", candidate.kind(), "");
+    assert_eq!(score.cooldown_level, 1);
+    assert_eq!(
+        score.cooldown.unwrap().reason,
+        Some(CooldownReason::Rejected)
+    );
+}
+
+#[test]
+fn a_pipe_gain_outside_an_outage_makes_earlier_drops_final() {
+    let (cache, _, candidate) = outage_cache();
+    let log = OutageLog::new(cache.clone());
+    let key = candidate_key("a", &candidate);
+    log.with(true, |journal| {
+        cache.report_journaled(
+            &key,
+            CacheOutcome::ShortDrop,
+            CarrierObservation::default(),
+            journal,
+        );
+    });
+    // A member became stable: the drop is final.
+    log.connected();
+    log.observe(false);
+    log.observe(true);
+    let score = cache.score("a", candidate.kind(), "");
+    assert_eq!(score.cooldown_level, 1);
+    assert!(score.short_drops > 0.0);
 }
