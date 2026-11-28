@@ -283,7 +283,12 @@ async fn empty_injector(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_messages_count_in_pipe_positions() {
     let (addr, listener, _serving) = server().await;
-    let (front, relay) = empty_injector(addr, 100_000).await;
+    // Twice the no-effect budget's 4096 tokens: charged, they would end the
+    // session with a budget violation instead. The client's next record
+    // follows them through the relay, so they all pass before the server
+    // acknowledges past them; many more would take the relay longer than
+    // the server's idle timeout on a loaded host.
+    let (front, relay) = empty_injector(addr, 8192).await;
     let client = zmux_websocket::connect(
         format!("ws://{front}/zmux"),
         &zmux_websocket::Options::default(),
@@ -291,7 +296,6 @@ async fn empty_messages_count_in_pipe_positions() {
     )
     .await
     .unwrap();
-    // The relay writes the empty messages one by one: slow on a loaded host.
     let e = tokio::time::timeout(Duration::from_secs(60), client.closing())
         .await
         .expect("closed");

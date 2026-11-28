@@ -1521,24 +1521,27 @@ impl OutPipe {
         // 4 x min_rtt. A FIFO path held its bytes that long and was busy all the
         // while, so the sample is the path's rate: a bottleneck sample, in a bubble
         // too, and taken also from bytes sent before the pipe became SUSPECT (its
-        // RTT sample stays out). Only a batch sent behind unacknowledged bytes
-        // of the pipe can be queue-proven: a lone batch has no backlog to wait
-        // behind, a rise of the propagation delay alone delays it as much, and
-        // its interval spans the idle time before it.
+        // RTT sample stays out). The batch must also have been sent behind a
+        // backlog of the pipe that takes at least 4 x min_rtt at R_p: a smaller
+        // one (none, or a few control bytes) does not explain the delay, which
+        // a rise of the propagation delay alone gives as well, and the sample
+        // of a few bytes over an idle interval would replace R_p with a few
+        // hundred bytes a second.
         // A zero RTT (which the filter keeps as 1 ns) proves nothing.
         let min_rtt = self
             .est
             .min_rtt
             .get()
             .filter(|&m| m > Duration::from_nanos(1));
+        let rate = self.est.rate;
         let proven = |b: &Batch| {
-            b.delivered < b.start
-                && min_rtt.is_some_and(|m| {
-                    now.saturating_duration_since(b.time)
-                        .saturating_sub(ack_delay.min(peer_mad))
-                        .saturating_sub(m)
-                        >= m * 4
-                })
+            min_rtt.is_some_and(|m| {
+                now.saturating_duration_since(b.time)
+                    .saturating_sub(ack_delay.min(peer_mad))
+                    .saturating_sub(m)
+                    >= m * 4
+                    && drain_time(b.start.saturating_sub(b.delivered), rate) >= m * 4
+            })
         };
         if let Some(b) = self
             .batches
@@ -2951,7 +2954,9 @@ mod tests {
         let mut done = t0;
         let mut acks = Vec::new();
         for (i, len) in std::iter::once(20)
-            .chain(std::iter::repeat_n(1000, 40))
+            // Past 80 kB ahead (4 x min_rtt at the initial 1 MB/s) a batch's
+            // backlog explains its delay.
+            .chain(std::iter::repeat_n(1000, 200))
             .enumerate()
         {
             let sent = if i == 0 { t0 } else { t0 + rtt * 2 };
@@ -2994,7 +2999,7 @@ mod tests {
     /// queue, so its few bytes over the idle time before it do not replace
     /// `R_p`.
     #[test]
-    fn a_lone_batch_after_a_delay_rise_is_not_queue_proven() {
+    fn a_small_backlog_after_a_delay_rise_is_not_queue_proven() {
         let t0 = Instant::now();
         let mut o = pipe(t0);
         let mut pos = 0;
@@ -3006,17 +3011,22 @@ mod tests {
             at += MS * 100;
         }
         let before = o.est().rate;
-        for _ in 0..20 {
-            batch(&mut o, 0, 36, at);
-            pos += 36;
-            ack(&mut o, 0, pos, at + MS * 400);
-            at += MS * 1000;
+        // Alone, then behind a few unacknowledged bytes (a PIPE_PING ahead):
+        // neither backlog explains a 400 ms delay at R_p.
+        for ahead in [0, 36] {
+            for _ in 0..20 {
+                if ahead > 0 {
+                    batch(&mut o, 0, ahead, at);
+                    pos += ahead;
+                }
+                batch(&mut o, 0, 36, at);
+                pos += 36;
+                ack(&mut o, 0, pos, at + MS * 400);
+                at += MS * 1000;
+            }
+            let r = o.est().rate;
+            assert!(r >= before, "ahead {ahead}: R_p {r} fell from {before}");
         }
-        assert!(
-            o.est().rate >= before,
-            "R_p {} fell from {before}",
-            o.est().rate
-        );
     }
 
     /// `Q_p` and `unsent_ahead` on a slow carrier that reports no unsent
