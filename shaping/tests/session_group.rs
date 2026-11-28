@@ -11,7 +11,7 @@ use zmux_shaping::{Bundle, Options};
 fn session_group_resolves_count_and_chooses_strongest_rotation_limits() {
     let bundle = Bundle::from_json(
         br#"{
-        "schema":2,
+        
         "kinds":{"default":[{"pool":{
             "count":2,
             "retire":[

@@ -1445,7 +1445,7 @@ mod size_tests {
         let segs = vec!["[1,1,2]"; 2000].join(",");
         let refs = vec![r#"{"t":"a"}"#; refs].join(",");
         format!(
-            r#"{{"schema":2,"tables":{{"a":[{segs}]}},"kinds":{{"default":[{{"pool":{{"dial_after":[{refs}]}}}}]}}}}"#
+            r#"{{"tables":{{"a":[{segs}]}},"kinds":{{"default":[{{"pool":{{"dial_after":[{refs}]}}}}]}}}}"#
         )
     }
 
@@ -1533,7 +1533,7 @@ mod size_tests {
             .map(|i| format!(r#""{i}":[[1,1,2]]"#))
             .collect();
         let doc = format!(
-            r#"{{"schema":2,"tables":{{{}}},"kinds":{{"default":[{{}}]}}}}"#,
+            r#"{{"tables":{{{}}},"kinds":{{"default":[{{}}]}}}}"#,
             members.join(",")
         );
         let t0 = std::time::Instant::now();

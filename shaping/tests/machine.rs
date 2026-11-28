@@ -25,10 +25,10 @@ fn limits_and_budget_require_a_bounded_account() {
     assert!(parse_limits(br#"{"wire":{"initial":1}}"#).is_err());
     assert!(parse_limits(br#"{"wire":{"ceiling":0,"initial":1}}"#).is_err());
 
-    let invalid = br#"{"schema":2,"kinds":{"default":[{"budget":{"wire":{
+    let invalid = br#"{"kinds":{"default":[{"budget":{"wire":{
         "ceiling":{"t":[[1,2,3]],"scope":"session"},"initial":{"t":[[1,1,3]],"scope":"session"}}}}]}}"#;
     assert!(Bundle::from_json(invalid, &Options::default()).is_err());
-    let valid = br#"{"schema":2,"kinds":{"default":[{"budget":{"wire":{
+    let valid = br#"{"kinds":{"default":[{"budget":{"wire":{
         "ceiling":100,"initial":{"t":[[1,20,20]],"scope":"session"}}}}]}}"#;
     let bundle = Bundle::from_json(valid, &Options::default()).unwrap();
     let budget = bundle

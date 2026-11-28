@@ -277,13 +277,9 @@ impl Bundle {
         let Json::Obj(top) = &doc else {
             return Err(err("type", "bundle"));
         };
-        let allowed = ["schema", "generated_at", "next_change", "tables", "kinds"];
+        let allowed = ["generated_at", "next_change", "tables", "kinds"];
         if let Some((k, _)) = top.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
             return Err(err("unknown_member", format!("bundle.{k}")));
-        }
-        match doc.get("schema").and_then(crate::value::int) {
-            Some(2) => {}
-            _ => return Err(err("schema", "expected bundle schema 2")),
         }
         for k in ["generated_at", "next_change"] {
             if doc.get(k).is_some_and(|v| !matches!(v, Json::Str(_))) {
