@@ -716,7 +716,7 @@ impl PipeIo {
             exporter: None,
             variant: None,
             protocol: None,
-            carrier: None,
+            carrier: Some(crate::CarrierKind::Raw),
             unsent: socket.as_ref().and_then(TcpSocket::unsent_query),
             carrier_stats: None,
             accounting_sources: None,

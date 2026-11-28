@@ -16,7 +16,7 @@ tokio = { version = "1.54", features = ["full"] }
 zmux = { path = "../.." }
 zmux-http = { path = "../../adapter/http", features = ["websocket"] }
 zmux-rustls = { path = "../../adapter/rustls" }
-hyper = { version = "1.12", features = ["client", "http2"] }
+hyper = { version = "1.13", features = ["client", "http2"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 zmux-testcert = { path = "../../testcert" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

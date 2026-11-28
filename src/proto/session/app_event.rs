@@ -47,11 +47,14 @@ pub enum CarrierKind {
     Http3,
     /// A WebTransport session.
     WebTransport,
+    /// A reliable ordered byte connection that carries the records with no framing of its own: TCP,
+    /// TLS, a Unix socket, a stream of another session.
+    Raw,
 }
 
 impl CarrierKind {
     /// Every kind.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::WebSocket,
         Self::Streaming,
         Self::Split,
@@ -59,10 +62,11 @@ impl CarrierKind {
         Self::Quic,
         Self::Http3,
         Self::WebTransport,
+        Self::Raw,
     ];
 
     /// The kind's name: `websocket`, `streaming`, `split`, `exchange`,
-    /// `quic`, `http3`, `webtransport`.
+    /// `quic`, `http3`, `webtransport`, `raw`.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -73,6 +77,7 @@ impl CarrierKind {
             Self::Quic => "quic",
             Self::Http3 => "http3",
             Self::WebTransport => "webtransport",
+            Self::Raw => "raw",
         }
     }
 

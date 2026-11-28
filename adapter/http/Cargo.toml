@@ -15,7 +15,7 @@ base64 = "0.23"
 bytes = "1"
 http = "1"
 http-body = "1"
-hyper = { version = "1.12", features = ["client", "server", "http1", "http2"] }
+hyper = { version = "1.13", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server-auto"] }
 tokio = { version = "1.54", default-features = false, features = ["net", "rt", "io-util", "time", "sync", "macros"] }
 zmux = { version = "1.4.0", path = "../.." }

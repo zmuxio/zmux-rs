@@ -785,7 +785,7 @@ impl PipeIo {
             io.socket = socket;
         }
         io.init_lowat();
-        io
+        io.with_carrier(crate::CarrierKind::Raw)
     }
 
     /// The TCP socket under this carrier (for example under TLS): it is
@@ -1767,7 +1767,10 @@ impl PipeIo {
 
     /// The carrier's kind: the [`ShapedPipe::carrier`] a shaper factory
     /// sees for its pipe, and the kind in pipe events and statistics. The
-    /// adapters set it; a carrier without one (raw TCP or TLS) has none.
+    /// adapters set it, and [`PipeIo::from_tcp`] sets [`CarrierKind::Raw`];
+    /// a carrier built from halves has none until it is set.
+    ///
+    /// [`CarrierKind::Raw`]: crate::CarrierKind::Raw
     ///
     /// [`ShapedPipe::carrier`]: crate::shaping::ShapedPipe::carrier
     #[must_use]

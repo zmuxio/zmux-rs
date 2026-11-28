@@ -209,9 +209,9 @@ async fn kinds_reach_the_factories_of_both_ends() {
     listener.close();
 }
 
-/// A raw TCP carrier has no kind, on either end.
+/// A raw TCP carrier is of kind `raw`, on either end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raw_tcp_has_no_kind() {
+async fn raw_tcp_is_of_kind_raw() {
     let server_shaper = Arc::new(Recording::default());
     let client_shaper = Arc::new(Recording::default());
     let listener = Listener::new(
@@ -230,9 +230,12 @@ async fn raw_tcp_has_no_kind() {
     echo(server.clone());
     exchange(&client).await;
     let zero = PipeId::new(0);
-    assert_eq!(server_shaper.kind_of(zero), Some(None));
-    assert_eq!(client_shaper.kind_of(zero), Some(None));
-    assert_eq!(server.pipe(zero).unwrap().stats().unwrap().carrier, None);
+    assert_eq!(server_shaper.kind_of(zero), Some(Some(CarrierKind::Raw)));
+    assert_eq!(client_shaper.kind_of(zero), Some(Some(CarrierKind::Raw)));
+    assert_eq!(
+        server.pipe(zero).unwrap().stats().unwrap().carrier,
+        Some(CarrierKind::Raw)
+    );
     client.close().await;
     listener.close();
 }

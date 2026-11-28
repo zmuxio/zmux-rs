@@ -137,7 +137,9 @@ where
     // gives no value.
     let shared = Arc::new(Mutex::new(stream));
     let exporter = Arc::downgrade(&shared);
-    let mut io = PipeIo::from_halves(Half(shared.clone()), Half(shared)).with_partial_reads();
+    let mut io = PipeIo::from_halves(Half(shared.clone()), Half(shared))
+        .with_partial_reads()
+        .with_carrier(zmux::CarrierKind::Raw);
     if done {
         io = io.with_terminated_tls(move || Some(state.clone()));
     }
