@@ -9,7 +9,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
-use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::listen::PipeHint;
@@ -92,6 +91,7 @@ pub struct PipeStream {
     /// Bytes to deliver before the reader's: the carrier's prefix, then the
     /// rest of the current message.
     pending: Vec<u8>,
+    sending: crate::Chunk,
     at: usize,
 }
 
@@ -156,6 +156,34 @@ impl AsyncRead for PipeStream {
     }
 }
 
+impl PipeStream {
+    fn poll_queued(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !self.sending.is_empty() {
+            let Some(Writer::Chunks(writer)) = &mut self.writer else {
+                unreachable!("only chunk carriers stage a write");
+            };
+            let offered = self.sending.len();
+            let result = ready!(
+                writer
+                    .as_mut()
+                    .poll_write_chunks(cx, std::slice::from_mut(&mut self.sending))
+            );
+            match result {
+                Ok(n) if n > 0 && (self.framing != Framing::Records || n == offered) => {}
+                Ok(_) => {
+                    self.sending.clear();
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                Err(error) => {
+                    self.sending.clear();
+                    return Poll::Ready(Err(error));
+                }
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl AsyncWrite for PipeStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -163,6 +191,7 @@ impl AsyncWrite for PipeStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        ready!(this.poll_queued(cx))?;
         let Some(w) = this.writer.as_mut() else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -173,9 +202,17 @@ impl AsyncWrite for PipeStream {
         let n = match w {
             Writer::Io(w) => ready!(w.as_mut().poll_write(cx, buf))?,
             Writer::Sealed(w) => ready!(w.as_mut().poll_write(cx, buf))?,
-            Writer::Chunks(w) => {
-                let mut chunk = [Bytes::copy_from_slice(buf)];
-                ready!(w.as_mut().poll_write_chunks(cx, &mut chunk))?
+            Writer::Chunks(_) => {
+                if buf.is_empty() {
+                    return Poll::Ready(Ok(0));
+                }
+                // The buffered write has been accepted by this AsyncWrite,
+                // even if the carrier now needs to wait for its own I/O.
+                this.sending = crate::Chunk::copy_from_slice(buf);
+                if let Poll::Ready(Err(error)) = this.poll_queued(cx) {
+                    return Poll::Ready(Err(error));
+                }
+                buf.len()
             }
             Writer::Stream(w) => ready!(Pin::new(w).poll_write(cx, buf))?,
         };
@@ -189,14 +226,18 @@ impl AsyncWrite for PipeStream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut().writer.as_mut() {
+        let this = self.get_mut();
+        ready!(this.poll_queued(cx))?;
+        match this.writer.as_mut() {
             Some(w) => w.poll_flush(cx),
             None => Poll::Ready(Ok(())),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut().writer.as_mut() {
+        let this = self.get_mut();
+        ready!(this.poll_queued(cx))?;
+        match this.writer.as_mut() {
             Some(w) => w.poll_shutdown(cx),
             None => Poll::Ready(Ok(())),
         }
@@ -273,6 +314,7 @@ impl PipeIo {
 
     fn take_stream(&mut self) -> PipeStream {
         PipeStream {
+            sending: crate::Chunk::new(),
             reader: self.reader.take(),
             writer: self.writer.take(),
             framing: self.framing,

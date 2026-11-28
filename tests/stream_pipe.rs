@@ -43,7 +43,7 @@ fn carrier_failed() -> VarInt {
 
 fn multipath() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 6;
+    c.session_policy.limits.steady_attachments = 6;
     c.pipe_auth = PipeAuth::psk(*b"nested-psk------0123456789abcdef").with_end_to_end();
     c
 }
@@ -284,7 +284,10 @@ impl Nested {
             .open_pipe_stream(&zmux::Preamble::new())
             .await
             .unwrap();
-        let p = self.x.begin_add_pipe(pipe, PipeOptions::default()).unwrap();
+        let p = self
+            .x
+            .test_begin_join(pipe, PipeOptions::default())
+            .unwrap();
         self.until_active(&p).await;
         p
     }
@@ -297,7 +300,10 @@ impl Nested {
             .open_pipe_stream(&zmux::Preamble::new())
             .await
             .unwrap();
-        let p = self.x.begin_add_pipe(pipe, PipeOptions::default()).unwrap();
+        let p = self
+            .x
+            .test_begin_join(pipe, PipeOptions::default())
+            .unwrap();
         let (send, recv) = self.os.accept_bi().await.unwrap();
         let (send, recv) = (Raw::new(send), Raw::new(recv));
         let l = self.listener.clone();
@@ -552,13 +558,13 @@ fn a_pipe_never_runs_over_its_own_session() {
             // nested session that runs over it.
             let looped = n.x.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
             assert!(matches!(
-                n.oc.begin_add_pipe(looped, PipeOptions::default()).err(),
+                n.oc.test_begin_join(looped, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
             ));
             // Nor a session a stream of its own.
             let own = n.x.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
             assert!(matches!(
-                n.x.begin_add_pipe(own, PipeOptions::default()).err(),
+                n.x.test_begin_join(own, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
             ));
             // Once the pipe over the outer session is gone, nothing runs
@@ -567,7 +573,7 @@ fn a_pipe_never_runs_over_its_own_session() {
             eventually(10, "the stream pipe retired", || p.stats().is_none()).await;
             let unlooped = n.x.open_pipe_stream(&zmux::Preamble::new()).await.unwrap();
             assert!(!matches!(
-                n.oc.begin_add_pipe(unlooped, PipeOptions::default()).err(),
+                n.oc.test_begin_join(unlooped, PipeOptions::default()).err(),
                 Some(PipeError::CarrierLoop)
             ));
             n.x.close().await;
@@ -599,7 +605,7 @@ fn the_listener_refuses_a_join_over_a_stream_of_its_own_session() {
             };
             let (send, recv) = n.x.open_bi().await.unwrap();
             let hidden = PipeIo::from_halves(Raw::new(recv), Raw::new(send));
-            let p = n.x.begin_add_pipe(hidden, PipeOptions::default()).unwrap();
+            let p = n.x.test_begin_join(hidden, PipeOptions::default()).unwrap();
             let handled = watchdog(10, "the join handled", handled).await.unwrap();
             assert_eq!(handled.err(), Some(zmux::HandleError::Refused));
             // ZMUX_PIPE_RESOURCE_LIMIT: a limit of the session.

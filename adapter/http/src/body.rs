@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use http_body::{Body, Frame};
 use tokio::io::{AsyncRead, ReadBuf};
 use zmux::adapter::{ChunkBuf, ChunkWrite};
@@ -150,7 +150,9 @@ impl Abort {
             let n = Buf::chunk(&replay).len();
             written.push(Buf::copy_to_bytes(&mut replay, n));
         }
-        chunks.take_from(&mut written);
+        for chunk in written {
+            chunks.push(chunk);
+        }
         s.chunks = chunks;
         s.gone = false;
         Some(PipeBody(Inner::Fed(self.0.clone(), s.generation)))
@@ -192,7 +194,7 @@ impl BodyWriter {
     /// Puts `data` in front of the body, before any write: the body's
     /// first data frame.
     pub(crate) fn preload(&self, data: Bytes) {
-        self.0.lock().chunks.take_from(&mut [data]);
+        self.0.lock().chunks.push(data);
     }
 }
 
@@ -200,7 +202,7 @@ impl ChunkWrite for BodyWriter {
     fn poll_write_chunks(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        chunks: &mut [Bytes],
+        chunks: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
         let waker = {
             let mut s = self.0.lock();
@@ -218,13 +220,13 @@ impl ChunkWrite for BodyWriter {
             }
             let s = &mut *s;
             if let Some(replay) = &mut s.replay {
-                let n: usize = chunks.iter().map(Bytes::len).sum();
+                let n: usize = chunks.iter().map(zmux::Chunk::len).sum();
                 if replay.len() + n > REPLAY_MAX {
                     s.replay = None;
                     s.over = true;
                 } else {
                     for c in chunks.iter() {
-                        replay.push(c.clone());
+                        replay.push(c.clone().into_bytes());
                     }
                 }
             }
@@ -798,84 +800,86 @@ where
     Ok(Ok(rest.map_or(first, bytes::BytesMut::freeze)))
 }
 
-/// Bytes read from a body: one data frame as it is, several joined in a
-/// buffer that grows with what arrives, never with a length the peer
-/// declares.
-#[derive(Default)]
+/// The adapter-owned copy of an exchange body, bounded by its declared
+/// length. An HTTP frame's visible bytes can be part of a larger allocation.
 pub(crate) struct Gathered {
-    first: Bytes,
+    limit: usize,
+    bytes: bytes::BytesMut,
     pub(crate) trailers: Option<Box<http::HeaderMap>>,
-    joined: Option<bytes::BytesMut>,
+    pub(crate) overflowed: bool,
 }
 
 impl Gathered {
-    /// The bytes gathered.
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        match &self.joined {
-            Some(j) => j,
-            None => &self.first,
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            bytes: bytes::BytesMut::new(),
+            trailers: None,
+            overflowed: false,
         }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.as_slice().len()
+        self.bytes.len()
     }
 
-    fn push(&mut self, data: Bytes) {
-        match &mut self.joined {
-            Some(j) => j.extend_from_slice(&data),
-            None if self.first.is_empty() => self.first = data,
-            None => {
-                let mut j = bytes::BytesMut::with_capacity(self.first.len() + data.len());
-                j.extend_from_slice(&self.first);
-                j.extend_from_slice(&data);
-                self.first = Bytes::new();
-                self.joined = Some(j);
-            }
+    fn push(&mut self, data: impl Buf) -> bool {
+        if data.remaining() > self.limit - self.len() {
+            self.overflowed = true;
+            return false;
         }
+        if data.has_remaining() {
+            if self.bytes.capacity() == 0 {
+                self.bytes = bytes::BytesMut::with_capacity(self.limit);
+            }
+            self.bytes.put(data);
+        }
+        true
     }
 
-    /// The bytes gathered, without a copy.
     pub(crate) fn freeze(self) -> Bytes {
-        self.joined.map_or(self.first, bytes::BytesMut::freeze)
+        self.bytes.freeze()
     }
 }
 
-/// Reads `body` into `read` until it holds at least `len` bytes, or until
-/// `deadline`, without reading beyond the frame that completes them.
-/// Whether it does; a body that ends, fails or passes the deadline first
-/// leaves what was read. A trailers frame read on the way ends the reading
-/// and is retained for HTTP fallback.
+/// Reads until `read` holds at least `len` bytes. Any complete frame read
+/// on the way is retained, up to the admitted body length. A trailers frame
+/// read on the way ends the reading and is retained for HTTP fallback.
 pub(crate) async fn read_to<B>(
     body: &mut B,
     read: &mut Gathered,
     len: usize,
-    deadline: Option<tokio::time::Instant>,
+    deadline: impl std::future::Future<Output = ()>,
 ) -> bool
 where
     B: Body + Unpin,
     B::Data: Buf,
 {
-    while read.len() < len {
-        let next = std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx));
-        let Some(Some(Ok(frame))) =
-            zmux::adapter::while_open(zmux::adapter::wait_deadline(deadline), next).await
-        else {
-            return false;
-        };
-        let mut data = match frame.into_data() {
-            Ok(data) => data,
-            Err(frame) => {
-                read.trailers = frame.into_trailers().ok().map(Box::new);
+    zmux::adapter::while_open(deadline, async {
+        while read.len() < len {
+            let next = std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx));
+            let Some(Ok(frame)) = next.await else {
+                return false;
+            };
+            let data = match frame.into_data() {
+                Ok(data) => data,
+                Err(frame) => {
+                    read.trailers = frame.into_trailers().ok().map(Box::new);
+                    return false;
+                }
+            };
+            if !read.push(data) {
                 return false;
             }
-        };
-        let data = data.copy_to_bytes(data.remaining());
-        if !data.is_empty() {
-            read.push(data);
         }
-    }
-    true
+        true
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -898,13 +902,13 @@ mod tests {
         let flag = Arc::new(Flag(AtomicBool::new(false)));
         let waker = Waker::from(flag.clone());
         let mut cx = Context::from_waker(&waker);
-        let mut bufs = [Bytes::from_static(b"one")];
+        let mut bufs = [zmux::Chunk::from_static(b"one")];
         assert!(matches!(
             Pin::new(&mut writer).poll_write_chunks(&mut cx, &mut bufs),
             Poll::Ready(Ok(3))
         ));
         assert!(bufs[0].is_empty());
-        let mut bufs = [Bytes::from_static(b"two")];
+        let mut bufs = [zmux::Chunk::from_static(b"two")];
         assert!(
             Pin::new(&mut writer)
                 .poll_write_chunks(&mut cx, &mut bufs)
@@ -928,13 +932,13 @@ mod tests {
         let flag = Arc::new(Flag(AtomicBool::new(false)));
         let waker = Waker::from(flag.clone());
         let mut cx = Context::from_waker(&waker);
-        let payload = Bytes::from(vec![7u8; 5000]);
-        let mut bufs = [Bytes::from_static(b"hd"), payload.clone()];
+        let payload = zmux::Chunk::from(vec![7u8; 5000]);
+        let mut bufs = [zmux::Chunk::from_static(b"hd"), payload.clone()];
         assert!(matches!(
             Pin::new(&mut writer).poll_write_chunks(&mut cx, &mut bufs),
             Poll::Ready(Ok(5002))
         ));
-        let mut next = [Bytes::from_static(b"x")];
+        let mut next = [zmux::Chunk::from_static(b"x")];
         assert!(
             Pin::new(&mut writer)
                 .poll_write_chunks(&mut cx, &mut next)
@@ -999,7 +1003,7 @@ mod replay_tests {
     fn write(w: &mut BodyWriter, data: &[u8]) {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
-        let mut chunks = [Bytes::copy_from_slice(data)];
+        let mut chunks = [zmux::Chunk::copy_from_slice(data)];
         let r = Pin::new(w).poll_write_chunks(&mut cx, &mut chunks);
         assert!(matches!(r, Poll::Ready(Ok(n)) if n == data.len()));
     }

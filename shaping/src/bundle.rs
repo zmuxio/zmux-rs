@@ -6,13 +6,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use zmux::CarrierKind;
-use zmux::shaping::{Factory, HandshakeShaper, ShapedPipe, Shaper, ShapingBudget, UnitPlan};
+use zmux::shaping::{
+    Factory, HandshakeShaper, ProfileLimits, ShapedPipe, Shaper, ShapingBudget, UnitPlan,
+};
 
 use crate::error::{Error, err};
 use crate::json::{Json, parse};
-use crate::limits::parse_budget;
-use crate::machine::{MachineFactory, Options, compile, parse_machines};
-use crate::pool::{MachinePoolPolicy, PoolSpec};
+use crate::limits::{parse_budget, switch};
+use crate::machine::{GateBounds, MachineFactory, Options, compile, parse_machines};
+use crate::pool::PoolSpec;
 use crate::value::{FREE_SCOPES, Family, Reader, Sampler, Value, parse_value, to_usize};
 
 const KINDS: &[&str] = &[
@@ -105,10 +107,11 @@ pub struct Compiled {
     source: Mutex<Sampler>,
     factory: Option<MachineFactory>,
     budget: Option<ShapingBudget>,
-    /// The candidate's bound on one wait.
-    max_delay: Option<Duration>,
+    profile: ProfileLimits,
+    #[cfg(feature = "tokio")]
     pool: Option<PoolSpec>,
     shared: Vec<u64>,
+    #[cfg(feature = "tokio")]
     options: Options,
 }
 
@@ -120,7 +123,14 @@ impl std::fmt::Debug for Compiled {
 
 impl Compiled {
     fn new(c: &Json, tables: Option<&Json>, options: &Options) -> Result<Self, Error> {
-        let allowed = ["requires", "handshakes", "machines", "budget", "pool"];
+        let allowed = [
+            "requires",
+            "handshakes",
+            "machines",
+            "budget",
+            "pool",
+            "include_control",
+        ];
         let Json::Obj(m) = c else {
             return Err(err("type", "candidate"));
         };
@@ -153,8 +163,24 @@ impl Compiled {
                 f.settle(&mut s, &mut shared);
             }
         }
+        let include_control = switch(c, "include_control")?;
+        let profile = budget
+            .as_ref()
+            .and_then(|b| b.profile)
+            .unwrap_or(ProfileLimits::LIGHTWEIGHT);
         let factory = machines
-            .map(|m| MachineFactory(Arc::new(compile(m, &mut s, &mut shared, options.clone()))));
+            .map(|machines| {
+                let gate_bounds = GateBounds::check(&machines, profile)?;
+                Ok::<_, Error>(MachineFactory(Arc::new(compile(
+                    machines,
+                    include_control,
+                    &mut s,
+                    &mut shared,
+                    options.clone(),
+                    gate_bounds,
+                ))))
+            })
+            .transpose()?;
         if let Some(p) = &mut pool {
             p.settle(&mut s, &mut shared);
         }
@@ -162,10 +188,12 @@ impl Compiled {
             plans,
             source: Mutex::new(s),
             factory,
-            max_delay: budget.as_ref().and_then(|b| b.max_delay),
+            profile,
             budget: budget.map(|b| b.source(options.sampler())),
+            #[cfg(feature = "tokio")]
             pool,
             shared,
+            #[cfg(feature = "tokio")]
             options: options.clone(),
         })
     }
@@ -184,10 +212,7 @@ impl Compiled {
         let pad_to = to_usize(draw(&e.pad_to));
         let pad_multiple = to_usize(draw(&e.pad_multiple));
         let pad = to_usize(draw(&e.pad));
-        let mut delay = Duration::from_micros(draw(&e.delay));
-        if let Some(m) = self.max_delay {
-            delay = delay.min(m);
-        }
+        let delay = Duration::from_micros(draw(&e.delay)).min(self.profile.max_added_delay);
         Some(UnitPlan::new(pad_to, pad_multiple, pad).with_delay(delay))
     }
 
@@ -204,11 +229,23 @@ impl Compiled {
         self.budget.clone()
     }
 
-    /// A new pool policy; `None` without one.
+    /// Resolves the session portion of the pool profile into a controller target.
+    #[cfg(feature = "tokio")]
     #[must_use]
-    pub fn pool_policy(&self) -> Option<MachinePoolPolicy> {
-        let p = self.pool.as_ref()?;
-        Some(MachinePoolPolicy::from_spec(p.clone(), &self.options))
+    pub fn session_group(
+        &self,
+        id: impl Into<String>,
+        candidates: Vec<zmux::TargetCandidate>,
+    ) -> zmux::GroupTarget {
+        let id = id.into();
+        if let Some(pool) = &self.pool {
+            return pool.session_group(id, candidates, &self.options);
+        }
+        zmux::GroupTarget {
+            id,
+            quotas: Vec::new(),
+            rotation: zmux::RotationPolicy::default(),
+        }
     }
 
     /// The `shared` values of the handshakes, the machines and the pool, in the order
@@ -240,9 +277,13 @@ impl Bundle {
         let Json::Obj(top) = &doc else {
             return Err(err("type", "bundle"));
         };
-        let allowed = ["generated_at", "next_change", "tables", "kinds"];
+        let allowed = ["schema", "generated_at", "next_change", "tables", "kinds"];
         if let Some((k, _)) = top.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
             return Err(err("unknown_member", format!("bundle.{k}")));
+        }
+        match doc.get("schema").and_then(crate::value::int) {
+            Some(2) => {}
+            _ => return Err(err("schema", "expected bundle schema 2")),
         }
         for k in ["generated_at", "next_change"] {
             if doc.get(k).is_some_and(|v| !matches!(v, Json::Str(_))) {
@@ -347,6 +388,15 @@ impl Bundle {
 
 /// Runs the machines of the pipe's kind.
 impl Factory for Bundle {
+    fn required_gate_wait(&self, preamble: u64) -> Duration {
+        self.kinds
+            .values()
+            .filter_map(|(_, c)| c.factory())
+            .map(|factory| factory.required_gate_wait(preamble))
+            .max()
+            .unwrap_or_default()
+    }
+
     fn shaper(&self, pipe: &ShapedPipe) -> Option<Box<dyn Shaper>> {
         let f = self.of(pipe.carrier)?.factory()?;
         Some(Box::new(f.shaper()))

@@ -43,6 +43,7 @@ pub(crate) struct KemFn {
     /// `(ciphertext, shared secret)` for a received key and randomness `m`;
     /// `kex` on an invalid key. The only check of a received key.
     pub(crate) encapsulate: EncapsOp,
+    pub(crate) check_key: fn(&[u8]) -> Result<(), Error>,
     /// Has no failure of its own: a wrong ciphertext gives a pseudorandom
     /// secret (implicit rejection), and the AEAD that follows fails.
     pub(crate) decapsulate: fn(&[u8], &[u8]) -> Secret,
@@ -55,6 +56,7 @@ static MLKEM768: KemFn = KemFn {
     random_len: MLKEM768_RANDOM_LEN,
     generate: |seed| kex::mlkem768_generate(seed).expect("length checked against the table"),
     encapsulate: kex::mlkem768_encapsulate,
+    check_key: kex::mlkem768_check_ek,
     decapsulate: |dk, ct| kex::mlkem768_decapsulate(dk, ct).expect("length checked on reading"),
 };
 

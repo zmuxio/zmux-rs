@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::super::stream::{RECV_KEEP, RecvPart, make_id};
+use super::super::stream::{RecvPart, make_id};
 use bytes::Bytes;
 
 use super::super::{Backing, Config, PipeAuth, PipeId, Role, SessionCore, StreamKey, TransmitBuf};
@@ -17,7 +17,7 @@ const TY: u64 = 0x08;
 
 fn config() -> Config {
     Config {
-        max_pipes: 4,
+        session_policy: crate::SessionPolicy::with_steady_attachments(4),
         pipe_auth: PipeAuth::psk(*b"0123456789abcdef0123456789abcdef"),
         max_idle_timeout: Some(Duration::from_secs(600)),
         max_incoming_uni_streams: crate::proto::session::UniCredit::Limit(4),
@@ -27,11 +27,22 @@ fn config() -> Config {
 
 /// A multipath pair on pipe 0, established.
 fn pair() -> (SessionCore, SessionCore, Instant) {
-    let now = Instant::now();
-    let mut a = SessionCore::new(config(), Role::Client, None, now).unwrap();
-    let mut b = SessionCore::new(config(), Role::Server, None, now).unwrap();
-    a.attach_pipe(PipeId(0), Framing::ByteStream, now);
-    b.attach_pipe(PipeId(0), Framing::ByteStream, now);
+    pair_framed(Framing::ByteStream)
+}
+
+fn pair_framed(framing: Framing) -> (SessionCore, SessionCore, Instant) {
+    pair_with_config(config(), framing, Instant::now())
+}
+
+fn pair_with_config(
+    config: Config,
+    framing: Framing,
+    now: Instant,
+) -> (SessionCore, SessionCore, Instant) {
+    let mut a = SessionCore::new(config.clone(), Role::Client, None, now).unwrap();
+    let mut b = SessionCore::new(config, Role::Server, None, now).unwrap();
+    a.attach_pipe(PipeId(0), framing, now);
+    b.attach_pipe(PipeId(0), framing, now);
     pump(&mut a, &mut b, now);
     assert!(a.is_multipath() && b.is_multipath());
     assert!(b.features.preamble);
@@ -56,7 +67,18 @@ fn pump(a: &mut SessionCore, b: &mut SessionCore, now: Instant) {
                 }
                 wire.clear();
                 out.copy_to_vec(&mut wire);
-                to.receive(PipeId(0), &wire, now);
+                if out.is_records() {
+                    let mut offset = 0;
+                    for &len in out.message_lens() {
+                        let message = crate::proto::ReceivedRecord::copy_from_slice(
+                            &wire[offset..offset + len],
+                        );
+                        to.receive_message(PipeId(0), message, now);
+                        offset += len;
+                    }
+                } else {
+                    to.receive(PipeId(0), &wire, now);
+                }
                 progress = true;
             }
         }
@@ -97,6 +119,112 @@ fn key(s: &SessionCore, id: u64) -> StreamKey {
     s.streams.key_of(id).expect("stream known")
 }
 
+#[test]
+fn owned_message_keeps_the_carrier_allocation_until_the_last_view() {
+    let (_, mut recv, now) = pair_framed(Framing::Records);
+    let mut payload = preamble();
+    let expected = [42; 5000];
+    payload.extend_from_slice(&expected);
+    let frame = crate::proto::frame::Frame::Stream(stream(0, &payload));
+    let mut record = vec![0; frame.encoded_len()];
+    frame.encode(&mut record).unwrap();
+    let allocation = record[record.len() - expected.len()..].as_ptr();
+    recv.receive_message(
+        PipeId(0),
+        crate::proto::ReceivedRecord::from_vec(record),
+        now,
+    );
+    let (chunk, _) = recv
+        .read_chunk(key(&recv, UNI), expected.len())
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk.as_ptr(), allocation);
+    drop(recv);
+    assert_eq!(chunk.as_ref(), expected);
+}
+
+#[test]
+fn nested_record_keeps_the_outer_receive_backing() {
+    let (_, mut outer, now) = pair();
+    let (_, mut inner, _) = pair();
+    let expected = [42; 5000];
+    let mut inner_payload = preamble();
+    inner_payload.extend_from_slice(&expected);
+    let mut outer_payload = preamble();
+    append_stream_record(&mut outer_payload, &inner_payload);
+    let mut wire = Vec::new();
+    append_stream_record(&mut wire, &outer_payload);
+    let mut buffer = crate::ChunkBuffer::with_capacity(wire.capacity() * 2);
+    buffer.extend_from_slice(&wire);
+    let wire = buffer.publish();
+    let backing = wire.backing;
+    let original = wire.slice(wire.len() - expected.len()..);
+
+    assert!(backing.size > wire.len());
+    assert_eq!(outer.receive_shared(PipeId(0), &wire, now), wire.len());
+    let (record, _) = outer
+        .read_segment(key(&outer, UNI), usize::MAX)
+        .unwrap()
+        .unwrap();
+    inner.receive_segment(PipeId(0).into(), &record, now);
+    let (data, _) = inner
+        .read_segment(key(&inner, UNI), usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(data.backing, backing);
+    assert_eq!(data.bytes.as_ptr(), original.as_ptr());
+    drop((wire, record, outer, inner));
+    assert_eq!(data.bytes.as_ref(), expected);
+}
+
+fn append_stream_record(wire: &mut Vec<u8>, data: &[u8]) {
+    let frame = crate::proto::frame::Frame::Stream(stream(0, data));
+    let len = frame.encoded_len();
+    let at = wire.len();
+    let size = crate::proto::record::size_len(len as u64);
+    wire.resize(at + size + len, 0);
+    crate::proto::record::encode_size(len as u64, &mut wire[at..]).unwrap();
+    frame.encode(&mut wire[at + size..]).unwrap();
+}
+
+#[test]
+fn a_shared_receive_root_is_charged_once_and_released_when_sparse() {
+    const LEN: usize = 5000;
+    let (_, mut recv, now) = pair_framed(Framing::Records);
+    let mut payload = preamble();
+    payload.resize(payload.len() + LEN, 42);
+    let frame = |stream_id| {
+        crate::proto::frame::Frame::Stream(Stream {
+            stream_id,
+            ..stream(0, &payload)
+        })
+    };
+    let next = make_id(1, Dir::Uni, true);
+    let first_len = frame(UNI).encoded_len();
+    let mut record = vec![0; first_len + frame(next).encoded_len()];
+    frame(UNI).encode(&mut record[..first_len]).unwrap();
+    frame(next).encode(&mut record[first_len..]).unwrap();
+    let capacity = record.capacity();
+    recv.receive_message(
+        PipeId(0),
+        crate::proto::ReceivedRecord::from_vec(record),
+        now,
+    );
+    assert_eq!(recv.receive_root_capacity(), capacity);
+
+    let mut sink = [0; LEN];
+    assert_eq!(
+        recv.read(key(&recv, UNI), &mut sink).unwrap().unwrap().0,
+        LEN
+    );
+    assert_eq!(recv.receive_root_capacity(), 5000);
+    assert_eq!(
+        recv.read(key(&recv, next), &mut sink).unwrap().unwrap().0,
+        LEN
+    );
+    assert_eq!(sink, [42; LEN]);
+}
+
 /// Bytes of a frame that arrived before the preamble and overlap it leave
 /// the buffers when the preamble is parsed:
 /// the session's and the stream's buffered counts both drop to 0, and the
@@ -110,9 +238,9 @@ fn preamble_overlap_leaves_the_buffers() {
     let p = pre.len();
     let mut data = pre[3..].to_vec();
     data.extend_from_slice(&[7; 100]);
-    b.on_stream(stream(3, &data), TY, now).unwrap();
+    b.on_stream(stream(3, &data), TY, now, None).unwrap();
     assert_eq!(b.streams.recv_flow().buffered, (p - 3 + 100) as u64);
-    b.on_stream(stream(0, &pre), TY, now).unwrap();
+    b.on_stream(stream(0, &pre), TY, now, None).unwrap();
     let k = key(&b, UNI);
     let mut sink = [0u8; 256];
     let (n, _) = b.read(k, &mut sink).unwrap().expect("data");
@@ -141,26 +269,28 @@ fn ranges_beyond_a_gap_merge() {
     let (_a, mut b, now) = pair();
     // Adjacent frames extend one range.
     for off in 2000..2200 {
-        b.on_stream(stream(off, &[1]), TY, now).unwrap();
+        b.on_stream(stream(off, &[1]), TY, now, None).unwrap();
     }
     // A frame that fills the gap between two ranges joins them.
-    b.on_stream(stream(1000, &[1; 500]), TY, now).unwrap();
-    b.on_stream(stream(1500, &[1; 500]), TY, now).unwrap();
+    b.on_stream(stream(1000, &[1; 500]), TY, now, None).unwrap();
+    b.on_stream(stream(1500, &[1; 500]), TY, now, None).unwrap();
     let r = b.streams.get(key(&b, UNI)).unwrap().recv.as_ref().unwrap();
-    assert_eq!(r.fragments(), 1);
+    assert_eq!(r.buf.gaps(&b.receive), 1);
     assert_eq!(r.held() - r.buf.len() as u64, 1200);
     let tokens = b.budget.tokens();
     // Small ranges at alternating offsets: held, never charged.
     for i in 0..10_000u64 {
-        b.on_stream(stream(150_000 + 2 * i, &[3]), TY, now).unwrap();
+        b.on_stream(stream(150_000 + 2 * i, &[3]), TY, now, None)
+            .unwrap();
     }
     assert_eq!(b.budget.tokens(), tokens);
     // Filling the gaps joins them all.
     for i in 0..10_000u64 {
-        b.on_stream(stream(150_001 + 2 * i, &[3]), TY, now).unwrap();
+        b.on_stream(stream(150_001 + 2 * i, &[3]), TY, now, None)
+            .unwrap();
     }
     let r = b.streams.get(key(&b, UNI)).unwrap().recv.as_ref().unwrap();
-    assert_eq!(r.fragments(), 2);
+    assert_eq!(r.buf.gaps(&b.receive), 2);
 }
 
 /// Bytes beyond a gap release session credit when they arrive; the gap
@@ -169,9 +299,11 @@ fn ranges_beyond_a_gap_merge() {
 fn gap_bytes_release_no_credit_before_they_arrive() {
     let (_a, mut b, now) = pair();
     let released = b.streams.recv_flow().released;
-    b.on_stream(stream(100_000, &[5; 1000]), TY, now).unwrap();
+    b.on_stream(stream(100_000, &[5; 1000]), TY, now, None)
+        .unwrap();
     assert_eq!(b.streams.recv_flow().released - released, 1000);
-    b.on_stream(stream(50_000, &[5; 1000]), TY, now).unwrap();
+    b.on_stream(stream(50_000, &[5; 1000]), TY, now, None)
+        .unwrap();
     assert_eq!(b.streams.recv_flow().released - released, 2000);
 }
 
@@ -182,13 +314,15 @@ fn bytes_received_is_distinct_and_monotonic() {
     let (_a, mut b, now) = pair();
     let pre = preamble();
     let p = pre.len() as u64;
-    b.on_stream(stream(p + 100, &[1; 100]), TY, now).unwrap();
+    b.on_stream(stream(p + 100, &[1; 100]), TY, now, None)
+        .unwrap();
     let k = key(&b, UNI);
     let got = |b: &SessionCore| b.stream_stats(k).unwrap().bytes_received;
     assert_eq!(got(&b), 0, "no application bytes before the preamble");
-    b.on_stream(stream(0, &pre), TY, now).unwrap();
+    b.on_stream(stream(0, &pre), TY, now, None).unwrap();
     assert_eq!(got(&b), 100);
-    b.on_stream(stream(p + 150, &[1; 100]), TY, now).unwrap();
+    b.on_stream(stream(p + 150, &[1; 100]), TY, now, None)
+        .unwrap();
     assert_eq!(got(&b), 150, "duplicates count once");
     // RESET_STREAM_AT below the held data drops it unread.
     b.on_reset(UNI, 9, p + 400, Some(p + 50), TY, now).unwrap();
@@ -201,18 +335,14 @@ fn drained_receive_buffers_release_their_capacity() {
     let (_a, mut b, now) = pair();
     let pre = preamble();
     let mut data = pre.clone();
-    data.extend_from_slice(&vec![4; 2 * RECV_KEEP]);
-    b.on_stream(stream(0, &data), TY, now).unwrap();
+    let size = 128 * 1024;
+    data.extend_from_slice(&vec![4; size]);
+    b.on_stream(stream(0, &data), TY, now, None).unwrap();
     let k = key(&b, UNI);
-    let mut sink = vec![0u8; 4 * RECV_KEEP];
+    let mut sink = vec![0u8; size];
     let (n, _) = b.read(k, &mut sink).unwrap().expect("data");
-    assert_eq!(n, 2 * RECV_KEEP);
-    let r = b.streams.get(k).unwrap().recv.as_ref().unwrap();
-    assert!(
-        r.buf.memory() <= RECV_KEEP,
-        "an idle stream keeps {} bytes",
-        r.buf.memory()
-    );
+    assert_eq!(n, size);
+    assert_eq!(b.receive_root_capacity(), 0);
 }
 
 /// A local stream's receiving part leaves the buffer cap's `n_local`
@@ -278,7 +408,7 @@ fn retired_read_buffers_stay_within_twice_the_referenced_bytes() {
             id: next,
             size: 128 * 1024,
         };
-        let used = b.receive_shared(PipeId(0), &Bytes::from(wire), backing, now);
+        let used = b.receive_buffer(PipeId(0), &Bytes::from(wire), backing, now);
         assert!(used > 0);
         while b.poll_event().is_some() {}
         // B's acknowledgements and credit.
@@ -447,7 +577,7 @@ fn consumption_rechecks_the_read_buffer_bound() {
             id: 2000 + next,
             size: 128 * 1024,
         };
-        b.receive_shared(PipeId(0), &Bytes::from(wire), backing, now);
+        b.receive_buffer(PipeId(0), &Bytes::from(wire), backing, now);
         while b.poll_event().is_some() {}
         let mut back = Vec::new();
         while b.wants_write(PipeId(0)) {
@@ -482,12 +612,13 @@ fn a_granted_datagram_the_queue_refuses_is_refunded() {
     c.dgram_mut().recv_bytes = cap;
     c.dgram_mut().held_bytes += 10;
     let mut staged = vec![super::super::ReceivedDatagram {
+        sequence: None,
         stream: None,
-        data: Bytes::from_static(&[1; 10]),
+        data: crate::Chunk::from_static(&[1; 10]),
         granted: Some(10),
     }];
     assert_eq!(c.admit_datagrams(&mut staged), 10, "the grant is refunded");
-    assert_eq!(c.stats.datagrams_dropped_recv, 1);
+    assert_eq!(c.stats().datagrams_dropped_recv, 1);
     assert_eq!(c.recv_datagram(c.now).unwrap(), None);
 }
 
@@ -498,12 +629,12 @@ fn pipe_snapshot_keeps_epoch_and_distinguishes_missing_lane_positions() {
     let initial = a.pipe_info(PipeId(0)).unwrap();
     assert_eq!(initial.epoch, Some(0));
     assert_eq!(initial.replace_by, now.checked_add(period * 2));
-    assert_eq!(initial.lanes, []);
+    assert_eq!(initial.lanes, [] as [crate::LaneStats; 0]);
     assert!(a.pipe_info(PipeId(99)).is_none());
 
     let outbound = a.out_mut(0).unwrap();
     let sent_lane = outbound.request_lane();
-    assert!(outbound.lane_attached(sent_lane, Framing::ByteStream, now));
+    assert!(outbound.lane_attached(sent_lane, Framing::ByteStream));
     let inbound_lane = (1 << 40) + 7;
     a.inp_mut(0)
         .unwrap()
@@ -628,7 +759,7 @@ fn stream_reset_and_stop_preserve_their_codes_and_reliable_size() {
     let mut data = preamble();
     let base = data.len() as u64;
     data.extend_from_slice(b"abc");
-    b.on_stream(stream(0, &data), TY, now).unwrap();
+    b.on_stream(stream(0, &data), TY, now, None).unwrap();
     b.on_reset(UNI, 42, base + 3, Some(base + 2), TY, now)
         .unwrap();
     let recv = key(&b, UNI);
@@ -662,6 +793,167 @@ fn stream_reset_and_stop_preserve_their_codes_and_reliable_size() {
 }
 
 #[test]
+fn a_shared_listener_advertises_more_streams_before_the_peer_blocks() {
+    use super::super::{BIDI, UNI, config::STAGED_UNI_STREAMS};
+    use crate::proto::memory::Ledger;
+
+    let now = Instant::now();
+    let ledger = Ledger::new(Some(crate::DEFAULT_MEMORY_BUDGET), None);
+    let config = Config::default();
+    let mut sender = SessionCore::new(config.clone(), Role::Client, None, now).unwrap();
+    let mut receiver =
+        SessionCore::new_in(config.into(), Role::Server, None, now, Some(ledger), 0).unwrap();
+    sender.attach_pipe(PipeId(0), Framing::ByteStream, now);
+    receiver.attach_pipe(PipeId(0), Framing::ByteStream, now);
+    pump(&mut sender, &mut receiver, now);
+    let initial = sender.streams.local_dir(BIDI).peer_max;
+    let (staged, target) = STAGED_UNI_STREAMS;
+    assert!(initial > 4);
+    assert_eq!(sender.streams.local_dir(UNI).peer_max, staged);
+
+    for i in 1..=initial.div_ceil(2) {
+        let key = sender.open(Dir::Bidi).unwrap();
+        assert_eq!(sender.write(key, b"x").unwrap(), 1);
+        pump(&mut sender, &mut receiver, now);
+        if i < initial.div_ceil(2) {
+            assert_eq!(sender.streams.local_dir(BIDI).peer_max, initial);
+        }
+    }
+    assert!(sender.streams.local_dir(BIDI).peer_max > initial);
+    assert_eq!(receiver.streams.remote_dir(BIDI).blocked_seen, None);
+    assert_eq!(receiver.accept(Dir::Uni).unwrap(), None);
+    pump(&mut sender, &mut receiver, now);
+    assert_eq!(sender.streams.local_dir(UNI).peer_max, target);
+}
+
+#[test]
+fn stop_and_reset_keep_advertised_max_data_backed() {
+    use crate::VarInt;
+
+    for stop_first in [false, true] {
+        let (_sender, mut recv, now) = pair();
+        let pre = preamble();
+        let start = pre.len() as u64;
+        recv.on_stream(stream(0, &pre), TY, now, None).unwrap();
+        let key = key(&recv, UNI);
+        recv.on_stream(stream(start + 32, &[1; 8]), TY, now, None)
+            .unwrap();
+        if stop_first {
+            recv.stop(key, VarInt::from_u32(43)).unwrap();
+        }
+        recv.on_reset(UNI, 42, start + 64, Some(start + 36), TY, now)
+            .unwrap();
+        if !stop_first {
+            recv.stop(key, VarInt::from_u32(43)).unwrap();
+        }
+        assert!(recv.streams.recv_flow().has_protected_history());
+
+        let limit = recv.streams.recv_flow().limit_sent;
+        assert_eq!(recv.reserve_receive_credit(0), limit);
+        let wanted = limit + 128;
+        let granted = recv.reserve_receive_credit(wanted);
+        assert_eq!(granted, wanted);
+        recv.streams.max_data_written(granted, now);
+
+        recv.on_reset(UNI, 42, start + 64, Some(start + 16), TY, now)
+            .unwrap();
+        assert!(!recv.streams.recv_flow().has_protected_history());
+        assert_eq!(recv.reserve_receive_credit(0), granted);
+        recv.on_stream(stream(start, &[2; 40]), TY, now, None)
+            .unwrap();
+        assert_eq!(
+            recv.streams.recv_flow().unsettled(granted),
+            granted - start - 64
+        );
+    }
+}
+
+#[test]
+fn fragmented_receive_heap_stays_within_promised_positions() {
+    use super::super::{memory::MIN_INITIAL, recv_store::ReceiveStore};
+    use proptest::{
+        collection::vec,
+        prelude::*,
+        test_runner::{Config as PropConfig, RngSeed, TestRunner},
+    };
+
+    let mut runner = TestRunner::new(PropConfig {
+        cases: 96,
+        rng_seed: RngSeed::Fixed(0x7A22_C190),
+        failure_persistence: None,
+        ..PropConfig::default()
+    });
+    // Every case fixes the connection's receive promise P. The two
+    // fragment phases straddle a STOP and a reliable RESET in either order.
+    let fragment = (0..MIN_INITIAL, 1usize..128, any::<u8>());
+    let fragments = vec(fragment, 64..192);
+    let now = Instant::now();
+    runner
+        .run(
+            &(fragments.clone(), fragments, 0..MIN_INITIAL, any::<bool>()),
+            |(before, after, cut, stop_first)| {
+                let config = Config {
+                    initial_connection_receive_window: MIN_INITIAL,
+                    ..config()
+                };
+                let (_sender, mut recv, _) = pair_with_config(config, Framing::ByteStream, now);
+                let pre = preamble();
+                let base = pre.len() as u64;
+                let reliable = base + cut % (MIN_INITIAL - base);
+                recv.on_stream(stream(0, &pre), TY, now, None).unwrap();
+                let key = key(&recv, UNI);
+                let limit = recv.streams.recv_flow().limit_sent;
+                prop_assert_eq!(limit, MIN_INITIAL);
+                let check = |recv: &SessionCore| {
+                    let queue = recv.streams.recv(key).map_or(0, RecvPart::memory);
+                    let heap_bytes = recv.receive.heap_bytes() + queue;
+                    prop_assert!(
+                        heap_bytes as u64 <= limit * ReceiveStore::POSITION_COST,
+                        "receive heap {heap_bytes} bytes exceeds the {limit}-position promise"
+                    );
+                    Ok(())
+                };
+                let deliver = |recv: &mut SessionCore, (offset, len, byte): (u64, usize, u8)| {
+                    let offset = base + offset % (limit - base);
+                    let len = len.min(usize::try_from(limit - offset).unwrap());
+                    recv.on_stream(stream(offset, &[byte; 128][..len]), TY, now, None)
+                        .unwrap();
+                    check(recv)
+                };
+                // Force holes and overlap, so even a shrunk counterexample
+                // exercises arrivals before and beyond the contiguous prefix.
+                for offset in (1..64).step_by(2) {
+                    deliver(&mut recv, (offset, 1, 0x71))?;
+                }
+                deliver(&mut recv, (8, 24, 0x25))?;
+                for fragment in before {
+                    deliver(&mut recv, fragment)?;
+                }
+                if stop_first {
+                    recv.stop(key, crate::VarInt::from_u32(43)).unwrap();
+                } else {
+                    recv.on_reset(UNI, 42, limit, Some(reliable), TY, now)
+                        .unwrap();
+                }
+                check(&recv)?;
+                for fragment in after {
+                    deliver(&mut recv, fragment)?;
+                }
+                if stop_first {
+                    recv.on_reset(UNI, 42, limit, Some(reliable), TY, now)
+                        .unwrap();
+                } else {
+                    recv.stop(key, crate::VarInt::from_u32(43)).unwrap();
+                }
+                check(&recv)?;
+                recv.on_reset(UNI, 42, limit, Some(base), TY, now).unwrap();
+                check(&recv)
+            },
+        )
+        .unwrap();
+}
+
+#[test]
 fn resume_grace_uses_the_configured_duration_before_the_peer_cap() {
     let now = Instant::now();
     let mut local = config();
@@ -685,4 +977,35 @@ fn resume_grace_uses_the_configured_duration_before_the_peer_cap() {
         b.mp.as_ref().unwrap().suspension().deadline(),
         now.checked_add(Duration::from_millis(2))
     );
+}
+
+#[cfg(all(feature = "test-hooks", feature = "tokio", not(loom)))]
+#[test]
+fn refused_splice_read_preserves_reliable_offset_and_credit() {
+    let (mut sender, mut receiver, now) = pair();
+    let open = sender.open(Dir::Bidi).unwrap();
+    sender.write(open, b"unread").unwrap();
+    pump(&mut sender, &mut receiver, now);
+    let key = receiver.accept(Dir::Bidi).unwrap().unwrap();
+    assert!(receiver.test_read_loan_slots(0));
+    let before = receiver.stream_stats(key).unwrap();
+    let held = receiver.receive_root_capacity();
+    let refused = receiver.read_splice_chunk(
+        key,
+        6,
+        |_| panic!("destination root check ran with no receive loan"),
+        |_| false,
+    );
+    assert!(matches!(refused, Err(crate::StreamError::BorrowLimit)));
+    let after = receiver.stream_stats(key).unwrap();
+    assert_eq!(after.bytes_read, before.bytes_read);
+    assert_eq!(after.recv_buffered, before.recv_buffered);
+    assert_eq!(receiver.receive_root_capacity(), held);
+    let (_, _, chunk) = receiver
+        .read_splice_chunk(key, 6, |_| unreachable!(), |size| size == 6)
+        .unwrap()
+        .unwrap();
+    assert!(chunk.copied);
+    assert_eq!(&*chunk.data, b"unread");
+    assert_eq!(receiver.stream_stats(key).unwrap().bytes_read, 6);
 }

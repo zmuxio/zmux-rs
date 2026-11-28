@@ -6,7 +6,7 @@ use std::io;
 use std::time::Duration;
 
 use zmux::proto::seal::{Framing, RecordMode};
-use zmux::{AdmittedValue, CarrierKind};
+use zmux::{AdmittedValue, CarrierKind, ClockDomain};
 
 use crate::establish::read_frame;
 use crate::exporter_of;
@@ -27,7 +27,7 @@ pub(crate) trait Carrier: Sized + Send {
     fn early_data_possible(&self) -> bool;
     /// What a wait of the handshake ends with: the carrier's shutdown on the std driver.
     type Wait: Send + Sync;
-    fn wait(&self) -> Self::Wait;
+    fn wait(&self, clock: &ClockDomain) -> Self::Wait;
     /// Waits as a shaper said.
     fn sleep(wait: &Self::Wait, d: Duration) -> impl Future<Output = ()> + Send;
     /// Reads one unit, failing with `TimedOut` once `limit` passes. The std driver's reads
@@ -35,15 +35,23 @@ pub(crate) trait Carrier: Sized + Send {
     /// one the read is not bounded.
     fn read_unit_within(
         &mut self,
+        clock: &ClockDomain,
         framing: Framing,
         buf: &mut Vec<u8>,
         limit: Duration,
-    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send;
+    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
+        async move {
+            let deadline = clock.now().checked_add(limit);
+            zmux::adapter::while_open(clock.sleep_until(deadline), read_frame(self, framing, buf))
+                .await
+                .unwrap_or_else(|| Err(timed_out()))
+        }
+    }
     /// The carrier of a finished handshake; `rest` is what was read beyond it.
     fn finish(self, rest: Vec<u8>, complete: zmux_seal_proto::Complete, mode: RecordMode) -> Self;
     fn admitted(self, value: AdmittedValue) -> Self;
     /// With the padding bytes the handshake added.
-    fn padded(self, bytes: u64) -> Self;
+    fn with_establish_receipts(self, receipts: zmux::shaping::EstablishReceipts) -> Self;
     /// The carrier with what was read of it first.
     fn replay(self, read: Vec<u8>) -> Self;
 }
@@ -70,20 +78,12 @@ impl Carrier for zmux::PipeIo {
     fn early_data_possible(&self) -> bool {
         zmux::PipeIo::early_data_possible(self)
     }
-    type Wait = ();
-    fn wait(&self) {}
-    async fn sleep((): &(), d: Duration) {
-        tokio::time::sleep(d).await;
+    type Wait = ClockDomain;
+    fn wait(&self, clock: &ClockDomain) -> ClockDomain {
+        clock.clone()
     }
-    async fn read_unit_within(
-        &mut self,
-        framing: Framing,
-        buf: &mut Vec<u8>,
-        limit: Duration,
-    ) -> io::Result<Vec<u8>> {
-        tokio::time::timeout(limit, read_frame(self, framing, buf))
-            .await
-            .unwrap_or_else(|_| Err(timed_out()))
+    async fn sleep(clock: &ClockDomain, d: Duration) {
+        clock.sleep_until(clock.now().checked_add(d)).await;
     }
     fn finish(self, rest: Vec<u8>, complete: zmux_seal_proto::Complete, mode: RecordMode) -> Self {
         let keep = complete.exporter_only();
@@ -98,8 +98,8 @@ impl Carrier for zmux::PipeIo {
     fn admitted(self, value: AdmittedValue) -> Self {
         self.with_admitted(value)
     }
-    fn padded(self, bytes: u64) -> Self {
-        self.with_handshake_padding(bytes)
+    fn with_establish_receipts(self, receipts: zmux::shaping::EstablishReceipts) -> Self {
+        self.with_establish_receipts(receipts)
     }
     fn replay(self, read: Vec<u8>) -> Self {
         self.with_prefix(read)
@@ -134,7 +134,7 @@ impl Carrier for zmux::blocking::PipeIo {
         false
     }
     type Wait = zmux::blocking::HandshakeWait;
-    fn wait(&self) -> Self::Wait {
+    fn wait(&self, _: &ClockDomain) -> Self::Wait {
         self.handshake_wait()
     }
     async fn sleep(wait: &Self::Wait, d: Duration) {
@@ -142,6 +142,7 @@ impl Carrier for zmux::blocking::PipeIo {
     }
     async fn read_unit_within(
         &mut self,
+        _: &ClockDomain,
         framing: Framing,
         buf: &mut Vec<u8>,
         limit: Duration,
@@ -167,8 +168,8 @@ impl Carrier for zmux::blocking::PipeIo {
     fn admitted(self, value: AdmittedValue) -> Self {
         self.with_admitted(value)
     }
-    fn padded(self, bytes: u64) -> Self {
-        self.with_handshake_padding(bytes)
+    fn with_establish_receipts(self, receipts: zmux::shaping::EstablishReceipts) -> Self {
+        self.with_establish_receipts(receipts)
     }
     fn replay(self, read: Vec<u8>) -> Self {
         self.with_prefix(read)

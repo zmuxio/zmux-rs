@@ -1,66 +1,12 @@
-//! A pool policy read from configuration. Times are microseconds, proportions parts per
-//! million.
-
-use std::collections::HashMap;
-use std::fmt;
+//! Pool profile values compiled into session controller targets.
 
 use crate::error::{Error, err};
-use crate::json::{Json, parse};
+use crate::json::Json;
+#[cfg(feature = "tokio")]
 use crate::machine::Options;
 use crate::value::{
-    ALL_SCOPES, FREE_SCOPES, Family, Reader, Sampler, Scope, Value, int, jitter_with, parse_value,
-    to_u32,
+    ALL_SCOPES, FREE_SCOPES, Family, Reader, Sampler, Scope, Value, int, parse_value, to_u32,
 };
-
-/// A member of a pool as a [`MachinePoolPolicy`] sees it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct PoolMember {
-    /// The member's ID; values of scope `pipe` are kept per ID.
-    pub id: u64,
-    /// Microseconds since it was added.
-    pub age: u64,
-    /// Microseconds since it last carried traffic.
-    pub idle: u64,
-    /// Pipes it carries.
-    pub pipes: u64,
-    /// Bytes sent.
-    pub bytes_sent: u64,
-    /// Bytes received.
-    pub bytes_received: u64,
-}
-
-impl PoolMember {
-    /// The member `id`, every metric zero.
-    #[must_use]
-    pub fn new(id: u64) -> Self {
-        Self {
-            id,
-            ..Self::default()
-        }
-    }
-}
-
-/// The answer of [`MachinePoolPolicy::decide_members`], the policy's values as it
-/// evaluates them, out of range ones included (building the pool's `PoolDecision` from
-/// them, in [`zmux::helpers::PoolPolicy::decide`], is where one is refused); `None` and
-/// an empty list keep the pool's own behaviour.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct MemberDecision {
-    /// Members to keep.
-    pub count: Option<u64>,
-    /// Earliest next dial after the last one, microseconds.
-    pub dial_after: Option<u64>,
-    /// IDs of members to retire, in the order given, each once.
-    pub retire: Vec<u64>,
-    /// Decide again within this many microseconds, even if nothing changes; never 0.
-    pub recheck: Option<u64>,
-    /// The idle-probe interval of the pipes added from now on, microseconds; 0: none.
-    pub probe_interval: Option<u64>,
-    /// Their idle-probe jitter, parts per million.
-    pub probe_jitter: Option<u32>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Metric {
@@ -76,23 +22,14 @@ impl Metric {
     const fn timed(self) -> bool {
         matches!(self, Self::Age | Self::Idle)
     }
-
-    const fn of(self, m: &PoolMember) -> u64 {
-        match self {
-            Self::Age => m.age,
-            Self::Idle => m.idle,
-            Self::Pipes => m.pipes,
-            Self::BytesSent => m.bytes_sent,
-            Self::BytesReceived => m.bytes_received,
-            Self::Bytes => m.bytes_sent.saturating_add(m.bytes_received),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 struct Rule {
+    #[cfg(feature = "tokio")]
     metric: Metric,
     above: Value,
+    #[cfg(feature = "tokio")]
     jitter: u32,
 }
 
@@ -105,7 +42,6 @@ pub(crate) struct PoolSpec {
     rules: Vec<Rule>,
     probe_interval: Option<Value>,
     probe_jitter: Option<u32>,
-    pipe_slots: usize,
 }
 
 fn jitter(x: &Json, what: &str) -> Result<u32, Error> {
@@ -171,9 +107,6 @@ impl PoolSpec {
             }
         }
         if let Some(p) = x.get("probe_interval") {
-            // A drawn value outside 0 or [10^6, 10^15] is the decision's to
-            // refuse ([`MemberDecision::validate`], reported to the pool's
-            // `decision_rejected`): the shared vectors accept it here.
             let v = parse_value(p, Family::Time, tables, FREE_SCOPES, "probe_interval")?;
             s.probe_interval = Some(v);
         }
@@ -214,10 +147,15 @@ impl PoolSpec {
             Family::Counter
         };
         let above = q.get("above").ok_or_else(|| err("type", "retire.above"))?;
+        let jitter = q.get("jitter").map_or(Ok(0), |j| jitter(j, "jitter"))?;
+        #[cfg(not(feature = "tokio"))]
+        let _ = jitter;
         Ok(Rule {
+            #[cfg(feature = "tokio")]
             metric,
             above: parse_value(above, fam, tables, ALL_SCOPES, "above")?,
-            jitter: q.get("jitter").map_or(Ok(0), |j| jitter(j, "jitter"))?,
+            #[cfg(feature = "tokio")]
+            jitter,
         })
     }
 
@@ -229,272 +167,63 @@ impl PoolSpec {
         for v in &mut self.dial_after {
             v.settle(s, shared);
         }
-        let mut slots = 0;
-        for r in &mut self.rules {
-            if r.above.scope == Scope::Pipe {
-                r.above.slot = slots;
-                slots += 1;
-            } else {
-                r.above.settle(s, shared);
+        for rule in &mut self.rules {
+            if rule.above.scope != Scope::Pipe {
+                rule.above.settle(s, shared);
             }
         }
-        self.pipe_slots = slots;
         if let Some(v) = &mut self.probe_interval {
             v.settle(s, shared);
         }
     }
 }
 
-/// The wait for the next dial that a `dial_jitter` draw belongs to.
-#[derive(Clone, Copy)]
-struct DialWait {
-    failures: u32,
-    since_dial: Option<u64>,
-    u: u64,
-}
+#[cfg(feature = "tokio")]
+impl PoolSpec {
+    pub(crate) fn session_group(
+        &self,
+        id: String,
+        candidates: Vec<zmux::TargetCandidate>,
+        options: &Options,
+    ) -> zmux::GroupTarget {
+        use std::time::Duration;
+        use zmux::{Directions, GroupTarget, MemberQuota, RotationPolicy};
 
-/// What is kept per member: its `pipe` values, and the draw of each rule's jitter.
-struct Kept {
-    values: Vec<Option<u64>>,
-    jitter: Vec<u64>,
-}
-
-/// A pool policy: each decision sets the count, the delay of the next dial from the entry
-/// of `dial_after` for the number of consecutive failures (the last entry for any higher
-/// number), and lists the members for which a `retire` rule's metric exceeds its threshold.
-pub struct MachinePoolPolicy {
-    spec: PoolSpec,
-    sampler: Sampler,
-    wait: Option<DialWait>,
-    members: HashMap<u64, Kept>,
-}
-
-impl fmt::Debug for MachinePoolPolicy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MachinePoolPolicy")
-            .field("members", &self.members.len())
-            .finish_non_exhaustive()
-    }
-}
-
-/// Reads a pool policy: a JSON object with the optional members `count`, `dial_after`,
-/// `dial_jitter`, `retire` (`metric`, `above`, `jitter`), `probe_interval`, `probe_jitter`.
-///
-/// # Errors
-///
-/// See [`MachinePoolPolicy::from_json`].
-pub fn pool_policy(json: &[u8], options: Options) -> Result<MachinePoolPolicy, Error> {
-    MachinePoolPolicy::from_json(json, options)
-}
-
-impl MachinePoolPolicy {
-    /// See [`pool_policy`].
-    ///
-    /// # Errors
-    ///
-    /// Fails if `json` exceeds the input limit, is not valid JSON, or has an unknown,
-    /// mistyped or out-of-range member.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "public signature; `pool_policy` hands its options over"
-    )]
-    pub fn from_json(json: &[u8], options: Options) -> Result<Self, Error> {
-        options.limits.input(json.len())?;
-        let mut spec = PoolSpec::parse(&parse(json)?, &Reader::new(None, options.limits))?;
         let mut sampler = options.sampler();
-        spec.settle(&mut sampler, &mut Vec::new());
-        Ok(Self {
-            spec,
-            sampler,
-            wait: None,
-            members: HashMap::new(),
-        })
-    }
-
-    pub(crate) fn from_spec(spec: PoolSpec, options: &Options) -> Self {
-        Self {
-            spec,
-            sampler: options.sampler(),
-            wait: None,
-            members: HashMap::new(),
-        }
-    }
-
-    /// Decides for a pool whose members are `members`, whose dials failed `failures` times
-    /// in a row and whose last dial started `since_dial` microseconds ago. Values kept for
-    /// IDs not in `members` are dropped; a member seen for the first time draws its rules'
-    /// jitter.
-    pub fn decide_members(
-        &mut self,
-        failures: u32,
-        since_dial: Option<u64>,
-        members: &[PoolMember],
-        out: &mut MemberDecision,
-    ) {
-        let mut recheck: Option<u64> = None;
-        let mut soon = |x: u64| recheck = Some(recheck.map_or(x, |r: u64| r.min(x)));
-        self.members
-            .retain(|id, _| members.iter().any(|m| m.id == *id));
-        if let Some(v) = &self.spec.count {
-            out.count = Some(self.sampler.draw(v));
-        }
-        if !self.spec.dial_after.is_empty() {
-            let k = (failures as usize).min(self.spec.dial_after.len() - 1);
-            let x = self.sampler.draw(&self.spec.dial_after[k]);
-            let u = self.wait_draw(failures, since_dial);
-            let x = if self.spec.dial_jitter > 0 {
-                jitter_with(u, x, self.spec.dial_jitter)
-            } else {
-                x
-            };
-            out.dial_after = Some(x);
-            if let Some(left) = since_dial.map(|s| x.saturating_sub(s)).filter(|l| *l > 0) {
-                soon(left);
+        let count = self.count.as_ref().map_or(1, |count| sampler.draw(count));
+        let mut rotation = RotationPolicy::default();
+        for rule in &self.rules {
+            let mut limit = sampler.draw(&rule.above);
+            if rule.jitter != 0 {
+                limit = crate::value::jitter_with(sampler.next_u64(), limit, rule.jitter);
             }
-        }
-        if let Some(v) = &self.spec.probe_interval {
-            out.probe_interval = Some(self.sampler.draw(v));
-            out.probe_jitter = self.spec.probe_jitter;
-        }
-        for m in members {
-            if !self.members.contains_key(&m.id) {
-                let jitter = (0..self.spec.rules.len())
-                    .map(|r| {
-                        if self.spec.rules[r].jitter > 0 {
-                            self.sampler.next_u64()
-                        } else {
-                            0
-                        }
-                    })
-                    .collect();
-                let values = vec![None; self.spec.pipe_slots];
-                self.members.insert(m.id, Kept { values, jitter });
+            if limit == 0 {
+                continue;
             }
-            let mut fires: Option<u64> = None;
-            let mut retired = false;
-            for r in 0..self.spec.rules.len() {
-                let t = self.threshold(r, m.id);
-                let rule = &self.spec.rules[r];
-                let x = rule.metric.of(m);
-                if x > t {
-                    if !out.retire.contains(&m.id) {
-                        out.retire.push(m.id);
-                    }
-                    retired = true;
-                    break;
+            match rule.metric {
+                Metric::Age => {
+                    let limit = Duration::from_micros(limit);
+                    rotation.max_age = Some(rotation.max_age.map_or(limit, |age| age.min(limit)));
                 }
-                if rule.metric.timed() {
-                    let left = (t - x).max(1);
-                    fires = Some(fires.map_or(left, |f| f.min(left)));
-                }
-            }
-            if let Some(f) = fires.filter(|_| !retired) {
-                soon(f);
+                Metric::BytesSent => update_minimum(&mut rotation.send_bytes, limit),
+                Metric::BytesReceived => update_minimum(&mut rotation.receive_bytes, limit),
+                Metric::Idle | Metric::Pipes | Metric::Bytes => {}
             }
         }
-        out.recheck = recheck;
-    }
-
-    fn threshold(&mut self, r: usize, id: u64) -> u64 {
-        let rule = &self.spec.rules[r];
-        let kept = self.members.get_mut(&id).expect("seen above");
-        let v = if rule.above.scope == Scope::Pipe {
-            *kept.values[rule.above.slot].get_or_insert_with(|| self.sampler.draw(&rule.above))
-        } else {
-            self.sampler.draw(&rule.above)
-        };
-        if rule.jitter > 0 {
-            jitter_with(kept.jitter[r], v, rule.jitter)
-        } else {
-            v
+        GroupTarget {
+            id,
+            quotas: vec![MemberQuota {
+                id: "members".into(),
+                count: crate::value::to_usize(count),
+                directions: Directions::BOTH,
+                candidates,
+            }],
+            rotation,
         }
-    }
-
-    /// The `dial_jitter` draw of the current wait: the previous decision's, unless a new
-    /// wait started.
-    fn wait_draw(&mut self, failures: u32, since_dial: Option<u64>) -> u64 {
-        if self.spec.dial_jitter == 0 {
-            return 0;
-        }
-        let same = self.wait.is_some_and(|w| {
-            w.failures == failures
-                && match (w.since_dial, since_dial) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => b >= a,
-                    _ => false,
-                }
-        });
-        let u = match self.wait {
-            Some(w) if same => w.u,
-            _ => self.sampler.next_u64(),
-        };
-        self.wait = Some(DialWait {
-            failures,
-            since_dial,
-            u,
-        });
-        u
     }
 }
 
 #[cfg(feature = "tokio")]
-impl zmux::helpers::PoolPolicy for MachinePoolPolicy {
-    /// Members are the view's members (ID = their first pipe's); failures are the
-    /// pool's consecutive failed dials; the next dial waits the delay from the start of
-    /// the last dial (or of the pool); retired members are replaced now. The values of
-    /// [`MachinePoolPolicy::decide_members`] are given to the `PoolDecision` as they are;
-    /// one it refuses (an idle-probe interval in (0, 1 s)) is returned as the error,
-    /// which the pool rejects and reports.
-    fn decide(
-        &mut self,
-        view: &zmux::helpers::PoolView<'_>,
-        out: &mut zmux::helpers::PoolDecision,
-    ) -> Result<(), zmux::helpers::PolicyError> {
-        use std::time::Duration;
-        let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-        let members: Vec<PoolMember> = view
-            .members
-            .iter()
-            .map(|m| PoolMember {
-                id: m.pipe.get(),
-                age: micros(m.age),
-                idle: micros(m.idle),
-                pipes: m.pipes as u64,
-                bytes_sent: m.bytes_sent,
-                bytes_received: m.bytes_received,
-            })
-            .collect();
-        let mut d = MemberDecision::default();
-        let since = view.since_last_dial.map(micros);
-        self.decide_members(view.failures, since, &members, &mut d);
-        // The decision's setters refuse a value out of range; the error is the
-        // pool's rejection: the default decision applies and it is reported.
-        if let Some(c) = d
-            .count
-            .and_then(|c| std::num::NonZeroUsize::new(usize::try_from(c).unwrap_or(usize::MAX)))
-        {
-            out.set_count(c);
-        }
-        if let Some(after) = d.dial_after {
-            out.set_dial_after(Duration::from_micros(after));
-        }
-        out.set_retire_pipes(d.retire.into_iter().map(zmux::PipeId::new));
-        if let Some(r) = d.recheck {
-            out.set_recheck(Duration::from_micros(r))?;
-        }
-        // The jitter is within bounds from the policy's construction, the interval
-        // is refused by `set_liveness`. A file's 0 turns the probes off.
-        if d.probe_interval.is_some() || d.probe_jitter.is_some() {
-            let mut live = zmux::PipeLiveness::default();
-            if let Some(i) = d.probe_interval {
-                live.probe_interval =
-                    zmux::Inherit::Set((i != 0).then(|| Duration::from_micros(i)));
-            }
-            if let Some(j) = d.probe_jitter {
-                live.probe_jitter = zmux::Inherit::Set(f64::from(j) / 1e6);
-            }
-            out.set_liveness(live)?;
-        }
-        Ok(())
-    }
+fn update_minimum(value: &mut Option<u64>, limit: u64) {
+    *value = Some(value.map_or(limit, |current| current.min(limit)));
 }

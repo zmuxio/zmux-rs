@@ -128,7 +128,7 @@ fn the_stream_bytes_bound_each_stream_queue() {
     let kib4 = 4 * 1024;
     let (got, dropped) = to_an_unread_stream(
         config(|c| {
-            c.datagram_stream_bytes = Some(16 * 1024);
+            c.datagram_config_mut().stream_receive_bytes = Some(16 * 1024);
             c.datagram_receive_bytes = 1000;
         }),
         10,
@@ -140,7 +140,7 @@ fn the_stream_bytes_bound_each_stream_queue() {
 
     let (got, dropped) = to_an_unread_stream(
         config(|c| {
-            c.datagram_stream_bytes = None;
+            c.datagram_config_mut().stream_receive_bytes = None;
             c.datagram_receive_bytes = 1000;
         }),
         10,
@@ -150,8 +150,11 @@ fn the_stream_bytes_bound_each_stream_queue() {
     assert_eq!(dropped, 0);
 
     // A datagram larger than the bound alone is kept alone.
-    let (got, dropped) =
-        to_an_unread_stream(config(|c| c.datagram_stream_bytes = Some(1000)), 2, 1500);
+    let (got, dropped) = to_an_unread_stream(
+        config(|c| c.datagram_config_mut().stream_receive_bytes = Some(1000)),
+        2,
+        1500,
+    );
     assert_eq!(got, [(0, Bytes::from(vec![1; 1500]))]);
     assert_eq!(dropped, 1);
 
@@ -168,7 +171,7 @@ fn zero_is_not_a_queue_size() {
         |c| c.datagram_receive_queue = 0,
         |c| c.datagram_stream_queue = 0,
         |c| c.datagram_receive_bytes = 0,
-        |c| c.datagram_stream_bytes = Some(0),
+        |c| c.datagram_config_mut().stream_receive_bytes = Some(0),
     ];
     for set in sets {
         let r = SessionCore::new(config(set), Role::Client, None, Instant::now());
@@ -217,7 +220,7 @@ fn a_stream_queue_read_late_drops_by_sojourn() {
         config(|_| {}),
         config(|c| {
             c.datagram_stream_queue = 1000;
-            c.datagram_stream_bytes = None;
+            c.datagram_config_mut().stream_receive_bytes = None;
         }),
     );
     let k = p.a.open(Dir::Bidi).unwrap();

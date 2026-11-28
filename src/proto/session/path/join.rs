@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use crate::proto::frame::{Frame, JoinDirection};
+use crate::proto::frame::{Frame, Frames, Gates, JoinDirection, Stream};
 use crate::proto::ident::{Classifier, FirstRecord, Verdict};
 use crate::proto::record::Framing;
 use crate::proto::seal::join::{
@@ -21,12 +21,12 @@ use crate::proto::session::pipes::{
     Attachment, InPipe, InState, OutPipe, OutState, PipeHalf, SentFrame,
 };
 use crate::proto::session::shaping::{
-    PlanAnswer, UnitPlan, first_batch_limit, fit_item, join_hello_len, join_reply_len, message_len,
-    pad_fill, pad_item, reply_room, varint_len,
+    JoinUnit, PlanAnswer, UnitPlan, first_batch_limit, fit_item, join_hello_len, join_reply_len,
+    message_len, reply_room, varint_len,
 };
 use crate::proto::session::{
-    CoreEvent, InvalidConfig, PipeDirection, PipeError, PipeFailure, PipeId, PipeOptions,
-    SessionCore, State, check_record_limit,
+    CoreEvent, InvalidConfig, JoinFirstBatch, PipeDirection, PipeError, PipeFailure, PipeId,
+    PipeOptions, SessionCore, State, check_record_limit,
 };
 use crate::proto::{Error, TransportErrorCode as T, keys};
 
@@ -271,6 +271,7 @@ pub(in crate::proto::session) struct LocalJoin {
     proven: Option<Proven>,
     /// The one leading transport parameters record was consumed.
     leading_seen: bool,
+    work: Option<super::super::memory::JoinWork>,
 }
 
 impl std::fmt::Debug for LocalJoin {
@@ -287,12 +288,14 @@ impl LocalJoin {
         mode: RecordMode,
         binding: Vec<u8>,
         group: Option<u64>,
+        work: Option<super::super::memory::JoinWork>,
     ) -> Self {
         Self {
             id,
             mode: Some(mode),
             binding,
             group,
+            work,
             ..Self::default()
         }
     }
@@ -308,11 +311,13 @@ const PADDING_ITEM: u64 = 0;
 #[non_exhaustive]
 pub struct JoinFinished {
     /// The confirmation, possibly empty.
-    pub confirm: Vec<u8>,
+    pub confirm: JoinUnit,
     /// The record directions in Sealed.
     pub records: JoinRecords,
     /// The handshake's exporter.
     pub finished: Box<Finished>,
+    // Retains the grant until the caller has finished writing Confirm.
+    _work: Option<super::super::memory::JoinWork>,
 }
 
 impl std::fmt::Debug for JoinFinished {
@@ -378,9 +383,14 @@ pub struct PeerJoin {
     key_group: u64,
     /// The epoch of the Hello's key.
     epoch: u64,
+    auth_generation: u64,
+    deadline: Option<Instant>,
+    pending: Option<std::sync::Arc<()>>,
+    locator: Vec<u8>,
     suite: &'static Suite,
     payload: Payload,
     state: PeerJoinState,
+    _work: Option<super::super::memory::JoinWork>,
 }
 
 enum PeerJoinState {
@@ -400,6 +410,18 @@ impl std::fmt::Debug for PeerJoin {
 }
 
 impl PeerJoin {
+    /// The policy generation when the Hello was authenticated.
+    #[must_use]
+    pub const fn auth_generation(&self) -> u64 {
+        self.auth_generation
+    }
+
+    /// The epoch whose keys authenticated this Hello.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// The Hello's join pipe item.
     #[must_use]
     pub fn pipe(&self) -> &JoinPipe {
@@ -410,6 +432,31 @@ impl PeerJoin {
     #[must_use]
     pub fn mode(&self) -> RecordMode {
         self.mode
+    }
+
+    /// Structure of the authenticated first batch.
+    #[must_use]
+    pub fn first_batch(&self) -> JoinFirstBatch {
+        JoinFirstBatch::parse(self.payload.frames().unwrap_or_default())
+    }
+
+    /// Direction of the requested attachment at the acceptor.
+    #[must_use]
+    pub fn direction(&self) -> PipeDirection {
+        match self.pipe.direction {
+            0 => PipeDirection::In,
+            1 => PipeDirection::Out,
+            _ => PipeDirection::Bidi,
+        }
+    }
+
+    /// Whether this attachment needs an inbound half and an outbound half.
+    pub(crate) fn halves(&self) -> (bool, bool) {
+        let direction = self.direction();
+        (
+            direction != PipeDirection::Out,
+            direction != PipeDirection::In,
+        )
     }
 
     /// Reads the joiner's confirmation at the start of `input`: `Ok(Some(consumed))` once
@@ -462,6 +509,8 @@ pub enum OpenedHello {
     /// The Hello's Locator is not one the session accepts now (an epoch deleted it): an
     /// unknown Locator, given the listener's reject policy. Nothing is written.
     UnknownLocator,
+    /// This session could not reserve memory to open and process the Hello.
+    MemoryBudget,
     /// Close the carrier and write nothing: a replay, a session that cannot take joins.
     Close,
     /// The Hello did not verify: close the carrier. Reported as
@@ -477,10 +526,19 @@ pub enum OpenedHello {
 /// What [`SessionCore::claim_hello`] did.
 #[derive(Debug)]
 pub enum ClaimedHello {
-    /// Write this Reply: the carrier is Unconfirmed and waits for the confirmation.
-    Accept(Vec<u8>),
+    /// Write the Reply and wait for confirmation where required.
+    Accept {
+        /// The successful Reply.
+        reply: JoinUnit,
+        /// Setup carriers whose pending confirmations this Claim evicted.
+        evicted: Vec<crate::proto::listener::CarrierId>,
+    },
     /// Write this Reply and close the carrier: decision 1.
-    Refuse(Vec<u8>),
+    Refuse(JoinUnit),
+    /// The session changed the authorization generation before the claim.
+    AuthorizationChanged,
+    /// The current policy requires a known local carrier source.
+    UnknownSource,
     /// Close the carrier and write nothing.
     Close,
 }
@@ -496,6 +554,12 @@ pub enum ConfirmedJoin {
     },
     /// The cap no longer allows it: close the carrier. `PIPE_ABANDON` goes on another pipe.
     Refused,
+    /// The session changed the authorization generation after the Reply.
+    AuthorizationChanged,
+    /// A newer authenticated Join evicted this pending confirmation.
+    Evicted,
+    /// The current policy requires a known local carrier source.
+    UnknownSource,
     /// Close the carrier: the session is ending.
     Close,
 }
@@ -505,14 +569,21 @@ impl std::fmt::Debug for ConfirmedJoin {
         match self {
             Self::Attached { pipe, .. } => f.debug_tuple("Attached").field(pipe).finish(),
             Self::Refused => f.write_str("Refused"),
+            Self::AuthorizationChanged => f.write_str("AuthorizationChanged"),
+            Self::Evicted => f.write_str("Evicted"),
+            Self::UnknownSource => f.write_str("UnknownSource"),
             Self::Close => f.write_str("Close"),
         }
     }
 }
 
 /// What the acceptor's carrier provides and how it stands to the session.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PeerCarrier {
+    /// The listener's setup identity, when a listener owns this carrier.
+    pub setup: Option<crate::proto::listener::CarrierId>,
+    /// The adapter's verified routes for the carrier halves.
+    pub sources: super::super::CarrierHalfSources,
     /// The acceptor can read it.
     pub inbound: Option<Framing>,
     /// The acceptor can write it.
@@ -523,6 +594,23 @@ pub struct PeerCarrier {
     pub overhead: u16,
     /// The bytes received on it: at least what the Hello consumed.
     pub received: usize,
+}
+
+/// Pending confirmation identity under the session owner. The handshake
+/// holds the strong reference so dropping it gives up its slot.
+#[derive(Debug)]
+struct PendingPeer {
+    token: std::sync::Weak<()>,
+    setup: Option<crate::proto::listener::CarrierId>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct PendingPeers(std::collections::VecDeque<PendingPeer>);
+
+impl PendingPeers {
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Whether bytes in `b` begin as one leading transport parameters record: its length, or
@@ -597,6 +685,17 @@ impl SessionCore {
         }))
     }
 
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn local_join_work(&self, pipe: PipeId) -> Option<super::super::memory::JoinWork> {
+        self.mp
+            .as_deref()?
+            .local_joins
+            .iter()
+            .find(|j| j.id == pipe.0)?
+            .work
+            .clone()
+    }
+
     fn other_usable(&self, id: u64) -> bool {
         self.atts
             .iter()
@@ -611,7 +710,7 @@ impl SessionCore {
         (framing, overhead): (Framing, u16),
         plan: &UnitPlan,
         now: Instant,
-    ) -> Result<Vec<u8>, PipeError> {
+    ) -> Result<JoinUnit, PipeError> {
         self.tick(now);
         if self.state >= State::Closing {
             return Err(PipeError::NotEstablished);
@@ -680,7 +779,14 @@ impl SessionCore {
         // The frames item stays within what the Hello's ciphertext holds.
         let hello_room = (u16::MAX as usize).saturating_sub(item_len + suite.tag_len());
         let limit = fit_item(hello_room).map_or(0, |v| v.min(limit));
-        let batch = self.first_batch(id, limit);
+        #[cfg(all(feature = "tokio", not(loom)))]
+        let mut handoffs = Vec::new();
+        let batch = self.first_batch(
+            id,
+            limit,
+            #[cfg(all(feature = "tokio", not(loom)))]
+            &mut handoffs,
+        );
         let plain_len = item_len
             + if batch.is_empty() {
                 0
@@ -688,12 +794,11 @@ impl SessionCore {
                 item_size(batch.len())
             };
         let w = unit(plain_len);
-        let gap = plan.pad_for(w).cast_signed() - w.cast_signed();
         // The padding stays within the Hello's ciphertext and its message floor.
         let room = (u16::MAX as usize)
             .saturating_sub(plain_len + suite.tag_len())
             .min(floor_room(w, usize::from(overhead)));
-        let padding = pad_item(gap, room);
+        let padding = self.join_padding_item(plan, w, room);
         let zeros = vec![0; padding.unwrap_or(0)];
         let mut items: Vec<(u64, &[u8])> = Vec::with_capacity(3);
         if padding.is_some() {
@@ -704,10 +809,17 @@ impl SessionCore {
             items.push((FRAMES_ITEM, &batch));
         }
         let payload = encode_payload(&items);
-        let (wire, sent) = joiner
-            .write_hello(&payload)
+        let extra = padding.map_or(0, item_size);
+        let offset = w - usize::from(overhead) - plain_len - suite.tag_len();
+        let (wire, sent) = self
+            .seal_shaped_join(offset, extra, || joiner.write_hello(&payload))
             .map_err(|_| PipeError::InvalidArgument)?;
-        self.shaping_spend(padding.map_or(0, |v| item_size(v) as u64));
+        #[cfg(all(feature = "tokio", not(loom)))]
+        let wire = {
+            let mut wire = wire;
+            wire.handoffs = handoffs;
+            wire
+        };
         let j = &mut self.mp_mut().local_joins[i];
         j.framing = Some(framing);
         j.overhead = overhead;
@@ -722,10 +834,30 @@ impl SessionCore {
         Ok(wire)
     }
 
+    pub(crate) fn join_shaping_limits(&self) -> crate::shaping::Limits {
+        if self.shape_budget.is_some() {
+            self.shaping_limits_in_force()
+        } else {
+            self.shaping_limits()
+        }
+    }
+
+    fn join_padding_item(&self, plan: &UnitPlan, baseline: usize, room: usize) -> Option<usize> {
+        if self.shaping_limits().no_padding {
+            return None;
+        }
+        let allowance = plan.handshake_room(baseline, room);
+        fit_item(allowance)
+    }
+
     /// Counts a handshake shaper's answer about a message of a Join.
     pub fn note_join_plan(&mut self, answer: PlanAnswer) -> UnitPlan {
         match answer {
-            PlanAnswer::Plan(p) => return p,
+            PlanAnswer::Plan(mut plan) => {
+                plan.apply_limits(&self.join_shaping_limits());
+                self.note_join_delay(plan.delay);
+                return plan;
+            }
             PlanAnswer::Unplanned => self.join_shaping.unplanned += 1,
             PlanAnswer::Fault => self.join_shaping.faults += 1,
         }
@@ -803,7 +935,7 @@ impl SessionCore {
             return self.join_failed(id, now);
         };
         let consumed = skip + used;
-        self.stats.join_failures = 0;
+        self.mp_mut().counters.join_failures = 0;
         if proven.payload().join_accepted() == Some(false) {
             self.mp_mut().end_local_join(id);
             self.join_declined(id, now);
@@ -848,14 +980,26 @@ impl SessionCore {
         };
         let w = message_len(framing == Framing::ByteStream, body, overhead);
         let room = room.min(floor_room(w, overhead));
-        let zeros = pad_fill(plan.pad_for(w).cast_signed() - w.cast_signed(), room);
-        let Ok((confirm, finished)) = proven.write_confirm(zeros) else {
+        let zeros = if self.shaping_limits().no_padding {
+            0
+        } else {
+            plan.handshake_room(w, room)
+        };
+        let head = usize::from(framing == Framing::ByteStream && body != 0) * 2;
+        let offset = if mode == RecordMode::Trusted {
+            head + body
+        } else {
+            head
+        };
+        let Ok((confirm, finished)) =
+            self.seal_shaped_join(offset, zeros, || proven.write_confirm(zeros))
+        else {
             self.join_failed(id, now);
             return Err(PipeError::Failed(PipeFailure::JoinFailed));
         };
-        self.shaping_spend(zeros as u64);
         let mut finished = Box::new(finished);
         let records = finished.take_records();
+        let work = self.mp_mut().local_joins[i].work.take();
         self.mp_mut().end_local_join(id);
         self.epoch_attached(id, epoch, now);
         self.join_proven(id, mode, now);
@@ -866,6 +1010,7 @@ impl SessionCore {
             confirm,
             records,
             finished,
+            _work: work,
         })
     }
 
@@ -953,7 +1098,7 @@ impl SessionCore {
             return OpenedHello::Close;
         };
         if mp.keys.pending() {
-            self.stats.join_pending += 1;
+            self.mp_mut().counters.join_pending += 1;
             return OpenedHello::KeyWait;
         }
         if !self.accepts_locator(hello.locator()) {
@@ -976,7 +1121,7 @@ impl SessionCore {
         let epoch = self
             .accepted_epochs()
             .into_iter()
-            .find(|e| e & 1 == u64::from(hello.phase()));
+            .find(|e| e & 1 == u64::from(hello.phase()) && self.accepts_join_epoch(*e));
         let psk = epoch.and_then(|e| keys.epoch(e)?.psk(hello.suite().value(), peer_initiator));
         // No accepted epoch of this phase: a key no joiner has, so that the Hello fails
         // as any wrong key does.
@@ -985,6 +1130,9 @@ impl SessionCore {
             self.stats.join_auth_failures += 1;
             self.push_event(CoreEvent::JoinAuthFailed { reason: "auth" });
             return OpenedHello::AuthFailed;
+        };
+        let Ok(work) = self.reserve_join_work() else {
+            return OpenedHello::MemoryBudget;
         };
         let opened = Acceptor::open(
             hello,
@@ -1019,7 +1167,7 @@ impl SessionCore {
         let mp = self.mp();
         if !mp.is_local(id) && (self.att_index(id).is_some() || self.is_retired(id)) {
             // Step 6: a replay, or too late.
-            self.stats.join_replays += 1;
+            self.mp_mut().counters.join_replays += 1;
             return OpenedHello::Close;
         }
         if mp.is_local(id) {
@@ -1029,46 +1177,72 @@ impl SessionCore {
             );
             return OpenedHello::Fatal;
         }
-        self.epoch_peer_joined(epoch, now);
         OpenedHello::Verified(Box::new(PeerJoin {
             pipe,
             epoch,
+            auth_generation: self.session_policy().auth_generation,
+            deadline: self.now.checked_add(self.config.join_wait()),
+            pending: None,
+            locator: hello.locator().to_vec(),
             mode: hello.mode(),
             key_group: opened.group().value(),
             suite: hello.suite(),
             payload,
             state: PeerJoinState::Opened(opened),
+            _work: work,
         }))
     }
 
-    /// The rest of step 7: sets the Pipe ID's bit, applies the first batch and writes the
-    /// Reply under `plan` with its read-only decision. It changes no pipe, cap or
-    /// suspension. Before Confirmed, a Reply in Sealed or Bound keeps within three times
-    /// the bytes received, padding included.
+    /// The rest of step 7, after local authorization. Rechecks the authenticated
+    /// Hello against the live session, sets the replay bit and prepares the Reply.
+    /// The epoch and the first batch are committed after key exchange succeeds.
+    /// Before Confirmed, a Reply in Sealed or Bound keeps within three times the
+    /// bytes received, padding included.
     pub fn claim_hello(
         &mut self,
         join: &mut PeerJoin,
-        carrier: PeerCarrier,
+        carrier: &PeerCarrier,
         plan: &UnitPlan,
         now: Instant,
     ) -> ClaimedHello {
         self.tick(now);
-        let id = join.pipe.id;
-        let replayed = self.att_index(id).is_some() || self.is_retired(id);
-        if self.state >= State::Closing || self.mp.is_none() || replayed {
-            self.stats.join_replays += u64::from(replayed);
+        if join.auth_generation != self.session_policy().auth_generation {
+            return ClaimedHello::AuthorizationChanged;
+        }
+        if self.state >= State::Closing
+            || self.mp.is_none()
+            || join.deadline.is_some_and(|limit| self.now >= limit)
+        {
             return ClaimedHello::Close;
         }
-        self.use_peer_id(id, true);
-        let (want_in, want_out) = wanted(join.pipe.direction);
-        let refuse = (want_in && carrier.inbound.is_none())
-            || (want_out && carrier.outbound.is_none())
-            || carrier.looped
-            || !self.room_predicted(false, want_in, want_out);
+        if !self
+            .session_policy()
+            .permits_join_sources(Some(&carrier.sources), join.halves())
+        {
+            return ClaimedHello::UnknownSource;
+        }
+        let id = join.pipe.id;
+        let replayed = self.att_index(id).is_some() || self.is_retired(id);
+        if replayed {
+            self.mp_mut().counters.join_replays += 1;
+            return ClaimedHello::Close;
+        }
+        // Authorization and the reply plan can run while another carrier advances
+        // the epoch. The opened Hello still holds its cryptographic state, so test
+        // the epoch and locator here before claiming its ID.
+        if !self.accepts_locator(&join.locator) || !self.accepts_join_epoch(join.epoch) {
+            return ClaimedHello::Close;
+        }
         let PeerJoinState::Opened(opened) = std::mem::replace(&mut join.state, PeerJoinState::Gone)
         else {
             return ClaimedHello::Close;
         };
+        self.use_peer_id(id, true);
+        let (want_in, want_out) = join.halves();
+        let refuse = (want_in && carrier.inbound.is_none())
+            || (want_out && carrier.outbound.is_none())
+            || carrier.looped
+            || !self.room_predicted(false, want_in, want_out);
         let decision = [u8::from(refuse)];
         let framing = carrier
             .outbound
@@ -1086,7 +1260,7 @@ impl SessionCore {
         if join.mode != RecordMode::Trusted {
             room = room.min(reply_room(carrier.received, w, 0).1);
         }
-        let padding = pad_item(plan.pad_for(w).cast_signed() - w.cast_signed(), room);
+        let padding = self.join_padding_item(plan, w, room);
         let zeros = vec![0; padding.unwrap_or(0)];
         let mut items: Vec<(u64, &[u8])> = Vec::with_capacity(2);
         if padding.is_some() {
@@ -1096,64 +1270,159 @@ impl SessionCore {
         let payload = encode_payload(&items);
         // The key exchange runs only now, with the Pipe ID's bit set: a replayed Hello costs
         // at most its AEAD. A refused share closes the carrier and leaves the bit set.
-        let (reply, wait) = match opened.write_reply(&payload) {
-            Ok(v) => v,
-            Err(seal::Error::Kex) => {
-                self.stats.join_auth_failures += 1;
-                self.push_event(CoreEvent::JoinAuthFailed { reason: "kex" });
-                return ClaimedHello::Close;
-            }
-            Err(_) => return ClaimedHello::Close,
-        };
-        self.shaping_spend(padding.map_or(0, |v| item_size(v) as u64));
-        if let Some(frames) = join.payload.frames().map(<[u8]>::to_vec) {
-            self.apply_batch(&frames, now);
-        }
-        join.state = PeerJoinState::AwaitConfirm(wait);
-        // A Bound carrier is Confirmed by the Hello having passed.
-        if join.mode == RecordMode::Bound && !refuse {
-            let _ = join.read_confirm(&[]);
+        let extra = padding.map_or(0, item_size);
+        let offset = w - usize::from(carrier.overhead) - plain_len - join.suite.tag_len();
+        let (reply, wait) =
+            match self.seal_shaped_join(offset, extra, || opened.write_reply(&payload)) {
+                Ok(v) => v,
+                Err(seal::Error::Kex) => {
+                    self.stats.join_auth_failures += 1;
+                    self.push_event(CoreEvent::JoinAuthFailed { reason: "kex" });
+                    return ClaimedHello::Close;
+                }
+                Err(_) => return ClaimedHello::Close,
+            };
+        self.epoch_peer_joined(join.epoch, now);
+        if let Some(frames) = join.payload.frames() {
+            self.apply_batch(frames, now);
         }
         if refuse {
-            ClaimedHello::Refuse(reply)
-        } else {
-            ClaimedHello::Accept(reply)
+            return ClaimedHello::Refuse(reply);
         }
+        join.state = PeerJoinState::AwaitConfirm(wait);
+        let evicted = if join.mode == RecordMode::Bound {
+            // A Bound carrier is Confirmed by the Hello having passed.
+            let _ = join.read_confirm(&[]);
+            Vec::new()
+        } else {
+            self.hold_peer_join(join, carrier.setup)
+        };
+        ClaimedHello::Accept { reply, evicted }
+    }
+
+    fn hold_peer_join(
+        &mut self,
+        join: &mut PeerJoin,
+        setup: Option<crate::proto::listener::CarrierId>,
+    ) -> Vec<crate::proto::listener::CarrierId> {
+        let limit = self.session_policy().limits.pending_peer_joins.get();
+        let pending = &mut self.mp_mut().join_control.get_or_insert_default().pending.0;
+        pending.retain(|p| p.token.strong_count() != 0);
+        let evict = (pending.len() + 1).saturating_sub(limit);
+        let evicted = pending.drain(..evict).filter_map(|p| p.setup).collect();
+        let token = std::sync::Arc::new(());
+        pending.push_back(PendingPeer {
+            token: std::sync::Arc::downgrade(&token),
+            setup,
+        });
+        join.pending = Some(token);
+        evicted
+    }
+
+    fn release_peer_join(&mut self, join: &PeerJoin) -> bool {
+        if join.mode == RecordMode::Bound {
+            return true;
+        }
+        let (Some(token), Some(mp)) = (&join.pending, self.mp.as_mut()) else {
+            return false;
+        };
+        let token = std::sync::Arc::downgrade(token);
+        let Some(control) = &mut mp.join_control else {
+            return false;
+        };
+        let mut found = false;
+        control.pending.0.retain(|p| {
+            let matches = p.token.ptr_eq(&token);
+            found |= matches;
+            !matches && p.token.strong_count() != 0
+        });
+        if control.idle() {
+            mp.join_control = None;
+        }
+        found
+    }
+
+    /// Releases the session's protocol slot for a peer Join whose carrier
+    /// has exited before confirmation.
+    pub fn cancel_peer_join(&mut self, join: &PeerJoin) {
+        self.release_peer_join(join);
+    }
+
+    /// Number of peer Joins holding a protocol confirmation slot.
+    #[must_use]
+    pub fn pending_peer_joins(&self) -> usize {
+        self.mp
+            .as_ref()
+            .and_then(|mp| mp.join_control.as_ref())
+            .map_or(0, |control| {
+                control
+                    .pending
+                    .0
+                    .iter()
+                    .filter(|p| p.token.strong_count() != 0)
+                    .count()
+            })
     }
 
     /// Step 8: the only place where a peer join moves a pipe, the cap or a suspension.
     pub fn confirm_join(
         &mut self,
         join: PeerJoin,
-        carrier: PeerCarrier,
+        carrier: &PeerCarrier,
         now: Instant,
     ) -> ConfirmedJoin {
         self.tick(now);
-        if self.state >= State::Closing {
+        if !self.release_peer_join(&join) {
+            return if join.pending.is_some() {
+                ConfirmedJoin::Evicted
+            } else {
+                ConfirmedJoin::Close
+            };
+        }
+        if join.auth_generation != self.session_policy().auth_generation {
+            return ConfirmedJoin::AuthorizationChanged;
+        }
+        if !self
+            .session_policy()
+            .permits_join_sources(Some(&carrier.sources), join.halves())
+        {
+            return ConfirmedJoin::UnknownSource;
+        }
+        if self.state >= State::Closing
+            || join.deadline.is_some_and(|limit| self.now >= limit)
+            || !self.accepts_locator(&join.locator)
+            || !self.accepts_join_epoch(join.epoch)
+        {
             return ConfirmedJoin::Close;
         }
+        let direction = join.direction();
+        let (want_in, want_out) = join.halves();
         let PeerJoinState::Confirmed(mut finished) = join.state else {
             return ConfirmedJoin::Close;
         };
         let j = join.pipe;
         let id = j.id;
-        let (want_in, want_out) = wanted(j.direction);
-        if carrier.looped || !self.room_for_join(false, want_in, want_out, now) {
+        if (want_in && carrier.inbound.is_none())
+            || (want_out && carrier.outbound.is_none())
+            || carrier.looped
+            || !self.room_for_join(false, want_in, want_out, now)
+        {
             self.add_unattached(id, T::ZMUX_PIPE_RESOURCE_LIMIT.0, None);
             self.after_pipe_change(now);
             return ConfirmedJoin::Refused;
         }
         let seq = self.next_att_seq();
         let mut att = Attachment::accepted(id, j.fate_group, seq);
+        if carrier.sources.send.route.is_some() || carrier.sources.receive.route.is_some() {
+            self.mp_mut()
+                .join_control
+                .get_or_insert_default()
+                .peer_sources
+                .insert(id, carrier.sources.clone());
+        }
         att.set_mode(join.mode);
         att.set_key_group(join.key_group);
-        att.set_options(
-            &PipeOptions::new().with_direction(match (want_in, want_out) {
-                (true, false) => PipeDirection::In,
-                (false, true) => PipeDirection::Out,
-                _ => PipeDirection::Bidi,
-            }),
-        );
+        att.set_options(&PipeOptions::new().with_direction(direction));
         let sealed = join.mode == RecordMode::Sealed;
         let framed = |f: Framing| if sealed { Framing::Records } else { f };
         let max = self.local_tp().max_record_size();
@@ -1190,22 +1459,39 @@ impl SessionCore {
     /// Applies frames of a verified Hello or Reply: STREAM without FIN only. A frame in
     /// error is dropped and counted and never closes the session, because a batch can be
     /// a replay; it counts in no position and acknowledges nothing.
-    fn apply_batch(&mut self, mut bytes: &[u8], now: Instant) {
-        while !bytes.is_empty() {
-            let Ok((frame, used)) = Frame::decode(bytes, &self.receive_gates()) else {
-                self.stats.join_batch_dropped += 1;
-                return;
-            };
-            bytes = &bytes[used..];
-            match frame {
-                Frame::Stream(f) if !f.fin => {
-                    if self.batch_stream(f, now).is_err() {
-                        self.stats.join_batch_dropped += 1;
-                    }
-                }
-                _ => self.stats.join_batch_dropped += 1,
+    fn apply_batch(&mut self, bytes: &[u8], now: Instant) {
+        for frame in batch_streams(bytes) {
+            if frame.is_none_or(|stream| self.batch_stream(stream, now).is_err()) {
+                self.mp_mut().counters.join_batch_dropped += 1;
             }
         }
+    }
+}
+
+fn batch_streams(bytes: &[u8]) -> impl Iterator<Item = Option<Stream<'_>>> {
+    // This checks the batch grammar. Negotiated gates for normal records do
+    // not change which frames can be skipped in a first batch.
+    Frames::new(bytes, Gates::ALL).map(|frame| match frame {
+        Ok(Frame::Stream(stream)) if !stream.fin => Some(stream),
+        _ => None,
+    })
+}
+
+impl JoinFirstBatch {
+    fn parse(bytes: &[u8]) -> Self {
+        let mut summary = Self {
+            encoded_bytes: bytes.len(),
+            ..Self::default()
+        };
+        for frame in batch_streams(bytes) {
+            if let Some(stream) = frame {
+                summary.stream_frames += 1;
+                summary.stream_bytes += stream.data.len();
+            } else {
+                summary.malformed = true;
+            }
+        }
+        summary
     }
 }
 
@@ -1234,10 +1520,6 @@ fn unknown_phase_key_in(
     Some(&key[..len.min(64)])
 }
 
-fn wanted(direction: u8) -> (bool, bool) {
-    (direction != 1, direction != 0)
-}
-
 impl SessionCore {
     /// The first batch of `id`'s Hello: unacknowledged and unsent stream data, as STREAM
     /// frames without FIN, while no other outbound pipe is usable. New bytes count as sent
@@ -1245,7 +1527,14 @@ impl SessionCore {
     /// since the batch counts in no position, all it carries goes again as reinjected
     /// information and the receiver deduplicates. A new stream's ID is allocated here and
     /// not cancelled afterwards.
-    fn first_batch(&mut self, id: u64, limit: usize) -> Vec<u8> {
+    fn first_batch(
+        &mut self,
+        id: u64,
+        limit: usize,
+        #[cfg(all(feature = "tokio", not(loom)))] handoffs: &mut Vec<
+            super::super::splice_handoff::HandoffSpan,
+        >,
+    ) -> Vec<u8> {
         if limit == 0
             || self.other_usable(id)
             || self.atts.get(id).is_none_or(|a| a.out().is_none())
@@ -1273,6 +1562,16 @@ impl SessionCore {
                 .and_then(|s| Some((s.id?, s.send.as_ref()?)))
                 .and_then(|(id, send)| {
                     let (frame, new) = send.first_batch_frame(id, left, room)?;
+                    #[cfg(all(feature = "tokio", not(loom)))]
+                    {
+                        let app_start = frame.off.max(send.base);
+                        let payload =
+                            frame.data.len() - crate::util::usize_sat(app_start - frame.off);
+                        send.buf
+                            .visit_handoffs(app_start - send.mp().buf_floor, payload, |part| {
+                                handoffs.push(part);
+                            });
+                    }
                     Some((id, frame, new))
                 })
             else {
@@ -1337,7 +1636,7 @@ impl SessionCore {
         now: Instant,
     ) -> Result<(), Error> {
         let ty = Frame::Stream(frame).frame_type().0;
-        self.on_stream(frame, ty, now)
+        self.on_stream(frame, ty, now, None)
     }
 
     /// The carrier of a JOINING attachment failed.
@@ -1373,8 +1672,21 @@ impl SessionCore {
 
 #[cfg(test)]
 mod tests {
-    use super::unknown_phase_key_in;
+    use super::{JoinFirstBatch, unknown_phase_key_in};
     use std::sync::OnceLock;
+
+    #[test]
+    fn first_batch_summary_counts_only_non_fin_stream_data() {
+        // STREAM with length and three bytes, PADDING, STREAM with FIN
+        // and one byte, another valid STREAM, then a truncated frame.
+        let batch = b"\x0a\x00\x03abc\x00\x0b\x00\x01d\x0a\x04\x01e\x0a";
+        let summary = JoinFirstBatch::parse(batch);
+        assert_eq!(summary.encoded_bytes, batch.len());
+        assert_eq!(summary.stream_frames, 2);
+        assert_eq!(summary.stream_bytes, 4);
+        assert!(summary.malformed);
+        assert!(!JoinFirstBatch::parse(&batch[..6]).malformed);
+    }
 
     #[test]
     fn unknown_phase_key_never_falls_back_to_a_constant() {

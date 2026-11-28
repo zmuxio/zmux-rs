@@ -6,6 +6,7 @@
 //! ```text
 //! Channel Datagram {
 //!   Pipe Stream ID (i),     -- on shared channels only
+//!   [PADDING (..)],        -- when negotiated
 //!   DATAGRAM Frame (..),    -- type 0x30, no Length field
 //! }
 //! ```
@@ -18,6 +19,48 @@
 use super::{Datagram, Frame, FrameType, Gates};
 use crate::proto::error::{EncodeError, Error};
 use crate::proto::varint;
+
+/// A routing varint in the buffer passed to the carrier for one datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prefix {
+    /// This channel belongs to the pipe and needs no routing prefix.
+    None,
+    /// zmux's Pipe Stream ID on a shared carrier channel.
+    Pipe(u64),
+    /// A carrier-owned prefix, such as an HTTP Datagram Quarter Stream ID.
+    Carrier(u64),
+}
+
+impl Prefix {
+    /// The varint to encode, if present.
+    #[must_use]
+    pub const fn id(self) -> Option<u64> {
+        match self {
+            Self::None => None,
+            Self::Pipe(id) | Self::Carrier(id) => Some(id),
+        }
+    }
+
+    /// The bytes belonging to the framing below zmux.
+    #[must_use]
+    pub const fn outer_bytes(self) -> usize {
+        match self {
+            Self::Carrier(id) => varint::len(id),
+            _ => 0,
+        }
+    }
+}
+
+impl From<Option<u64>> for Prefix {
+    fn from(id: Option<u64>) -> Self {
+        id.map_or(Self::None, Self::Pipe)
+    }
+}
+
+/// Maximum frame area of a channel datagram that carries leading padding.
+pub(crate) fn max_padded_frame_len() -> usize {
+    crate::util::usize_sat(crate::proto::params::ZMUX_MAX_RECORD_SIZE)
+}
 
 /// The bytes before the DATAGRAM frame's data: the Pipe Stream ID `id`
 /// when present, and the frame type 0x30.
@@ -75,13 +118,25 @@ pub fn split(datagram: &[u8]) -> Option<(u64, &[u8])> {
     Some((id, &datagram[n..]))
 }
 
-/// Decodes the frame of a channel datagram, which must be exactly one
-/// DATAGRAM frame of type 0x30 that `gates` accepts; anything else
-/// (another or a truncated frame, a Length field, bytes after it) is a
-/// `PROTOCOL_VIOLATION`. The data borrows from `frame`.
-pub fn decode_frame<'a>(frame: &'a [u8], gates: &Gates) -> Result<Datagram<'a>, Error> {
+/// Decodes a single Length-less DATAGRAM frame with optional negotiated leading padding.
+/// The data borrows from `frame`.
+pub fn decode_frame<'a>(
+    mut frame: &'a [u8],
+    gates: &Gates,
+    padding: bool,
+) -> Result<Datagram<'a>, Error> {
     const NOT_ONE: &str = "channel datagram is not one DATAGRAM frame without Length";
     let ty = FrameType::DATAGRAM.0;
+    if padding && frame.first() == Some(&0) {
+        if frame.len() > max_padded_frame_len() {
+            return Err(Error::protocol_violation(
+                ty,
+                "padded channel datagram exceeds 65535 bytes",
+            ));
+        }
+        let start = frame.iter().position(|&b| b != 0).unwrap_or(frame.len());
+        frame = &frame[start..];
+    }
     if frame.first() != Some(&DATAGRAM_TYPE) {
         return Err(Error::protocol_violation(ty, NOT_ONE));
     }
@@ -105,7 +160,7 @@ mod tests {
                 assert_eq!(b.len(), datagram_len(Some(id), data.len()));
                 let (got, frame) = split(&b).expect("split");
                 assert_eq!(got, id);
-                let d = decode_frame(frame, &gates).expect("decode");
+                let d = decode_frame(frame, &gates, false).expect("decode");
                 assert_eq!(d.data, data);
                 assert!(!d.explicit_len);
             }
@@ -114,6 +169,25 @@ mod tests {
         assert_eq!(encode(None, b"x"), [0x30, b'x']);
         assert_eq!(datagram_len(None, 1), 2);
         assert_eq!(header_len(Some(64)), 3);
+    }
+
+    #[test]
+    fn negotiated_padding_is_bounded_and_preserves_the_payload() {
+        let gates = Gates::ALL;
+        let bytes = [0, 0, 0, 0x30, 0, 0, b'a', 0];
+        let (id, frame) = split(&bytes).unwrap();
+        assert_eq!(id, 0);
+        assert!(decode_frame(frame, &gates, false).is_err());
+        assert_eq!(
+            decode_frame(frame, &gates, true).unwrap().data,
+            [0, 0, b'a', 0]
+        );
+        assert!(decode_frame(&[0; 3], &gates, true).is_err());
+        let mut max = vec![0; max_padded_frame_len()];
+        max[max_padded_frame_len() - 1] = 0x30;
+        assert!(decode_frame(&max, &gates, true).is_ok());
+        max.push(0);
+        assert!(decode_frame(&max, &gates, true).is_err());
     }
 
     #[test]
@@ -130,7 +204,7 @@ mod tests {
             ("non-minimal type", &[0x40, 0x30, b'x'][..]),
             ("stream frame", &[0x08, 0x00, b'x'][..]),
         ] {
-            let e = decode_frame(b, &gates).expect_err(name);
+            let e = decode_frame(b, &gates, false).expect_err(name);
             assert_eq!(
                 e.code(),
                 crate::proto::TransportErrorCode::PROTOCOL_VIOLATION,
@@ -139,12 +213,12 @@ mod tests {
         }
         // Not announced, or larger than announced.
         let none = Gates::NONE;
-        assert!(decode_frame(&[0x30, 1], &none).is_err());
+        assert!(decode_frame(&[0x30, 1], &none, false).is_err());
         let small = Gates {
             max_datagram_frame_size: 2,
             ..Gates::ALL
         };
-        assert!(decode_frame(&[0x30, 1], &small).is_ok());
-        assert!(decode_frame(&[0x30, 1, 2], &small).is_err());
+        assert!(decode_frame(&[0x30, 1], &small, false).is_ok());
+        assert!(decode_frame(&[0x30, 1, 2], &small, false).is_err());
     }
 }

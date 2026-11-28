@@ -92,6 +92,8 @@ pub fn feed_join(
         st.buf.extend_from_slice(bytes);
     }
     let carrier = PeerCarrier {
+        setup: None,
+        sources: zmux::CarrierHalfSources::default(),
         inbound: Some(BS),
         outbound: Some(BS),
         looped: false,
@@ -106,18 +108,24 @@ pub fn feed_join(
                 return fed;
             }
             OpenedHello::Verified(mut join) => {
-                match session.claim_hello(&mut join, carrier, &UnitPlan::default(), now) {
-                    ClaimedHello::Accept(reply) => {
-                        fed.reply = reply;
+                match session.claim_hello(&mut join, &carrier, &UnitPlan::default(), now) {
+                    ClaimedHello::Accept { mut reply, .. } => {
+                        let len = reply.len();
+                        session.complete_join_write(&mut reply, len, false, now);
+                        fed.reply = reply.to_vec();
                         st.join = Some(join);
                     }
-                    ClaimedHello::Refuse(reply) => {
-                        fed.reply = reply;
+                    ClaimedHello::Refuse(mut reply) => {
+                        let len = reply.len();
+                        session.complete_join_write(&mut reply, len, false, now);
+                        fed.reply = reply.to_vec();
                         st.close(listener);
                         fed.joined = Joined::Refused;
                         return fed;
                     }
-                    ClaimedHello::Close => {
+                    ClaimedHello::Close
+                    | ClaimedHello::AuthorizationChanged
+                    | ClaimedHello::UnknownSource => {
                         st.close(listener);
                         fed.joined = Joined::Refused;
                         return fed;
@@ -146,7 +154,7 @@ pub fn feed_join(
         }
     }
     let join = st.join.take().expect("held above");
-    fed.joined = match session.confirm_join(*join, carrier, now) {
+    fed.joined = match session.confirm_join(*join, &carrier, now) {
         ConfirmedJoin::Attached { pipe, .. } => {
             let rest = std::mem::take(&mut st.buf);
             session.receive(pipe, &rest, now);
@@ -204,11 +212,13 @@ pub fn feed_reply(
             JoinStep::Verified { consumed, .. } => {
                 input.drain(..consumed);
                 let plan = UnitPlan::default();
-                let confirm = session
+                let mut confirm = session
                     .join_finish(pipe, &plan, now)
                     .map_err(|_| ())?
                     .confirm;
-                return Ok(Some((confirm, std::mem::take(input))));
+                let len = confirm.len();
+                session.complete_join_write(&mut confirm, len, false, now);
+                return Ok(Some((confirm.to_vec(), std::mem::take(input))));
             }
             JoinStep::Declined | JoinStep::Failed => return Err(()),
         }
@@ -228,9 +238,11 @@ pub fn join_at_once(
         .join_prepare(pipe, now)
         .expect("a joining pipe")
         .expect("not deferred");
-    let hello = joiner
+    let mut hello = joiner
         .join_hello(pipe, (BS, 0), &UnitPlan::default(), now)
         .expect("a joining pipe");
+    let len = hello.len();
+    joiner.complete_join_write(&mut hello, len, false, now);
     let mut st = Accepting::default();
     let fed = feed_join(listener, acceptor, &mut st, pipe.get(), &hello, now);
     if fed.joined != Joined::Pending {

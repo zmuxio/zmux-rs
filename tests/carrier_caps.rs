@@ -64,8 +64,8 @@ async fn the_write_overhead_reaches_the_shaper_factory() {
     .unwrap();
 }
 
-#[tokio::test(start_paused = true)]
-async fn pipe_stats_seed_at_attachment_and_return_the_cache() {
+#[tokio::test]
+async fn pipe_stats_start_native_sampling_on_explicit_read() {
     use zmux::{CarrierCounts, CarrierSource, PipeDirection};
 
     let (a, b) = tokio::io::duplex(1 << 16);
@@ -86,11 +86,21 @@ async fn pipe_stats_seed_at_attachment_and_return_the_cache() {
     );
     let client = client.unwrap();
     let server = server.unwrap();
-    assert_eq!(calls.load(Relaxed), 1);
+    assert_eq!(calls.load(Relaxed), 0);
     assert!(server.pipe_stats().remove(0).carrier_sample.is_none());
 
     let pipe = client.pipes().remove(0);
-    let initial = pipe.stats().unwrap().carrier_sample.unwrap();
+    assert!(pipe.stats().unwrap().carrier_sample.is_none());
+    let initial = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(sample) = pipe.stats().unwrap().carrier_sample {
+                break sample;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the requested native sample was never published");
     assert_eq!(initial.direction, PipeDirection::Out);
     assert_eq!(initial.generation, 0);
     assert_eq!(
@@ -100,9 +110,6 @@ async fn pipe_stats_seed_at_attachment_and_return_the_cache() {
             packets_lost: 0,
         })
     );
-    tokio::time::advance(Duration::from_millis(999)).await;
-    assert_eq!(client.pipe_stats().remove(0).carrier_sample, Some(initial));
-    assert_eq!(calls.load(Relaxed), 1);
 }
 
 #[tokio::test]
@@ -113,7 +120,7 @@ async fn receive_only_pipes_never_register_or_query() {
 
     tokio::time::timeout(LIMIT, async {
         let mut cfg = Config::default();
-        cfg.max_pipes = 4;
+        cfg.session_policy.limits.steady_attachments = 4;
         cfg.pipe_auth = PipeAuth::psk([7; 32]).with_end_to_end();
         let listener = Listener::new(cfg.clone(), ListenerConfig::default()).unwrap();
         let (a, b) = tokio::io::duplex(65536);
@@ -143,7 +150,7 @@ async fn receive_only_pipes_never_register_or_query() {
             let mut options = PipeOptions::default();
             options.direction = direction;
             let (added, setup) = tokio::join!(
-                client.add_pipe(near, options),
+                client.test_join(near, options),
                 listener.handle_pipe(far, PipeHint::default()),
             );
             setup.unwrap();

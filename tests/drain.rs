@@ -219,7 +219,7 @@ async fn an_aborted_carrier_drops_its_drain_unrun() {
     use zmux::{Listener, ListenerConfig, PipeAuth, PipeHint, PipeId, PipeOptions};
     let held = Arc::new(Held::default());
     let mut config = Config::default();
-    config.max_pipes = 4;
+    config.session_policy.limits.steady_attachments = 4;
     config.pipe_auth = PipeAuth::psk(*b"drain-abort-test-0123456789abcde").with_end_to_end();
     let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
     let carrier = |drain: Option<&Arc<Held>>| {
@@ -244,7 +244,7 @@ async fn an_aborted_carrier_drops_its_drain_unrun() {
         .unwrap();
     let server = listener.accept().await.unwrap();
     client
-        .add_pipe(carrier(None), PipeOptions::default())
+        .test_join(carrier(None), PipeOptions::default())
         .await
         .unwrap();
     client.pipe(PipeId::new(0)).unwrap().abort().unwrap();
@@ -265,7 +265,7 @@ async fn a_joined_carriers_unused_half_arms_its_drain() {
     use zmux::{Listener, ListenerConfig, PipeAuth, PipeDirection, PipeHint, PipeOptions};
     let held = Arc::new(Held::default());
     let mut config = Config::default();
-    config.max_pipes = 4;
+    config.session_policy.limits.steady_attachments = 4;
     config.pipe_auth = PipeAuth::psk(*b"drain-unused-test-0123456789abcd").with_end_to_end();
     let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
     let carrier = || {
@@ -286,7 +286,7 @@ async fn a_joined_carriers_unused_half_arms_its_drain() {
     let mut only_in = PipeOptions::default();
     only_in.direction = PipeDirection::In;
     client
-        .add_pipe(
+        .test_join(
             carrier().with_drain(endless(&held), Duration::from_millis(200)),
             only_in,
         )

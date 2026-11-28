@@ -11,28 +11,13 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 
 use crate::helpers::capsule::{self, Decoded, Decoder, MAX_HEADER};
-use crate::proto::session::Preamble;
+pub use crate::proto::session::SendPolicy;
+use crate::proto::session::{PacketAdmission, Preamble};
 use crate::proto::{ApplicationErrorCode, VarInt, varint};
 use crate::{DatagramError, OpenError, RecvStream, SendStream, Session, StreamError};
 
 /// The default bound of a packet's payload: 65535 bytes.
 pub const DEFAULT_MAX_PACKET: usize = 65535;
-
-/// How a [`PacketStream`] sends a packet.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SendPolicy {
-    /// As a datagram when the session's datagrams are in use and the
-    /// packet fits the stream's largest datagram at that moment, else as a
-    /// capsule. A datagram refused by a limiter is dropped, never sent as
-    /// a capsule instead.
-    #[default]
-    PreferDatagram,
-    /// Always as a capsule: in order and reliably.
-    StreamOnly,
-    /// Always as a datagram: a packet that does not fit fails.
-    DatagramOnly,
-}
 
 /// How a [`PacketStream`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +71,6 @@ pub enum Sent {
     Datagram,
     /// As a DATAGRAM capsule in the stream's bytes.
     Capsule,
-    /// Not at all: a datagram limiter refused it.
-    Dropped,
 }
 
 /// Why a packet operation failed.
@@ -279,6 +262,19 @@ impl PacketStream {
         self.tx.send_with_context(context, payload).await
     }
 
+    /// Sends a packet using the same local options as a stream datagram.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`PacketSender::send_with_context`].
+    pub async fn send_packet_with(
+        &mut self,
+        context: u64,
+        payload: Bytes,
+        options: crate::DatagramSendOptions,
+    ) -> Result<Sent, PacketError> {
+        self.tx.send_packet_with(context, payload, options).await
+    }
+
     /// The next packet. See [`PacketReceiver::recv`].
     ///
     /// # Errors
@@ -316,7 +312,7 @@ pub struct PacketSender {
     max: usize,
     /// What remains of a capsule whose write was cancelled: its header and
     /// payload, written before anything else.
-    pending: [Option<Bytes>; 2],
+    pending: [Option<crate::Chunk>; 2],
     /// Some bytes of the pending capsule were written: it must be
     /// completed to keep the stream's bytes whole capsules. Otherwise a
     /// cancelled capsule is dropped, never sent.
@@ -354,69 +350,59 @@ impl PacketSender {
         context: u64,
         payload: Bytes,
     ) -> Result<Sent, PacketError> {
+        self.send_packet_with(context, payload, crate::DatagramSendOptions::default())
+            .await
+    }
+
+    /// Sends a packet using the same local options as a stream datagram.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`PacketSender::send_with_context`].
+    pub async fn send_packet_with(
+        &mut self,
+        context: u64,
+        payload: Bytes,
+        options: crate::DatagramSendOptions,
+    ) -> Result<Sent, PacketError> {
         if context > varint::MAX {
             return Err(PacketError::InvalidContext);
         }
         if payload.len() > self.max {
             return Err(PacketError::TooLarge { max: self.max });
         }
-        let fits = self
-            .send
-            .max_datagram_size(context)
-            .filter(|&m| payload.len() <= m);
-        match self.policy {
-            SendPolicy::StreamOnly => {}
-            SendPolicy::PreferDatagram if fits.is_none() => {}
-            SendPolicy::PreferDatagram => match self.datagram(context, payload.clone()) {
-                Ok(sent) => return Ok(sent),
-                // Lost the fit since it was asked: a capsule instead.
-                Err(PacketError::TooLarge { .. } | PacketError::NotNegotiated) => {}
-                Err(e) => return Err(e),
-            },
-            SendPolicy::DatagramOnly => {
-                return match self.send.max_datagram_size(context) {
-                    None => Err(PacketError::NotNegotiated),
-                    Some(max) if payload.len() > max => {
-                        self.stats.dropped_too_large += 1;
-                        Err(PacketError::TooLarge { max })
+        let (payload, deadline) =
+            match self
+                .send
+                .admit_packet(context, payload, options, self.policy)
+            {
+                Ok(PacketAdmission::Datagram) => {
+                    self.stats.sent_datagrams += 1;
+                    return Ok(Sent::Datagram);
+                }
+                Ok(PacketAdmission::Capsule { data, deadline }) => (data, deadline),
+                Err(DatagramError::TooLarge { max }) => {
+                    self.stats.dropped_too_large += 1;
+                    return Err(PacketError::TooLarge { max });
+                }
+                Err(DatagramError::NotNegotiated) => return Err(PacketError::NotNegotiated),
+                Err(error) => {
+                    if matches!(error, DatagramError::Dropped(crate::DatagramDrop::Limiter)) {
+                        self.stats.dropped_limited += 1;
                     }
-                    Some(_) => {
-                        let r = self.datagram(context, payload);
-                        if matches!(r, Err(PacketError::TooLarge { .. })) {
-                            self.stats.dropped_too_large += 1;
-                        }
-                        r
-                    }
-                };
-            }
-        }
+                    return Err(PacketError::Datagram(error));
+                }
+            };
         self.finish_pending().await?;
         let mut h = [0; MAX_HEADER];
         let n = capsule::datagram_header(context, payload.len(), &mut h);
         self.pending = [
-            Some(Bytes::copy_from_slice(&h[..n])),
-            (!payload.is_empty()).then_some(payload),
+            Some(crate::Chunk::copy_from_slice(&h[..n])),
+            (!payload.is_empty()).then(|| crate::Chunk::copy_from_slice(&payload)),
         ];
         self.started = false;
-        self.flush().await?;
+        self.flush(deadline).await?;
         self.stats.sent_capsules += 1;
         Ok(Sent::Capsule)
-    }
-
-    fn datagram(&mut self, context: u64, payload: Bytes) -> Result<Sent, PacketError> {
-        match self.send.try_send_datagram(context, payload) {
-            Ok(true) => {
-                self.stats.sent_datagrams += 1;
-                Ok(Sent::Datagram)
-            }
-            Ok(false) => {
-                self.stats.dropped_limited += 1;
-                Ok(Sent::Dropped)
-            }
-            Err(DatagramError::TooLarge { max }) => Err(PacketError::TooLarge { max }),
-            Err(DatagramError::NotNegotiated) => Err(PacketError::NotNegotiated),
-            Err(e) => Err(PacketError::Datagram(e)),
-        }
     }
 
     /// Completes a capsule whose write was cancelled after it began, or
@@ -429,16 +415,30 @@ impl PacketSender {
             self.pending = [None, None];
             return Ok(());
         }
-        self.flush().await?;
+        self.flush(None).await?;
         self.stats.sent_capsules += 1;
         Ok(())
     }
 
     /// Writes what remains of a capsule.
-    async fn flush(&mut self) -> Result<(), PacketError> {
+    async fn flush(&mut self, deadline: Option<std::time::Instant>) -> Result<(), PacketError> {
         let (send, pending, started) = (&self.send, &mut self.pending, &mut self.started);
+        let clock = deadline.map(|_| send.packet_clock());
+        let expiry = pin!(async {
+            if let Some(clock) = &clock {
+                clock.sleep_until(deadline).await;
+            }
+        });
+        let mut expiry = expiry;
         let mut wait = send.wait_slot();
         poll_fn(|cx: &mut Context<'_>| {
+            if let (Some(at), Some(clock)) = (deadline, &clock)
+                && !*started
+                && (clock.now() >= at || expiry.as_mut().poll(cx).is_ready())
+            {
+                *pending = [None, None];
+                return Poll::Ready(Err(PacketError::Datagram(send.expire_packet())));
+            }
             for slot in pending.iter_mut() {
                 while let Some(part) = slot {
                     match send.poll_write_part(cx.waker(), &mut wait.ticket, part) {
@@ -551,16 +551,10 @@ impl PacketReceiver {
             loop {
                 if *datagram_first && !tried && !*datagrams_done {
                     tried = true;
-                    match datagram.as_mut().poll(cx) {
-                        Poll::Ready(Ok(d)) => {
-                            stats.received_datagrams += 1;
-                            return Poll::Ready(Ok(Some(Packet {
-                                context: d.context,
-                                payload: d.payload,
-                            })));
-                        }
-                        Poll::Ready(Err(_)) => *datagrams_done = true,
-                        Poll::Pending => {}
+                    if let Some(packet) =
+                        poll_datagram(datagram.as_mut(), cx, datagrams_done, stats)
+                    {
+                        return Poll::Ready(Ok(Some(packet)));
                     }
                 }
                 match decoder.decode(buf) {
@@ -579,7 +573,7 @@ impl PacketReceiver {
                 }
                 match recv.poll_read_chunk(cx.waker(), &mut wait.ticket, decoder.want()) {
                     Poll::Ready(Ok(Some(chunk))) => {
-                        *buf = chunk;
+                        *buf = chunk.into_bytes();
                         continue;
                     }
                     Poll::Ready(Ok(None)) if decoder.at_boundary() => {
@@ -598,18 +592,12 @@ impl PacketReceiver {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                     Poll::Pending => {}
                 }
-                if !tried && !*datagrams_done {
-                    match datagram.as_mut().poll(cx) {
-                        Poll::Ready(Ok(d)) => {
-                            stats.received_datagrams += 1;
-                            return Poll::Ready(Ok(Some(Packet {
-                                context: d.context,
-                                payload: d.payload,
-                            })));
-                        }
-                        Poll::Ready(Err(_)) => *datagrams_done = true,
-                        Poll::Pending => {}
-                    }
+                if !tried
+                    && !*datagrams_done
+                    && let Some(packet) =
+                        poll_datagram(datagram.as_mut(), cx, datagrams_done, stats)
+                {
+                    return Poll::Ready(Ok(Some(packet)));
                 }
                 return Poll::Pending;
             }
@@ -635,21 +623,39 @@ fn drain<F>(
 where
     F: Future<Output = Result<crate::StreamDatagram, StreamError>>,
 {
-    if !*datagrams_done {
-        match next_datagram.poll(cx) {
-            Poll::Ready(Ok(d)) => {
-                counts.received_datagrams += 1;
-                return Some(Packet {
-                    context: d.context,
-                    payload: d.payload,
-                });
-            }
-            Poll::Ready(Err(_)) => *datagrams_done = true,
-            Poll::Pending => {}
-        }
+    let packet = poll_datagram(next_datagram, cx, datagrams_done, counts);
+    if packet.is_none() {
+        *state = RecvState::Ended;
     }
-    *state = RecvState::Ended;
-    None
+    packet
+}
+
+fn poll_datagram<F>(
+    next: std::pin::Pin<&mut F>,
+    cx: &mut Context<'_>,
+    done: &mut bool,
+    counts: &mut PacketStats,
+) -> Option<Packet>
+where
+    F: Future<Output = Result<crate::StreamDatagram, StreamError>>,
+{
+    if *done {
+        return None;
+    }
+    match next.poll(cx) {
+        Poll::Ready(Ok(d)) => {
+            counts.received_datagrams += 1;
+            Some(Packet {
+                context: d.context,
+                payload: d.payload,
+            })
+        }
+        Poll::Ready(Err(_)) => {
+            *done = true;
+            None
+        }
+        Poll::Pending => None,
+    }
 }
 
 fn malformed(recv: &RecvStream, state: &mut RecvState) -> PacketError {

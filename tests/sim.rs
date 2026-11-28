@@ -86,7 +86,7 @@ fn config(multipath: bool, rng: &mut Rng) -> Config {
     h.session_nonce = Some([9; 16]);
     if multipath {
         c.test_hooks().locator = b"sim".to_vec();
-        c.max_pipes = 4;
+        c.session_policy.limits.steady_attachments = 4;
         c.pipe_auth = PipeAuth::psk(*b"sim-test-psk-0123456789abcdef!!!").with_end_to_end();
         c.liveness.suspect_floor = Duration::from_millis(100);
     }
@@ -404,7 +404,7 @@ impl Sim {
                 tokio::spawn(async move {
                     let _ = listener.handle_pipe(b, PipeHint::default()).await;
                 });
-                if let Ok(p) = self.ends[0].begin_add_pipe(a, PipeOptions::default()) {
+                if let Ok(p) = self.ends[0].test_begin_join(a, PipeOptions::default()) {
                     self.note(|| format!("add pipe {}", p.id()));
                     self.ctl.push(ca.clone());
                     self.pipes.push((p, ca));
@@ -460,12 +460,18 @@ impl Sim {
                 );
             }
             let t = s.debug_tables();
-            // Every call of this harness ends before the next: only the
-            // shutdowns wait.
+            // Every foreground call ends before the next. The shutdowns
+            // and the drivers' asynchronous join handshakes may still wait.
             assert!(
                 t.waits <= self.shutdowns.len(),
                 "seed {seed}: {} waits registered: {t:?}",
                 t.waits
+            );
+            assert!(
+                t.join_waits <= self.ctl.len(),
+                "seed {seed}: {} join waits for {} carriers",
+                t.join_waits,
+                self.ctl.len()
             );
             assert!(t.pipe_events <= 256, "seed {seed}: pipe events unbounded");
         }

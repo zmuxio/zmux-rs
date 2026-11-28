@@ -172,7 +172,7 @@ macro_rules! duplicate_api {
             pub rule: $crate::helpers::DuplicateRule,
             /// The rejoin of `opts.rejoin` was started: this endpoint
             /// dialed the losing session, the survivor uses multipath, has
-            /// fewer attachments than its `max_pipes`, and a pipe added now
+            /// fewer attachments than its steady limit, and a pipe added now
             /// would join at once (the peer's cap and refusal backoff). The
             /// dial and the pipe's addition run in the background (a task,
             /// or a thread with the std driver); a failed dial or join is

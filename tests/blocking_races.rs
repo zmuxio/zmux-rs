@@ -19,16 +19,18 @@
 mod basics;
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use basics::{small_windows, tcp};
 use zmux::blocking::{PipeIo, Session};
 use zmux::sched::Scheduler;
-use zmux::{Config, PipeAuth, PipeOptions};
+use zmux::{ClockDomain, Config, MonotonicClock, PipeAuth, PipeOptions};
+
+#[path = "common/clock.rs"]
+mod clock;
 
 /// Runs `f` on a thread and fails when it does not finish within `secs`.
 fn watchdog<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -88,15 +90,25 @@ fn echo_once(session: &Session, len: usize, seed: u8) -> bool {
 struct Failing<W> {
     inner: W,
     left: usize,
+    prefix: Option<mpsc::Sender<()>>,
+    after_prefix: Option<mpsc::Receiver<()>>,
 }
 
 impl<W: Write> Write for Failing<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.left == 0 {
+            if let Some(cut) = self.after_prefix.take() {
+                cut.recv().unwrap();
+            }
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
         let n = self.inner.write(&buf[..buf.len().min(self.left)])?;
         self.left -= n;
+        if self.left == 0
+            && let Some(prefix) = self.prefix.take()
+        {
+            prefix.send(()).unwrap();
+        }
         Ok(n)
     }
 
@@ -110,18 +122,21 @@ impl<W: Write> Write for Failing<W> {
 fn carrier_ends_mid_batch(eof: bool) {
     let (a, b) = tcp();
     let shut = a.try_clone().unwrap();
-    let client_pipe = if eof {
-        PipeIo::from_tcp(a)
-    } else {
-        let reader = a.try_clone().unwrap();
-        PipeIo::from_halves(
-            reader,
-            Failing {
-                inner: a,
-                left: 2 * 1024 * 1024 + 333,
-            },
-        )
-    };
+    let closer = a.try_clone().unwrap();
+    let (prefix, written) = mpsc::channel();
+    let (cut, cutting) = mpsc::channel();
+    let client_pipe = PipeIo::from_halves(
+        a.try_clone().unwrap(),
+        Failing {
+            inner: a,
+            left: 2 * 1024 * 1024 + 333,
+            prefix: eof.then_some(prefix),
+            after_prefix: eof.then_some(cutting),
+        },
+    )
+    .with_closer(move |how| {
+        let _ = closer.shutdown(how);
+    });
     let server =
         thread::spawn(move || Session::accept(PipeIo::from_tcp(b), Config::default()).unwrap());
     let client = Session::connect(client_pipe, Config::default()).unwrap();
@@ -145,8 +160,9 @@ fn carrier_ends_mid_batch(eof: bool) {
         })
         .collect();
     if eof {
-        thread::sleep(Duration::from_millis(200));
-        let _ = shut.shutdown(std::net::Shutdown::Both);
+        written.recv().unwrap();
+        shut.shutdown(Shutdown::Both).unwrap();
+        cut.send(()).unwrap();
     }
     for j in jobs {
         j.join().expect("no panic");
@@ -174,7 +190,7 @@ fn carrier_write_error_mid_batch() {
 
 fn mp_config() -> Config {
     let mut c = small_windows(Config::default());
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"blocking-race-psk-0123456789abcd").with_end_to_end();
     c.scheduler = Scheduler::SpreadEta;
     c.liveness.suspect_floor = Duration::from_millis(100);
@@ -182,46 +198,33 @@ fn mp_config() -> Config {
 }
 
 /// A TCP relay that can be cut: both sockets are shut down.
-fn relay(target: SocketAddr) -> (SocketAddr, Arc<AtomicBool>) {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    let cut = Arc::new(AtomicBool::new(false));
-    let c = cut.clone();
-    thread::spawn(move || {
-        let Ok((a, _)) = l.accept() else {
-            return;
-        };
-        let b = TcpStream::connect(target).unwrap();
-        let pump = |mut r: TcpStream, mut w: TcpStream, cut: Arc<AtomicBool>| {
-            thread::spawn(move || {
-                r.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
-                let mut buf = vec![0u8; 16 * 1024];
-                while !cut.load(Ordering::SeqCst) {
-                    match r.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if w.write_all(&buf[..n]).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                            ) => {}
-                        Err(_) => break,
-                    }
-                }
-                let _ = r.shutdown(std::net::Shutdown::Both);
-                let _ = w.shutdown(std::net::Shutdown::Both);
-            })
-        };
-        let t1 = pump(a.try_clone().unwrap(), b.try_clone().unwrap(), c.clone());
-        let t2 = pump(b, a, c);
-        let _ = t1.join();
-        let _ = t2.join();
+fn relay(
+    target: SocketAddr,
+) -> (
+    SocketAddr,
+    mpsc::Receiver<(TcpStream, TcpStream)>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (opened, awaiting) = mpsc::channel();
+    let task = thread::spawn(move || {
+        let (left, _) = listener.accept().unwrap();
+        let right = TcpStream::connect(target).unwrap();
+        opened
+            .send((left.try_clone().unwrap(), right.try_clone().unwrap()))
+            .unwrap();
+        let mut from = left.try_clone().unwrap();
+        let mut to = right.try_clone().unwrap();
+        let upstream = thread::spawn(move || {
+            let _ = std::io::copy(&mut from, &mut to);
+        });
+        let _ = std::io::copy(&mut &right, &mut &left);
+        let _ = left.shutdown(Shutdown::Both);
+        let _ = right.shutdown(Shutdown::Both);
+        upstream.join().unwrap();
     });
-    (addr, cut)
+    (addr, awaiting, task)
 }
 
 /// A multipath server on a tokio listener (the std driver has none):
@@ -281,36 +284,54 @@ fn multipath_pipe_loss_during_traffic() {
         )
         .unwrap();
         assert_eq!(client.multipath(), zmux::Multipath::InUse);
-        let (raddr, cut) = relay(addr);
+        let (raddr, connected, relay_task) = relay(addr);
         let pipe = client
-            .begin_add_pipe(
+            .test_begin_join(
                 PipeIo::from_tcp(TcpStream::connect(raddr).unwrap()),
                 PipeOptions::default(),
             )
             .unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
+        let (left, right) = connected.recv().unwrap();
+        let (opened, streams_ready) = mpsc::channel();
         let jobs: Vec<_> = (0..6u8)
-            .map(|i| {
-                let c = client.clone();
-                let stop = stop.clone();
-                thread::spawn(move || {
-                    let mut n = 0;
-                    while !stop.load(Ordering::SeqCst) {
-                        assert!(echo_once(&c, 256 * 1024, i), "echo {i} lost data");
-                        n += 1;
-                    }
-                    n
-                })
+            .map(|seed| {
+                let client = client.clone();
+                let opened = opened.clone();
+                let (resume, continuing) = mpsc::channel();
+                let job = thread::spawn(move || {
+                    let (mut send, mut recv) = client.open_bi().unwrap();
+                    let prefix = [seed; 1024];
+                    send.write_all(&prefix).unwrap();
+                    let mut echoed = [0; 1024];
+                    recv.read_exact(&mut echoed).unwrap();
+                    assert_eq!(echoed, prefix);
+                    opened.send(()).unwrap();
+                    continuing.recv().unwrap();
+                    let suffix = vec![seed; 256 * 1024];
+                    let writer = thread::spawn(move || {
+                        send.write_all(&suffix).unwrap();
+                        send.finish().unwrap();
+                    });
+                    let data = recv.read_to_end(256 * 1024).unwrap();
+                    writer.join().unwrap();
+                    assert_eq!(data, vec![seed; 256 * 1024]);
+                });
+                (resume, job)
             })
             .collect();
-        thread::sleep(Duration::from_millis(150));
-        cut.store(true, Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(400));
+        for _ in &jobs {
+            streams_ready.recv().unwrap();
+        }
+        left.shutdown(Shutdown::Both).unwrap();
+        right.shutdown(Shutdown::Both).unwrap();
+        relay_task.join().unwrap();
         let _ = pipe.abort();
-        thread::sleep(Duration::from_millis(100));
-        stop.store(true, Ordering::SeqCst);
-        let echoes: usize = jobs.into_iter().map(|j| j.join().expect("echo")).sum();
-        assert!(echoes > 0);
+        for (resume, _) in &jobs {
+            resume.send(()).unwrap();
+        }
+        for (_, job) in jobs {
+            job.join().unwrap();
+        }
         client.close();
         client.closing().unwrap();
         rt.shutdown_timeout(Duration::from_secs(5));
@@ -324,18 +345,75 @@ fn multipath_pipe_loss_during_traffic() {
 #[test]
 fn idle_readers_resume_with_a_new_buffer() {
     watchdog(30, "idle readers", || {
+        struct ObserveReads {
+            socket: TcpStream,
+            at_boundary: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+            after_idle: Option<mpsc::Sender<()>>,
+            check_small_read: bool,
+        }
+
+        impl Read for ObserveReads {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.check_small_read) {
+                    assert_eq!(
+                        buf.len(),
+                        256,
+                        "an idle read must give back the large buffer"
+                    );
+                    self.after_idle.take().unwrap().send(()).unwrap();
+                    // Split the next record at a prescribed byte, independently of TCP read size.
+                    return self.socket.read(&mut buf[..1]);
+                }
+                // A read into the entire large buffer starts at a record boundary.
+                if buf.len() == 128 * 1024
+                    && let Some((entered, resume)) = self.at_boundary.take()
+                {
+                    entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                    self.check_small_read = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.socket.read(buf)
+            }
+        }
+
         let (a, b) = tcp();
         let server =
             thread::spawn(move || Session::accept(PipeIo::from_tcp(b), Config::default()).unwrap());
-        let client = Session::connect(PipeIo::from_tcp(a), Config::default()).unwrap();
+        let (entered, waiting) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let (after_idle, small_read) = mpsc::channel();
+        let closer = a.try_clone().unwrap();
+        let reader = ObserveReads {
+            socket: a.try_clone().unwrap(),
+            at_boundary: Some((entered, resume)),
+            after_idle: Some(after_idle),
+            check_small_read: false,
+        };
+        let pipe = PipeIo::from_halves(reader, a).with_closer(move |how| {
+            let _ = closer.shutdown(how);
+        });
+        let (clock, domain) = clock::ManualClock::domain(Duration::ZERO);
+        let mut config = Config::default();
+        config.clock_domain = domain;
+        config.test_hooks().unpaced = true;
+        let client = Session::connect(pipe, config).unwrap();
         let server = server.join().unwrap();
         let task = serve(server.clone());
-        assert!(echo_once(&client, 64 * 1024, 1));
-        for seed in 2..4 {
-            thread::sleep(Duration::from_millis(1300));
-            assert!(client.ping().is_ok());
-            assert!(echo_once(&client, 300 * 1024 + 7, seed));
-        }
+        let warming = {
+            let client = client.clone();
+            thread::spawn(move || echo_once(&client, 64 * 1024, 1))
+        };
+        waiting
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reader reached a record boundary with the large buffer");
+        clock.advance(Duration::from_secs(1));
+        release.send(()).unwrap();
+        small_read
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reader resumed with its small buffer");
+        assert!(warming.join().unwrap());
+        assert!(echo_once(&client, 300 * 1024 + 7, 2));
         client.close();
         let _ = server.closing();
         task.join().unwrap();

@@ -28,8 +28,7 @@ pub(crate) enum Kind {
     /// A listener's shared state.
     #[cfg(any(feature = "tokio", feature = "test-hooks"))]
     Listener,
-    /// A pipe maintainer (`maintain_pipes`).
-    #[cfg(any(feature = "tokio", feature = "test-hooks"))]
+    /// An active session controller binding.
     Maintainer,
     /// A session's hook task or thread.
     Hook,
@@ -57,9 +56,9 @@ impl Live {
     }
 }
 
-#[cfg(feature = "test-hooks")]
 impl Drop for Live {
     fn drop(&mut self) {
+        #[cfg(feature = "test-hooks")]
         COUNTS[self.kind as usize].fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -110,6 +109,8 @@ pub fn resources() -> Resources {
 pub struct Tables {
     /// Registered waits (wakers and wait-list entries).
     pub waits: usize,
+    /// Driver-owned waits for in-progress join handshakes.
+    pub join_waits: usize,
     /// Pipe events queued for the application.
     pub pipe_events: usize,
     /// Carrier halves waiting to be closed.

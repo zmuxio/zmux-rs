@@ -65,7 +65,7 @@ impl SessionCore {
         self.state = State::Suspended;
         self.idle_deadline = None;
         self.keep_alive_deadline = None;
-        self.stats.suspensions += 1;
+        self.mp_mut().counters.suspensions += 1;
         let s = self.mp_mut().suspension_mut();
         s.was_draining = draining;
         s.since = Some(now);
@@ -102,7 +102,7 @@ impl SessionCore {
             State::Active
         };
         if let Some(t) = since {
-            self.stats.suspended_time += now.saturating_duration_since(t);
+            self.mp_mut().counters.suspended_time += now.saturating_duration_since(t);
         }
         self.restart_idle(now);
         self.push_event(CoreEvent::Resumed);
@@ -129,6 +129,18 @@ impl SessionCore {
         if self.state == State::Suspended {
             self.close_resume(T::ZMUX_RESUME_TIMEOUT, "suspended session limit", now);
         }
+    }
+
+    /// The last representable instant strictly inside an active recovery grace.
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn attempt_grace_cutoff(&self, now: Instant) -> Option<Instant> {
+        (self.state == State::Suspended).then(|| {
+            self.mp
+                .as_deref()
+                .and_then(|mp| mp.suspension().deadline())
+                .and_then(|grace| grace.checked_sub(Duration::from_nanos(1)))
+                .unwrap_or(now)
+        })
     }
 
     /// When the session entered SUSPENDED, while it is.

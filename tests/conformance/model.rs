@@ -213,6 +213,15 @@ pub enum FrameSpec {
         #[serde(default = "yes")]
         has_len: bool,
     },
+    #[serde(rename = "DATAGRAM_ACK")]
+    DatagramAck {
+        pipe: u64,
+        channel: u8,
+        largest: u64,
+        delay: u64,
+        first_range: u64,
+        ranges: Vec<DatagramAckRange>,
+    },
     QxTransportParameters {
         params: Vec<ParamSpec>,
     },
@@ -331,12 +340,17 @@ pub struct Config {
     pub early_data: Option<EarlyData>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DatagramAckRange {
+    pub gap: u64,
+    pub length: u64,
+}
+
 /// The `early_data` knob: absent fields are false.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EarlyData {
-    #[serde(default)]
-    pub zmux_peer: bool,
     #[serde(default)]
     pub replayable: bool,
 }
@@ -371,6 +385,19 @@ pub struct TestHooks {
     pub lane_key: Option<Hex>,
     pub epoch_locator_prefix: Option<Hex>,
     pub unconfirmed_cap: Option<u64>,
+    pub datagram: Option<DatagramHooks>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatagramHooks {
+    pub window: Option<usize>,
+    pub hold_packets: Option<usize>,
+    pub hold_ms: Option<u64>,
+    pub ttl_ms: Option<u64>,
+    pub next_sequence: Option<u64>,
+    pub feedback: Option<bool>,
+    pub copies: Option<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -476,6 +503,19 @@ pub enum DownHow {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+pub enum JoinHold {
+    Keys(bool),
+    Stage(JoinStage),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinStage {
+    Authorization,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClosedHow {
@@ -529,6 +569,9 @@ pub enum Op {
         pairing: Option<Hex>,
         framing: Option<FramingName>,
         source: Option<String>,
+        #[serde(default)]
+        channel: bool,
+        remembered_plain: Option<BTreeMap<String, Option<ParamValue>>>,
     },
     PipeDown {
         pipe: Option<u64>,
@@ -555,8 +598,7 @@ pub enum Op {
         #[serde(default)]
         bad_key: bool,
         binding: Option<Hex>,
-        #[serde(default)]
-        hold: bool,
+        hold: Option<JoinHold>,
         confirm: Option<bool>,
         group: Option<u64>,
         key_share: Option<String>,
@@ -566,6 +608,7 @@ pub enum Op {
     PeerJoinFinish {
         carrier: String,
         outcome: String,
+        authorized: Option<bool>,
     },
     PeerConfirm {
         carrier: String,
@@ -607,6 +650,12 @@ pub enum Op {
         chunks: Option<Vec<usize>>,
         #[serde(default)]
         invalid: bool,
+        #[serde(default)]
+        carrier_early: bool,
+    },
+    PeerDatagram {
+        pipe: u64,
+        hex: Hex,
     },
     #[serde(skip)]
     Api(ApiStep),
@@ -1125,6 +1174,11 @@ pub struct FramePattern {
     pub incremental: Option<ValuePattern>,
     pub locator: Option<ValuePattern>,
     pub pipe: Option<ValuePattern>,
+    pub channel: Option<ValuePattern>,
+    pub largest: Option<ValuePattern>,
+    pub delay: Option<ValuePattern>,
+    pub first_range: Option<ValuePattern>,
+    pub ranges: Option<Vec<DatagramAckRange>>,
     pub direction: Option<ValuePattern>,
     pub standby: Option<ValuePattern>,
     pub fate_group: Option<ValuePattern>,

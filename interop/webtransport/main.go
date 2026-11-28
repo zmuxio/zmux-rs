@@ -1,4 +1,4 @@
-// A loopback peer for the Rust WebTransport negotiation test.
+// Loopback peer for the native Go and Rust WebTransport adapters.
 package main
 
 import (
@@ -8,118 +8,219 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/webtransport-go"
-	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/zmuxh3"
 )
 
 func main() {
-	if err := run(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	if err := run(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	// Both peers are local test processes with ephemeral certificates.
-	if len(os.Args) == 2 {
-		tr := &webtransport.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-		s, err := zmuxh3.DialSession(ctx, tr, os.Args[1], nil, nil)
-		if err != nil {
-			return fmt.Errorf("Go dial: %w", err)
+func run(ctx context.Context, args []string) error {
+	switch {
+	case len(args) == 1 && args[0] == "server":
+		return serve(ctx)
+	case len(args) == 3 && args[0] == "client":
+		id, err := strconv.Atoi(args[2])
+		if err != nil || (id != 0 && id != 4) {
+			return fmt.Errorf("invalid requested CONNECT ID %q", args[2])
 		}
-		defer s.CloseWithError(0, "")
-		st, err := s.OpenStreamSync(ctx)
-		if err != nil {
-			return err
-		}
-		deadline, _ := ctx.Deadline()
-		if err := st.SetDeadline(deadline); err != nil {
-			return err
-		}
-		if _, err := st.Write([]byte("ping")); err != nil {
-			return err
-		}
-		if err := st.Close(); err != nil {
-			return err
-		}
-		reply, err := io.ReadAll(st)
-		if err != nil {
-			return err
-		}
-		if string(reply) != "ping" {
-			return fmt.Errorf("echo: %q", reply)
-		}
-		return nil
+		return dial(ctx, args[1], id != 0)
+	default:
+		return fmt.Errorf("usage: go-peer server | client URL CONNECT-ID")
 	}
+}
 
+func dial(ctx context.Context, url string, reserve bool) error {
+	// Only the loopback test client accepts the Rust fixture's ephemeral certificate.
+	transport := &zmuxh3.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	defer transport.Close()
+	var connection *quic.Conn
+	transport.DialAddr = func(ctx context.Context, addr string, tls *tls.Config, config *quic.Config) (*quic.Conn, error) {
+		conn, err := quic.DialAddr(ctx, addr, tls, config)
+		if err != nil {
+			return nil, err
+		}
+		if reserve {
+			stream, err := conn.OpenStreamSync(ctx)
+			if err != nil {
+				_ = conn.CloseWithError(0, "")
+				return nil, err
+			}
+			if stream.StreamID() != 0 {
+				_ = conn.CloseWithError(0, "")
+				return nil, fmt.Errorf("reserved stream ID %d, want 0", stream.StreamID())
+			}
+		}
+		connection = conn
+		return conn, nil
+	}
+	session, err := zmuxh3.DialSession(ctx, transport, url, nil, nil)
+	if err != nil {
+		return fmt.Errorf("Go CONNECT: %w", err)
+	}
+	if err := exchange(ctx, session, true); err != nil {
+		return err
+	}
+	if err := session.CloseWithError(42, "done"); err != nil {
+		return err
+	}
+	// Let the owned adapter finish CONNECT before closing the transport.
+	select {
+	case <-connection.Context().Done():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func serve(ctx context.Context) error {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return err
 	}
-	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)}}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1), NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
+	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
 		return err
 	}
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		return err
 	}
-	defer pc.Close()
-	h3 := &http3.Server{
-		TLSConfig:  http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}),
-		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
-	}
-	webtransport.ConfigureHTTP3Server(h3)
-	server := &webtransport.Server{H3: h3}
+	defer packet.Close()
+	server := &zmuxh3.Server{H3: &http3.Server{
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}},
+	}}
 	defer server.Close()
-	listener, err := zmux.NewListener(&zmux.ListenerConfig{
-		Config: &zmux.Config{},
-		Admission: &zmux.Admission{Peek: 1, Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
-			if info.Stage == zmux.StageHead {
-				return zmux.Decision{Verdict: zmux.VerdictDefer}
-			}
-			return zmux.Decision{Verdict: zmux.VerdictFallback}
-		}},
-		Fallback: func(_ context.Context, takeover *zmux.Takeover) {
-			pipe := takeover.Pipe()
-			session := pipe.W.(zmux.CarrierConner).CarrierConn().(*webtransport.Session)
-			if _, err := io.Copy(pipe.W, pipe.R); err != nil {
-				fmt.Fprintln(os.Stderr, "Go echo:", err)
-				return
-			}
-			if err := pipe.W.Close(); err != nil {
-				fmt.Fprintln(os.Stderr, "Go echo FIN:", err)
-				return
-			}
+	result := make(chan error, 2)
+	server.H3.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		session, err := server.Upgrade(w, r)
+		if err == nil {
+			err = exchange(ctx, session, false)
+		}
+		if err == nil {
 			select {
 			case <-session.Context().Done():
+				cause := context.Cause(session.Context())
+				var closeErr *zmuxh3.SessionError
+				if !errors.As(cause, &closeErr) || closeErr.ErrorCode != 42 || closeErr.Message != "done" || !closeErr.Remote {
+					err = fmt.Errorf("remote close: %w", cause)
+				}
 			case <-ctx.Done():
+				err = ctx.Err()
 			}
-		},
+		}
+		result <- err
 	})
+	fmt.Printf("https://%s/zmux\n%x\n", packet.LocalAddr(), der)
+	go func() { result <- server.Serve(packet) }()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func exchange(ctx context.Context, session *zmuxh3.Session, client bool) error {
+	for _, fromClient := range []bool{true, false} {
+		prefix := "server"
+		if fromClient {
+			prefix = "client"
+		}
+		open := client == fromClient
+		if err := exchangePipe(ctx, session, open, prefix+"-pipe"); err != nil {
+			return err
+		}
+		if open {
+			lane, err := session.OpenUniStreamSync(ctx)
+			if err != nil {
+				return err
+			}
+			if err := writeFIN(ctx, lane, prefix+"-lane"); err != nil {
+				return err
+			}
+			if err := session.SendDatagram([]byte(prefix + "-datagram")); err != nil {
+				return err
+			}
+		} else {
+			lane, err := session.AcceptUniStream(ctx)
+			if err != nil {
+				return err
+			}
+			if err := readFIN(ctx, lane, prefix+"-lane"); err != nil {
+				return err
+			}
+			payload, err := session.ReceiveDatagram(ctx)
+			if err != nil || string(payload) != prefix+"-datagram" {
+				return fmt.Errorf("native datagram: %q, %v", payload, err)
+			}
+		}
+	}
+	return nil
+}
+
+func exchangePipe(ctx context.Context, session *zmuxh3.Session, open bool, payload string) error {
+	if open {
+		pipe, err := session.OpenStreamSync(ctx)
+		if err != nil {
+			return err
+		}
+		if err := writeFIN(ctx, pipe, payload); err != nil {
+			return err
+		}
+		return readFIN(ctx, pipe, payload)
+	}
+	pipe, err := session.AcceptStream(ctx)
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
-	h3.Handler, err = zmuxh3.NewHandler(listener, nil, server)
-	if err != nil {
+	if err := readFIN(ctx, pipe, payload); err != nil {
 		return err
 	}
-	fmt.Printf("https://%s/zmux\n", pc.LocalAddr())
-	go func() { _ = server.Serve(pc) }()
-	<-ctx.Done()
+	return writeFIN(ctx, pipe, payload)
+}
+
+func writeFIN(ctx context.Context, stream *zmuxh3.Stream, text string) error {
+	deadline, _ := ctx.Deadline()
+	if err := stream.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(stream, text); err != nil {
+		return err
+	}
+	return stream.Close()
+}
+
+func readFIN(ctx context.Context, stream *zmuxh3.Stream, text string) error {
+	deadline, _ := ctx.Deadline()
+	if err := stream.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	buf, err := io.ReadAll(io.LimitReader(stream, int64(len(text)+1)))
+	if err != nil || string(buf) != text {
+		return fmt.Errorf("stream %q, want %q: %v", buf, text, err)
+	}
 	return nil
 }

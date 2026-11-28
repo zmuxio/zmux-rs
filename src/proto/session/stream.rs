@@ -3,18 +3,21 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::num::NonZeroU16;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::{Buf, Bytes, BytesMut};
 
 use super::ranges::RangeSet;
-use super::reasm::{Arrived, Held};
-use super::recv_buf::{Backing, RecvBuf};
+use super::reasm::Arrived;
+use super::recv_store::{ReceiveQueue, ReceiveStore, Source};
 use super::tuner::StreamTuner;
+use super::{Backing, Chunk};
 use crate::proto::frame::{Dir, Priority};
+use crate::proto::memory::{Ledger, WriteRoot};
 use crate::proto::meter::{Count, Meter};
-use crate::util::usize_sat;
+use crate::util::{CapacityPool, usize_sat};
 
 /// A handle to a stream in a session. It stays valid until the stream's
 /// state is discarded; a stale handle is reported as a closed stream.
@@ -69,9 +72,6 @@ impl RecvState {
 const CHUNK: usize = 64 * 1024;
 /// The smallest first chunk of a stream.
 const SMALL_CHUNK: usize = 1024;
-/// A receive buffer that empties with more capacity than this gives it up;
-/// the session keeps one such buffer for the next data of any stream.
-pub(crate) const RECV_KEEP: usize = 64 * 1024;
 /// Chunks a batch being written may still reference, and one more.
 const IN_FLIGHT: usize = super::DEFAULT_BATCH / CHUNK + 1;
 
@@ -81,7 +81,8 @@ const IN_FLIGHT: usize = super::DEFAULT_BATCH / CHUNK + 1;
 /// themselves keep none, so an idle stream holds only its tail.
 #[derive(Debug, Default)]
 pub(crate) struct ChunkPool {
-    free: VecDeque<Bytes>,
+    free: VecDeque<SendTail>,
+    pub(super) domain: Option<Arc<Ledger>>,
     cap: usize,
 }
 
@@ -95,32 +96,63 @@ impl ChunkPool {
         self.free.truncate(self.cap);
     }
 
-    fn put(&mut self, chunk: Bytes) {
-        if self.free.len() < self.cap {
-            self.free.push_back(chunk);
+    fn put(&mut self, tail: SendTail) {
+        if self.free.len() < self.cap && tail.backing.size == CHUNK {
+            if self.free.len() == self.free.capacity() {
+                let capacity = self.free.capacity().saturating_mul(2).max(4);
+                grow_write_storage(&CHUNK_STORAGE, &mut self.free, capacity);
+            }
+            self.free.push_back(tail);
         }
     }
 
-    /// A released chunk nothing references any more, cleared.
-    fn take(&mut self) -> Option<BytesMut> {
+    /// Takes an owned anchor for a released input, once its shared views left.
+    fn take(&mut self) -> Option<SendTail> {
         for _ in 0..self.free.len() {
-            let b = self.free.pop_front()?;
-            match b.try_into_mut() {
-                Ok(mut m) => {
-                    m.clear();
-                    m.reserve(CHUNK);
-                    return Some(m);
-                }
-                // Still referenced (by a batch being written): later.
-                Err(b) => self.free.push_back(b),
+            let mut tail = self.free.pop_front()?;
+            if tail.bytes.try_reclaim(tail.backing.size) {
+                return Some(tail);
             }
+            self.free.push_back(tail);
         }
         None
+    }
+
+    fn allocate(&mut self, size: usize) -> Option<SendTail> {
+        let backing = Backing::new(size);
+        let write = match &self.domain {
+            Some(domain) => Some(domain.reserve_write_root(backing).or_else(|| {
+                self.free.clear();
+                domain.reserve_write_root(backing)
+            })?),
+            None => None,
+        };
+        let bytes = BytesMut::with_capacity(size);
+        assert_eq!(bytes.capacity(), size);
+        Some(SendTail {
+            bytes,
+            backing,
+            write,
+        })
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(super) fn clear_idle(&mut self) {
+        self.free.clear();
     }
 
     /// Heap bytes held.
     pub(crate) fn memory(&self) -> usize {
         self.free.len() * CHUNK
+    }
+}
+
+static CHUNK_STORAGE: Mutex<CapacityPool<VecDeque<SendTail>>> =
+    Mutex::new(CapacityPool::new(super::DEFAULT_BATCH));
+
+impl Drop for ChunkPool {
+    fn drop(&mut self) {
+        give_write_storage(&CHUNK_STORAGE, std::mem::take(&mut self.free));
     }
 }
 
@@ -142,9 +174,10 @@ pub(crate) struct SendBuf {
     /// Frozen data (chunks, and `tail` data that was referenced), oldest
     /// first; all of it precedes `tail`.
     segs: VecDeque<Seg>,
+    seg_space: Option<crate::proto::memory::Reservation>,
     /// Data copied from `write`, after every segment: a chunk filled up to
     /// its capacity, never grown in place.
-    tail: BytesMut,
+    tail: SendTail,
     /// Unsent bytes (after the cursor).
     len: u64,
     /// Sent bytes still held (before the cursor).
@@ -153,14 +186,56 @@ pub(crate) struct SendBuf {
     /// the offset in it.
     seg: usize,
     seg_off: usize,
+    #[cfg(all(feature = "tokio", not(loom)))]
+    has_handoffs: bool,
 }
 
-/// A segment of a send buffer: its bytes, and whether they are a chunk of
-/// the buffer (frozen from `tail`) rather than the application's `Bytes`.
+#[derive(Debug, Default)]
+struct SendTail {
+    bytes: BytesMut,
+    backing: Backing,
+    write: Option<WriteRoot>,
+}
+
 #[derive(Debug)]
 struct Seg {
-    bytes: Bytes,
-    own: bool,
+    bytes: Chunk,
+}
+
+/// Empty segment arrays shared between writers. Each active array is charged
+/// to its session for as long as it holds that storage.
+static SEGMENT_POOL: Mutex<CapacityPool<VecDeque<Seg>>> =
+    Mutex::new(CapacityPool::new(super::DEFAULT_BATCH));
+
+fn give_write_storage<T>(pool: &Mutex<CapacityPool<VecDeque<T>>>, mut array: VecDeque<T>) {
+    array.clear();
+    let bytes = array.capacity() * size_of::<T>();
+    pool.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .give(bytes, array);
+}
+
+#[cold]
+fn grow_write_storage<T>(
+    pool: &Mutex<CapacityPool<VecDeque<T>>>,
+    current: &mut VecDeque<T>,
+    capacity: usize,
+) {
+    let bytes = capacity * size_of::<T>();
+    let saved = pool
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take(bytes..=bytes);
+    let mut array = saved.unwrap_or_else(|| VecDeque::with_capacity(capacity));
+    assert_eq!(array.capacity(), capacity);
+    array.append(current);
+    give_write_storage(pool, std::mem::replace(current, array));
+}
+
+impl Drop for SendBuf {
+    fn drop(&mut self) {
+        give_write_storage(&SEGMENT_POOL, std::mem::take(&mut self.segs));
+    }
 }
 
 impl SendBuf {
@@ -180,61 +255,122 @@ impl SendBuf {
 
     /// The bytes of run `i` (a segment, or `tail` for `segs.len()`).
     fn run(&self, i: usize) -> &[u8] {
-        self.segs.get(i).map_or(&self.tail[..], |s| &s.bytes[..])
+        self.segs
+            .get(i)
+            .map_or(&self.tail.bytes[..], |s| &s.bytes[..])
     }
 
-    pub(crate) fn push_slice(&mut self, mut data: &[u8], pool: &mut ChunkPool) {
-        self.len += data.len() as u64;
+    pub(crate) fn push_slice(&mut self, mut data: &[u8], pool: &mut ChunkPool) -> usize {
+        let original = data.len();
         while !data.is_empty() {
-            let room = self.tail.capacity() - self.tail.len();
+            let room = self.tail.bytes.capacity() - self.tail.bytes.len();
             if room == 0 {
-                self.next_chunk(data.len(), pool);
+                if !self.next_chunk(data.len(), pool) {
+                    break;
+                }
                 continue;
             }
             let k = room.min(data.len());
-            self.tail.extend_from_slice(&data[..k]);
+            self.tail.bytes.extend_from_slice(&data[..k]);
             data = &data[k..];
         }
+        let written = original - data.len();
+        self.len += written as u64;
+        written
     }
 
-    /// Starts a new chunk for `tail`: the filled one is frozen, and a
-    /// released one is reused when nothing references it any more.
-    fn next_chunk(&mut self, want: usize, pool: &mut ChunkPool) {
+    /// Starts a new charged tail when the current one is full.
+    fn next_chunk(&mut self, want: usize, pool: &mut ChunkPool) -> bool {
+        // Every new tail has a slot reserved for when it is frozen.
         self.freeze_tail();
-        if let Some(m) = pool.take() {
-            self.tail = m;
-            return;
+        if !self.reserve_segments(1, pool) {
+            return false;
         }
-        // The first chunk of a stream fits small writes; later ones are
-        // full chunks.
         let size = if self.segs.is_empty() && self.kept == 0 {
             want.clamp(SMALL_CHUNK, CHUNK).next_power_of_two()
         } else {
             CHUNK
         };
-        self.tail = BytesMut::with_capacity(size);
+        if self
+            .tail
+            .bytes
+            .try_reclaim(size.min(self.tail.backing.size))
+            && self.tail.bytes.capacity() != 0
+            && (self.tail.bytes.capacity() >= size || self.tail.bytes.capacity() >= want)
+        {
+            return true;
+        }
+        pool.put(std::mem::take(&mut self.tail));
+        let Some(tail) = pool.take().or_else(|| pool.allocate(size)) else {
+            return false;
+        };
+        self.tail = tail;
+        true
     }
 
-    pub(crate) fn push_bytes(&mut self, data: Bytes) {
+    pub(crate) fn push_bytes(&mut self, mut data: Chunk, pool: &ChunkPool) -> bool {
         if data.is_empty() {
-            return;
+            return true;
+        }
+        if !self.reserve_segments(1 + usize::from(!self.tail.bytes.is_empty()), pool)
+            || pool
+                .domain
+                .as_ref()
+                .is_some_and(|domain| !data.reserve(domain, self.segs.back().map(|seg| &seg.bytes)))
+        {
+            return false;
         }
         self.freeze_tail();
         self.len += data.len() as u64;
-        self.segs.push_back(Seg {
-            bytes: data,
-            own: false,
-        });
+        #[cfg(all(feature = "tokio", not(loom)))]
+        {
+            self.has_handoffs |= data.handoff.is_some();
+        }
+        self.segs.push_back(Seg { bytes: data });
+        true
+    }
+
+    fn reserve_segments(&mut self, additional: usize, pool: &ChunkPool) -> bool {
+        let old = self.segs.capacity();
+        let needed = self.segs.len() + additional;
+        if needed <= old {
+            return true;
+        }
+        let new = needed.max(old.saturating_mul(2)).max(4);
+        let bytes = (new * size_of::<Seg>()) as u64;
+        let replacing = bytes + (old * size_of::<Seg>()) as u64;
+        if let Some(domain) = &pool.domain {
+            if let Some(grant) = &mut self.seg_space {
+                if !grant.resize_growth(replacing) {
+                    return false;
+                }
+            } else {
+                let Some(grant) = domain.reserve_growth(replacing) else {
+                    return false;
+                };
+                self.seg_space = Some(grant);
+            }
+        }
+        grow_write_storage(&SEGMENT_POOL, &mut self.segs, new);
+        if let Some(grant) = &mut self.seg_space {
+            assert!(grant.resize(bytes));
+        }
+        true
     }
 
     /// Moves `tail`'s data into a segment, so that it can be referenced
     /// (or a chunk can follow it); the cursor keeps its place.
     fn freeze_tail(&mut self) {
-        if !self.tail.is_empty() {
-            let frozen = self.tail.split().freeze();
+        if !self.tail.bytes.is_empty() {
+            let frozen = self.tail.bytes.split().freeze();
             self.segs.push_back(Seg {
-                bytes: frozen,
-                own: true,
+                bytes: Chunk {
+                    bytes: frozen,
+                    backing: self.tail.backing,
+                    write: self.tail.write.clone(),
+                    #[cfg(all(feature = "tokio", not(loom)))]
+                    handoff: None,
+                },
             });
             // A cursor at the end of the frozen data moves to what follows.
             if self.seg < self.segs.len() && self.seg_off >= self.segs[self.seg].bytes.len() {
@@ -247,6 +383,51 @@ impl SendBuf {
     /// The length of the next contiguous unsent run.
     pub(crate) fn front_len(&self) -> usize {
         self.run(self.seg).len() - self.seg_off
+    }
+
+    /// The length of the next write from the front, and whether to share its backing.
+    pub(super) fn front_for_write(&self, remaining: usize, threshold: usize) -> (usize, bool) {
+        let count = self.front_len().min(remaining);
+        #[cfg(all(feature = "tokio", not(loom)))]
+        if self.has_handoffs
+            && self
+                .segs
+                .get(self.seg)
+                .is_some_and(|seg| seg.bytes.handoff.is_some())
+        {
+            return (count, true);
+        }
+        (count, count >= threshold)
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(super) fn visit_handoffs(
+        &self,
+        off: u64,
+        len: usize,
+        mut visit: impl FnMut(super::splice_handoff::HandoffSpan),
+    ) {
+        if !self.has_handoffs || len == 0 {
+            return;
+        }
+        let mut skip = usize_sat(off);
+        let mut remaining = len;
+        for segment in &self.segs {
+            let size = segment.bytes.len();
+            if skip >= size {
+                skip -= size;
+                continue;
+            }
+            let count = remaining.min(size - skip);
+            if let Some(handoff) = &segment.bytes.handoff {
+                visit(handoff.slice(skip, count));
+            }
+            remaining -= count;
+            if remaining == 0 {
+                return;
+            }
+            skip = 0;
+        }
     }
 
     /// Moves the cursor over `n` bytes of its run.
@@ -279,12 +460,12 @@ impl SendBuf {
     }
 
     /// Takes up to `max` bytes of the front run without copying.
-    pub(crate) fn take_shared(&mut self, max: usize, retain: bool, pool: &mut ChunkPool) -> Bytes {
+    pub(crate) fn take_shared(&mut self, max: usize, retain: bool, pool: &mut ChunkPool) -> Chunk {
         if self.seg == self.segs.len() {
             self.freeze_tail();
         }
         let Some(c) = self.segs.get(self.seg).map(|s| &s.bytes) else {
-            return Bytes::new();
+            return Chunk::new();
         };
         let k = (c.len() - self.seg_off).min(max);
         let out = c.slice(self.seg_off..self.seg_off + k);
@@ -305,17 +486,17 @@ impl SendBuf {
     }
 
     /// Drops `n` sent bytes from the front (acknowledged, or not needed).
-    pub(crate) fn release(&mut self, n: u64, pool: &mut ChunkPool) {
+    pub(crate) fn release(&mut self, n: u64, _pool: &mut ChunkPool) {
         let mut left = usize_sat(n.min(self.kept));
         self.kept -= left as u64;
         while left > 0 {
             let Some(front) = self.segs.front_mut().map(|s| &mut s.bytes) else {
                 // The rest is at the front of `tail`; all of it keeps the
                 // chunk's capacity for the next writes.
-                if left == self.tail.len() {
-                    self.tail.clear();
+                if left == self.tail.bytes.len() {
+                    self.tail.bytes.clear();
                 } else {
-                    self.tail.advance(left);
+                    self.tail.bytes.advance(left);
                 }
                 self.seg_off -= left;
                 return;
@@ -323,11 +504,7 @@ impl SendBuf {
             let k = left.min(front.len());
             left -= k;
             if k == front.len() {
-                if let Some(done) = self.segs.pop_front()
-                    && done.own
-                {
-                    pool.put(done.bytes);
-                }
+                self.segs.pop_front();
                 if self.seg > 0 {
                     self.seg -= 1;
                 } else {
@@ -356,23 +533,8 @@ impl SendBuf {
         if off + dst.len() as u64 > self.len {
             return false;
         }
-        let mut skip = usize_sat(off) + self.seg_off;
-        let mut done = 0;
-        for i in self.seg..=self.segs.len() {
-            if done == dst.len() {
-                break;
-            }
-            let run = self.run(i);
-            if skip >= run.len() {
-                skip -= run.len();
-                continue;
-            }
-            let k = (run.len() - skip).min(dst.len() - done);
-            dst[done..done + k].copy_from_slice(&run[skip..skip + k]);
-            skip = 0;
-            done += k;
-        }
-        done == dst.len()
+        let runs = (self.seg..=self.segs.len()).map(|index| self.run(index));
+        copy_runs(runs, usize_sat(off) + self.seg_off, dst)
     }
 
     /// Copies `dst.len()` sent bytes starting `off` bytes after the first
@@ -381,27 +543,12 @@ impl SendBuf {
         if off + dst.len() as u64 > self.kept {
             return false;
         }
-        let mut skip = usize_sat(off);
-        let mut done = 0;
-        for run in self.kept_runs() {
-            if done == dst.len() {
-                break;
-            }
-            if skip >= run.len() {
-                skip -= run.len();
-                continue;
-            }
-            let k = (run.len() - skip).min(dst.len() - done);
-            dst[done..done + k].copy_from_slice(&run[skip..skip + k]);
-            skip = 0;
-            done += k;
-        }
-        done == dst.len()
+        copy_runs(self.kept_runs(), usize_sat(off), dst)
     }
 
     /// The sent bytes at `off..off + len` after the first one held, without
     /// copying, when they lie in one frozen segment.
-    pub(crate) fn shared_kept(&self, off: u64, len: usize) -> Option<Bytes> {
+    pub(crate) fn shared_kept(&self, off: u64, len: usize) -> Option<Chunk> {
         if off + len as u64 > self.kept {
             return None;
         }
@@ -421,16 +568,23 @@ impl SendBuf {
     /// (a discarded stream's buffers serve the next stream).
     pub(crate) fn clear(&mut self) {
         self.segs.clear();
-        self.tail.clear();
+        self.tail.bytes.clear();
         self.len = 0;
         self.kept = 0;
         self.seg = 0;
         self.seg_off = 0;
     }
 
+    #[cfg(feature = "tokio")]
+    pub(super) fn release_idle(&mut self) {
+        if self.len == 0 && self.kept == 0 {
+            *self = Self::default();
+        }
+    }
+
     /// Heap bytes the buffers hold.
     pub(crate) fn capacity(&self) -> usize {
-        self.tail.capacity() + self.segs.capacity() * size_of::<Seg>()
+        self.tail.backing.size + self.segs.capacity() * size_of::<Seg>()
     }
 
     /// Drops the unsent data; sent bytes stay held.
@@ -469,9 +623,9 @@ impl SendBuf {
             } else {
                 self.segs.truncate(i);
             }
-            self.tail.clear();
+            self.tail = SendTail::default();
         } else {
-            self.tail.truncate(off);
+            self.tail.bytes.truncate(off);
         }
         self.len = keep;
     }
@@ -586,7 +740,7 @@ pub(crate) struct SendPart {
     /// waiting writers (`SessionCore::send_waiters`).
     pub(crate) waiter: Option<u32>,
     /// Waits until every byte written was sent (`SessionCore::data_sent`).
-    pub(crate) sent_waiting: bool,
+    pub(crate) sent_waiting: Option<u64>,
     /// A flush owes the opening frame, with nothing else to send
     /// (`SessionCore::flush`).
     pub(crate) open_want: bool,
@@ -677,6 +831,7 @@ pub(crate) struct SendMp {
     /// The pipe that carried the stream's opening frame (multipath): its
     /// datagrams follow it there until the opening is acknowledged.
     pub(crate) open_pipe: Option<u64>,
+    pub(crate) open_acked: bool,
     /// The STREAM frames of the direction in the pipes' logs: the first transmissions in offset
     /// order, the copies (reinjected, opportunistic and redundant) in order of their ends,
     /// and the end of the first transmissions logged.
@@ -736,6 +891,12 @@ impl SendMp {
                 .filter(move |c| c.off <= x)
                 .copied(),
         )
+    }
+
+    pub(crate) fn opening_sent(&mut self, offset: u64, pipe: u64) {
+        if offset == 0 && !self.open_acked {
+            self.open_pipe = Some(pipe);
+        }
     }
 
     /// Bytes `[off, end)` were acknowledged.
@@ -820,6 +981,7 @@ impl SendMp {
         copies_unacked: 0,
         picked: None,
         open_pipe: None,
+        open_acked: false,
         carried: VecDeque::new(),
         copies: VecDeque::new(),
         logged_to: 0,
@@ -936,6 +1098,11 @@ impl SendPart {
 }
 
 impl SendPart {
+    /// Wakes writers when the earliest requested offset is sent.
+    pub(crate) fn wait_sent_through(&mut self, through: u64) {
+        self.sent_waiting = Some(self.sent_waiting.map_or(through, |old| old.min(through)));
+    }
+
     /// A sending part whose data goes into `buf` (an empty buffer, maybe
     /// with capacity from a discarded stream).
     pub(crate) fn with_buf(max_data: u64, buf: SendBuf) -> Self {
@@ -957,7 +1124,7 @@ impl SendPart {
             deficit: 0,
             queued: None,
             waiter: None,
-            sent_waiting: false,
+            sent_waiting: None,
             open_want: false,
             waits: Waits::default(),
             mp: None,
@@ -1136,7 +1303,7 @@ impl SendPart {
 pub(crate) struct RecvPart {
     pub(crate) state: RecvState,
     /// Unread application data.
-    pub(crate) buf: RecvBuf,
+    pub(super) buf: ReceiveQueue,
     /// Stream offset of the first byte of `buf`.
     pub(crate) read_offset: u64,
     /// The highest offset received so far (the end of the contiguous data
@@ -1145,11 +1312,9 @@ pub(crate) struct RecvPart {
     /// The end of the data received without gaps: `buf` holds
     /// `read_offset..contig`.
     pub(crate) contig: u64,
-    /// Data and offsets received beyond a gap (multipath only), allocated
-    /// when the first gap appears.
-    gaps: Option<Box<Gaps>>,
-    /// Every byte below this offset arrived (or, once the part discards its
-    /// data, counts as arrived): each byte releases session credit once,
+    /// Arrival evidence beyond `arrived_to` for releasing connection credit.
+    gaps: Option<Box<Arrived>>,
+    /// Every byte below this offset arrived: each byte releases session credit once,
     /// when it arrives.
     pub(crate) arrived_to: u64,
     pub(crate) final_size: Option<u64>,
@@ -1174,7 +1339,7 @@ pub(crate) struct RecvPart {
     /// A `MAX_STREAM_DATA` update is owed.
     pub(crate) update_pending: bool,
     /// Preamble size; application data starts here.
-    pub(crate) preamble_size: Option<u64>,
+    preamble_size: Option<NonZeroU16>,
     /// `MAX_STREAM_DATA` was lost with a pipe: send the limit again.
     pub(crate) resend: bool,
     /// Application bytes returned to the application.
@@ -1194,11 +1359,16 @@ pub(crate) struct RecvCold {
     /// final size that had not arrived; bytes there release nothing more
     /// and are not tracked.
     pub(crate) released_from: Option<u64>,
+    /// Arrival count retained for statistics after a reset drops the
+    /// noncontiguous evidence above its Reliable Size.
+    released_arrivals: u64,
     /// The peer's reset: code and Reliable Size (the final size for
     /// `RESET_STREAM`).
     pub(crate) reset: Option<(u64, u64)>,
     /// The application stopped reading with this code.
     pub(crate) stopped: Option<u64>,
+    /// The stop request was already handed to a writer.
+    pub(crate) stop_written: bool,
     /// Largest limit reported in `STREAM_DATA_BLOCKED` (NE-4).
     pub(crate) blocked_seen: Option<u64>,
 }
@@ -1206,28 +1376,38 @@ pub(crate) struct RecvCold {
 impl RecvCold {
     const NONE: Self = Self {
         released_from: None,
+        released_arrivals: 0,
         reset: None,
         stopped: None,
+        stop_written: false,
         blocked_seen: None,
     };
 }
 
 impl RecvPart {
+    pub(crate) fn preamble_size(&self) -> Option<u64> {
+        self.preamble_size.map(|size| u64::from(size.get()))
+    }
+
+    /// The decoded Length field occupies at least one byte. The total
+    /// was checked against the `u16` receive limit when it was parsed.
+    pub(crate) fn set_preamble_size(&mut self, size: usize) {
+        let size = u16::try_from(size).expect("validated preamble size");
+        self.preamble_size = Some(NonZeroU16::new(size).expect("preamble includes its length"));
+    }
+
     /// Whether the auto-tuning cap is automatic: no fixed cap of its own,
     /// the session's memory allowance (with the 64 MiB floor) bounds it.
     pub(crate) fn automatic_cap(&self) -> bool {
         self.max_window == crate::proto::varint::MAX
     }
 
-    /// A receiving part whose data goes into `buf` (an empty buffer, maybe
-    /// with capacity from a discarded stream).
-    pub(crate) fn with_buf(window: u64, max_window: u64, storage: BytesMut) -> Self {
-        let mut buf = RecvBuf::default();
-        buf.give_storage(storage);
+    /// A receiving part with no accepted ranges.
+    pub(crate) fn new(window: u64, max_window: u64) -> Self {
         Self {
             max_window: max_window.max(window),
             state: RecvState::Recv,
-            buf,
+            buf: ReceiveQueue::default(),
             read_offset: 0,
             received: 0,
             contig: 0,
@@ -1274,15 +1454,25 @@ impl RecvPart {
         if start >= end {
             return 0;
         }
-        if start == self.arrived_to && self.gaps.as_ref().is_none_or(|g| g.arrived.is_empty()) {
+        if start == self.arrived_to && self.gaps.as_deref().is_none_or(Arrived::is_empty) {
             // In order: the common case and the only one on a single pipe.
             self.arrived_to = end;
             return end - start;
         }
-        let arrived = &mut self.gaps.get_or_insert_with(Box::default).arrived;
+        let stopped = self.cold().stopped.is_some();
+        let arrived = self.gaps.get_or_insert_with(|| {
+            Box::new(if stopped {
+                Arrived::missing(self.arrived_to)
+            } else {
+                Arrived::default()
+            })
+        });
         let fresh = arrived.insert(start, end, self.arrived_to);
         if let Some(e) = arrived.advance(self.arrived_to) {
             self.arrived_to = e;
+        }
+        if arrived.is_empty() {
+            self.gaps = None;
         }
         fresh
     }
@@ -1297,7 +1487,7 @@ impl RecvPart {
             + self
                 .gaps
                 .as_ref()
-                .map_or(0, |g| g.arrived.covered(start.max(self.arrived_to), end))
+                .map_or(0, |g| g.covered(start.max(self.arrived_to), end))
     }
 
     /// A reset with this Reliable Size and final size: the bytes of
@@ -1309,8 +1499,19 @@ impl RecvPart {
         if reliable >= upto {
             return 0;
         }
-        self.cold_mut().released_from = Some(reliable);
-        (upto - reliable) - self.arrived_in(reliable, upto)
+        let received = self.arrived_in(reliable, upto);
+        let cut = reliable.max(self.arrived_to);
+        let released_arrivals = self.arrived_in(cut, upto);
+        if let Some(gaps) = &mut self.gaps {
+            gaps.remove_from(cut);
+            if gaps.is_empty() {
+                self.gaps = None;
+            }
+        }
+        let cold = self.cold_mut();
+        cold.released_from = Some(reliable);
+        cold.released_arrivals += released_arrivals;
+        (upto - reliable) - received
     }
 
     /// Bytes below the final size whose credit is not handled: below a
@@ -1323,198 +1524,69 @@ impl RecvPart {
         })
     }
 
-    /// Distinct bytes at or beyond `base` that arrived (or counted as
-    /// arrived when the part discarded its data); never decreases.
+    /// Distinct bytes at or beyond `base` that arrived; never decreases.
     pub(crate) fn arrived_from(&self, base: u64) -> u64 {
-        self.arrived_in(base, u64::MAX)
+        self.arrived_in(base, u64::MAX) + self.cold().released_arrivals
     }
 
-    /// Stores `data` at stream offset `off` (reassembly by offset, RFC 9000
-    /// Section 2.2). Bytes below `contig` or already held are duplicates.
-    /// Returns the bytes newly stored.
-    pub(crate) fn store(&mut self, off: u64, data: &[u8], src: Option<(&Bytes, Backing)>) -> u64 {
-        let end = off + data.len() as u64;
-        if end <= self.contig {
-            return 0;
-        }
-        let (off, data) = if off < self.contig {
-            let skip = usize_sat(self.contig - off);
-            (self.contig, &data[skip..])
-        } else {
-            (off, data)
-        };
-        // In-order data references the read buffer it arrived in, when the
-        // driver handed one over; anything else is copied.
-        let push = |buf: &mut RecvBuf, d: &[u8]| match src {
-            Some((b, backing)) if within(b, d) => buf.push_shared(b.slice_ref(d), backing),
-            _ => buf.push_copy(d),
-        };
-        if off == self.contig && self.gaps.as_ref().is_none_or(|g| g.held.is_empty()) {
-            // In order: the common case and the only one on a single pipe.
-            push(&mut self.buf, data);
-            self.contig = end;
-            return data.len() as u64;
-        }
-        let mut stored = 0u64;
-        let mut rest = (off, data);
-        if off == self.contig {
-            // Fills the first gap, up to the next held range.
-            let next = self
-                .gaps
-                .as_ref()
-                .and_then(|g| g.held.first())
-                .map_or(end, |o| o.min(end));
-            let k = usize_sat(next - off);
-            push(&mut self.buf, &data[..k]);
-            self.contig = next;
-            stored += k as u64;
-            rest = (next, &data[k..]);
-        }
-        if !rest.1.is_empty() {
-            // Beyond a gap: held, a large piece of the read buffer
-            // referenced as in-order data is.
-            let held = &mut self.gaps.get_or_insert_with(Box::default).held;
-            stored += held.store(rest.0, rest.1, self.read_offset, src);
-        }
-        let trimmed = self.pull_ooo();
-        debug_assert_eq!(trimmed, 0, "held ranges start beyond the contiguous data");
-        stored
+    pub(super) fn protected_history(&self) -> u64 {
+        self.gaps.as_deref().map_or(0, Arrived::protected_history)
     }
 
-    /// Whether any received data, in order or held, references a read
-    /// buffer.
-    pub(crate) fn references(&self) -> bool {
-        self.buf.references() || self.gaps.as_ref().is_some_and(|g| g.held.references())
-    }
-
-    /// Bytes of the received data, in order or held, that reference read
-    /// buffers.
-    pub(crate) fn referenced(&self) -> usize {
-        self.buf.referenced()
-            + self.gaps.as_ref().map_or(0, |g| {
-                usize::try_from(g.held.referenced()).unwrap_or(usize::MAX)
-            })
-    }
-
-    /// Whether the part is to be listed among those that reference read
-    /// buffers: it references one and is not listed yet.
-    pub(crate) fn needs_listing(&mut self) -> bool {
-        let new = !self.buf.listed() && self.references();
-        if new {
-            self.buf.set_listed(true);
-        }
-        new
-    }
-
-    /// Calls `f` with each read buffer the received data references and the
-    /// bytes it references in it.
-    pub(crate) fn tally(&self, f: &mut impl FnMut(Backing, usize)) {
-        self.buf.tally(f);
-        if let Some(g) = &self.gaps {
-            g.held.tally(f);
+    pub(super) fn discard_arrival_data(&mut self) {
+        let high = self
+            .received
+            .min(self.cold().released_from.unwrap_or(u64::MAX));
+        if let Some(gaps) = &mut self.gaps {
+            gaps.discard_data(self.arrived_to, high);
         }
     }
 
-    /// Copies the received data of the read buffers `out` names into
-    /// storage of the stream's own; returns whether it still references a
-    /// read buffer (it stays listed).
-    pub(crate) fn copy_out(&mut self, out: &impl Fn(u64) -> bool) -> bool {
-        self.buf.copy_out(out);
-        if let Some(g) = &mut self.gaps {
-            g.held.copy_out(out);
-        }
-        self.keep_listed()
+    /// Stores the validated bytes without replacing overlapping arrivals.
+    pub(super) fn store(
+        &mut self,
+        store: &mut ReceiveStore,
+        off: u64,
+        data: &[u8],
+        src: Source<'_>,
+    ) -> u64 {
+        let (contig, added) = self.buf.insert(store, self.contig, off, data, src);
+        self.contig = contig;
+        added
     }
 
-    /// Whether the part stays listed among those that reference read
-    /// buffers (it is unlisted when it references none).
-    pub(crate) fn keep_listed(&mut self) -> bool {
-        let listed = self.references();
-        self.buf.set_listed(listed);
-        listed
-    }
-
-    /// Ranges held beyond a gap.
-    #[cfg(test)]
-    pub(crate) fn fragments(&self) -> usize {
-        self.gaps.as_ref().map_or(0, |g| g.held.ranges())
-    }
-
-    /// Moves held ranges that became contiguous into `buf` after the
-    /// preamble moved the contiguous end; returns the held bytes that lay
-    /// below it (preamble bytes that also arrived in a later frame), which
-    /// left the buffers.
-    pub(crate) fn pull_held(&mut self) -> u64 {
-        self.pull_ooo()
-    }
-
-    /// Moves held ranges that became contiguous into `buf`; returns the
-    /// held bytes below the contiguous end, dropped.
-    fn pull_ooo(&mut self) -> u64 {
-        let Some(g) = self.gaps.as_mut() else {
-            return 0;
-        };
-        let (contig, trimmed) = g.held.pull(self.contig, &mut self.buf);
+    /// Moves held ranges across the newly recognized preamble boundary.
+    pub(super) fn pull_held(&mut self, store: &mut ReceiveStore) -> u64 {
+        let (contig, trimmed) = self.buf.promote(store, self.contig);
         self.contig = contig;
         trimmed
     }
 
-    /// Heap bytes of the received data held for the application, with
-    /// its bookkeeping.
-    pub(crate) fn memory(&self) -> usize {
-        self.buf.memory()
-            + self.tuner.memory()
-            + self.gaps.as_ref().map_or(0, |g| {
-                size_of::<Gaps>() + g.held.memory() + g.arrived.memory()
-            })
+    /// Heap bytes of the per-stream arrival bookkeeping and tuner.
+    pub(super) fn memory(&self) -> usize {
+        self.tuner.memory()
+            + self.buf.heap_bytes()
+            + self
+                .gaps
+                .as_deref()
+                .map_or(0, |arrived| size_of::<Arrived>() + arrived.memory())
     }
 
     /// Bytes held for the application, contiguous or not.
     pub(crate) fn held(&self) -> u64 {
-        self.buf.len() as u64 + self.gaps.as_ref().map_or(0, |g| g.held.bytes())
+        self.buf.held()
     }
 
-    /// Drops held data at or beyond stream offset `limit`; returns the
-    /// bytes dropped.
-    pub(crate) fn drop_from(&mut self, limit: u64) -> u64 {
-        let mut dropped = 0;
-        let keep = limit.saturating_sub(self.read_offset);
-        if (self.buf.len() as u64) > keep {
-            dropped += self.buf.truncate(usize_sat(keep)) as u64;
-            self.contig = self.contig.min(limit.max(self.read_offset));
-        }
-        if let Some(g) = self.gaps.as_mut() {
-            dropped += g.held.drop_from(limit);
-        }
-        dropped
+    /// Drops held data at or beyond the reliable boundary.
+    pub(super) fn drop_from(&mut self, store: &mut ReceiveStore, limit: u64) -> u64 {
+        self.contig = self.contig.min(limit.max(self.read_offset));
+        self.buf.truncate(store, limit)
     }
 
-    /// Drops all held data; returns the bytes dropped. A large buffer is
-    /// released: nothing will be stored in it again.
-    pub(crate) fn drop_all(&mut self) -> u64 {
-        let n = self.held();
-        self.buf.clear(RECV_KEEP);
-        if let Some(g) = self.gaps.as_mut() {
-            g.held.clear();
-        }
-        n
+    /// Drops every queued range, preserving the arrival evidence for credit.
+    pub(super) fn drop_all(&mut self, store: &mut ReceiveStore) -> u64 {
+        self.buf.clear(store)
     }
-}
-
-/// Whether `part` lies within `whole`'s bytes.
-fn within(whole: &Bytes, part: &[u8]) -> bool {
-    let (w, p) = (whole.as_ptr() as usize, part.as_ptr() as usize);
-    p >= w && p + part.len() <= w + whole.len()
-}
-
-/// What a receiving part keeps of the data and offsets received beyond a
-/// gap (multipath): the data in memory bounded by the span however the
-/// peer fragments it, and the offsets that arrived
-/// beyond `arrived_to` (session credit).
-#[derive(Debug, Default)]
-struct Gaps {
-    held: Held,
-    arrived: Arrived,
 }
 
 /// How the stream is offered to the application.
@@ -1653,15 +1725,48 @@ impl StreamExtra {
     };
 }
 
+fn copy_runs<'a>(
+    runs: impl Iterator<Item = &'a [u8]>,
+    mut skip: usize,
+    mut dst: &mut [u8],
+) -> bool {
+    for run in runs {
+        if dst.is_empty() {
+            break;
+        }
+        if skip >= run.len() {
+            skip -= run.len();
+            continue;
+        }
+        let count = (run.len() - skip).min(dst.len());
+        let (head, rest) = dst.split_at_mut(count);
+        head.copy_from_slice(&run[skip..skip + count]);
+        dst = rest;
+        skip = 0;
+    }
+    dst.is_empty()
+}
+
+#[derive(Debug)]
+pub(super) struct QueuedStreamDatagram {
+    pub(super) context: u64,
+    pub(super) data: Chunk,
+    pub(super) at: Instant,
+    pub(super) expires: Option<Instant>,
+}
+
 /// A stream's datagram flow (datagram flows).
 #[derive(Debug, Default)]
 pub(crate) struct StreamDatagrams {
+    pub(crate) options: super::DatagramSendOptions,
     /// Received datagrams, not yet read: context, payload and when it was
     /// queued.
-    pub(crate) queue: VecDeque<(u64, Bytes, Instant)>,
+    pub(super) queue: VecDeque<QueuedStreamDatagram>,
+    /// The entry for this queue in the session's expiry index.
+    pub(super) expiry: Option<Instant>,
     /// The queue's delay bound ([`Config::datagram_queue_delay`](super::Config::datagram_queue_delay)).
     pub(crate) codel: super::codel::Codel,
-    /// Payload bytes in `queue` ([`Config::datagram_stream_bytes`](super::Config::datagram_stream_bytes)).
+    /// Payload bytes in `queue` ([`super::DatagramConfig::stream_receive_bytes`]).
     pub(crate) bytes: usize,
     /// Counts.
     pub(crate) counts: DatagramCounts,
@@ -1673,6 +1778,7 @@ pub(crate) struct DatagramCounts {
     pub(crate) sent: u64,
     pub(crate) received: u64,
     pub(crate) dropped_recv: u64,
+    pub(crate) expired_recv: u64,
     pub(crate) bytes_sent: u64,
     pub(crate) bytes_received: u64,
 }
@@ -1766,6 +1872,13 @@ impl Stream {
     pub(crate) fn extra_mut(&mut self) -> &mut StreamExtra {
         self.extra
             .get_or_insert_with(|| Box::new(StreamExtra::NONE))
+    }
+
+    /// Whether the stream still has work for a graceful session shutdown.
+    pub(super) fn shutdown_pending(&self) -> bool {
+        !self.parts_terminal()
+            || self.ctrl_queued
+            || self.send.as_ref().is_some_and(|s| s.queued.is_some())
     }
 
     /// Whether every part is terminal.
@@ -1936,6 +2049,19 @@ impl Slab {
             f(key, e.and_then(|e| e.stream.as_ref()));
         }
         touched.clear();
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn release_idle_sends(&mut self) {
+        for entry in self.pages.iter_mut().flat_map(|page| page.iter_mut()) {
+            if let Some(send) = entry
+                .stream
+                .as_mut()
+                .and_then(|stream| stream.send.as_mut())
+            {
+                send.buf.release_idle();
+            }
+        }
     }
 
     pub(crate) fn memory(&self) -> usize {

@@ -41,6 +41,16 @@ impl RangeSet {
         self.ranges.first().copied()
     }
 
+    pub(super) fn memory(&self) -> usize {
+        self.ranges.capacity() * size_of::<(u64, u64)>()
+    }
+
+    pub(super) fn trim_spare(&mut self) {
+        if self.ranges.capacity() / 4 > self.ranges.len() {
+            self.ranges.shrink_to_fit();
+        }
+    }
+
     /// Adds `[start, end)`; returns the number of bytes that were new.
     pub(crate) fn insert(&mut self, start: u64, end: u64) -> u64 {
         if start >= end {

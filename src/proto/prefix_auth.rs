@@ -1,555 +1,629 @@
-//! Prefix authentication tokens: an admission
-//! function under which a carrier starts with a token both ends compute
-//! from a pre-shared key. A token is a random Nonce and a MAC over the
-//! sender's time slot, an optional binding to the carrier's TLS handshake
-//! and the Nonce:
-//!
-//! ```text
-//! Kp   = HMAC-SHA256(PSK, "zmux-prefix-auth/1")
-//! Tag  = HMAC-SHA256(Kp, Slot (64) || Binding Length (8) || Binding || Nonce)[..16]
-//! Token = Nonce (128) || Tag (128)
-//! ```
-//!
-//! A carrier decided on its HTTP request head carries the token in a
-//! request header field instead, in base64url without padding.
-//!
-//! [`PrefixAuth`] makes tokens, and is a client's [`CarrierCredential`];
-//! [`PrefixAuthVerifier`] checks them within a number of slots of its own
-//! clock and accepts each Nonce once.
+//! First-message carrier admission under secure-carrier §3.4.
 
+mod store;
+
+pub use store::{
+    MemoryPrefixStore, PrefixClaim, PrefixDeadline, PrefixGeneration, PrefixSchedule, PrefixStore,
+    PrefixStoreFuture, PrefixTicket, PrefixWindow,
+};
+
+use std::fmt;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::admission::{AdmissionVerdict, CarrierCredential, CarrierInfo};
+use super::admission::{CarrierCredential, CarrierInfo};
 use super::oob;
-use super::replay::{ReplayFilter, ReplayVerdict};
-use crate::util::HmacSha256;
+use crate::util::{HmacSha256, wipe};
 
-/// The length of a token: the admission's prefix length.
-pub const PREFIX_TOKEN_LEN: usize = NONCE_LEN + TAG_LEN;
-pub use super::keys::PREFIX_AUTH_EXPORTER_LABEL;
-/// The length of a binding.
-pub const PREFIX_AUTH_BINDING_LEN: usize = 32;
-/// The request header field of the header form, unless both ends agree on
-/// another ([`PrefixAuth::with_header`]).
+/// Binary length of a ticket presentation.
+pub const PREFIX_TOKEN_LEN: usize = 64;
+/// Request field for a head-stage presentation.
 pub const PREFIX_AUTH_HEADER: &str = "Zmux-Prefix-Auth";
-/// The length of a token in the header form: 32 bytes in base64url
-/// without padding.
+/// Label of the completed carrier handshake's exporter.
+pub use super::keys::PREFIX_AUTH_EXPORTER_LABEL;
+/// Length of the bound form's exporter.
+pub const PREFIX_AUTH_BINDING_LEN: usize = 32;
+/// Default verifier ceiling on slot tolerance.
+pub const DEFAULT_MAX_SKEW: u32 = 2;
+
+#[cfg(all(feature = "tokio", not(loom)))]
 const HEADER_VALUE_LEN: usize = oob::encoded_len(PREFIX_TOKEN_LEN);
 
-const NONCE_LEN: usize = 16;
-const TAG_LEN: usize = 16;
-const KEY_LABEL: &[u8] = b"zmux-prefix-auth/1";
-
-/// A [`PrefixAuth`] that cannot be made: an empty key, or a slot length
-/// that is not a positive whole number of seconds.
+/// Invalid prefix authentication configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidPrefixAuth;
+pub struct InvalidPrefixAuth(&'static str);
 
-impl std::fmt::Display for InvalidPrefixAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "prefix auth needs a non-empty key, a slot of whole seconds and room for a Nonce",
-        )
+impl fmt::Display for InvalidPrefixAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
     }
 }
 
 impl std::error::Error for InvalidPrefixAuth {}
 
-/// The parameters both ends of prefix authentication share: the key, the
-/// slot length, whether tokens are bound to the carrier's TLS
-/// handshake, and the request header field of
-/// the header form. Makes tokens; as a [`CarrierCredential`], a fresh one for
-/// each carrier. Cheap to clone.
+/// Validates a custom field shared by HTTP adapters and prefix admission.
+#[doc(hidden)]
+pub fn check_custom_header(name: &str) -> Result<(), &'static str> {
+    const RESERVED: &[&str] = &[
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "transfer-encoding",
+        "host",
+        "connection",
+        "upgrade",
+        "keep-alive",
+        "te",
+        "trailer",
+        "authorization",
+        "cookie",
+        "expect",
+        "date",
+        "early-data",
+        "forwarded",
+        "via",
+        "location",
+        "origin",
+        "cache-control",
+        "pragma",
+        "accept",
+        "user-agent",
+        "referer",
+        "range",
+    ];
+    const PREFIXES: &[&str] = &["proxy-", "sec-", "x-forwarded-", "accept-", "if-"];
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_|~".contains(&b) || b == 0x60)
+    {
+        return Err("is not a header field name");
+    }
+    let lower = name.to_ascii_lowercase();
+    if name.eq_ignore_ascii_case(PREFIX_AUTH_HEADER)
+        || RESERVED.contains(&lower.as_str())
+        || PREFIXES.iter().any(|p| lower.starts_with(p))
+    {
+        return Err("is reserved");
+    }
+    Ok(())
+}
+
+fn prefix_header(name: Arc<str>) -> Result<Arc<str>, InvalidPrefixAuth> {
+    if name.is_empty() || name.eq_ignore_ascii_case(PREFIX_AUTH_HEADER) {
+        return Ok(PREFIX_AUTH_HEADER.into());
+    }
+    if check_custom_header(&name).is_err() || name.eq_ignore_ascii_case(oob::PAIR_HEADER) {
+        return Err(InvalidPrefixAuth(
+            "reserved or invalid prefix-authentication header",
+        ));
+    }
+    Ok(name)
+}
+
+struct Key([u8; 32]);
+
+impl Key {
+    fn shared(mut bytes: [u8; 32]) -> Arc<Self> {
+        let key = Arc::new(Self(bytes));
+        wipe(&mut bytes);
+        key
+    }
+}
+
+impl fmt::Debug for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Key(..)")
+    }
+}
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+/// Deployment policy for the carrier that carries a ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixBinding {
+    /// Bind to the 1-RTT TLS 1.3 or QUIC exporter of this carrier.
+    Bound,
+    /// A bearer ticket on an encrypted carrier.
+    Encrypted,
+    /// Also allow cleartext binary presentation. Use only where theft of a
+    /// presentation can cause denial of service and grants no authority.
+    AllowCleartext,
+}
+
+impl PrefixBinding {
+    fn export(self, info: &CarrierInfo, header: bool) -> io::Result<super::seal::Secret> {
+        let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+        if info.is_early_data()
+            || (!info.is_encrypted() && (header || self != Self::AllowCleartext))
+        {
+            return Err(denied());
+        }
+        if self != Self::Bound {
+            return Ok(super::seal::Secret::default());
+        }
+        if !info.has_prefix_binding() {
+            return Err(denied());
+        }
+        info.export(PREFIX_AUTH_EXPORTER_LABEL, &[], PREFIX_AUTH_BINDING_LEN)
+            .filter(|bytes| bytes.len() == PREFIX_AUTH_BINDING_LEN)
+            .map(Into::into)
+            .ok_or_else(denied)
+    }
+}
+
+fn unix_now() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn nonce() -> io::Result<[u8; 16]> {
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+    Ok(nonce)
+}
+
+fn first_tag(mac: &HmacSha256, parts: &[&[u8]]) -> [u8; 16] {
+    let mut full = mac.mac(parts);
+    let tag = *full.first_chunk().expect("SHA-256 output");
+    wipe(&mut full);
+    tag
+}
+
+fn masked_id(outer: &HmacSha256, n: &[u8], id: &[u8; 16]) -> [u8; 16] {
+    let mut mask = first_tag(outer, &[&[0], n]);
+    let result = std::array::from_fn(|i| id[i] ^ mask[i]);
+    wipe(&mut mask);
+    result
+}
+
+fn ticket_mac<'a>(
+    id: &'a [u8; 16],
+    envelope: &'a [u8],
+    slot: &'a [u8; 8],
+    len: &'a [u8; 1],
+    binding: &'a [u8],
+) -> [&'a [u8]; 6] {
+    [&[2], id, envelope, slot, len, binding]
+}
+
+/// A ticket presenter and its locally installed outer key schedule.
 #[derive(Clone)]
 pub struct PrefixAuth {
-    kp: HmacSha256,
-    slot: u64,
-    bind_tls: bool,
+    ticket: PrefixTicket,
+    schedule: Arc<PrefixSchedule>,
+    seconds: std::num::NonZeroU64,
+    binding: PrefixBinding,
     header: Arc<str>,
 }
 
-impl std::fmt::Debug for PrefixAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for PrefixAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrefixAuth")
-            .field("slot", &self.slot)
-            .field("bind_tls", &self.bind_tls)
-            .field("header", &self.header)
+            .field("binding", &self.binding)
             .finish_non_exhaustive()
     }
 }
 
 impl PrefixAuth {
-    /// Tokens under the pre-shared key `psk` (non-empty) and slots of
-    /// `slot` (a positive whole number of seconds); `bind_tls` binds them
-    /// to the carrier's TLS handshake. The header form uses
-    /// [`PREFIX_AUTH_HEADER`].
-    pub fn new(psk: &[u8], slot: Duration, bind_tls: bool) -> Result<Self, InvalidPrefixAuth> {
-        if psk.is_empty() || slot.subsec_nanos() != 0 || slot.as_secs() == 0 {
-            return Err(InvalidPrefixAuth);
-        }
-        let kp = crate::proto::seal::Secret::from(&HmacSha256::new(psk).mac(&[KEY_LABEL])[..]);
+    /// Constructs a presenter.
+    ///
+    /// # Errors
+    ///
+    /// The agreed slot length must be positive.
+    pub fn new(
+        ticket: PrefixTicket,
+        schedule: Arc<PrefixSchedule>,
+        slot_seconds: u64,
+        binding: PrefixBinding,
+    ) -> Result<Self, InvalidPrefixAuth> {
+        let seconds =
+            std::num::NonZeroU64::new(slot_seconds).ok_or(InvalidPrefixAuth("zero slot length"))?;
         Ok(Self {
-            kp: HmacSha256::new(&kp),
-            slot: slot.as_secs(),
-            bind_tls,
+            ticket,
+            schedule,
+            seconds,
+            binding,
             header: PREFIX_AUTH_HEADER.into(),
         })
     }
 
-    /// With this request header field for the header form instead of
-    /// [`PREFIX_AUTH_HEADER`], where an intermediary strips unknown fields:
-    /// a local agreement of both ends. Compared without regard to case.
-    #[must_use]
-    pub fn with_header(mut self, name: impl Into<String>) -> Self {
-        self.header = name.into().into();
-        self
+    /// Selects the agreed name of the field on a request head.
+    ///
+    /// # Errors
+    ///
+    /// The field name is invalid or reserved. An empty name selects the default.
+    pub fn with_header(mut self, name: impl Into<Arc<str>>) -> Result<Self, InvalidPrefixAuth> {
+        self.header = prefix_header(name.into())?;
+        Ok(self)
     }
 
-    /// Whether tokens are bound to the carrier's TLS handshake.
-    #[must_use]
-    pub fn binds_tls(&self) -> bool {
-        self.bind_tls
-    }
-
-    /// The request header field of the header form.
-    #[must_use]
-    pub fn header_name(&self) -> &str {
-        &self.header
-    }
-
-    /// The binding of a carrier with metadata `info`: its exporter's value
-    /// when tokens are bound, else `None`; an error when they are bound
-    /// and `info` has no exporter, or one that gives its values later and
-    /// was not resolved yet ([`CarrierExporter::resolve`](crate::CarrierExporter::resolve);
-    /// a listener resolves it before its admission decides).
-    pub fn binding(&self, info: &CarrierInfo) -> io::Result<Option<[u8; PREFIX_AUTH_BINDING_LEN]>> {
-        if !self.bind_tls {
-            return Ok(None);
-        }
-        let b = info
-            .export(PREFIX_AUTH_EXPORTER_LABEL, &[], PREFIX_AUTH_BINDING_LEN)
-            .ok_or_else(|| {
-                let why = match info.exporter() {
-                    Some(e) if !e.is_resolved() => {
-                        "the carrier's exporter gives its values later and was not resolved \
-                         (CarrierExporter::resolve)"
-                    }
-                    Some(_) => "the carrier's TLS exporter failed",
-                    None => "bound prefix authentication needs the carrier's TLS exporter",
-                };
-                io::Error::new(io::ErrorKind::InvalidInput, why)
-            })?;
-        let mut a = [0u8; PREFIX_AUTH_BINDING_LEN];
-        a.copy_from_slice(&b);
-        Ok(Some(a))
-    }
-
-    /// A token for the current slot of the system clock and a fresh Nonce.
-    /// `binding` is the carrier's binding ([`PREFIX_AUTH_EXPORTER_LABEL`])
-    /// when tokens are bound, else `None`. Fails only when the system's
-    /// random source does.
-    pub fn token(
-        &self,
-        binding: Option<&[u8; PREFIX_AUTH_BINDING_LEN]>,
-    ) -> io::Result<[u8; PREFIX_TOKEN_LEN]> {
-        let mut nonce = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-        Ok(self.token_at(binding, unix_now(), nonce))
-    }
-
-    /// `token` in the header form: base64url without padding, 43
-    /// characters.
+    /// Canonical unpadded base64url for a binary presentation.
     #[must_use]
     pub fn header_value(token: &[u8; PREFIX_TOKEN_LEN]) -> String {
         oob::encode_string(token)
     }
 
-    /// The token for time `unix` (seconds since the epoch) and `nonce`.
-    #[must_use]
-    pub fn token_at(
-        &self,
-        binding: Option<&[u8; PREFIX_AUTH_BINDING_LEN]>,
-        unix: u64,
-        nonce: [u8; NONCE_LEN],
-    ) -> [u8; PREFIX_TOKEN_LEN] {
-        let mut t = [0u8; PREFIX_TOKEN_LEN];
-        t[..NONCE_LEN].copy_from_slice(&nonce);
-        let binding = binding.map_or(&[][..], |b| &b[..]);
-        let hdr = slot_header(unix / self.slot, binding.len());
-        let tag = self.kp.mac(&[&hdr, binding, &nonce]);
-        t[NONCE_LEN..].copy_from_slice(&tag[..TAG_LEN]);
-        t
-    }
-}
-
-/// Verifies tokens: their tag for a slot within `skew` slots of the
-/// verifier's clock, compared in constant time, and a Nonce not seen
-/// before. Safe for concurrent use.
-pub struct PrefixAuthVerifier {
-    auth: PrefixAuth,
-    skew: u64,
-    record: ReplayFilter,
-    /// The first slot whose tokens are taken: the one it started in.
-    first_slot: u64,
-}
-
-impl std::fmt::Debug for PrefixAuthVerifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PrefixAuthVerifier")
-            .field("auth", &self.auth)
-            .field("skew", &self.skew)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PrefixAuthVerifier {
-    /// A verifier of `auth`'s tokens that accepts the slots within `skew`
-    /// of its current one and records at most `max_nonces` Nonces; a token
-    /// that finds the record full is not accepted. Each token costs up to
-    /// `2 * skew + 1` HMACs to verify: keep `skew` small.
-    ///
-    /// The Nonces of an earlier run are gone: tokens stamped before the
-    /// slot this verifier starts in are refused, so that one captured
-    /// before a restart replays at most within that slot (a client whose
-    /// clock is a slot behind fails until the next).
+    /// Generates a fresh binary presentation on this carrier.
     ///
     /// # Errors
     ///
-    /// [`InvalidPrefixAuth`] for `max_nonces` of zero, which could record
-    /// no Nonce and so accept no token.
-    pub fn new(auth: PrefixAuth, skew: u32, max_nonces: usize) -> Result<Self, InvalidPrefixAuth> {
-        let skew = u64::from(skew);
-        let slot = auth.slot;
-        let record = ReplayFilter::new(
-            Duration::from_secs((skew + 1).saturating_mul(slot)),
-            max_nonces,
-        )
-        .map_err(|_| InvalidPrefixAuth)?;
-        Ok(Self {
-            auth,
-            skew,
-            record,
-            first_slot: unix_now() / slot,
-        })
+    /// Carrier or ticket policy prevents presenting, or the random source fails.
+    pub fn token(&self, info: &CarrierInfo) -> io::Result<[u8; PREFIX_TOKEN_LEN]> {
+        self.present(info, false)
     }
 
-    /// As if it started at `unix` (seconds since the epoch): the slot whose
-    /// tokens it takes first, for verifying at given times
-    /// ([`Self::verify_at`]).
+    /// Generates an unbound fixture presentation at a fixed Unix time.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
     #[must_use]
-    pub fn started_at(mut self, unix: u64) -> Self {
-        self.first_slot = unix / self.auth.slot;
-        self
-    }
-
-    /// The parameters it verifies.
-    pub fn auth(&self) -> &PrefixAuth {
-        &self.auth
-    }
-
-    /// Whether `token` is valid for `binding` at the system clock and its
-    /// Nonce is new; records the Nonce when it is.
-    pub fn verify(&self, token: &[u8], binding: Option<&[u8; PREFIX_AUTH_BINDING_LEN]>) -> bool {
-        self.verify_at(token, binding, unix_now())
-    }
-
-    /// [`PrefixAuthVerifier::verify`] at time `unix` (seconds since the
-    /// epoch).
-    pub fn verify_at(
+    pub fn fixture_token(
         &self,
-        token: &[u8],
-        binding: Option<&[u8; PREFIX_AUTH_BINDING_LEN]>,
-        unix: u64,
-    ) -> bool {
-        if token.len() != PREFIX_TOKEN_LEN {
-            return false;
+        unix_seconds: u64,
+        nonce: [u8; 16],
+    ) -> Option<[u8; PREFIX_TOKEN_LEN]> {
+        if self.binding != PrefixBinding::AllowCleartext {
+            return None;
         }
-        let (nonce, tag) = token.split_at(NONCE_LEN);
-        let binding = binding.map_or(&[][..], |b| &b[..]);
-        let cur = unix / self.auth.slot;
-        let low = cur.saturating_sub(self.skew);
-        let low = low.max(self.first_slot);
-        let Some(slot) = (low..=cur.saturating_add(self.skew)).find(|&s| {
-            let hdr = slot_header(s, binding.len());
-            self.auth.kp.verify(&[&hdr, binding, nonce], tag)
-        }) else {
-            return false;
-        };
-        let ms = |secs: u64| i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX);
-        // A slot stands for its start: within (skew + 1) slots of the clock.
-        self.record
-            .check_at(nonce, ms(slot.saturating_mul(self.auth.slot)), ms(unix))
-            == ReplayVerdict::Fresh
+        self.token_at(unix_seconds / self.seconds, nonce, &[])
     }
 
-    /// An admission decision: [`AdmissionVerdict::Accept`] of the token when it
-    /// verifies, with the binding of `info`'s exporter when tokens are
-    /// bound, and [`AdmissionVerdict::Fallback`] for every other outcome. The token
-    /// is the prefix ([`PREFIX_TOKEN_LEN`] bytes, accepted with them), or,
-    /// on a carrier decided on its request head
-    /// ([`AdmissionStage::Head`](crate::proto::admission::AdmissionStage::Head)),
-    /// the one value of the request header field
-    /// ([`PrefixAuth::header_name`]), 43 base64url characters (accepted with
-    /// no prefix): a missing, repeated or malformed field fails like a
-    /// wrong token.
-    pub fn decide(&self, info: &CarrierInfo, prefix: &[u8]) -> AdmissionVerdict {
-        let header;
-        let (token, accept) = if info.is_head() {
-            let Some(t) = self.header_token(info) else {
-                return AdmissionVerdict::fallback();
-            };
-            header = t;
-            (&header[..], 0)
-        } else {
-            (prefix, PREFIX_TOKEN_LEN)
-        };
-        let Ok(binding) = self.auth.binding(info) else {
-            return AdmissionVerdict::fallback();
-        };
-        if self.verify(token, binding.as_ref()) {
-            AdmissionVerdict::accept(accept)
-        } else {
-            AdmissionVerdict::fallback()
-        }
+    fn present(&self, info: &CarrierInfo, header: bool) -> io::Result<[u8; PREFIX_TOKEN_LEN]> {
+        let binding = self
+            .binding
+            .export(info, header)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let slot = unix_now().ok_or(io::ErrorKind::InvalidData)? / self.seconds;
+        self.token_at(slot, nonce()?, &binding)
+            .ok_or_else(|| io::ErrorKind::PermissionDenied.into())
     }
 
-    /// The token of the header form: the field's one value, decoded.
-    fn header_token(&self, info: &CarrierInfo) -> Option<[u8; PREFIX_TOKEN_LEN]> {
-        // Decoded in place, without a copy of the value.
-        let mut token = [0u8; PREFIX_TOKEN_LEN];
-        let mut decoded = false;
-        let mut fields = 0usize;
-        info.for_each_header(|name, v| {
-            if name.eq_ignore_ascii_case(&self.auth.header) {
-                fields += 1;
-                decoded = v.len() == HEADER_VALUE_LEN
-                    && oob::decode(v, &mut token) == Ok(PREFIX_TOKEN_LEN);
-            }
-        });
-        (fields == 1 && decoded).then_some(token)
+    fn token_at(
+        &self,
+        slot: u64,
+        nonce: [u8; 16],
+        binding: &[u8],
+    ) -> Option<[u8; PREFIX_TOKEN_LEN]> {
+        let generation = self.schedule.eligible(&(slot..=slot)).first()?;
+        if !self.ticket.slots.contains(&slot) {
+            return None;
+        }
+        let outer = HmacSha256::new(&generation.key.0);
+        let mut token = [0; PREFIX_TOKEN_LEN];
+        token[..16].copy_from_slice(&nonce);
+        token[16..32].copy_from_slice(&masked_id(&outer, &nonce, &self.ticket.id));
+        let tag = first_tag(&outer, &[&[1], &token[..32]]);
+        token[32..48].copy_from_slice(&tag);
+        let key = HmacSha256::new(&self.ticket.key.0);
+        let tag = first_tag(
+            &key,
+            &ticket_mac(
+                &self.ticket.id,
+                &token[..48],
+                &slot.to_be_bytes(),
+                &binding_length(binding),
+                binding,
+            ),
+        );
+        token[48..].copy_from_slice(&tag);
+        Some(token)
     }
 }
 
 impl CarrierCredential for PrefixAuth {
-    /// A fresh token, bound to the carrier when tokens are bound.
+    fn prefix_ticket_header(&self) -> Option<&str> {
+        Some(&self.header)
+    }
+
     fn prefix(&self, info: &CarrierInfo) -> io::Result<Vec<u8>> {
-        Ok(self.token(self.binding(info)?.as_ref())?.to_vec())
+        Ok(self.token(info)?.into())
     }
 
-    /// A fresh token in the header form: [`PrefixAuth::header_name`] and the
-    /// token in base64url without padding.
     fn header(&self, info: &CarrierInfo) -> io::Result<(String, String)> {
-        let token = self.token(self.binding(info)?.as_ref())?;
-        Ok((self.header.to_string(), Self::header_value(&token)))
+        Ok((
+            self.header.to_string(),
+            Self::header_value(&self.present(info, true)?),
+        ))
     }
 }
 
-/// Slot (64) || Binding Length (8).
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "a binding is PREFIX_AUTH_BINDING_LEN (32) bytes or empty"
-)]
-fn slot_header(slot: u64, binding_len: usize) -> [u8; 9] {
-    let mut h = [0u8; 9];
-    h[..8].copy_from_slice(&slot.to_be_bytes());
-    // A binding is PREFIX_AUTH_BINDING_LEN bytes or empty.
-    h[8] = binding_len as u8;
-    h
+fn binding_length(binding: &[u8]) -> [u8; 1] {
+    [if binding.is_empty() { 0 } else { 32 }]
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+#[cfg(all(feature = "tokio", not(loom)))]
+struct CancelAttempt(PrefixDeadline);
+
+#[cfg(all(feature = "tokio", not(loom)))]
+impl Drop for CancelAttempt {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Verifies and redeems presentations using a shared admission-domain authority.
+#[cfg(all(feature = "tokio", not(loom)))]
+pub struct PrefixAuthVerifier {
+    store: Arc<dyn PrefixStore>,
+    window: PrefixWindow,
+    binding: PrefixBinding,
+    header: Arc<str>,
+    clock: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+}
 
-    fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+#[cfg(all(feature = "tokio", not(loom)))]
+impl fmt::Debug for PrefixAuthVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrefixAuthVerifier")
+            .field("window", &self.window)
+            .field("binding", &self.binding)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+impl PrefixAuthVerifier {
+    /// Configures a verifier with the domain's immutable slot parameters.
+    ///
+    /// # Errors
+    ///
+    /// The store's tolerance exceeds [`DEFAULT_MAX_SKEW`].
+    pub fn new(
+        store: Arc<dyn PrefixStore>,
+        binding: PrefixBinding,
+    ) -> Result<Self, InvalidPrefixAuth> {
+        Self::with_max_skew(store, binding, DEFAULT_MAX_SKEW)
     }
 
-    const T: u64 = 1_767_225_600;
-    const NONCE: [u8; 16] = [
-        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae,
-        0xaf,
-    ];
-
-    fn binding() -> [u8; 32] {
-        std::array::from_fn(|i| u8::try_from(i).unwrap())
-    }
-
-    #[test]
-    fn spec_vectors() {
-        let psk = [0x6b; 32];
-        assert_eq!(
-            HmacSha256::new(&psk).mac(&[KEY_LABEL]).to_vec(),
-            unhex("2eaed9a5e8ca0729884488be9c349871b69823f01876ad48062a8b15c6c1839c")
-        );
-        let a = PrefixAuth::new(&psk, Duration::from_secs(30), false).unwrap();
-        assert_eq!(T / 30, 58_907_520);
-        assert_eq!(
-            a.token_at(None, T, NONCE).to_vec(),
-            unhex("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf3fed5e50dc8fc8fce2e962ddb13dbfae")
-        );
-        assert_eq!(
-            a.token_at(Some(&binding()), T, NONCE).to_vec(),
-            unhex("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf36747d163099e42de649d7159d462334")
-        );
-    }
-
-    #[test]
-    fn verifies_within_skew_once() {
-        let a = PrefixAuth::new(b"k", Duration::from_secs(30), false).unwrap();
-        let v = PrefixAuthVerifier::new(a.clone(), 1, 16)
-            .unwrap()
-            .started_at(0);
-        let tok = a.token_at(None, T, NONCE);
-        assert!(!v.verify_at(&tok, None, T + 60), "two slots later");
-        assert!(v.verify_at(&tok, None, T + 30));
-        assert!(!v.verify_at(&tok, None, T + 30), "Nonce used");
-        let bound = a.token_at(Some(&binding()), T, [1; 16]);
-        assert!(!v.verify_at(&bound, None, T), "binding differs");
-        assert!(v.verify_at(&bound, Some(&binding()), T));
-        let mut bad = a.token_at(None, T, [2; 16]);
-        bad[31] ^= 1;
-        assert!(!v.verify_at(&bad, None, T));
-        assert!(!v.verify_at(&bad[..31], None, T));
-    }
-
-    #[test]
-    fn full_record_refuses_until_its_slots_expire() {
-        let a = PrefixAuth::new(b"k", Duration::from_secs(1), false).unwrap();
-        let v = PrefixAuthVerifier::new(a.clone(), 0, 2)
-            .unwrap()
-            .started_at(0);
-        assert!(v.verify_at(&a.token_at(None, 10, [1; 16]), None, 10));
-        assert!(v.verify_at(&a.token_at(None, 10, [2; 16]), None, 10));
-        assert!(
-            !v.verify_at(&a.token_at(None, 10, [3; 16]), None, 10),
-            "full"
-        );
-        assert!(
-            v.verify_at(&a.token_at(None, 12, [3; 16]), None, 12),
-            "slot 10 dropped"
-        );
-    }
-
-    #[test]
-    fn header_vectors() {
-        let a = PrefixAuth::new(&[0x6b; 32], Duration::from_secs(30), false).unwrap();
-        assert_eq!(
-            PrefixAuth::header_value(&a.token_at(None, T, NONCE)),
-            "oKGio6SlpqeoqaqrrK2urz_tXlDcj8j84uli3bE9v64"
-        );
-        assert_eq!(
-            PrefixAuth::header_value(&a.token_at(Some(&binding()), T, NONCE)),
-            "oKGio6SlpqeoqaqrrK2urzZ0fRYwmeQt5knXFZ1GIzQ"
-        );
-    }
-
-    fn upgrade(fields: &[(&str, &str)]) -> CarrierInfo {
-        let fields: Vec<(String, String)> = fields
-            .iter()
-            .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
-            .collect();
-        CarrierInfo::new()
-            .with_stage(crate::proto::admission::AdmissionStage::Head)
-            .with_headers(move |each| {
-                for (n, v) in &fields {
-                    each(n, v.as_bytes());
-                }
-            })
-    }
-
-    /// The header form of the test vectors verifies at their time,
-    /// once, by the configured field; missing, repeated and malformed
-    /// fields fail.
-    #[test]
-    fn header_form_decides() {
-        let a = PrefixAuth::new(&[0x6b; 32], Duration::from_secs(30), false).unwrap();
-        let v = PrefixAuthVerifier::new(a.clone(), 1, 16)
-            .unwrap()
-            .started_at(0);
-        let tok = a.token_at(None, unix_now(), NONCE);
-        let val = PrefixAuth::header_value(&tok);
-        let ok = [("zmux-prefix-auth", val.as_str())];
-        assert_eq!(v.decide(&upgrade(&ok), &[]), AdmissionVerdict::accept(0));
-        assert_eq!(
-            v.decide(&upgrade(&ok), &[]),
-            AdmissionVerdict::fallback(),
-            "Nonce used"
-        );
-        // The token as a prefix is not looked at on an upgrade.
-        assert_eq!(v.decide(&upgrade(&[]), &tok), AdmissionVerdict::fallback());
-        let tok = a.token_at(None, unix_now(), [7; 16]);
-        let val = PrefixAuth::header_value(&tok);
-        let twice = [
-            (PREFIX_AUTH_HEADER, val.as_str()),
-            (PREFIX_AUTH_HEADER, val.as_str()),
-        ];
-        assert_eq!(
-            v.decide(&upgrade(&twice), &[]),
-            AdmissionVerdict::fallback()
-        );
-        let (padded, plus) = (format!("{val}="), format!("+{}", &val[1..]));
-        for bad in [&val[..42], padded.as_str(), plus.as_str()] {
-            let f = [(PREFIX_AUTH_HEADER, bad)];
-            assert_eq!(
-                v.decide(&upgrade(&f), &[]),
-                AdmissionVerdict::fallback(),
-                "{bad}"
-            );
+    /// Configures a verifier with an explicit ceiling on the store's slot tolerance.
+    ///
+    /// # Errors
+    ///
+    /// The store's tolerance exceeds the configured ceiling.
+    pub fn with_max_skew(
+        store: Arc<dyn PrefixStore>,
+        binding: PrefixBinding,
+        max_skew: u32,
+    ) -> Result<Self, InvalidPrefixAuth> {
+        let window = store.window();
+        if window.skew() > max_skew {
+            return Err(InvalidPrefixAuth("skew exceeds verifier limit"));
         }
-        let other = PrefixAuthVerifier::new(a.clone().with_header("X-Auth"), 1, 16)
-            .unwrap()
-            .started_at(0);
-        assert_eq!(
-            v.decide(&upgrade(&[("x-auth", val.as_str())]), &[]),
-            AdmissionVerdict::fallback()
-        );
-        assert_eq!(
-            other.decide(&upgrade(&[("x-auth", val.as_str())]), &[]),
-            AdmissionVerdict::accept(0)
-        );
-
-        let bound = PrefixAuth::new(&[0x6b; 32], Duration::from_secs(30), true).unwrap();
-        let v = PrefixAuthVerifier::new(bound.clone(), 1, 16)
-            .unwrap()
-            .started_at(0);
-        let exported = |_: &str, _: &[u8], out: &mut [u8]| {
-            out.copy_from_slice(&binding());
-            true
-        };
-        let exported = crate::proto::exporter::CarrierExporter::new(exported);
-        let info = CarrierInfo::new().with_exporter(exported.clone());
-        let (name, value) = bound.header(&info).unwrap();
-        assert_eq!(name, PREFIX_AUTH_HEADER);
-        let f = [(PREFIX_AUTH_HEADER, value.as_str())];
-        assert_eq!(
-            v.decide(&upgrade(&f), &[]),
-            AdmissionVerdict::fallback(),
-            "no exporter"
-        );
-        let info = upgrade(&f).with_exporter(exported);
-        assert_eq!(v.decide(&info, &[]), AdmissionVerdict::accept(0));
-        assert!(
-            bound.prefix(&CarrierInfo::new()).is_err(),
-            "bound needs an exporter"
-        );
+        Ok(Self {
+            window,
+            store,
+            binding,
+            header: PREFIX_AUTH_HEADER.into(),
+            clock: Arc::new(unix_now),
+        })
     }
 
-    #[test]
-    fn invalid_parameters() {
-        assert!(PrefixAuth::new(b"", Duration::from_secs(1), false).is_err());
-        assert!(PrefixAuth::new(b"k", Duration::from_millis(1500), false).is_err());
-        assert!(PrefixAuth::new(b"k", Duration::ZERO, false).is_err());
+    /// Selects the agreed request field.
+    ///
+    /// # Errors
+    ///
+    /// The field name is invalid or reserved. An empty name selects the default.
+    pub fn with_header(mut self, name: impl Into<Arc<str>>) -> Result<Self, InvalidPrefixAuth> {
+        self.header = prefix_header(name.into())?;
+        Ok(self)
+    }
+
+    /// The agreed request field for ticket presentations.
+    #[must_use]
+    pub fn header_name(&self) -> &str {
+        &self.header
+    }
+
+    /// Supplies the verifier's UTC clock in whole Unix seconds.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> Option<u64> + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    fn token(&self, info: &CarrierInfo, prefix: &[u8]) -> Option<[u8; PREFIX_TOKEN_LEN]> {
+        if !info.is_head() {
+            if info.framing == super::record::Framing::Records && prefix.len() != PREFIX_TOKEN_LEN {
+                return None;
+            }
+            return prefix.first_chunk().copied();
+        }
+        let mut field = None;
+        let mut repeated = false;
+        info.for_each_header(|name, value| {
+            if name.eq_ignore_ascii_case(&self.header) {
+                repeated |= field.is_some();
+                let mut token = [0; PREFIX_TOKEN_LEN];
+                field = Some(
+                    (value.len() == HEADER_VALUE_LEN
+                        && oob::decode(value, &mut token) == Ok(PREFIX_TOKEN_LEN))
+                    .then_some(token),
+                );
+            }
+        });
+        if repeated { None } else { field.flatten() }
+    }
+
+    pub(crate) async fn redeem(
+        &self,
+        info: &CarrierInfo,
+        prefix: &[u8],
+        attempt: PrefixDeadline,
+        worker: Box<dyn Send + Sync>,
+    ) -> Option<(usize, Option<[u8; 16]>)> {
+        let _cancel = CancelAttempt(attempt.clone());
+        if attempt.ended() {
+            return None;
+        }
+        let token = self.token(info, prefix)?;
+        let binding = self.binding.export(info, info.is_head()).ok()?;
+        let local = (self.clock)()? / self.window.slot_seconds();
+        let (schedule, hint) = self.store.local_schedule();
+        let initial = schedule.eligible(&self.window.slots(local.max(hint)));
+        let mut generation = outer_match(initial, &token)?;
+        let current = local.max(self.store.floor(attempt.clone()).await.ok()?);
+        let eligible = schedule.eligible(&self.window.slots(current));
+        if !std::ptr::eq(initial, eligible) {
+            generation = outer_match(eligible, &token)?;
+        }
+        let id = masked_id(
+            &HmacSha256::new(&generation.key.0),
+            &token[..16],
+            token[16..32].try_into().ok()?,
+        );
+        let ticket = self.store.lookup(attempt.clone(), id).await.ok()??;
+        if ticket.id != id || !ticket.slots.contains(&current) {
+            return None;
+        }
+        let issue_slot = match_slot(
+            &ticket,
+            &token,
+            &binding,
+            generation,
+            current,
+            self.window.skew,
+        )?;
+        let claim = PrefixClaim {
+            id,
+            nonce: *token.first_chunk()?,
+            commit_id: nonce().ok()?,
+            version: ticket.version,
+            schedule: schedule.version(),
+            generation: generation.first(),
+            issue_slot,
+            checked_slot: current,
+            local_slot: local,
+        };
+        drop(ticket);
+        drop(schedule);
+        drop(binding);
+        if attempt.ended() {
+            return None;
+        }
+        let committed = self.commit(attempt, claim, worker).await;
+        committed.then_some((
+            if info.is_head() { 0 } else { PREFIX_TOKEN_LEN },
+            (self.binding == PrefixBinding::Bound).then_some(id),
+        ))
+    }
+
+    async fn commit(
+        &self,
+        attempt: PrefixDeadline,
+        mut claim: PrefixClaim,
+        worker: Box<dyn Send + Sync>,
+    ) -> bool {
+        // Dropping the admission signals cancellation without losing a receipt
+        // query for an operation already dispatched to the authority.
+        let store = self.store.clone();
+        let utc = self.clock.clone();
+        let slot_seconds = self.window.slot_seconds();
+        let (result, wait) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _worker = worker;
+            if attempt.ended() {
+                return;
+            }
+            let Some(Some(unix)) = super::decision::host(|| utc()) else {
+                return;
+            };
+            claim.local_slot = unix / slot_seconds;
+            let mut result = result;
+            let received = tokio::select! {
+                result = super::decision::host_future(|| store.claim(attempt.clone(), claim)) => result,
+                () = attempt.clock.sleep_until(attempt.at) => {
+                    attempt.cancel();
+                    None
+                },
+                () = result.closed() => {
+                    attempt.cancel();
+                    None
+                },
+            };
+            let accepted = if let Some(Ok(accepted)) = received {
+                accepted
+            } else {
+                let Some(at) = attempt
+                    .clock
+                    .now()
+                    .checked_add(std::time::Duration::from_secs(1))
+                else {
+                    return;
+                };
+                let resolve = PrefixDeadline::new(attempt.clock.clone(), Some(at));
+                tokio::select! {
+                    result = super::decision::host_future(|| store.resolve(resolve.clone(), claim)) => {
+                        result.is_some_and(|answer| matches!(answer, Ok(true))) && !resolve.ended()
+                    },
+                    () = resolve.clock.sleep_until(Some(at)) => false,
+                }
+            };
+            let _ = result.send(accepted && !attempt.ended());
+        });
+        wait.await.unwrap_or(false)
     }
 }
+
+#[cfg(all(feature = "tokio", not(loom)))]
+fn outer_match<'a>(
+    generations: &'a [PrefixGeneration],
+    token: &[u8; PREFIX_TOKEN_LEN],
+) -> Option<&'a PrefixGeneration> {
+    let mut selected = None;
+    let mut unique = true;
+    for generation in generations {
+        let mac = HmacSha256::new(&generation.key.0);
+        if mac.verify(&[&[1], &token[..32]], &token[32..48]) {
+            unique &= selected.is_none();
+            selected = Some(generation);
+        }
+    }
+    if unique { selected } else { None }
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+fn match_slot(
+    ticket: &PrefixTicket,
+    token: &[u8; PREFIX_TOKEN_LEN],
+    binding: &[u8],
+    generation: &PrefixGeneration,
+    current: u64,
+    skew: u32,
+) -> Option<u64> {
+    let mac = HmacSha256::new(&ticket.key.0);
+    let len = binding_length(binding);
+    slot_trials(current, skew, generation, |slot| {
+        mac.verify(
+            &ticket_mac(&ticket.id, &token[..48], &slot.to_be_bytes(), &len, binding),
+            &token[48..],
+        )
+    })
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+fn slot_trials(
+    current: u64,
+    skew: u32,
+    generation: &PrefixGeneration,
+    mut verify: impl FnMut(u64) -> bool,
+) -> Option<u64> {
+    let mut matched = None;
+    for offset in -i64::from(skew)..=i64::from(skew) {
+        let candidate = current.checked_add_signed(offset);
+        let valid = std::hint::black_box(verify(candidate.unwrap_or(0)));
+        if valid && let Some(slot) = candidate.filter(|s| generation.contains(*s)) {
+            matched = Some(slot);
+        }
+    }
+    matched
+}
+
+#[cfg(all(test, feature = "tokio", not(loom)))]
+mod tests;

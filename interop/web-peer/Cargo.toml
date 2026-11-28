@@ -11,6 +11,7 @@ description = "Scripted zmux WebSocket and HTTP streaming peers for cross-implem
 
 [dependencies]
 http = "1"
+sha2 = "0.11"
 tokio = { version = "1.54", features = ["full"] }
 zmux = { path = "../.." }
 zmux-http = { path = "../../adapter/http", features = ["websocket"] }

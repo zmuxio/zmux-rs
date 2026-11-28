@@ -101,7 +101,7 @@ async fn a_third_party_reads_one_hello_and_nothing_else() {
                 });
             }
             let pipe = client
-                .begin_add_pipe(io, PipeOptions::new().with_record_mode(mode))
+                .test_begin_join(io, PipeOptions::new().with_record_mode(mode))
                 .unwrap();
             let mut hello = vec![0; 4096];
             let n = far.read(&mut hello).await.unwrap();
@@ -160,7 +160,7 @@ async fn a_bound_join_through_a_relay_fails_at_the_acceptor() {
         .with_carrier_secure()
         .with_exporter(exporter(2));
     let pipe = client
-        .begin_add_pipe(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
+        .test_begin_join(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
         .unwrap();
     assert!(
         timeout(Duration::from_secs(5), pipe.joined())
@@ -198,7 +198,7 @@ async fn a_bound_join_with_another_binding_is_closed_at_once_by_default() {
         .with_carrier_secure()
         .with_exporter(exporter(2));
     let pipe = client
-        .begin_add_pipe(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
+        .test_begin_join(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
         .unwrap();
     let (r, took) = timeout(Duration::from_secs(5), served)
         .await
@@ -247,7 +247,7 @@ async fn a_sealed_join_passes_a_relay_that_sees_no_plaintext() {
             .await
     });
     let pipe = client
-        .begin_add_pipe(PipeIo::new(near), PipeOptions::new())
+        .test_begin_join(PipeIo::new(near), PipeOptions::new())
         .unwrap();
     timeout(Duration::from_secs(5), pipe.joined())
         .await
@@ -349,7 +349,7 @@ async fn a_sealed_end_at_a_record_boundary_is_a_failure() {
             .await
     });
     let pipe = client
-        .begin_add_pipe(PipeIo::new(near), PipeOptions::new().with_probation(None))
+        .test_begin_join(PipeIo::new(near), PipeOptions::new().with_probation(None))
         .unwrap();
     timeout(Duration::from_secs(5), pipe.joined())
         .await
@@ -455,7 +455,7 @@ async fn a_bound_hello_without_a_binding_is_refused_as_auth() {
         },
     );
     let e = client
-        .begin_add_pipe(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
+        .test_begin_join(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
         .unwrap();
     let joined = timeout(Duration::from_secs(10), e.joined()).await.unwrap();
     assert!(joined.is_err());
@@ -477,16 +477,19 @@ fn trusted_hello(core: &mut SessionCore, now: Instant) -> (PipeId, Vec<u8>) {
         .add_pipe(f, f, &PipeOptions::new(), RecordMode::Trusted, None, now)
         .unwrap();
     core.join_prepare(id, now).unwrap().unwrap();
-    (
-        id,
-        core.join_hello(id, (Framing::ByteStream, 0), &UnitPlan::default(), now)
-            .unwrap(),
-    )
+    let mut unit = core
+        .join_hello(id, (Framing::ByteStream, 0), &UnitPlan::default(), now)
+        .unwrap();
+    let len = unit.len();
+    core.complete_join_write(&mut unit, len, false, now);
+    (id, unit.to_vec())
 }
 
 fn carrier() -> PeerCarrier {
     let f = Some(Framing::ByteStream);
     PeerCarrier {
+        setup: None,
+        sources: zmux::CarrierHalfSources::default(),
         inbound: f,
         outbound: f,
         looped: false,
@@ -513,8 +516,8 @@ fn a_replay_on_another_path_moves_nothing() {
         panic!("the Hello verifies at ciphertext level");
     };
     assert!(matches!(
-        p.b.claim_hello(&mut replay, carrier(), &UnitPlan::default(), now),
-        ClaimedHello::Accept(_)
+        p.b.claim_hello(&mut replay, &carrier(), &UnitPlan::default(), now),
+        ClaimedHello::Accept { .. }
     ));
     assert_eq!(
         p.b.pipe_ids(),
@@ -663,7 +666,9 @@ fn plans_reach_the_wire() {
         assert_eq!(name, "hello", "another pipe is usable");
         let plan = UnitPlan::new(700, 0, 0);
         let bs = (Framing::ByteStream, 0);
-        let hello = p.a.join_hello(id, bs, &plan, now).unwrap();
+        let mut hello = p.a.join_hello(id, bs, &plan, now).unwrap();
+        let len = hello.len();
+        p.a.complete_join_write(&mut hello, len, false, now);
         assert_eq!(hello.len(), 700);
         let OpenedHello::Verified(mut join) = open(&mut p.b, &hello, &[], now) else {
             panic!("not verified");
@@ -671,7 +676,8 @@ fn plans_reach_the_wire() {
         let mut c = carrier();
         c.received = hello.len();
         let reply_plan = UnitPlan::new(5000, 0, 0);
-        let ClaimedHello::Accept(reply) = p.b.claim_hello(&mut join, c, &reply_plan, now) else {
+        let ClaimedHello::Accept { reply, .. } = p.b.claim_hello(&mut join, &c, &reply_plan, now)
+        else {
             panic!("not accepted");
         };
         if mode == RecordMode::Trusted {
@@ -687,10 +693,12 @@ fn plans_reach_the_wire() {
             panic!("not verified");
         };
         assert_eq!(consumed, reply.len());
-        let done = p.a.join_finish(id, &UnitPlan::new(300, 0, 0), now).unwrap();
+        let mut done = p.a.join_finish(id, &UnitPlan::new(300, 0, 0), now).unwrap();
         assert_eq!(done.confirm.len(), 300);
         assert_eq!(join.read_confirm(&done.confirm).unwrap(), Some(300));
-        assert!(p.a.shaping_stats().wire_spent > 500);
+        p.a.complete_join_write(&mut done.confirm, 300, false, now);
+        assert!(p.a.shaping_stats().handshake_measured_bytes > 500);
+        assert_eq!(p.a.shaping_stats().wire_spent, 0);
     }
 }
 
@@ -764,8 +772,8 @@ fn a_hello_with_the_largest_locator_and_a_full_batch_fits_the_floor() {
     };
     let mut c = carrier();
     c.received = hello.len();
-    let ClaimedHello::Accept(reply) =
-        p.b.claim_hello(&mut join, c, &UnitPlan::new(60_000, 0, 0), now)
+    let ClaimedHello::Accept { reply, .. } =
+        p.b.claim_hello(&mut join, &c, &UnitPlan::new(60_000, 0, 0), now)
     else {
         panic!("not accepted");
     };
@@ -834,7 +842,7 @@ async fn refused_joins_stall_for_the_listeners_join_timeout() {
         },
     );
     let _join = client
-        .begin_add_pipe(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
+        .test_begin_join(near, PipeOptions::new().with_record_mode(RecordMode::Bound))
         .unwrap();
     task.await;
     assert_eq!(*reasons.lock().unwrap(), ["malformed", "auth"]);
@@ -906,7 +914,7 @@ async fn the_listener_refuses_a_suite_outside_the_session_as_unknown_suite() {
     // The client's Hello, its Suite changed on the way.
     let (cnear, mut cfar) = duplex(1 << 16);
     let _join = client
-        .begin_add_pipe(PipeIo::new(cnear).records(), PipeOptions::new())
+        .test_begin_join(PipeIo::new(cnear).records(), PipeOptions::new())
         .unwrap();
     let mut hello = vec![0u8; 1 << 16];
     let n = cfar.read(&mut hello).await.unwrap();
@@ -942,7 +950,8 @@ fn a_late_ack_cannot_attach_an_expired_installed_pipe() {
             panic!("authenticated Hello");
         };
         let plan = UnitPlan::default();
-        let ClaimedHello::Accept(reply) = p.b.claim_hello(&mut join, carrier(), &plan, now) else {
+        let ClaimedHello::Accept { reply, .. } = p.b.claim_hello(&mut join, &carrier(), &plan, now)
+        else {
             panic!("accepted Hello");
         };
         assert!(matches!(
@@ -952,7 +961,7 @@ fn a_late_ack_cannot_attach_an_expired_installed_pipe() {
         let done = p.a.join_finish(id, &plan, now).unwrap();
         assert!(join.read_confirm(&done.confirm).unwrap().is_some());
         assert!(matches!(
-            p.b.confirm_join(*join, carrier(), now),
+            p.b.confirm_join(*join, &carrier(), now),
             ConfirmedJoin::Attached { .. }
         ));
         assert!(matches!(p.a.pipe_joined(id), Some(Ok(()))));
@@ -1017,10 +1026,11 @@ fn a_late_ack_cannot_attach_an_expired_installed_pipe() {
 // HS-28
 fn a_deferred_join_keeps_its_abort_after_immediate_retirement() {
     let mut cfg = config();
-    cfg.max_pipes = 2;
+    cfg.session_policy.limits.steady_attachments = 2;
     let mut p = pair(cfg.clone(), cfg.clone());
     let f = Some(Framing::ByteStream);
-    let id = (0..=cfg.max_pipes + cfg.pipe_headroom)
+    let id = (0..=cfg.session_policy.limits.steady_attachments
+        + cfg.session_policy.limits.join_headroom)
         .find_map(|_| {
             let id =
                 p.a.add_pipe(f, f, &PipeOptions::new(), RecordMode::Trusted, None, p.now)

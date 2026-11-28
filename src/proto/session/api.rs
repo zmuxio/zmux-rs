@@ -1,20 +1,24 @@
 //! Application commands: opening and accepting streams, reading and
 //! writing, termination, priorities, datagrams and pings.
 
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use super::recv_buf::RecvBuf;
+use super::datagram::{DatagramDrop, ResolvedDatagramOptions};
+use super::recv_store::{ReceiveQueue, ReceiveStore};
 
 use super::stream::{
-    GoAwayFail, LocalReset, RECV_KEEP, RecvState, SendOutcome, SendPart, SendState, Stream,
+    GoAwayFail, LocalReset, RecvPart, RecvState, SendOutcome, SendPart, SendState, Stream,
     StreamKey,
 };
 use super::streams::Stopped;
 use super::tp::TpValues;
 use super::{
-    CoreEvent, DatagramError, OpenError, SessionCore, SessionError, StreamError, di, dir_of_index,
+    CoreEvent, DatagramError, DatagramSendOptions, OpenError, OutDatagram, PacketAdmission,
+    PacketRepresentation, SendPolicy, SessionCore, SessionError, StreamError, di, dir_of_index,
 };
 use crate::proto::frame::{Dir, Priority};
 use crate::proto::meter::Count;
@@ -26,7 +30,7 @@ use crate::util::usize_sat;
 /// ones.
 const MIN_PREAMBLE_FLOOR: u64 = 1024;
 /// This endpoint's own limit on the preambles it sends.
-const MAX_LOCAL_PREAMBLE: u64 = 4096;
+pub(super) const MAX_LOCAL_PREAMBLE: u64 = 4096;
 
 /// What a preamble leaves of the carrier record floor for the STREAM frame header and the
 /// record's own: the one margin of every language (EXTENSIONS.md Section 4.1), so the
@@ -109,6 +113,10 @@ impl SessionCore {
         if !self.streams.reserve_local(d, established) {
             return Err(OpenError::Blocked);
         }
+        if dir == Dir::Bidi && !self.reserve_local_receive() {
+            self.streams.unreserve_local(d);
+            return Err(OpenError::MemoryBudget);
+        }
         let peer = self.send_tp();
         let mut s = Stream::new(dir, true);
         match dir {
@@ -116,9 +124,7 @@ impl SessionCore {
                 let send = peer.map_or(0, |p| p.window_bidi_remote);
                 s.send = Some(self.streams.new_send_part(send));
                 let window = self.local_tp().window_bidi_local;
-                let mut recv = self
-                    .streams
-                    .new_recv_part(window, self.config.stream_window_cap());
+                let mut recv = RecvPart::new(window, self.config.stream_window_cap());
                 // Counts in n_local while open.
                 recv.counts_open = true;
                 s.recv = Some(recv);
@@ -139,11 +145,12 @@ impl SessionCore {
             return Err(e);
         }
         let d = di(dir);
-        // Staged unidirectional credit: 256 on the first accept, unless a
-        // GOAWAY was sent.
-        if self.streams.remote_dir(d).staged {
+        if self.streams.remote_dir(d).staged() {
             let grant = !self.goaway_announced();
             self.streams.unstage(d, grant);
+            if self.streams.remote_dir(d).activating() {
+                self.grow_peer_stream_credit(d);
+            }
         }
         Ok(self.streams.accept(d))
     }
@@ -155,7 +162,7 @@ impl SessionCore {
         let s = self.streams.get(key).ok_or(StreamError::ClosedLocally)?;
         let r = s.recv.as_ref().ok_or(StreamError::ClosedLocally)?;
         if let Some((code, reliable)) = r.cold().reset {
-            let base = r.preamble_size.unwrap_or(0);
+            let base = r.preamble_size().unwrap_or(0);
             return Ok(Some((super::varint(code), reliable.saturating_sub(base))));
         }
         if r.final_size.is_none()
@@ -375,16 +382,51 @@ impl SessionCore {
             }
             return Ok(0);
         }
-        self.streams
+        let epoch = self.current_budget_epoch();
+        let written = self
+            .streams
             .write_slice(key, &data[..n])
             .expect("checked by write_room");
-        self.wrote(key, n, n < data.len());
-        Ok(n)
+        if written < n {
+            self.wait_for_write_memory(key, epoch);
+        }
+        self.wrote(key, written, written == n && n < data.len());
+        Ok(written)
     }
 
     /// Writes a chunk without copying it. Returns the bytes taken: all of
     /// `data`, a prefix when the buffers are nearly full, or 0.
-    pub fn write_chunk(&mut self, key: StreamKey, data: Bytes) -> Result<usize, StreamError> {
+    pub fn write_chunk(
+        &mut self,
+        key: StreamKey,
+        data: super::Chunk,
+    ) -> Result<usize, StreamError> {
+        self.write_chunk_inner(
+            key,
+            data,
+            #[cfg(all(feature = "tokio", not(loom)))]
+            None,
+        )
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn write_splice_chunk(
+        &mut self,
+        key: StreamKey,
+        data: super::Chunk,
+        payment: &mut super::splice_handoff::Prepayment<'_>,
+    ) -> Result<usize, StreamError> {
+        self.write_chunk_inner(key, data, Some(payment))
+    }
+
+    fn write_chunk_inner(
+        &mut self,
+        key: StreamKey,
+        mut data: super::Chunk,
+        #[cfg(all(feature = "tokio", not(loom)))] mut payment: Option<
+            &mut super::splice_handoff::Prepayment<'_>,
+        >,
+    ) -> Result<usize, StreamError> {
         let room = self.write_room(key)?;
         let n = usize_sat(room.min(data.len() as u64));
         if n == 0 {
@@ -393,15 +435,36 @@ impl SessionCore {
             }
             return Ok(0);
         }
+        let epoch = self.current_budget_epoch();
+        let backing = data.backing;
         let data_len = data.len();
-        let chunk = if n == data.len() {
-            data
-        } else {
-            data.slice(..n)
-        };
-        self.streams
-            .write_bytes(key, chunk)
-            .expect("checked by write_room");
+        if n < data_len {
+            data.truncate(n);
+        }
+        #[cfg(all(feature = "tokio", not(loom)))]
+        let receipt = payment.as_ref().map(|payment| {
+            let receipt = payment.prepare(n);
+            data.handoff = Some(receipt.clone());
+            receipt
+        });
+        if !self
+            .streams
+            .write_bytes(key, data)
+            .expect("checked by write_room")
+        {
+            if self
+                .write_domain()
+                .is_some_and(|domain| !domain.write_root_fits(backing))
+            {
+                return Err(StreamError::MemoryBudget);
+            }
+            self.wait_for_write_memory(key, epoch);
+            return Ok(0);
+        }
+        #[cfg(all(feature = "tokio", not(loom)))]
+        if let (Some(payment), Some(receipt)) = (payment.as_mut(), receipt) {
+            payment.accept(&receipt);
+        }
         let partial = n < data_len;
         self.wrote(key, n, partial);
         Ok(n)
@@ -411,10 +474,22 @@ impl SessionCore {
     /// carrier (none is unsent); if not, registers for
     /// [`CoreEvent::StreamWritable`] once that is so or the part ends.
     pub fn data_sent(&mut self, key: StreamKey) -> Result<bool, StreamError> {
-        if self.writable_part(key)?.buf.is_empty() {
+        self.data_sent_through(key, None)
+    }
+
+    /// Waits for a prefix up to the given application offset to leave the
+    /// send buffer. None means all bytes written.
+    pub(crate) fn data_sent_through(
+        &mut self,
+        key: StreamKey,
+        through: Option<u64>,
+    ) -> Result<bool, StreamError> {
+        let send = self.writable_part(key)?;
+        let through = through.unwrap_or(send.written);
+        if send.offset.saturating_sub(send.base) >= through {
             return Ok(true);
         }
-        self.send_part(key).sent_waiting = true;
+        self.send_part(key).wait_sent_through(through);
         Ok(false)
     }
 
@@ -446,6 +521,16 @@ impl SessionCore {
         self.mark_write(key, 0, true);
         self.streams.add_send_waiter(key);
         self.sync_holder(key);
+    }
+
+    fn wait_for_write_memory(&mut self, key: StreamKey, epoch: Option<u64>) {
+        if self.write_blocked_at.is_none() {
+            self.write_blocked_at = epoch;
+        }
+        if !self.memory_writers.contains(&key) {
+            self.memory_writers.push(key);
+        }
+        self.mark_write(key, 0, true);
     }
 
     /// Makes the stream's opening frame owed, with the data written so far
@@ -495,7 +580,8 @@ impl SessionCore {
         if done && s.id.is_some() && !s.open_pending {
             return Ok(true);
         }
-        self.send_part(key).sent_waiting = true;
+        let through = send.written;
+        self.send_part(key).wait_sent_through(through);
         Ok(false)
     }
 
@@ -588,6 +674,16 @@ impl SessionCore {
     /// Marks the data written so far as reliable: a later reset still
     /// delivers it.
     pub fn set_reliable_boundary(&mut self, key: StreamKey) -> Result<(), StreamError> {
+        self.set_reliable_boundary_at(key, None)
+    }
+
+    /// Marks a prefix up to an application offset as reliable. None marks
+    /// all bytes written.
+    pub(crate) fn set_reliable_boundary_at(
+        &mut self,
+        key: StreamKey,
+        through: Option<u64>,
+    ) -> Result<(), StreamError> {
         let send = self
             .streams
             .send_mut(key)
@@ -595,7 +691,9 @@ impl SessionCore {
         if send.outcome.is_some() {
             return Err(StreamError::ClosedLocally);
         }
-        send.cold_mut().reliable_boundary = Some(send.written);
+        let boundary = through.unwrap_or(send.written);
+        debug_assert!(boundary <= send.written);
+        send.cold_mut().reliable_boundary = Some(boundary.min(send.written));
         Ok(())
     }
 
@@ -761,7 +859,7 @@ impl SessionCore {
             // was read; a session that ended before that data arrived
             // reports its own error.
             if r.read_offset >= reliable {
-                let base = r.preamble_size.unwrap_or(0);
+                let base = r.preamble_size().unwrap_or(0);
                 return Err(reset_error(code, reliable.saturating_sub(base)));
             }
         } else if r.final_size.is_some_and(|f| r.read_offset >= f) {
@@ -783,8 +881,13 @@ impl SessionCore {
         key: StreamKey,
         buf: &mut [u8],
     ) -> Result<Option<(usize, bool)>, StreamError> {
-        self.read_with(key, buf.len(), |src, n| (src.copy_to(&mut buf[..n]), ()))
-            .map(|r| r.map(|(n, fin, ())| (n, fin)))
+        self.read_with(key, buf.len(), |queue, store, n| {
+            let read = queue.consume(store, n, |offset, bytes| {
+                buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+            });
+            (read, ())
+        })
+        .map(|r| r.map(|(n, fin, ())| (n, fin)))
     }
 
     /// Appends up to `max` bytes to `out`. The stream's buffer keeps its
@@ -796,8 +899,13 @@ impl SessionCore {
         out: &mut Vec<u8>,
         max: usize,
     ) -> Result<Option<(usize, bool)>, StreamError> {
-        self.read_with(key, max, |src, n| (src.append_to(out, n), ()))
-            .map(|r| r.map(|(n, fin, ())| (n, fin)))
+        self.read_with(key, max, |queue, store, n| {
+            (
+                queue.consume(store, n, |_, bytes| out.extend_from_slice(bytes)),
+                (),
+            )
+        })
+        .map(|r| r.map(|(n, fin, ())| (n, fin)))
     }
 
     /// Reads up to `max` bytes as one chunk without copying: a piece of the
@@ -807,22 +915,170 @@ impl SessionCore {
         &mut self,
         key: StreamKey,
         max: usize,
-    ) -> Result<Option<(Bytes, bool)>, StreamError> {
-        self.read_with(key, max, |src, n| {
-            let b = src.take(n);
-            (b.len(), b)
+    ) -> Result<Option<(super::Chunk, bool)>, StreamError> {
+        self.read_segment(key, max).map(|read| {
+            read.map(|(segment, fin)| (super::Chunk::backed(segment.bytes, segment.backing), fin))
+        })
+    }
+
+    pub(crate) fn read_segment(
+        &mut self,
+        key: StreamKey,
+        max: usize,
+    ) -> Result<Option<(super::Segment, bool)>, StreamError> {
+        self.read_with(key, max, |queue, store, n| {
+            let segment = queue.take(store, n);
+            (segment.bytes.len(), segment)
         })
         .map(|r| r.map(|(_, fin, b)| (b, fin)))
+    }
+
+    /// Checks external pin eligibility before asking the splice owner whether
+    /// the destination fits. Only the normal read commit removes receive
+    /// ownership and advances offset and credit.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn read_splice_chunk(
+        &mut self,
+        key: StreamKey,
+        max: usize,
+        mut fits_root: impl FnMut(super::Backing) -> bool,
+        mut fits_copy: impl FnMut(usize) -> bool,
+    ) -> Result<Option<(usize, bool, super::SpliceChunk)>, StreamError> {
+        let ready = self.readable(key);
+        let Ok(Readable::Data(available)) = ready else {
+            return self.read_ready(key, max, ready, |_, _, _| unreachable!());
+        };
+        let recv = self.streams.recv(key).expect("checked by readable");
+        let (backing, segment) = recv.buf.front(&self.receive).expect("readable range");
+        let count = max.min(available).min(segment);
+        if count == 0 {
+            return Ok(Some((0, false, super::SpliceChunk::default())));
+        }
+        let loan = self.read_loans.get_or_init(Arc::default).acquire(backing);
+        if let Some(loan) = loan
+            && fits_root(backing)
+            && recv.buf.transferable_front(&self.receive, count)
+        {
+            return self.read_ready(key, count, ready, |queue, store, n| {
+                let segment = queue.take(store, n);
+                let chunk = super::Chunk::backed(loan.attach(segment.bytes), backing);
+                (
+                    chunk.len(),
+                    super::SpliceChunk {
+                        data: chunk,
+                        copied: false,
+                    },
+                )
+            });
+        }
+        if !fits_copy(count) {
+            return Err(StreamError::BorrowLimit);
+        }
+        self.read_ready(key, count, ready, |queue, store, n| {
+            let mut bytes = vec![0; n].into_boxed_slice();
+            let consumed = queue.consume(store, n, |offset, data| {
+                bytes[offset..offset + data.len()].copy_from_slice(data);
+            });
+            debug_assert_eq!(n, consumed);
+            (
+                consumed,
+                super::SpliceChunk {
+                    data: super::Chunk::from(bytes.into_vec()),
+                    copied: true,
+                },
+            )
+        })
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn prepare_read(
+        &mut self,
+        key: StreamKey,
+        max: usize,
+        chunk: bool,
+    ) -> Result<Option<(usize, Option<Bytes>)>, StreamError> {
+        let ready = self.readable(key);
+        match ready {
+            Ok(Readable::Data(n)) => {
+                let n = n.min(max);
+                if !chunk {
+                    return Ok(Some((n, None)));
+                }
+                let loans = self.read_loans.get_or_init(Arc::default);
+                let recv = self.streams.recv(key).expect("checked by readable");
+                let (backing, _) = recv.buf.front(&self.receive).expect("readable range");
+                let bytes = loans
+                    .lend(backing, || {
+                        recv.buf
+                            .peek(&self.receive, n)
+                            .expect("readable range")
+                            .bytes
+                    })
+                    .ok_or(StreamError::BorrowLimit)?;
+                Ok(Some((bytes.len(), Some(bytes))))
+            }
+            Ok(Readable::End) => Ok(Some((0, chunk.then(Bytes::new)))),
+            Ok(Readable::Pending) => Ok(None),
+            Err(_) => self
+                .read_ready::<()>(key, 0, ready, |_, _, _| unreachable!())
+                .map(|_| unreachable!()),
+        }
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn commit_read(
+        &mut self,
+        key: StreamKey,
+        n: usize,
+        mut buffer: Option<&mut [u8]>,
+    ) -> bool {
+        let ready = self.readable(key);
+        let unchanged = match ready {
+            Ok(Readable::Data(available)) => n != 0 && available >= n,
+            Ok(Readable::End) => n == 0,
+            _ => false,
+        };
+        if !unchanged {
+            return false;
+        }
+        self.read_ready(key, n, ready, |queue, store, count| {
+            let consumed = queue.consume(store, count, |offset, bytes| {
+                if let Some(buffer) = &mut buffer {
+                    buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
+                }
+            });
+            debug_assert_eq!(consumed, count);
+            (consumed, ())
+        })
+        .is_ok()
+    }
+
+    #[cfg(all(feature = "test-hooks", feature = "tokio", not(loom)))]
+    pub(crate) fn test_read_loan_slots(&self, slots: usize) -> bool {
+        self.read_loans
+            .set(Arc::new(super::recv_buf::ReadLoans::with_slots(slots)))
+            .is_ok()
     }
 
     fn read_with<T: Default>(
         &mut self,
         key: StreamKey,
         max: usize,
-        take: impl FnOnce(&mut RecvBuf, usize) -> (usize, T),
+        take: impl FnOnce(&mut ReceiveQueue, &mut ReceiveStore, usize) -> (usize, T),
+    ) -> Result<Option<(usize, bool, T)>, StreamError> {
+        let ready = self.readable(key);
+        self.read_ready(key, max, ready, take)
+    }
+
+    fn read_ready<T: Default>(
+        &mut self,
+        key: StreamKey,
+        max: usize,
+        ready: Result<Readable, StreamError>,
+        take: impl FnOnce(&mut ReceiveQueue, &mut ReceiveStore, usize) -> (usize, T),
     ) -> Result<Option<(usize, bool, T)>, StreamError> {
         let counted = self.draining_peer_close() && self.holds_unread(key);
-        let r = self.read_inner(key, max, take);
+        let r = self.read_inner(key, max, ready, take);
         if counted && !self.holds_unread(key) {
             // The last unread data or end after the peer's close may hold CLOSED.
             self.unread_drained();
@@ -834,9 +1090,10 @@ impl SessionCore {
         &mut self,
         key: StreamKey,
         max: usize,
-        take: impl FnOnce(&mut RecvBuf, usize) -> (usize, T),
+        ready: Result<Readable, StreamError>,
+        take: impl FnOnce(&mut ReceiveQueue, &mut ReceiveStore, usize) -> (usize, T),
     ) -> Result<Option<(usize, bool, T)>, StreamError> {
-        let n = match self.readable(key) {
+        let n = match ready {
             Ok(Readable::Data(n)) => n.min(max),
             Ok(Readable::End) => {
                 self.end_read(key);
@@ -853,16 +1110,9 @@ impl SessionCore {
         if n == 0 {
             return Ok(Some((0, false, T::default())));
         }
-        let (s, spare) = self
-            .streams
-            .stream_and_spare(key)
-            .expect("checked by readable");
+        let s = self.streams.get_mut(key).expect("checked by readable");
         let r = s.recv.as_mut().expect("checked by readable");
-        let (n, out) = take(&mut r.buf, n);
-        if r.buf.is_empty() && r.buf.storage_capacity() > RECV_KEEP {
-            // An emptied large buffer is not kept by an idle stream.
-            spare.put_drained(std::mem::take(&mut r.buf).into_storage());
-        }
+        let (n, out) = take(&mut r.buf, &mut self.receive, n);
         s.count(Count::Read, n as u64);
         let r = s.recv.as_mut().expect("checked by readable");
         r.read_offset += n as u64;
@@ -910,6 +1160,7 @@ impl SessionCore {
         // error, as every pending local operation does (SPEC.md Section 6.5).
         let lost = self.lost().filter(|_| self.draining_peer_close());
         self.local_stop(key, code.into_inner());
+        self.try_discard(key);
         lost.map_or(Ok(()), |e| Err(StreamError::SessionLost(e)))
     }
 
@@ -931,7 +1182,7 @@ impl SessionCore {
             local,
             dropped,
             stop_pending,
-        }) = self.streams.stop_recv(key, code)
+        }) = self.streams.stop_recv(key, code, &mut self.receive)
         else {
             return;
         };
@@ -1060,6 +1311,17 @@ impl SessionCore {
     /// last [`Self::set_scheduler`].
     pub fn scheduler(&self) -> super::Scheduler {
         self.config.scheduler.clone()
+    }
+
+    /// Sets the host preference for receive scheduling. Peer path requests
+    /// use the per-pipe priority and standby settings.
+    pub fn set_receive_scheduler(&mut self, policy: super::Scheduler) {
+        std::sync::Arc::make_mut(&mut self.config).receive_scheduler = policy;
+    }
+
+    /// Returns the local receive scheduling preference.
+    pub fn receive_scheduler(&self) -> super::Scheduler {
+        self.config.receive_scheduler.clone()
     }
 
     /// The scheduling policy set on a stream's sending part; `None`: the
@@ -1362,35 +1624,21 @@ impl SessionCore {
 
     // ---- datagrams ---------------------------------------------------------------
 
-    /// The largest session datagram payload the peer accepts, or `None`
-    /// when it accepts none: the smaller of the
-    /// peer's `max_datagram_frame_size` and `max_record_size`, minus the
-    /// frame type and, with datagram flows, Flow 0. 65533 with datagram
-    /// flows and 65534 without for a zmux peer, 16381 for a plain QMux peer
-    /// at the default record size; a datagram too large to share a record
-    /// goes last in a record or in one of its own. Applications that carry
-    /// packets use it as their MTU.
+    /// The largest session datagram payload the peer accepts, accounting for
+    /// the next sequence's encoded width and the session Flow when applicable.
     pub fn max_datagram_size(&self) -> Option<usize> {
-        let prefix = usize::from(self.features.datagram_flows);
-        self.max_datagram_frame()
-            .map(|max| max.saturating_sub(1 + prefix))
+        self.datagram_payload_limit(self.max_datagram_frame()?, None)
     }
 
-    /// The largest payload of a datagram on stream `key` with Context ID
-    /// `context`: the session's limit less the
-    /// stream's Flow and Context ID. Before the stream has an identifier
-    /// its Flow counts as the longest one. `None` without datagram flows.
+    /// The largest payload of a datagram on this stream for the specified context.
+    /// An unpinned stream uses its next possible identifier without claiming it.
     pub fn max_stream_datagram_size(&self, key: StreamKey, context: u64) -> Option<usize> {
-        if !self.features.datagram_flows {
-            return None;
-        }
-        let flow = self
-            .streams
-            .get(key)?
-            .id
-            .map_or(8, |id| varint::len(id + 1));
-        self.max_datagram_frame()
-            .map(|max| max.saturating_sub(1 + flow + varint::len(context)))
+        let flow = self.stream_datagram_candidate(key, context).ok()?;
+        self.datagram_payload_limit(self.max_datagram_frame()?, Some(flow))
+    }
+
+    fn datagram_payload_limit(&self, frame: usize, flow: Option<(u64, u64)>) -> Option<usize> {
+        frame.checked_sub(1 + self.next_datagram_prefix(flow)?.encoded_len())
     }
 
     /// The largest DATAGRAM frame this endpoint may send: the peer's
@@ -1401,64 +1649,117 @@ impl SessionCore {
     pub(super) fn max_datagram_frame(&self) -> Option<usize> {
         let peer = self.peer_tp.as_ref()?;
         let frame = Some(peer.max_datagram_frame_size()).filter(|&m| m > 0)?;
-        let frame = frame.min(peer.max_record_size());
-        Some(usize_sat(frame.min(self.carrier_record_limit() as u64)))
+        let protocol_limit = usize_sat(frame.min(peer.max_record_size()));
+        let record = self
+            .atts
+            .iter()
+            .filter(|a| a.out().is_some_and(super::pipes::OutPipe::is_live))
+            .filter_map(|a| self.datagram_record_limit(a.id()))
+            .max()
+            .unwrap_or(protocol_limit);
+        let native = self
+            .atts
+            .iter()
+            .filter_map(|a| self.channel_for(a.id()))
+            .map(|ch| {
+                ch.capacity
+                    .saturating_sub(ch.prefix.id().map_or(0, varint::len))
+            })
+            .max()
+            .unwrap_or(0)
+            .min(usize_sat(frame));
+        Some(record.max(native))
     }
 
-    /// The smallest record limit of the carriers of the outbound pipes: a frame that cannot
-    /// be split has to fit it to go on any of them; `usize::MAX` when none has a limit.
-    pub(super) fn carrier_record_limit(&self) -> usize {
-        self.atts
-            .outs()
-            .filter_map(super::pipes::OutPipe::max_record)
-            .min()
-            .unwrap_or(usize::MAX)
-    }
-
-    /// Queues a session datagram (Flow 0 with datagram flows). Never waits:
-    /// when the queue is full the oldest datagram is dropped.
+    /// Queues a session datagram (Flow 0 with datagram flows). Never waits.
+    /// At capacity, queued originals make room in arrival order. If carrier
+    /// outcomes occupy every slot, the new datagram is dropped.
     ///
     /// `allowed` is the send limiter's verdict on it
     /// ([`super::Config::datagram_limiter`]), which the caller asks before
     /// it takes the session's lock (`true` without a limiter): the core
     /// never calls the limiter. A datagram it refused
     /// is dropped and counted (`datagrams_dropped_limit`) once the checks
-    /// that fail the call passed. Returns whether the datagram was queued:
-    /// the caller then charges the limiter, after releasing the lock.
+    /// that fail the call passed. A refused send returns its local drop reason.
     pub fn send_datagram(
         &mut self,
         data: Bytes,
         allowed: bool,
         now: Instant,
-    ) -> Result<bool, DatagramError> {
+    ) -> Result<(), DatagramError> {
+        self.send_datagram_with(data, super::DatagramSendOptions::default(), allowed, now)
+    }
+
+    /// Queues a session datagram with per-packet settings.
+    pub fn send_datagram_with(
+        &mut self,
+        data: Bytes,
+        options: super::DatagramSendOptions,
+        allowed: bool,
+        now: Instant,
+    ) -> Result<(), DatagramError> {
         self.tick(now);
         if let Some(e) = self.lost() {
             return Err(DatagramError::SessionLost(e));
         }
-        if self.early_datagrams() {
-            if self.admitted(allowed) {
-                self.queue_early_datagram(None, data);
-            }
-            return Ok(allowed);
-        }
+        self.check_datagram_sequence()?;
+        let options = options
+            .inherit(self.config.datagram_config().defaults)
+            .resolve(self.now)?;
+        self.check_datagram_deadline(options)?;
         let max = self
-            .max_datagram_size()
+            .structural_datagram_frame_limit()
+            .and_then(|frame| self.datagram_payload_limit(frame, None))
             .ok_or(DatagramError::NotNegotiated)?;
         if data.len() > max {
             return Err(DatagramError::TooLarge { max });
         }
-        if self.admitted(allowed) {
-            self.queue_datagram(None, data);
-        }
-        Ok(allowed)
+        self.check_datagram_admission(options, allowed)?;
+        self.queue_datagram(self.outgoing_datagram(None, data, options))
     }
 
-    /// Counts a datagram the send limiter refused.
-    fn admitted(&mut self, allowed: bool) -> bool {
-        if !allowed {
-            self.stats.datagrams_dropped_limit += 1;
+    pub(super) fn structural_datagram_frame_limit(&self) -> Option<usize> {
+        let peer = self.peer_tp.as_ref()?;
+        let mut bytes = peer.max_datagram_frame_size();
+        if !self.features.carrier_datagrams {
+            let record = self
+                .atts
+                .iter()
+                .filter_map(|attachment| self.datagram_record_limit(attachment.id()))
+                .max()
+                .map_or_else(|| peer.max_record_size(), |size| size as u64);
+            bytes = bytes.min(record);
         }
-        allowed
+        (bytes > 0).then(|| usize_sat(bytes))
+    }
+
+    pub(crate) fn drop_datagram_admission(&mut self, reason: DatagramDrop) -> DatagramError {
+        self.count_datagram_drop(reason, 1);
+        DatagramError::Dropped(reason)
+    }
+
+    fn check_datagram_deadline(
+        &mut self,
+        options: ResolvedDatagramOptions,
+    ) -> Result<(), DatagramError> {
+        if options.deadline.is_some_and(|at| at <= self.now) {
+            return Err(self.drop_datagram_admission(DatagramDrop::Deadline));
+        }
+        Ok(())
+    }
+
+    fn check_datagram_admission(
+        &mut self,
+        options: ResolvedDatagramOptions,
+        allowed: bool,
+    ) -> Result<(), DatagramError> {
+        if options.require_native && !self.features.carrier_datagrams {
+            return Err(self.drop_datagram_admission(DatagramDrop::NoNativePath));
+        }
+        if !allowed {
+            return Err(self.drop_datagram_admission(DatagramDrop::Limiter));
+        }
+        Ok(())
     }
 
     /// Queues a datagram on a bidirectional stream (Flow = stream ID + 1). A stream without an
@@ -1471,135 +1772,298 @@ impl SessionCore {
         data: Bytes,
         allowed: bool,
         now: Instant,
-    ) -> Result<bool, DatagramError> {
-        self.tick(now);
-        if let Some(e) = self.lost() {
-            return Err(DatagramError::SessionLost(e));
-        }
-        if self.early_datagrams() {
-            let s = self.streams.get(key).ok_or(DatagramError::ClosedStream)?;
-            if s.dir != Dir::Bidi || s.send_released || s.parts_terminal() || context >= 1 << 62 {
-                return Err(DatagramError::ClosedStream);
-            }
-            if self.admitted(allowed) {
-                self.queue_early_datagram(Some((key, context)), data);
-            }
-            return Ok(allowed);
-        }
-        let (id, context) = self.stream_datagram_flow(key, context, data.len())?;
-        if self.admitted(allowed) {
-            self.queue_datagram(Some((id, context)), data);
-        }
-        Ok(allowed)
+    ) -> Result<(), DatagramError> {
+        self.send_stream_datagram_with(
+            key,
+            context,
+            data,
+            super::DatagramSendOptions::default(),
+            allowed,
+            now,
+        )
     }
 
-    /// The flow of a datagram of `len` payload bytes on stream `key` after
-    /// establishment, pinning the stream's identifier: the checks that fail
-    /// [`SessionCore::send_stream_datagram`].
-    fn stream_datagram_flow(
+    /// Sets the default settings of a stream's outbound datagram flow.
+    pub fn set_stream_datagram_options(
+        &mut self,
+        key: StreamKey,
+        options: super::DatagramSendOptions,
+    ) -> Result<(), DatagramError> {
+        options
+            .deadline_at(self.now)
+            .map_err(DatagramError::InvalidOptions)?;
+        let stream = self
+            .streams
+            .get_mut(key)
+            .ok_or(DatagramError::ClosedStream)?;
+        stream.datagrams_mut().options = options;
+        Ok(())
+    }
+
+    /// Effective per-packet settings on this flow.
+    pub(crate) fn stream_datagram_options(
+        &self,
+        key: StreamKey,
+        options: super::DatagramSendOptions,
+    ) -> super::DatagramSendOptions {
+        options
+            .inherit(
+                self.streams
+                    .get(key)
+                    .and_then(|s| s.datagrams.as_deref())
+                    .map_or_else(super::DatagramSendOptions::default, |d| d.options),
+            )
+            .inherit(self.config.datagram_config().defaults)
+    }
+
+    /// Queues a stream datagram with per-packet settings.
+    pub fn send_stream_datagram_with(
         &mut self,
         key: StreamKey,
         context: u64,
-        len: usize,
-    ) -> Result<(u64, u64), DatagramError> {
-        if !self.features.datagram_flows {
-            return Err(DatagramError::NotNegotiated);
+        data: Bytes,
+        options: super::DatagramSendOptions,
+        allowed: bool,
+        now: Instant,
+    ) -> Result<(), DatagramError> {
+        match self.admit_stream_packet(
+            (key, context),
+            data,
+            options,
+            SendPolicy::DatagramOnly,
+            allowed,
+            now,
+        )? {
+            PacketAdmission::Datagram => Ok(()),
+            PacketAdmission::Capsule { data, deadline } => {
+                unreachable!(
+                    "datagram-only policy for {} bytes at {deadline:?}",
+                    data.len()
+                )
+            }
         }
-        let frame = self
-            .max_datagram_frame()
-            .ok_or(DatagramError::NotNegotiated)?;
-        let s = self.streams.get(key).ok_or(DatagramError::ClosedStream)?;
-        if s.dir != Dir::Bidi
-            || s.send_released
-            || s.parts_terminal()
-            || s.goaway.is_some()
-            || context >= 1 << 62
+    }
+
+    /// Selects the packet's representation and admits a datagram in the same owner turn.
+    pub(crate) fn admit_stream_packet(
+        &mut self,
+        flow: (StreamKey, u64),
+        data: Bytes,
+        options: DatagramSendOptions,
+        policy: SendPolicy,
+        allowed: bool,
+        now: Instant,
+    ) -> Result<PacketAdmission, DatagramError> {
+        let (options, representation) =
+            self.prepare_stream_packet(flow, data.len(), options, policy, now)?;
+        match representation {
+            PacketRepresentation::Capsule => Ok(PacketAdmission::Capsule {
+                data,
+                deadline: options.deadline,
+            }),
+            PacketRepresentation::Datagram { stream_id, context } => {
+                self.queue_stream_packet(flow.0, (stream_id, context), data, options, allowed)?;
+                Ok(PacketAdmission::Datagram)
+            }
+        }
+    }
+
+    pub(crate) fn prepare_stream_packet(
+        &mut self,
+        flow: (StreamKey, u64),
+        largest: usize,
+        options: DatagramSendOptions,
+        policy: SendPolicy,
+        now: Instant,
+    ) -> Result<(ResolvedDatagramOptions, PacketRepresentation), DatagramError> {
+        self.tick(now);
+        let options = self
+            .stream_datagram_options(flow.0, options)
+            .resolve(self.now)?;
+        let candidate = self.stream_packet_representation(flow, largest, options, policy)?;
+        Ok((options, candidate))
+    }
+
+    /// The authoritative representation choice for a single packet or group.
+    pub(crate) fn stream_packet_representation(
+        &mut self,
+        (key, context): (StreamKey, u64),
+        largest: usize,
+        options: ResolvedDatagramOptions,
+        policy: SendPolicy,
+    ) -> Result<PacketRepresentation, DatagramError> {
+        if let Some(e) = self.lost() {
+            return Err(DatagramError::SessionLost(e));
+        }
+        if policy == SendPolicy::StreamOnly && options.require_native {
+            return Err(DatagramError::InvalidOptions(crate::InvalidConfig::new(
+                "packet_policy",
+                "a capsule-only stream cannot require native datagrams",
+            )));
+        }
+        if context > varint::MAX {
+            return Err(DatagramError::InvalidOptions(crate::InvalidConfig::new(
+                "datagram_context",
+                "above 2^62 - 1",
+            )));
+        }
+        if !self
+            .streams
+            .get(key)
+            .is_some_and(Self::stream_can_send_datagrams)
         {
             return Err(DatagramError::ClosedStream);
         }
-        // Checked against the identifier the stream has or would get, so
-        // that a datagram too large never pins it.
-        let would = s.id.unwrap_or_else(|| {
-            let client = matches!(self.role, super::Role::Client);
-            super::stream::make_id(self.streams.local_dir(di(s.dir)).next_index, s.dir, client)
-        });
-        let max = frame.saturating_sub(1 + varint::len(would + 1) + varint::len(context));
-        if len > max {
-            return Err(DatagramError::TooLarge { max });
+        self.check_datagram_deadline(options)?;
+        if policy == SendPolicy::StreamOnly {
+            return Ok(PacketRepresentation::Capsule);
+        }
+        let fallback = policy == SendPolicy::PreferDatagram && !options.require_native;
+        let frame = self
+            .structural_datagram_frame_limit()
+            .filter(|_| self.features.same_family);
+        let Some(frame) = frame else {
+            return if fallback && self.peer_tp.is_some() {
+                Ok(PacketRepresentation::Capsule)
+            } else {
+                Err(DatagramError::NotNegotiated)
+            };
+        };
+        self.check_datagram_sequence()?;
+        let candidate = self.stream_datagram_candidate(key, context)?;
+        let max = self.datagram_payload_limit(frame, Some(candidate));
+        if max.is_none_or(|max| largest > max) {
+            return if fallback {
+                Ok(PacketRepresentation::Capsule)
+            } else {
+                Err(DatagramError::TooLarge {
+                    max: max.unwrap_or(0),
+                })
+            };
+        }
+        if options.require_native && !self.features.carrier_datagrams {
+            return Err(self.drop_datagram_admission(DatagramDrop::NoNativePath));
+        }
+        let (stream_id, context) = candidate;
+        Ok(PacketRepresentation::Datagram { stream_id, context })
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn commit_stream_packet(
+        &mut self,
+        key: StreamKey,
+        context: u64,
+        data: Bytes,
+        options: ResolvedDatagramOptions,
+        allowed: bool,
+    ) -> Result<(), DatagramError> {
+        let PacketRepresentation::Datagram { stream_id, context } = self
+            .stream_packet_representation(
+                (key, context),
+                data.len(),
+                options,
+                SendPolicy::DatagramOnly,
+            )?
+        else {
+            unreachable!("datagram-only policy selected a capsule")
+        };
+        self.queue_stream_packet(key, (stream_id, context), data, options, allowed)
+    }
+
+    fn queue_stream_packet(
+        &mut self,
+        key: StreamKey,
+        candidate: (u64, u64),
+        data: Bytes,
+        options: ResolvedDatagramOptions,
+        allowed: bool,
+    ) -> Result<(), DatagramError> {
+        if !allowed {
+            return Err(self.drop_datagram_admission(DatagramDrop::Limiter));
         }
         let id = self.stream_id(key).map_err(|e| match e {
             StreamError::Blocked => DatagramError::Blocked,
             _ => DatagramError::ClosedStream,
         })?;
+        debug_assert_eq!(candidate.0, id);
+        self.queue_datagram(self.outgoing_datagram(Some(candidate), data, options))
+    }
+
+    /// Checks stream and Flow/Context admissibility without assigning a stream ID.
+    pub(super) fn stream_datagram_candidate(
+        &self,
+        key: StreamKey,
+        context: u64,
+    ) -> Result<(u64, u64), DatagramError> {
+        if !self.features.same_family {
+            return Err(DatagramError::NotNegotiated);
+        }
+        let stream = self.streams.get(key).ok_or(DatagramError::ClosedStream)?;
+        if !Self::stream_can_send_datagrams(stream) || context > varint::MAX {
+            return Err(DatagramError::ClosedStream);
+        }
+        let id = stream.id.unwrap_or_else(|| {
+            let client = matches!(self.role, super::Role::Client);
+            super::stream::make_id(
+                self.streams.local_dir(di(stream.dir)).next_index,
+                stream.dir,
+                client,
+            )
+        });
         Ok((id, context))
     }
 
-    /// Before establishment a datagram waits for the peer's parameters.
-    fn early_datagrams(&self) -> bool {
-        !self.is_established() && self.config.enable_datagrams
+    fn stream_can_send_datagrams(stream: &Stream) -> bool {
+        stream.dir == Dir::Bidi
+            && !stream.send_released
+            && !stream.parts_terminal()
+            && stream.goaway.is_none()
     }
 
-    /// Queues a datagram until establishment.
-    fn queue_early_datagram(&mut self, flow: Option<(StreamKey, u64)>, data: Bytes) {
-        if self.dgram_mut().early.len() >= self.config.datagram_send_queue {
-            self.dgram_mut().early.pop_front();
-            self.stats.datagrams_dropped_send += 1;
-        }
-        self.dgram_mut().early.push_back((flow, data));
+    pub(super) fn datagram_flow_open(&self, flow: Option<(u64, u64)>) -> bool {
+        flow.is_none_or(|(id, _)| {
+            self.streams
+                .key_of(id)
+                .and_then(|key| self.streams.get(key))
+                .is_some_and(Self::stream_can_send_datagrams)
+        })
     }
 
-    /// Establishment: datagrams sent before it go out now, those the
-    /// parameters do not allow (no datagram support, too large, stream
-    /// datagrams without datagram flows) are dropped and counted.
-    pub(super) fn release_early_datagrams(&mut self) {
-        let Some(early) = self
-            .dgram
-            .as_deref_mut()
-            .map(|d| std::mem::take(&mut d.early))
-        else {
-            return;
-        };
-        let now = self.now;
-        for (flow, data) in early {
-            // The send limiter passed them when they were queued.
-            let sent = match flow {
-                None => self.send_datagram(data, true, now).is_ok(),
-                Some((key, context)) => self
-                    .send_stream_datagram(key, context, data, true, now)
-                    .is_ok(),
-            };
-            if !sent {
-                self.stats.datagrams_dropped_send += 1;
-            }
-        }
-    }
-
-    fn queue_datagram(&mut self, flow: Option<(u64, u64)>, data: Bytes) {
-        if self.dgram_mut().send.len() >= self.config.datagram_send_queue {
-            self.dgram_mut().send.pop_front();
-            self.stats.datagrams_dropped_send += 1;
-        }
-        let at = self.now;
-        self.dgram_mut()
-            .send
-            .push_back(super::OutDatagram { flow, data, at });
+    fn queue_datagram(&mut self, packet: super::OutDatagram) -> Result<(), DatagramError> {
+        let turn = self.streams.next_send_turn();
+        let dgram = self.dgram.get_or_insert_with(Box::default);
+        let (accepted, dropped) = dgram.send.queue(packet, &self.config, turn);
+        self.count_datagram_drop(DatagramDrop::QueueOverflow, dropped);
+        self.constrain_native_flows();
+        self.prepare_datagram_dispatch();
         self.channel_kick();
+        if accepted {
+            Ok(())
+        } else {
+            Err(DatagramError::Dropped(DatagramDrop::QueueOverflow))
+        }
     }
 
     /// Removes the queued datagram `i`, which leaves the send queue; the
     /// queue's delay bound ends when it empties.
-    pub(super) fn take_send_datagram(&mut self, i: usize) -> Option<Bytes> {
+    pub(super) fn take_send_datagram(&mut self, i: usize) -> Option<OutDatagram> {
         let send_queue = self.config.datagram_send_queue;
-        let d = self.dgram_mut();
-        let was_full = d.send.len() >= send_queue;
-        let o = d.send.remove(i)?;
-        if d.send.is_empty() {
-            d.send_codel.idle();
+        if let Some(pipe) = self
+            .dgram()
+            .send
+            .get(i)
+            .and_then(|p| self.reserved_native_pipe(p.tag))
+        {
+            self.clear_native_plan(pipe);
         }
-        if was_full {
+        let turn = self.streams.next_send_turn();
+        let d = self.dgram_mut();
+        let was_full = d.send.occupied() >= send_queue;
+        let o = d.send.take(i, turn)?;
+        if was_full && d.send.occupied() < send_queue {
             self.events.push_back(CoreEvent::DatagramsUnblocked);
         }
-        Some(o.data)
+        Some(o)
     }
 
     /// Decides on the queued datagram `i`, about to leave the send queue
@@ -1608,22 +2072,18 @@ impl SessionCore {
     pub(super) fn send_delay_drop(&mut self, i: usize) -> bool {
         let (target, now) = (self.config.datagram_queue_delay, self.now);
         let d = self.dgram_mut();
-        let Some(at) = d.send.get(i).map(|o| o.at) else {
-            return false;
-        };
-        let alone = d.send.len() == i + 1;
-        if !d.send_codel.drop(at, now, target, alone) {
+        if !d.send.delayed(i, now, target) {
             return false;
         }
         let _ = self.take_send_datagram(i);
-        self.stats.datagrams_dropped_send += 1;
+        self.count_datagram_drop(DatagramDrop::Codel, 1);
         true
     }
 
     /// Whether the datagram send queue is full (a waiting sender waits for
     /// [`CoreEvent::DatagramsUnblocked`]).
     pub fn datagram_queue_full(&self) -> bool {
-        self.dgram().send.len() >= self.config.datagram_send_queue
+        self.dgram().send.occupied() >= self.config.datagram_send_queue
     }
 
     /// Whether received datagrams are held for the receive limiter
@@ -1653,7 +2113,8 @@ impl SessionCore {
         for d in datagrams.drain(..) {
             super::debit(&mut self.dgram_mut().held_bytes, d.data.len());
             let Some(granted) = d.granted else {
-                self.stats.datagrams_dropped_limit += 1;
+                self.dgram_mut().counters.dropped_limit += 1;
+                self.occupy_datagram(d.sequence, false);
                 continue;
             };
             let usable = d
@@ -1662,7 +2123,9 @@ impl SessionCore {
             if !usable {
                 refused += granted;
                 self.drop_received_datagram(d.stream);
+                self.occupy_datagram(d.sequence, false);
             } else if !self.queue_received_datagram(d.stream, d.data) {
+                self.occupy_datagram(d.sequence, false);
                 // The queue refused it: its grant goes back too.
                 refused += granted;
             }
@@ -1713,55 +2176,165 @@ impl SessionCore {
         key: StreamKey,
         now: Instant,
     ) -> Result<Option<(u64, Bytes)>, StreamError> {
+        if !self.stream_datagram_head(key, now)? {
+            return Ok(None);
+        }
+        let packet = self.take_stream_datagram(key);
+        Ok(Some((packet.context, packet.data.into_bytes())))
+    }
+
+    fn stream_datagram_head(&mut self, key: StreamKey, now: Instant) -> Result<bool, StreamError> {
         self.tick(now);
         let (target, now) = (self.config.datagram_queue_delay, self.now);
+        self.expire_stream_datagrams(now);
         let s = self
             .streams
             .get_mut(key)
             .ok_or(StreamError::ClosedLocally)?;
         let mut dropped = 0;
-        let mut dropped_bytes = 0;
-        let mut next = None;
+        let mut capacity = 0;
+        let mut refresh_expiry = false;
+        let mut ready = false;
         if let Some(q) = s.datagrams.as_mut() {
-            while let Some((context, data, at)) = q.queue.pop_front() {
-                if q.codel.drop(at, now, target, q.queue.is_empty()) {
-                    super::debit(&mut q.bytes, data.len());
-                    dropped_bytes += data.len();
-                    dropped += 1;
-                    continue;
-                }
-                next = Some((context, data));
-                break;
+            while q
+                .queue
+                .front()
+                .is_some_and(|head| q.codel.drop(head.at, now, target, q.queue.len() == 1))
+            {
+                let head = q.queue.pop_front().expect("queued datagram");
+                super::debit(&mut q.bytes, head.data.len());
+                capacity += head.data.backing_capacity();
+                refresh_expiry |= head.expires.is_some();
+                dropped += 1;
             }
-            if q.queue.is_empty() {
+            ready = !q.queue.is_empty();
+            if !ready {
                 q.codel.idle();
             }
             q.counts.dropped_recv += dropped;
         }
         if dropped > 0 {
-            super::debit(&mut self.dgram_mut().stream_bytes, dropped_bytes);
+            super::debit(&mut self.dgram_mut().stream_bytes, capacity);
             self.count_dropped(dropped);
         }
-        let s = self
-            .streams
-            .get_mut(key)
-            .ok_or(StreamError::ClosedLocally)?;
-        match next {
-            Some((context, d)) => {
-                let n = d.len() as u64;
-                let q = s.datagrams_mut();
-                q.counts.bytes_received += n;
-                super::debit(&mut q.bytes, d.len());
-                s.count(Count::DatagramReceived, n);
-                super::debit(&mut self.dgram_mut().stream_bytes, d.len());
-                self.meter.add(Count::DatagramReceived, n);
-                Ok(Some((context, d)))
-            }
-            None => match self.lost() {
-                Some(e) => Err(StreamError::SessionLost(e)),
-                None => Ok(None),
-            },
+        if refresh_expiry {
+            self.refresh_stream_datagram_expiry(key);
         }
+        if ready {
+            Ok(true)
+        } else {
+            self.lost()
+                .map_or(Ok(false), |error| Err(StreamError::SessionLost(error)))
+        }
+    }
+
+    fn take_stream_datagram(&mut self, key: StreamKey) -> super::stream::QueuedStreamDatagram {
+        let stream = self.streams.get_mut(key).expect("ready datagram stream");
+        let queue = stream.datagrams_mut();
+        let packet = queue.queue.pop_front().expect("ready datagram");
+        let len = packet.data.len();
+        queue.counts.bytes_received += len as u64;
+        super::debit(&mut queue.bytes, len);
+        if queue.queue.is_empty() {
+            queue.codel.idle();
+        }
+        stream.count(Count::DatagramReceived, len as u64);
+        super::debit(
+            &mut self.dgram_mut().stream_bytes,
+            packet.data.backing_capacity(),
+        );
+        self.meter.add(Count::DatagramReceived, len as u64);
+        if packet.expires.is_some() {
+            self.refresh_stream_datagram_expiry(key);
+        }
+        packet
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn read_splice_datagram(
+        &mut self,
+        key: StreamKey,
+        now: Instant,
+        max: usize,
+        fits_root: impl FnOnce(super::Backing) -> bool,
+        fits_copy: impl FnOnce(usize) -> bool,
+    ) -> Result<Option<super::SpliceDatagram>, StreamError> {
+        if !self.stream_datagram_head(key, now)? {
+            return Ok(None);
+        }
+        let queue = self
+            .streams
+            .get(key)
+            .and_then(|stream| stream.datagrams.as_ref())
+            .expect("checked by stream_datagram_head");
+        let head = queue.queue.front().expect("ready datagram");
+        let len = head.data.len();
+        if len > max {
+            self.take_stream_datagram(key);
+            return Ok(Some(super::SpliceDatagram::TooLarge));
+        }
+        let backing = head.data.backing;
+        let (data, copied) = if len == 0 {
+            (super::Chunk::new(), false)
+        } else {
+            let loan = self.read_loans.get_or_init(Arc::default).acquire(backing);
+            if let Some(loan) = loan
+                && fits_root(backing)
+            {
+                let packet = self.take_stream_datagram(key);
+                let chunk = super::Chunk::backed(loan.attach(packet.data.bytes), backing);
+                return Ok(Some(super::SpliceDatagram::Data {
+                    context: packet.context,
+                    data: chunk,
+                    remaining: packet
+                        .expires
+                        .map(|expires| expires.saturating_duration_since(self.now)),
+                    copied: false,
+                }));
+            }
+            if !fits_copy(len) {
+                return Err(StreamError::BorrowLimit);
+            }
+            let copy = super::Chunk::copy_from_slice(&head.data);
+            (copy, true)
+        };
+        let packet = self.take_stream_datagram(key);
+        Ok(Some(super::SpliceDatagram::Data {
+            context: packet.context,
+            data,
+            remaining: packet
+                .expires
+                .map(|expires| expires.saturating_duration_since(self.now)),
+            copied,
+        }))
+    }
+
+    #[cfg(all(feature = "test-hooks", feature = "tokio", not(loom)))]
+    pub(crate) fn fixture_splice_receive_datagram(
+        &mut self,
+        stream: u64,
+        context: u64,
+        data: super::Chunk,
+        expires: Option<Instant>,
+    ) -> bool {
+        let Some(key) = self.streams.key_of(stream) else {
+            return false;
+        };
+        self.queue_stream_datagram(key, context, data, expires)
+    }
+
+    #[cfg(all(feature = "test-hooks", feature = "tokio", not(loom)))]
+    pub(crate) fn fixture_splice_receive_state(&self, stream: u64) -> Option<(usize, usize, u64)> {
+        let queue = self
+            .streams
+            .get(self.streams.key_of(stream)?)?
+            .datagrams
+            .as_ref()?;
+        Some((
+            queue.queue.len(),
+            self.dgram().stream_bytes,
+            queue.counts.expired_recv,
+        ))
     }
 
     /// Raises the number of bidirectional and of unidirectional streams the
@@ -1771,7 +2344,7 @@ impl SessionCore {
     /// nothing. While unidirectional credit is staged, `uni` raises the
     /// value the first accept moves it to. After a GOAWAY no credit is
     /// sent. A value above [`MAX_STREAM_CREDIT`](crate::MAX_STREAM_CREDIT)
-    /// (2^60) is refused and changes nothing.
+    /// (2^60) or beyond the available memory budget is refused atomically.
     pub fn raise_incoming_streams(
         &mut self,
         bidi: u64,
@@ -1784,9 +2357,26 @@ impl SessionCore {
                 "a limit above MAX_STREAM_CREDIT (2^60)",
             ));
         }
-        let grant = self.goaway().sent.is_none() && self.lost().is_none();
-        self.streams.raise_remote(di(Dir::Bidi), bidi, grant);
-        self.streams.raise_remote(di(Dir::Uni), uni, grant);
+        if self.goaway().sent.is_some() || self.lost().is_some() {
+            return Ok(());
+        }
+        let bidi_dir = di(Dir::Bidi);
+        let uni_dir = di(Dir::Uni);
+        let requested = [(bidi_dir, bidi), (uni_dir, uni)].map(|(d, n)| {
+            if n > self.streams.remote_dir(d).target {
+                n
+            } else {
+                0
+            }
+        });
+        if !self.reserve_peer_directions(requested) {
+            return Err(crate::InvalidConfig::new(
+                "memory_budget",
+                "cannot reserve more incoming stream directions",
+            ));
+        }
+        self.streams.raise_remote(bidi_dir, bidi);
+        self.streams.raise_remote(uni_dir, uni);
         Ok(())
     }
 

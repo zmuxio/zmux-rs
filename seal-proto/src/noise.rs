@@ -328,6 +328,12 @@ impl Engine {
         Ok(out)
     }
 
+    pub(crate) fn check_reply_key(&self) -> Result<(), Error> {
+        self.re1
+            .as_deref()
+            .map_or(Ok(()), |key| (self.kem().check_key)(key))
+    }
+
     /// Encrypts the payload after [`Engine::write_tokens`].
     pub(crate) fn write_payload(
         &mut self,

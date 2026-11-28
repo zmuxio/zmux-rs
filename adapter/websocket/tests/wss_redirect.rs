@@ -86,7 +86,7 @@ async fn a_bound_join_over_wss() {
         .await
         .unwrap();
     let pipe = cs
-        .begin_add_pipe(
+        .test_begin_join(
             io,
             PipeOptions::new().with_record_mode(zmux::RecordMode::Bound),
         )
@@ -277,28 +277,28 @@ async fn a_carrier_mode_caches_the_redirected_url() {
     let (backend, listener, serving) = ws_server().await;
     let (addr, count, front) = front(backend, &[("/old", "/zmux")]).await;
     let cache = zmux::CarrierCache::default();
-    let mut policy = zmux::CarrierChoicePolicy::new();
-    policy.cache = Some(cache.clone());
-    policy.key = "server".into();
     let mut sessions = Vec::new();
-    for _ in 0..2 {
+    for index in 0..2 {
         let candidate = zmux_websocket::candidate(
             move || TcpStream::connect(addr),
             &format!("ws://{addr}/old"),
             &zmux_websocket::Options::default(),
-        );
-        let mode = zmux::CarrierChoice::auto([candidate]);
-        let (cs, ss) = tokio::join!(
-            zmux::dial_choice(&mode, Config::default(), &policy),
+        )
+        .with_identity("redirect", "server");
+        let mut options =
+            zmux::ControllerOptions::new(format!("ws-redirect-{index}"), vec![candidate]);
+        options.cache = Some(cache.clone());
+        let controller = zmux::SessionController::new(options).unwrap();
+        let (client, peer) = tokio::join!(
+            controller.open(Config::default(), zmux::SessionTarget::default()),
             listener.accept()
         );
-        sessions.push((cs.unwrap(), ss.unwrap()));
-        assert_eq!(
-            cache
-                .url("server", zmux::CarrierKind::WebSocket, None)
-                .as_deref(),
-            Some(format!("ws://{addr}/zmux").as_str())
-        );
+        let (client, control) = client.unwrap();
+        if let Some(control) = control {
+            control.release().unwrap();
+            control.done().await;
+        }
+        sessions.push((client, peer.unwrap()));
     }
     // The second candidate started at the cached URL: one redirect in all.
     assert_eq!(count.load(Ordering::SeqCst), 1);

@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 use zmux::RecordMode;
-use zmux::{Listener, ListenerConfig, PipeOptions, Session, SessionError, VarInt};
+use zmux::{Listener, ListenerConfig, Session, SessionError, VarInt};
 
-use super::{NoVerify, SEAL_NODE, provider, seal_keys, tls_server_config, x25519_dalek_public};
+use super::{
+    NoVerify, SEAL_NODE, hex, provider, seal_keys, tls_server_config, x25519_dalek_public,
+};
 
 const CLIENT_KEY: [u8; 32] = [0x6b; 32];
 const A_LEN: usize = 1 << 20;
@@ -23,15 +25,6 @@ fn pattern(n: usize) -> Vec<u8> {
     (0..n)
         .map(|i| u8::try_from((i * 31 + 7) % 256).expect("below 256"))
         .collect()
-}
-
-pub(crate) fn hex(b: &[u8]) -> String {
-    use std::fmt::Write as _;
-    b.iter()
-        .fold(String::with_capacity(b.len() * 2), |mut out, x| {
-            let _ = write!(out, "{x:02x}");
-            out
-        })
 }
 
 fn unhex(s: &str) -> Res<[u8; 32]> {
@@ -56,7 +49,7 @@ fn profile_of(sc: &str) -> Res<u64> {
 fn session_config(sc: &str) -> zmux::Config {
     let mut c = super::seal_config();
     if sc == "join" || sc == "epoch" {
-        c.max_pipes = 4;
+        c.session_policy.limits.steady_attachments = 4;
         c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode::new(|_, _, _| true));
     }
     c
@@ -421,13 +414,7 @@ async fn run_client(args: &[String]) -> Res {
                 .connect(name, tcp)
                 .await
                 .map_err(|e| format!("tls: {e}"))?;
-            let pipe = s
-                .begin_add_pipe(
-                    zmux_rustls::over_tcp(stream),
-                    PipeOptions::default().with_record_mode(RecordMode::Bound),
-                )
-                .map_err(|e| format!("add pipe: {e}"))?;
-            pipe.attached().await.map_err(|e| format!("attach: {e}"))?;
+            super::join_carrier(&s, zmux_rustls::over_tcp(stream), RecordMode::Bound).await?;
             println!("PIPES {}", s.pipes().len());
         }
         "epoch" => {
@@ -437,13 +424,7 @@ async fn run_client(args: &[String]) -> Res {
             let tcp = TcpStream::connect(&addr)
                 .await
                 .map_err(|e| format!("connect join: {e}"))?;
-            let pipe = s
-                .begin_add_pipe(
-                    zmux::PipeIo::from_tcp(tcp),
-                    PipeOptions::default().with_record_mode(RecordMode::Sealed),
-                )
-                .map_err(|e| format!("add pipe: {e}"))?;
-            pipe.attached().await.map_err(|e| format!("attach: {e}"))?;
+            super::join_carrier(&s, zmux::PipeIo::from_tcp(tcp), RecordMode::Sealed).await?;
             client_exchange(&s).await?;
             println!("EPOCH {}", epoch_of(&s, committed));
             return graceful_end(&s).await;

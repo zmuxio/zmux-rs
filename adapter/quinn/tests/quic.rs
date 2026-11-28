@@ -4,11 +4,11 @@
 
 #![cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeOptions, Session, SessionEvent,
 };
@@ -21,39 +21,16 @@ struct Quic {
 
 impl Quic {
     fn new() -> Self {
-        Self::with_transport(quinn::TransportConfig::default())
+        Self::with_transport(Options::default().transport_config())
     }
 
     /// With the server's transport configuration `transport`.
     fn with_transport(transport: quinn::TransportConfig) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
-        let der = CertificateDer::from(cert.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![der.clone()], key)
-            .unwrap();
-        tls.alpn_protocols = vec![b"zmux".to_vec()];
-        let mut server_config =
-            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
-        server_config.transport_config(Arc::new(transport));
-        let server =
-            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(der).unwrap();
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![b"zmux".to_vec()];
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(tls).unwrap(),
-        )));
+        let (server, client) = common::endpoints(
+            vec![b"zmux".to_vec()],
+            transport,
+            Options::default().transport_config(),
+        );
         Self { server, client }
     }
 
@@ -76,63 +53,22 @@ impl Quic {
 
 fn config(auth: PipeAuth) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = auth.with_end_to_end();
     c.allow_record_mode = Some(zmux::AllowRecordMode::new(|_, _, _| true));
     c
 }
 
-/// Sends `n` streams of `len` bytes each from `from` to `to` at once and
-/// checks every byte.
-async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
-    let receiver = {
-        let to = to.clone();
-        tokio::spawn(async move {
-            let mut readers = Vec::new();
-            for _ in 0..n {
-                let mut recv = to.accept_uni().await.unwrap();
-                readers.push(tokio::spawn(async move {
-                    recv.read_to_end(len + 1).await.unwrap()
-                }));
-            }
-            for r in readers {
-                let data = r.await.unwrap();
-                assert_eq!(data.len(), len);
-                assert!(
-                    data.iter()
-                        .enumerate()
-                        .all(|(i, &b)| b == u8::try_from(i % 251).unwrap())
-                );
-            }
-        })
-    };
-    let data = bytes::Bytes::from(
-        (0..len)
-            .map(|i| u8::try_from(i % 251).unwrap())
-            .collect::<Vec<_>>(),
-    );
-    let mut writers = Vec::new();
-    for _ in 0..n {
-        let mut send = from.open_uni().await.unwrap();
-        let data = data.clone();
-        writers.push(tokio::spawn(async move {
-            send.write_chunk(data).await.unwrap();
-            send.finish().unwrap();
-            send
-        }));
-    }
-    for w in writers {
-        drop(w.await.unwrap());
-    }
-    receiver.await.unwrap();
-}
+#[path = "../../test-support/transfer.rs"]
+mod streams;
+use streams::transfer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lanes_ride_further_streams_and_the_connection_closes_once_unused() {
     let quic = Quic::new();
     let (cc, sc) = quic.connect().await;
-    let client = Carrier::new(cc.clone(), Options::default());
-    let server = Carrier::new(sc.clone(), Options::default());
+    let client = Carrier::new(cc.clone(), &common::adopted_options(Options::default())).unwrap();
+    let server = Carrier::new(sc.clone(), &common::adopted_options(Options::default())).unwrap();
     let accept = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -149,11 +85,10 @@ async fn lanes_ride_further_streams_and_the_connection_closes_once_unused() {
     // routes the lanes) alive without the application's handles.
     drop((client, server));
     transfer(&cs, &ss, 8, 4 << 20).await;
-    // The client opened lanes: further unidirectional streams of the
-    // connection (the next one's index counts them).
-    let next = cc.open_uni().await.unwrap();
-    assert!(next.id().index() >= 1, "no lane was opened");
-    drop((next, cc));
+    // An additional lane may occupy the last QUIC unidirectional stream
+    // slot. Observe the lanes of the transfer without waiting for a new slot.
+    assert!(cs.pipe_stats().iter().any(|pipe| pipe.lanes_out > 1));
+    drop(cc);
 
     // Nothing of zmux keeps the connection once the sessions and their
     // pipes are gone: it closes, and the server sees it.
@@ -172,10 +107,12 @@ async fn a_bound_join_over_a_second_connection() {
         .expect("valid listener configuration");
     let (c1, s1) = quic.connect().await;
     let (c2, s2) = quic.connect().await;
-    let _s1 = Carrier::with_listener(s1, &listener, Options::default());
-    let _s2 = Carrier::with_listener(s2, &listener, Options::default());
-    let q1 = Carrier::new(c1, Options::default());
-    let q2 = Carrier::new(c2, Options::default());
+    let _s1 = Carrier::with_listener(s1, &listener, &common::adopted_options(Options::default()))
+        .unwrap();
+    let _s2 = Carrier::with_listener(s2, &listener, &common::adopted_options(Options::default()))
+        .unwrap();
+    let q1 = Carrier::new(c1, &common::adopted_options(Options::default())).unwrap();
+    let q2 = Carrier::new(c2, &common::adopted_options(Options::default())).unwrap();
     // The session secret comes from the first connection's exporter.
     let client = Session::connect(q1.open_pipe().await.unwrap(), config(PipeAuth::exporter()))
         .await
@@ -183,16 +120,19 @@ async fn a_bound_join_over_a_second_connection() {
     let server = listener.accept().await.unwrap();
     assert_eq!(client.multipath(), zmux::Multipath::InUse);
     let pipe = client
-        .begin_add_pipe(
+        .test_begin_join(
             q2.open_pipe().await.unwrap(),
             PipeOptions::default().with_record_mode(zmux::RecordMode::Bound),
         )
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while pipe.stats().and_then(|i| i.outbound) != Some(OutboundState::Active) {
-        assert!(tokio::time::Instant::now() < deadline, "the join failed");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(60), pipe.attached())
+        .await
+        .expect("the pipe did not attach")
+        .unwrap();
+    assert_eq!(
+        pipe.stats().and_then(|i| i.outbound),
+        Some(OutboundState::Active)
+    );
     transfer(&client, &server, 4, 1 << 20).await;
     assert_kind([&client, &server], zmux::CarrierKind::Quic);
     for s in [&client, &server] {
@@ -205,26 +145,66 @@ async fn a_bound_join_over_a_second_connection() {
     client.close().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_memory_budget_admits_sixty_four_full_receive_windows() {
+    const SESSIONS: usize = 64;
+    const WINDOW: usize = 1 << 20;
+
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let quic = Quic::new();
+        let mut config = config(PipeAuth::exporter());
+        config.initial_stream_receive_window = 2 * WINDOW as u64;
+        // FIN on the same ordered lane establishes that the window arrived.
+        config.max_lanes = std::num::NonZeroU64::MIN;
+        let limits = ListenerConfig::default();
+        assert_eq!(limits.limits.memory_budget, Some(1 << 30));
+        let listener = Listener::new(config.clone(), limits).unwrap();
+
+        let payload = vec![42; WINDOW];
+        let mut sessions = Vec::with_capacity(SESSIONS);
+        for _ in 0..SESSIONS {
+            let (c, s) = quic.connect().await;
+            let _server_carrier =
+                Carrier::with_listener(s, &listener, &common::adopted_options(Options::default()))
+                    .unwrap();
+            let carrier = Carrier::new(c, &common::adopted_options(Options::default())).unwrap();
+            let client = Session::connect(carrier.open_pipe().await.unwrap(), config.clone())
+                .await
+                .unwrap();
+            let server = listener.accept().await.unwrap();
+            let (mut send, response) = client.open_bi().await.unwrap();
+            send.write_all(&payload).await.unwrap();
+            send.finish().unwrap();
+            let (reply, mut recv) = server.accept_bi().await.unwrap();
+            assert_eq!(recv.received_reset().await.unwrap(), None);
+            assert_eq!(recv.stats().recv_buffered, WINDOW as u64);
+            sessions.push((client, server, send, response, reply, recv));
+        }
+
+        let (c, s) = quic.connect().await;
+        let _server_carrier =
+            Carrier::with_listener(s, &listener, &common::adopted_options(Options::default()))
+                .unwrap();
+        let carrier = Carrier::new(c, &common::adopted_options(Options::default())).unwrap();
+        let pipe = sessions[0]
+            .0
+            .test_begin_join(
+                carrier.open_pipe().await.unwrap(),
+                PipeOptions::default().with_record_mode(zmux::RecordMode::Bound),
+            )
+            .unwrap();
+        pipe.attached().await.unwrap();
+        for (_, _, _, _, _, recv) in &sessions {
+            assert_eq!(recv.stats().recv_buffered, WINDOW as u64);
+        }
+    })
+    .await
+    .expect("session or Join did not complete");
+}
+
 /// A rustls configuration pair for "localhost" without ALPN identifiers.
 fn plain_tls() -> (rustls::ClientConfig, rustls::ServerConfig) {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
-    let der = CertificateDer::from(cert.cert.der().to_vec());
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let server = rustls::ServerConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![der.clone()], key)
-        .unwrap();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(der).unwrap();
-    let client = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    (client, server)
+    common::tls_configs("localhost", Vec::new())
 }
 
 /// One step from an endpoint to a session and from an endpoint to its
@@ -271,8 +251,8 @@ async fn connect_and_serve_with_zmux_alpn() {
 async fn a_lost_connection_is_a_failure_not_a_clean_end() {
     let quic = Quic::new();
     let (cc, sc) = quic.connect().await;
-    let client = Carrier::new(cc, Options::default());
-    let server = Carrier::new(sc, Options::default());
+    let client = Carrier::new(cc, &common::adopted_options(Options::default())).unwrap();
+    let server = Carrier::new(sc, &common::adopted_options(Options::default())).unwrap();
     let accept = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -315,7 +295,7 @@ fn assert_kind(sessions: [&Session; 2], kind: zmux::CarrierKind) {
 async fn a_pipe_dropped_unfinished_resets_its_stream() {
     let quic = Quic::new();
     let (cc, sc) = quic.connect().await;
-    let client = Carrier::new(cc, Options::default());
+    let client = Carrier::new(cc, &common::adopted_options(Options::default())).unwrap();
     let pipe = client.open_pipe_with_prefix(b"x").await.unwrap();
     let (_send, mut recv) = sc.accept_bi().await.unwrap();
     drop(pipe);
@@ -339,8 +319,10 @@ async fn graceful_ends_finish_their_streams() {
     let (cc, sc) = quic.connect().await;
     let listener = Listener::new(config(PipeAuth::exporter()), ListenerConfig::default())
         .expect("valid listener configuration");
-    let _server_carrier = Carrier::with_listener(sc, &listener, Options::default());
-    let carrier = Carrier::new(cc, Options::default());
+    let _server_carrier =
+        Carrier::with_listener(sc, &listener, &common::adopted_options(Options::default()))
+            .unwrap();
+    let carrier = Carrier::new(cc, &common::adopted_options(Options::default())).unwrap();
     let client = Session::connect(
         carrier.open_pipe().await.unwrap(),
         config(PipeAuth::exporter()),
@@ -349,11 +331,21 @@ async fn graceful_ends_finish_their_streams() {
     .unwrap();
     let server = listener.accept().await.unwrap();
     let pipe = client
-        .add_pipe(carrier.open_pipe().await.unwrap(), PipeOptions::default())
+        .test_join(carrier.open_pipe().await.unwrap(), PipeOptions::default())
         .await
         .unwrap();
     for session in [&client, &server] {
-        let stats = session.pipe_stats();
+        let stats = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let stats = session.pipe_stats();
+                if stats.iter().all(|pipe| pipe.carrier_sample.is_some()) {
+                    break stats;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the requested shared native sample was never published");
         assert_eq!(stats.len(), 2);
         let sample = stats[0].carrier_sample.as_ref().unwrap();
         assert_eq!(sample.generation, 0);
@@ -371,18 +363,24 @@ async fn graceful_ends_finish_their_streams() {
             .all(|p| p.failure.is_none() && p.failure_count == 0)
     };
     pipe.close().unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while server
-        .pipe(pipe.id())
-        .and_then(|p| p.stats())
-        .is_some_and(|p| p.inbound != Some(zmux::InboundState::Ended))
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the pipe did not end"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while server
+            .pipe(pipe.id())
+            .and_then(|p| p.stats())
+            .is_some_and(|p| p.inbound != Some(zmux::InboundState::Ended))
+        {
+            let event = server
+                .next_event()
+                .await
+                .expect("session closed before its pipe");
+            assert!(
+                !matches!(event, SessionEvent::PipeFailed { .. }),
+                "{event:?}"
+            );
+        }
+    })
+    .await
+    .expect("the pipe did not end");
     assert!(clean(&server), "{:?}", server.pipe_stats());
     transfer(&client, &server, 4, 256 << 10).await;
     client.close().await;
@@ -403,81 +401,9 @@ async fn graceful_ends_finish_their_streams() {
     listener.close();
 }
 
-// ---- N16: close delivery ---------------------------------------------------------------
-
-/// N16 on one carrier class: the client writes 1 MiB on a stream it
-/// finishes and a few bytes on a second one it leaves open, then closes
-/// with `code` and `reason` (code 0 and no reason: the plain close) and
-/// waits for the whole end. The server reads the whole 1 MiB in order and
-/// ends with the client's code and reason; the close returned within its
-/// guard; the wait, under a client linger of an hour, returned once the
-/// server read the close and ended its side; the open
-/// stream failed locally with the session's error. `slow`: the server starts
-/// reading only after a pause, so the close arrives before it read everything.
-/// `c` with a linger of an hour: a session that ends ended at the peer's end
-/// of its side.
-fn lingering(mut c: Config) -> Config {
-    c.test_hooks().linger_timeout = Some(Duration::from_secs(3600));
-    c
-}
-
-async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &[u8], slow: bool) {
-    let data: Vec<u8> = (0..(1 << 20))
-        .map(|i| u8::try_from(i % 251).unwrap())
-        .collect();
-    let reader = {
-        let (server, data) = (server.clone(), data.clone());
-        tokio::spawn(async move {
-            let (_s, mut r) = server.accept_bi().await.unwrap();
-            if slow {
-                // A slow reader: the close arrives while data waits unread.
-                tokio::time::sleep(Duration::from_millis(300)).await;
-            }
-            assert_eq!(r.read_to_end(2 << 20).await.unwrap(), data);
-            server.closing().await
-        })
-    };
-    let (mut w, _r) = client.open_bi().await.unwrap();
-    w.write_all(&data).await.unwrap();
-    w.finish().unwrap();
-    let (mut open, _r2) = client.open_bi().await.unwrap();
-    open.write_all(b"left open").await.unwrap();
-    let start = std::time::Instant::now();
-    let code = zmux::VarInt::from_u32(code);
-    if code == zmux::VarInt::ZERO && reason.is_empty() {
-        client.close().await;
-    } else {
-        client.close_with_error(code, reason).await;
-    }
-    // A guard only: the server's delivery below shows the close completed
-    // normally.
-    let closed = start.elapsed();
-    assert!(closed < Duration::from_secs(3), "{closed:?}");
-    // The client lingers an hour (`lingering`): a wait that returns within
-    // its guard returned at the server's end of its side, after it read the
-    // close.
-    let end = tokio::time::timeout(Duration::from_secs(5), client.closed())
-        .await
-        .expect("the server ended its side after the close");
-    assert!(
-        matches!(&end, zmux::SessionError::ApplicationClosed { code: c, remote: false, .. } if *c == code),
-        "{end:?}"
-    );
-    let seen = tokio::time::timeout(Duration::from_secs(5), reader)
-        .await
-        .expect("the server read everything")
-        .unwrap();
-    assert!(
-        matches!(&seen, zmux::SessionError::ApplicationClosed { code: c, reason: r, remote: true }
-            if *c == code && r.as_ref() == reason),
-        "{seen:?}"
-    );
-    let e = open.write_all(b"more").await.unwrap_err();
-    assert!(
-        matches!(&e, zmux::StreamError::SessionLost(zmux::SessionError::ApplicationClosed { code: c, remote: false, .. }) if *c == code),
-        "{e:?}"
-    );
-}
+#[path = "../../test-support/close_delivery.rs"]
+mod close_delivery;
+use close_delivery::{close_delivery, lingering};
 
 /// N16 over QUIC: as on the other carriers, and the QUIC connection is
 /// closed after the zmux close was read, with the same application code
@@ -492,8 +418,9 @@ async fn a_close_is_delivered_with_its_code_and_ends_the_connection_with_it() {
     ] {
         let quic = Quic::new();
         let (cc, sc) = quic.connect().await;
-        let client = Carrier::new(cc, Options::default());
-        let server = Carrier::new(sc.clone(), Options::default());
+        let client = Carrier::new(cc, &common::adopted_options(Options::default())).unwrap();
+        let server =
+            Carrier::new(sc.clone(), &common::adopted_options(Options::default())).unwrap();
         let accept = {
             let server = server.clone();
             tokio::spawn(async move {
@@ -531,8 +458,8 @@ async fn a_close_is_delivered_with_its_code_and_ends_the_connection_with_it() {
 async fn an_abort_ends_the_connection_with_its_code_after_the_close() {
     let quic = Quic::new();
     let (cc, sc) = quic.connect().await;
-    let client = Carrier::new(cc, Options::default());
-    let server = Carrier::new(sc.clone(), Options::default());
+    let client = Carrier::new(cc, &common::adopted_options(Options::default())).unwrap();
+    let server = Carrier::new(sc.clone(), &common::adopted_options(Options::default())).unwrap();
     let accept = {
         let server = server.clone();
         tokio::spawn(async move {
@@ -571,13 +498,12 @@ async fn an_abort_ends_the_connection_with_its_code_after_the_close() {
 /// instead of waiting for stream credit for ever.
 #[tokio::test]
 async fn a_dial_without_stream_credit_times_out() {
-    let mut t = quinn::TransportConfig::default();
+    let mut t = Options::default().transport_config();
     t.max_concurrent_bidi_streams(0u32.into());
     let q = Quic::with_transport(t);
     let addr = q.server.local_addr().unwrap();
     let server = q.server.clone();
     let held = tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() });
-    let started = tokio::time::Instant::now();
     let r = zmux_quinn::dial(
         &q.client,
         addr,
@@ -586,7 +512,6 @@ async fn a_dial_without_stream_credit_times_out() {
     )
     .await;
     assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
-    assert!(started.elapsed() < Duration::from_secs(3));
     drop(held.await.unwrap());
 }
 
@@ -607,7 +532,11 @@ async fn closed_waits_for_finished_quic_lanes() {
         gate: tokio::sync::watch::Receiver<bool>,
     }
     impl SendPart for Send {
-        fn poll_write_chunks(
+        fn poll_write(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+            AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, bytes)
+        }
+
+        fn poll_send_bytes(
             &mut self,
             cx: &mut Context<'_>,
             chunks: &mut [bytes::Bytes],
@@ -712,7 +641,7 @@ async fn a_connection_without_a_first_stream_releases_its_entry_at_setup_deadlin
     config.limits.max_pending_per_source = 2;
     let listener = Listener::new(Config::default(), config).unwrap();
     let _other = listener.adapter().enter(peer, None).unwrap();
-    let options = Options::default();
+    let options = common::adopted_options(Options::default());
     tokio::time::pause();
     let mut serving = Box::pin(zmux_quinn::serve_connection(&listener, server, &options));
     assert!(

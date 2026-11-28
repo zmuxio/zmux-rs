@@ -142,7 +142,7 @@ fn examples_semantics() {
     assert_eq!(&s.data[size..], b"hello");
 
     // 3.3 and 3.4: datagram flow prefixes.
-    for (id, flow, payload) in [
+    for (id, flow, payload, padding) in [
         (
             "datagram-flow",
             Flow::Stream {
@@ -150,14 +150,21 @@ fn examples_semantics() {
                 context: 0,
             },
             &b"udp-payload"[..],
+            0,
         ),
-        ("datagram-session", Flow::Session, &b"ping"[..]),
+        ("datagram-session", Flow::Session, &b"ping\0"[..], 2),
     ] {
         let bytes = example(id);
-        let Frame::Datagram(d) = Frame::decode(body(&bytes), &Gates::ALL).unwrap().0 else {
+        let mut frames = zmux::proto::Frames::new(body(&bytes), Gates::ALL);
+        if padding != 0 {
+            assert!(matches!(frames.next(), Some(Ok(Frame::Padding(p))) if p.len == padding));
+        }
+        let Some(Ok(Frame::Datagram(d))) = frames.next() else {
             panic!("{id}");
         };
-        assert_eq!(Flow::parse(d.data).unwrap(), (flow, payload), "{id}");
+        let (_, received_flow, received_payload) = d.sequenced().unwrap();
+        assert_eq!((received_flow, received_payload), (flow, payload), "{id}");
+        assert!(frames.next().is_none(), "{id}: unexpected trailing frame");
     }
 }
 

@@ -21,9 +21,9 @@ use common::{duplex, multi_thread, watchdog};
 use zmux::adapter::{FirstBytes, classify_first_bytes};
 use zmux::proto::record::Framing;
 use zmux::{
-    Admission, AdmissionVerdict, CacheOutcome, CarrierCache, CarrierKind, Config, ExportError,
-    Listener, ListenerConfig, Liveness, PipeAuth, PipeError, PipeIo, ReplayFilter, ReplayVerdict,
-    Session, SessionError,
+    Admission, AdmissionVerdict, CarrierCache, CarrierKind, Config, ExportError, Listener,
+    ListenerConfig, Liveness, PipeAuth, PipeError, PipeIo, ReplayFilter, ReplayVerdict, Session,
+    SessionError,
 };
 
 fn exported(p: PipeIo, reads: Option<Arc<AtomicUsize>>) -> PipeIo {
@@ -38,21 +38,27 @@ fn exported(p: PipeIo, reads: Option<Arc<AtomicUsize>>) -> PipeIo {
     })
 }
 
-async fn connected(client: Config, server: Config, exporter: bool) -> (Session, Session) {
-    let ((a, _), (b, _)) = duplex(1 << 20);
-    let (a, b) = if exporter {
-        (exported(a, None), exported(b, None))
-    } else {
-        (a, b)
-    };
-    let server = tokio::spawn(common::accept(b, server));
-    let client = watchdog(5, "connect", Session::connect(a, client))
-        .await
-        .unwrap();
-    let server = watchdog(5, "accept", server).await.unwrap().unwrap();
-    watchdog(5, "c", client.established()).await.unwrap();
-    watchdog(5, "s", server.established()).await.unwrap();
-    (client, server)
+fn connected(
+    client: Config,
+    server: Config,
+    exporter: bool,
+) -> impl Future<Output = (Session, Session)> {
+    Box::pin(async move {
+        let ((a, _), (b, _)) = duplex(1 << 20);
+        let (a, b) = if exporter {
+            (exported(a, None), exported(b, None))
+        } else {
+            (a, b)
+        };
+        let server = tokio::spawn(common::accept(b, server));
+        let client = watchdog(5, "connect", Session::connect(a, client))
+            .await
+            .unwrap();
+        let server = watchdog(5, "accept", server).await.unwrap().unwrap();
+        watchdog(5, "c", client.established()).await.unwrap();
+        watchdog(5, "s", server.established()).await.unwrap();
+        (client, server)
+    })
 }
 
 #[test]
@@ -106,7 +112,7 @@ fn a_deferred_join_secret_holds_joins_until_it_is_given() {
         assert!(client.join_pending());
         let ((extra, _), _other) = duplex(1 << 16);
         assert!(matches!(
-            client.begin_add_pipe(extra, zmux::PipeOptions::default()),
+            client.test_begin_join(extra, zmux::PipeOptions::default()),
             Err(PipeError::JoinPending(zmux::JoinMissing::DeferredPsk))
         ));
         assert!(!client.adapter().join_ready());
@@ -150,32 +156,28 @@ fn a_held_join_counts_once_and_wakes_with_the_key() {
         client.set_join_secret(&key).unwrap();
         let ((extra_a, _), (extra_b, _)) = duplex(1 << 20);
         let serving = listener.clone();
-        tokio::spawn(async move {
+        let joined = tokio::spawn(async move {
             serving
                 .handle_pipe(extra_b, zmux::PipeHint::default())
                 .await
         });
-        client
-            .begin_add_pipe(extra_a, zmux::PipeOptions::default())
+        let pipe = client
+            .test_begin_join(extra_a, zmux::PipeOptions::default())
             .unwrap();
-        // Longer than a good many rounds of any polling.
-        watchdog(5, "held", async {
+        watchdog(60, "held", async {
             while server.stats().join_pending == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        watchdog(60, "bootstrap ping while the Join is held", client.ping())
+            .await
+            .unwrap();
         assert_eq!(server.stats().join_pending, 1);
         server.set_join_secret(&key).unwrap();
-        // The listener counts a join once it handed the attached pipe its
-        // task, just after the session shows the pipe.
-        watchdog(5, "joined", async {
-            while server.pipe_stats().len() < 2 || listener.stats().joins == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
+        watchdog(60, "joined", joined).await.unwrap().unwrap();
+        watchdog(60, "confirmed", pipe.attached()).await.unwrap();
+        assert_eq!(server.pipe_stats().len(), 2);
         assert_eq!(server.stats().join_pending, 1);
         assert_eq!(listener.stats().joins, 1);
     });
@@ -195,20 +197,16 @@ fn dropping_a_stream_while_unwinding_leaves_the_session_alive() {
             panic!("application panic, unrelated to the session");
         }));
         assert!(r.is_err());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            tokio::time::timeout(Duration::ZERO, client.closing())
-                .await
-                .is_err()
-        );
-        assert!(
-            tokio::time::timeout(Duration::ZERO, server.closing())
-                .await
-                .is_err()
-        );
-        let (mut send, _recv) = client.open_bi().await.unwrap();
-        send.write_all(b"x").await.unwrap();
-        send.flush().await.unwrap();
+        watchdog(60, "another stream crosses the session", async {
+            let (mut send, _recv) = client.open_bi().await.unwrap();
+            send.write_all(b"x").await.unwrap();
+            send.flush().await.unwrap();
+            let (_reply, mut recv) = server.accept_bi().await.unwrap();
+            let mut byte = [0];
+            recv.read_exact(&mut byte).await.unwrap();
+            assert_eq!(&byte, b"x");
+        })
+        .await;
     });
 }
 
@@ -249,11 +247,11 @@ fn a_secret_the_negotiation_did_not_select_is_dropped() {
         let ((a, _), (b, _)) = duplex(1 << 20);
         // The server session is kept: dropping it would close the session,
         // and the client would see the close instead of the negotiation.
-        let (client, _server) = watchdog(5, "connect", async {
+        let (client, _server) = Box::pin(watchdog(5, "connect", async {
             let server = tokio::spawn(Session::accept(b, Config::default()));
             let client = Session::connect(a, c).await.unwrap();
             (client, server.await.unwrap().unwrap())
-        })
+        }))
         .await;
         client.set_join_secret(&[7; 32]).ok();
         watchdog(5, "est", client.established()).await.unwrap();
@@ -268,7 +266,9 @@ fn a_secret_the_negotiation_did_not_select_is_dropped() {
 #[test]
 fn liveness_and_limits_change_while_the_session_runs() {
     multi_thread(async {
-        let (client, server) = connected(Config::default(), Config::default(), false).await;
+        let mut inbound = Config::default();
+        inbound.max_incoming_streams = 0;
+        let (client, server) = connected(Config::default(), inbound, false).await;
         let mut l = client.liveness();
         l.keep_alive_period = Some(Duration::from_millis(10));
         assert!(client.set_liveness(&l).is_err(), "below 1 s");
@@ -278,25 +278,19 @@ fn liveness_and_limits_change_while_the_session_runs() {
         assert_ne!(Liveness::default().keep_alive_period, None);
 
         let mut limits = client.shaping_limits();
-        limits.wire = zmux::shaping::Account::new((1 << 53) + 1, 0, 0);
+        limits.wire = Some(zmux::shaping::Account::new((1 << 53) + 1, 0, 0, 0));
         assert!(client.set_shaping_limits(limits).is_err());
-        limits.wire = zmux::shaping::Account::new(500, 0, 0);
+        limits.wire = Some(zmux::shaping::Account::new(500, 500, 0, 0));
         client.set_shaping_limits(limits).unwrap();
-        assert_eq!(client.shaping_limits().wire.initial, 500);
+        assert_eq!(client.shaping_limits().wire.unwrap().initial, 500);
 
         assert!(server.raise_incoming_streams((1 << 60) + 1, 0).is_err());
+        assert!(matches!(
+            client.try_open_bi(),
+            Err(zmux::OpenError::Blocked)
+        ));
         server.raise_incoming_streams(1000, 0).unwrap();
-        watchdog(5, "credit", async {
-            loop {
-                let r: Vec<_> = (0..600).map(|_| client.try_open_uni()).collect();
-                drop(r);
-                if client.try_open_bi().is_ok() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
+        watchdog(60, "credit", client.open_bi()).await.unwrap();
     });
 }
 
@@ -319,24 +313,6 @@ fn flush_opens_a_stream_with_nothing_written_and_data_goes_with_it() {
         let mut buf = [0; 5];
         watchdog(5, "read", r.read_exact(&mut buf)).await.unwrap();
         assert_eq!(&buf, b"hello");
-    });
-}
-
-#[test]
-fn early_flush_opens_on_the_floor_and_after_the_peer_answers() {
-    multi_thread(async {
-        let ((a, _), (b, _)) = duplex(1 << 20);
-        let mut c = Config::default();
-        c.early_data = zmux::EarlyData::for_zmux_peer();
-        let client = watchdog(5, "connect", Session::connect(a, c))
-            .await
-            .unwrap();
-        let (mut send, _r) = client.open_bi().await.unwrap();
-        watchdog(5, "flush", send.flush()).await.unwrap();
-        let server = watchdog(5, "accept", Session::accept(b, Config::default()))
-            .await
-            .unwrap();
-        watchdog(5, "accept_bi", server.accept_bi()).await.unwrap();
     });
 }
 
@@ -436,17 +412,233 @@ fn replay_filter_follows_the_shared_vectors() {
     assert!(ReplayFilter::new(Duration::from_secs(1), 0).is_err());
 }
 
-#[test]
-fn the_cache_takes_reports_per_variant() {
+#[tokio::test(start_paused = true)]
+async fn the_cache_takes_reports_per_variant() {
+    use std::sync::atomic::AtomicU64;
+    use std::time::SystemTime;
+    use zmux::{CarrierCacheConfig, CooldownReason, RetryAdmission};
+
+    let wall = Arc::new(AtomicU64::new(1_700_000_000));
+    let config = CarrierCacheConfig::default().with_wall_clock({
+        let wall = wall.clone();
+        move || SystemTime::UNIX_EPOCH + Duration::from_secs(wall.load(Ordering::Relaxed))
+    });
+    let cache = CarrierCache::new(config.clone()).unwrap();
+    let candidate = zmux::Candidate::new(CarrierKind::Split, || async {
+        Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+    })
+    .with_identity("candidate-x", "k")
+    .with_variant("x");
+    let mut options = zmux::ControllerOptions::new("variant-cache", vec![candidate]);
+    options.cache = Some(cache.clone());
+    let controller = zmux::SessionController::new(options).unwrap();
+    let refused = controller
+        .open(Config::default(), zmux::SessionTarget::default())
+        .await;
+    assert!(matches!(refused, Err(zmux::ControllerError::Bootstrap(_))));
+
+    assert_eq!(cache.score("k", CarrierKind::Split, "").cooldown, None);
+    let score = cache.score("k", CarrierKind::Split, "x");
+    let cooldown = score.cooldown.unwrap();
+    assert_eq!(cooldown.reason, Some(CooldownReason::Attempt));
+    assert_eq!(score.cooldown_level, 1);
+    assert_eq!(cooldown.nominal_wait, config.backoff.min);
+    let started = cooldown.started_at.unwrap();
+    assert_eq!(cooldown.retry_at - started, cooldown.sampled_wait.unwrap());
+    assert_eq!(
+        cache.retry_admission("k", CarrierKind::Split, "x"),
+        Err(RetryAdmission::Cooling)
+    );
+    let data = cache.export().unwrap();
+    let snapshot: serde_json::Value = serde_json::from_slice(&data).unwrap();
+    assert_eq!(snapshot["exported_at"], "2023-11-14T22:13:20Z");
+    assert_eq!(
+        snapshot["entries"][0]["history"]["at"],
+        snapshot["exported_at"]
+    );
+    assert_eq!(cache.export().unwrap(), data);
+
+    let elapsed = Duration::from_secs(1);
+    wall.fetch_add(elapsed.as_secs(), Ordering::Relaxed);
+    let restored = CarrierCache::new(config).unwrap();
+    restored.import(&data).unwrap();
+    assert_eq!(restored.score("k", CarrierKind::Split, "x").attempts, 1);
+    let imported = restored
+        .score("k", CarrierKind::Split, "x")
+        .cooldown
+        .unwrap();
+    assert_eq!(imported.nominal_wait, cooldown.nominal_wait);
+    assert_eq!(imported.reason, None);
+    assert_eq!(
+        restored.score("k", CarrierKind::Split, "x").cooldown_level,
+        1
+    );
+    assert_eq!(imported.sampled_wait, None);
+    let remaining_ms = snapshot["entries"][0]["cooling"]["remaining_ms"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        imported.retry_at,
+        restored.clock_domain().now()
+            + Duration::from_millis(remaining_ms)
+                .checked_sub(elapsed)
+                .unwrap()
+    );
+    assert_eq!(restored.score("k", CarrierKind::Split, "").attempts, 0);
+    let remaining = cooldown
+        .retry_at
+        .saturating_duration_since(tokio::time::Instant::now().into_std());
+    tokio::time::advance(remaining).await;
+    assert_eq!(cache.retry_admission("k", CarrierKind::Split, "x"), Ok(()));
+    let refused = controller
+        .open(Config::default(), zmux::SessionTarget::default())
+        .await;
+    assert!(matches!(refused, Err(zmux::ControllerError::Bootstrap(_))));
+    let doubled = cache.score("k", CarrierKind::Split, "x");
+    assert_eq!(doubled.cooldown_level, 2);
+    let second = doubled.cooldown.unwrap();
+    assert_eq!(second.reason, Some(CooldownReason::Attempt));
+    assert_eq!(second.nominal_wait, cooldown.nominal_wait * 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn controller_bootstrap_waits_for_dial_after_and_records_authenticated_refusal_as_a_failure()
+{
+    use zmux::{
+        CarrierRetryAfter, ClockDomain, ControllerError, CooldownEvent, CooldownReason,
+        RetryAdmission,
+    };
+
     let cache = CarrierCache::default();
-    cache.report("k", CarrierKind::Split, Some("x"), CacheOutcome::Rejected);
-    assert!(cache.failed_until("k", CarrierKind::Split, None).is_none());
-    let text = cache.snapshot().to_json();
-    assert!(text.contains("\"variant\":\"x\""), "{text}");
-    let back = zmux::CacheSnapshot::from_json(&text).unwrap();
-    assert_eq!(back.entries[0].variant.as_deref(), Some("x"));
-    cache.report("k", CarrierKind::Split, None, CacheOutcome::Usable);
-    assert!(cache.is_usable("k", CarrierKind::Split, None));
+    let mut events = cache.subscribe_cooldown();
+    let clock = ClockDomain::default();
+    let init = clock.now();
+    let after = init + Duration::from_secs(5);
+    let candidate = zmux::Candidate::new(CarrierKind::Split, move || {
+        let at = ClockDomain::default().now();
+        async move {
+            assert!(at >= after);
+            let authenticated: std::io::Error =
+                CarrierRetryAfter::new(Duration::from_mins(2)).into();
+            Err(std::io::Error::other(authenticated))
+        }
+    })
+    .with_identity("dial-after", "retry-key");
+    let mut options = zmux::ControllerOptions::new("bootstrap-dial-after", vec![candidate.clone()]);
+    options.cache = Some(cache.clone());
+    options.dial_after.insert("dial-after".into(), after);
+    let controller = zmux::SessionController::new(options).unwrap();
+    assert!(matches!(
+        controller
+            .open(Config::default(), zmux::SessionTarget::default())
+            .await,
+        Err(ControllerError::Bootstrap(_))
+    ));
+    let CooldownEvent::Started {
+        reason,
+        nominal_wait,
+        started_at,
+        ..
+    } = events.try_recv().unwrap()
+    else {
+        panic!("expected one fault event");
+    };
+    assert_eq!(reason, CooldownReason::Attempt);
+    assert_eq!(
+        nominal_wait,
+        zmux::CarrierCacheConfig::default().backoff.min
+    );
+    assert!(started_at >= after);
+    assert_eq!(
+        cache.retry_admission("retry-key", CarrierKind::Split, ""),
+        Err(RetryAdmission::RetryAfter)
+    );
+
+    let mut options =
+        zmux::ControllerOptions::new("bootstrap-dial-after-deadline", vec![candidate]);
+    let after = clock.now() + Duration::from_hours(1);
+    options.dial_after.insert("dial-after".into(), after);
+    let controller = zmux::SessionController::new(options).unwrap();
+    assert!(
+        matches!(controller.open(Config::default(), zmux::SessionTarget::default()).await,
+        Err(ControllerError::DialAfter(next)) if next == after)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn managed_dial_after_publishes_next_time_and_follows_binding_updates() {
+    use zmux::{
+        ClockDomain, ControllerBlock, ControllerOptions, Directions, GroupTarget, MemberQuota,
+        SessionController, SessionTarget, TargetCandidate,
+    };
+    let mut config = Config::multipath(PipeAuth::exporter());
+    config.session_policy.limits.steady_attachments = 4;
+    let (client, _server) = connected(config.clone(), config, true).await;
+    let clock = ClockDomain::default();
+    let initial = clock.now() + Duration::from_secs(5);
+    let updated = clock.now() + Duration::from_secs(7);
+    let candidate = zmux::Candidate::new(CarrierKind::Split, || async {
+        Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+    })
+    .with_identity("managed", "managed-key");
+    let mut options = ControllerOptions::new("managed-dial-after", vec![candidate]);
+    options.dial_after.insert("managed".into(), initial);
+    let controller = SessionController::new(options).unwrap();
+    let target = SessionTarget {
+        revision: 1,
+        groups: vec![GroupTarget {
+            id: "main".into(),
+            quotas: vec![MemberQuota {
+                id: "extra".into(),
+                count: 1,
+                directions: Directions::BOTH,
+                candidates: vec![TargetCandidate {
+                    id: "managed".into(),
+                    send: None,
+                    receive: None,
+                }],
+            }],
+
+            rotation: zmux::RotationPolicy::default(),
+        }],
+        replace: Vec::new(),
+    };
+    let control = controller.manage(&client, target).unwrap();
+    let mut states = control.subscribe();
+    let first = watchdog(
+        2,
+        "initial DialAfter",
+        states.wait_for(|s| {
+            s.blocked == Some(ControllerBlock::DialAfter) && s.next_retry == Some(initial)
+        }),
+    )
+    .await
+    .unwrap();
+    drop(first);
+    control
+        .set_dial_after("managed".into(), Some(updated))
+        .unwrap();
+    let changed = watchdog(
+        2,
+        "updated DialAfter",
+        states.wait_for(|s| {
+            s.blocked == Some(ControllerBlock::DialAfter) && s.next_retry == Some(updated)
+        }),
+    )
+    .await
+    .unwrap();
+    drop(changed);
+    let unblocked = watchdog(
+        12,
+        "DialAfter expires",
+        states.wait_for(|s| s.blocked != Some(ControllerBlock::DialAfter)),
+    )
+    .await
+    .unwrap();
+    assert!(clock.now() >= updated);
+    drop(unblocked);
+    control.release().unwrap();
+    watchdog(2, "managed stop", control.done()).await;
 }
 
 #[test]

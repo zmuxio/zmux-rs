@@ -5,14 +5,18 @@
 
 #![cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 
+mod common;
+
+#[path = "../../test-support/ticket.rs"]
+mod ticket;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zmux::{
-    Admission, AdmissionVerdict, Config, Fallback, Listener, ListenerConfig, OutboundState,
-    PipeAuth, PipeOptions, PrefixAuth, PrefixAuthVerifier, Session, Takeover,
+    Admission, AdmissionVerdict, Config, Fallback, Listener, ListenerConfig, PipeAuth, PipeOptions,
+    PrefixAuth, Session, Takeover,
 };
 use zmux_quinn::{Carrier, Options};
 
@@ -33,26 +37,15 @@ impl Server {
     /// With `one_by_one`, the host accepts each connection itself and
     /// hands it over with `serve_connection`.
     fn with(admission: Admission, fallback: Option<Fallback>, one_by_one: bool) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
-        let der = CertificateDer::from(cert.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![der.clone()], key)
-            .unwrap();
-        tls.alpn_protocols = zmux::alpn_protocols(&[]);
-        let opts = Options::default();
-        let endpoint = quinn::Endpoint::server(
-            zmux_quinn::server_config(tls, &opts).unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let opts = common::adopted_options(Options::default());
+        let (endpoint, client) = common::endpoints(
+            zmux::alpn_protocols(&[]),
+            opts.transport_config(),
+            opts.transport_config(),
+        );
         let addr = endpoint.local_addr().unwrap();
         let mut c = Config::default();
-        c.max_pipes = 4;
+        c.session_policy.limits.steady_attachments = 4;
         c.pipe_auth = PipeAuth::exporter().with_end_to_end();
         let mut lc = ListenerConfig::default();
         lc.admission = Some(admission);
@@ -79,16 +72,6 @@ impl Server {
         } else {
             tokio::spawn(zmux_quinn::serve(listener.clone(), endpoint, opts.clone()))
         };
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(der).unwrap();
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls.alpn_protocols = zmux::alpn_protocols(&[]);
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client.set_default_client_config(zmux_quinn::client_config(tls, &opts).unwrap());
         Self {
             addr,
             listener,
@@ -112,54 +95,28 @@ impl Server {
 }
 
 fn auth() -> PrefixAuth {
-    PrefixAuth::new(b"key", Duration::from_secs(30), true).unwrap()
+    ticket::fixture(zmux::PrefixBinding::Bound).0
 }
 
 fn admission() -> Admission {
-    Admission::prefix_auth(Arc::new(PrefixAuthVerifier::new(auth(), 1, 1024).unwrap()))
-        .with_peek_timeout(Duration::from_secs(5))
-        .with_stall_interval(Duration::from_millis(10), Duration::from_millis(20))
+    Admission::prefix_auth(
+        ticket::fixture(zmux::PrefixBinding::Bound).1,
+        zmux::PrefixRejection::Fallback,
+    )
+    .with_peek_timeout(Duration::from_secs(5))
+    .with_stall_interval(Duration::from_millis(10), Duration::from_millis(20))
 }
 
 /// The bound token of a client's connection.
 fn token(conn: &quinn::Connection) -> [u8; zmux::PREFIX_TOKEN_LEN] {
-    let mut binding = [0u8; zmux::PREFIX_AUTH_BINDING_LEN];
-    conn.export_keying_material(
-        &mut binding,
-        zmux::PREFIX_AUTH_EXPORTER_LABEL.as_bytes(),
-        b"",
-    )
-    .unwrap();
-    auth().token(Some(&binding)).unwrap()
+    auth()
+        .token(&zmux_quinn::Handshake::of(conn).carrier_info(conn))
+        .unwrap()
 }
 
-/// Streams of `len` bytes from `from` to `to`, every byte checked.
-async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
-    let to = to.clone();
-    let receiver = tokio::spawn(async move {
-        for _ in 0..n {
-            let mut recv = to.accept_uni().await.unwrap();
-            let data = recv.read_to_end(len + 1).await.unwrap();
-            assert_eq!(data.len(), len);
-            assert!(
-                data.iter()
-                    .enumerate()
-                    .all(|(i, &b)| b == u8::try_from(i % 251).unwrap())
-            );
-        }
-    });
-    let data = bytes::Bytes::from(
-        (0..len)
-            .map(|i| u8::try_from(i % 251).unwrap())
-            .collect::<Vec<_>>(),
-    );
-    for _ in 0..n {
-        let mut send = from.open_uni().await.unwrap();
-        send.write_chunk(data.clone()).await.unwrap();
-        send.finish().unwrap();
-    }
-    receiver.await.unwrap();
-}
+#[path = "../../test-support/transfer.rs"]
+mod streams;
+use streams::transfer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bound_token_is_accepted_and_the_connection_carries_further_pipes() {
@@ -170,10 +127,10 @@ async fn a_bound_token_is_accepted_and_the_connection_carries_further_pipes() {
 
 async fn bound_token(server: Server) {
     let conn = server.connect().await;
-    let carrier = Carrier::new(conn.clone(), Options::default());
+    let carrier = Carrier::new(conn.clone(), &common::adopted_options(Options::default())).unwrap();
     let pipe = carrier.open_pipe_with_prefix(&token(&conn)).await.unwrap();
     let mut config = Config::default();
-    config.max_pipes = 4;
+    config.session_policy.limits.steady_attachments = 4;
     config.pipe_auth = PipeAuth::exporter().with_end_to_end();
     let client = Session::connect(pipe, config).await.unwrap();
     let accepted = tokio::time::timeout(LIMIT, server.listener.accept())
@@ -181,17 +138,17 @@ async fn bound_token(server: Server) {
         .unwrap()
         .unwrap();
     assert_eq!(accepted.protocol().as_deref(), Some("qmux-02"));
+    assert_eq!(accepted.bound_prefix_principal(), Some(ticket::ID));
     transfer(&client, &accepted, 8, 1 << 20).await;
     transfer(&accepted, &client, 2, 1 << 16).await;
     // A further pipe on the same connection joins without a token.
     let joined = client
-        .begin_add_pipe(carrier.open_pipe().await.unwrap(), PipeOptions::default())
+        .test_begin_join(carrier.open_pipe().await.unwrap(), PipeOptions::default())
         .unwrap();
-    let deadline = tokio::time::Instant::now() + LIMIT;
-    while joined.stats().and_then(|i| i.outbound) != Some(OutboundState::Active) {
-        assert!(tokio::time::Instant::now() < deadline, "the join failed");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(LIMIT, joined.joined())
+        .await
+        .unwrap()
+        .unwrap();
     transfer(&client, &accepted, 4, 1 << 18).await;
     assert_eq!(server.listener.stats().setup_failures, 0);
     client.close().await;
@@ -259,50 +216,55 @@ async fn a_wrong_token_goes_to_the_fallback_with_every_byte() {
 /// afterwards, and the library never closes it; the host does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_detached_takeover_keeps_its_connection() {
-    let fallback = Fallback::new(|t: Takeover| async move {
-        t.detach().unwrap();
-        let conn = zmux_quinn::takeover_connection(&t).expect("a QUIC connection");
-        let mut stream = t.into_stream().expect("the first stream");
-        tokio::spawn(async move {
-            // Served once the future completed and its entry moved on.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let mut got = Vec::new();
-            stream.read_to_end(&mut got).await.unwrap();
-            stream.write_all(&got).await.unwrap();
-            stream.shutdown().await.unwrap();
-            let mut more = conn.open_uni().await.unwrap();
-            more.write_all(b"later").await.unwrap();
-            more.finish().unwrap();
-            // Done once the client has read it: it says so.
-            let _ = tokio::time::timeout(LIMIT, conn.accept_uni()).await;
-            conn.close(quinn::VarInt::from_u32(7), b"host");
+    tokio::time::timeout(LIMIT, async {
+        let (detached, mut taken) = tokio::sync::mpsc::unbounded_channel();
+        let fallback = Fallback::new(move |t: Takeover| {
+            let detached = detached.clone();
+            async move {
+                t.detach().unwrap();
+                let conn = zmux_quinn::takeover_connection(&t).unwrap();
+                let stream = t.into_stream().unwrap();
+                let (release, keep) = tokio::sync::oneshot::channel();
+                detached.send(release).unwrap();
+                let _ = keep.await;
+                let mut stream = stream;
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await.unwrap();
+                stream.write_all(&got).await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut more = conn.open_uni().await.unwrap();
+                more.write_all(b"later").await.unwrap();
+                more.finish().unwrap();
+                let mut done = conn.accept_uni().await.unwrap();
+                assert_eq!(done.read_to_end(16).await.unwrap(), b"read");
+                conn.close(quinn::VarInt::from_u32(7), b"host");
+            }
         });
-    });
-    let server = Server::new(admission(), Some(fallback));
-    let conn = server.connect().await;
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let payload = vec![9u8; zmux::PREFIX_TOKEN_LEN + 10];
-    send.write_all(&payload).await.unwrap();
-    send.finish().unwrap();
-    let echo = tokio::time::timeout(LIMIT, recv.read_to_end(1024))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(echo, payload);
-    let mut later = tokio::time::timeout(LIMIT, conn.accept_uni())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(later.read_to_end(64).await.unwrap(), b"later");
-    let mut done = conn.open_uni().await.unwrap();
-    done.write_all(b"read").await.unwrap();
-    done.finish().unwrap();
-    let closed = tokio::time::timeout(LIMIT, conn.closed()).await.unwrap();
-    match closed {
-        quinn::ConnectionError::ApplicationClosed(c) => assert_eq!(c.error_code.into_inner(), 7),
-        e => panic!("{e:?}"),
-    }
-    server.stop().await;
+        let server = Server::with(admission(), Some(fallback), true);
+        let conn = server.connect().await;
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let payload = vec![9u8; zmux::PREFIX_TOKEN_LEN + 10];
+        send.write_all(&payload).await.unwrap();
+        send.finish().unwrap();
+        let release = taken.recv().await.unwrap();
+        server.listener.close();
+        release.send(()).unwrap();
+        assert_eq!(recv.read_to_end(1024).await.unwrap(), payload);
+        let mut later = conn.accept_uni().await.unwrap();
+        assert_eq!(later.read_to_end(64).await.unwrap(), b"later");
+        let mut done = conn.open_uni().await.unwrap();
+        done.write_all(b"read").await.unwrap();
+        done.finish().unwrap();
+        match conn.closed().await {
+            quinn::ConnectionError::ApplicationClosed(c) => {
+                assert_eq!(c.error_code.into_inner(), 7);
+            }
+            e => panic!("{e:?}"),
+        }
+        server.stop().await;
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -335,19 +297,24 @@ async fn streams_reach_the_listener_only_after_the_first_is_accepted() {
     // Stream 0: the first bidirectional stream, its prefix not sent yet.
     let (mut first, _first_recv) = conn.open_bi().await.unwrap();
     // A session started on stream 4, and a unidirectional stream.
-    let carrier = Carrier::new(conn.clone(), Options::default());
+    let carrier = Carrier::new(conn.clone(), &common::adopted_options(Options::default())).unwrap();
     let mut config = Config::default();
-    config.max_pipes = 4;
+    config.session_policy.limits.steady_attachments = 4;
     config.pipe_auth = PipeAuth::exporter().with_end_to_end();
     let pipe = carrier.open_pipe().await.unwrap();
     let connecting = tokio::spawn(Session::connect(pipe, config));
     let mut uni = conn.open_uni().await.unwrap();
     uni.write_all(b"not a lane").await.unwrap();
-    let early = tokio::time::timeout(Duration::from_millis(500), server.listener.accept()).await;
-    assert!(
-        early.is_err(),
-        "a session before the first stream was accepted"
-    );
+    {
+        let mut early = std::pin::pin!(server.listener.accept());
+        assert!(
+            std::future::Future::poll(
+                early.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            )
+            .is_pending()
+        );
+    }
     let stats = server.listener.stats();
     assert_eq!((stats.sessions, stats.refused), (0, 0));
     assert_eq!(stats.admission, zmux::AdmissionStats::default());

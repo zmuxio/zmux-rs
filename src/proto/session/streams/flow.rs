@@ -111,13 +111,25 @@ impl LocalDir {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) enum RemoteStage {
+    #[default]
+    Active,
+    WaitingForAccept,
+    Funding,
+}
+
 /// State of one stream type for streams the peer opens.
 #[derive(Debug, Default)]
 pub(in super::super) struct RemoteDir {
     /// Streams opened so far (highest index + 1).
     pub(in super::super) opened: u64,
-    /// The initial limit (our transport parameter).
+    /// Concurrent stream slots funded for this type.
     pub(in super::super) initial: u64,
+    /// Desired concurrency, including credit still waiting for backing.
+    pub(in super::super) target: u64,
+    /// Small funded batch to keep when a managed direction drains.
+    pub(in super::super) floor: u64,
     /// The limit written in `MAX_STREAMS` (or the initial one).
     pub(in super::super) limit_sent: u64,
     /// Streams discarded so far.
@@ -132,9 +144,8 @@ pub(in super::super) struct RemoteDir {
     pub(in super::super) blocked_seen: Option<u64>,
     /// Lowest GOAWAY watermark sent.
     pub(in super::super) goaway_sent: Option<u64>,
-    /// More credit is granted on the first accept (staged unidirectional
-    /// credit).
-    pub(in super::super) staged: bool,
+    /// Unidirectional credit waits for the first accept before funding.
+    pub(super) stage: RemoteStage,
     /// `MAX_STREAMS` was lost with a pipe: send the current limit again.
     pub(in super::super) resend: bool,
 }
@@ -144,9 +155,29 @@ impl RemoteDir {
     pub(super) fn new(limit: u64) -> Self {
         Self {
             initial: limit,
+            target: limit,
+            floor: limit,
             limit_sent: limit,
             ..Self::default()
         }
+    }
+
+    pub(in super::super) fn staged(&self) -> bool {
+        self.stage == RemoteStage::WaitingForAccept
+    }
+
+    pub(in super::super) fn activating(&self) -> bool {
+        self.stage == RemoteStage::Funding
+    }
+
+    pub(in super::super) fn needs_batch(&self) -> bool {
+        !self.staged()
+            && !self.update_pending
+            && self.goaway_sent.is_none()
+            && self.initial < self.target
+            && self.limit_sent < super::super::config::MAX_STREAM_CREDIT
+            && (self.activating()
+                || self.limit_sent.saturating_sub(self.opened) <= self.initial / 2)
     }
 
     /// The limit `MAX_STREAMS` would carry now: the initial one plus the
@@ -176,6 +207,13 @@ impl RemoteDir {
     }
 }
 
+/// The point at which buffered data can replenish the receive window.
+#[derive(Debug, PartialEq, Eq)]
+enum ReleasePoint {
+    Receipt,
+    Consumption,
+}
+
 /// Session-level receive flow control.
 #[derive(Debug)]
 pub(in super::super) struct RecvFlow {
@@ -183,8 +221,16 @@ pub(in super::super) struct RecvFlow {
     pub(in super::super) limit_sent: u64,
     /// The session window W (auto-tuned).
     pub(in super::super) window: u64,
+    pub(in super::super) initial_window: u64,
+    /// A shared domain reuses credit when the application consumes bytes.
+    release_point: ReleasePoint,
     /// Sum over streams of max(received, final size).
     pub(in super::super) used: u64,
+    /// Bytes consumed or known to be unable to occupy receive storage.
+    settled: u64,
+    /// Arrived and discarded offsets whose presence still bounds a missing
+    /// interval after STOP. Their evidence retains the original promise.
+    protected_history: u64,
     /// Credit released.
     pub(in super::super) released: u64,
     /// Bytes received at or above the buffer cap, not released yet.
@@ -208,7 +254,11 @@ impl RecvFlow {
         Self {
             limit_sent: window,
             window,
+            initial_window: window,
+            release_point: ReleasePoint::Receipt,
             used: 0,
+            settled: 0,
+            protected_history: 0,
             released: 0,
             held: 0,
             at_cap: false,
@@ -224,6 +274,28 @@ impl RecvFlow {
     #[inline]
     pub(in super::super) fn credit(&self) -> u64 {
         self.released + self.window
+    }
+
+    /// Positions that can still be resident at this limit, including bytes
+    /// already buffered. Gaps consume no more than their original promise.
+    pub(in super::super) fn unsettled(&self, limit: u64) -> u64 {
+        limit.saturating_sub(self.settled) + self.protected_history
+    }
+
+    fn replace_protected_history(&mut self, previous: u64, current: u64) {
+        self.protected_history = self.protected_history - previous + current;
+    }
+
+    pub(in super::super) fn has_protected_history(&self) -> bool {
+        self.protected_history != 0
+    }
+
+    /// Advertised positions that may still require backing. Highest stream
+    /// offsets include gaps, so the sum of those offsets cannot be used here.
+    #[cfg(test)]
+    pub(in super::super) fn unbacked_credit(&self) -> u64 {
+        self.unsettled(self.limit_sent)
+            .saturating_sub(self.buffered)
     }
 
     /// Whether `increase` more bytes counted against the session stay
@@ -245,7 +317,7 @@ impl RecvFlow {
         fresh_consumed: u64,
     ) {
         if fresh_buffered > 0 {
-            if self.buffered < cap {
+            if self.buffered < cap && self.release_point == ReleasePoint::Receipt {
                 self.released += fresh_buffered;
             } else {
                 self.held += fresh_buffered;
@@ -256,17 +328,23 @@ impl RecvFlow {
             self.at_cap = true;
         }
         self.released += fresh_consumed;
+        self.settled += fresh_consumed;
         self.check_credit();
     }
 
     /// `n` bytes left stream buffers; under memory `pressure` held credit
     /// is released only as it is consumed.
     pub(super) fn consumed(&mut self, cap: u64, n: u64, pressure: bool) {
-        self.buffered = self.buffered.saturating_sub(n);
+        self.buffered -= n;
+        self.settled += n;
         let from_held = n.min(self.held);
         self.held -= from_held;
         self.released += from_held;
-        if self.buffered < cap && self.held > 0 && !pressure {
+        if self.buffered < cap
+            && self.held > 0
+            && !pressure
+            && self.release_point == ReleasePoint::Receipt
+        {
             self.released += self.held;
             self.held = 0;
         }
@@ -280,6 +358,7 @@ impl RecvFlow {
     pub(super) fn check_credit(&mut self) {
         let c = self.credit();
         if c <= self.limit_sent {
+            self.update_pending = false;
             return;
         }
         let remaining = self.limit_sent.saturating_sub(self.used);
@@ -307,9 +386,9 @@ impl RecvFlow {
         bottleneck
     }
 
-    /// `MAX_DATA` is no longer owed.
-    pub(super) fn update_settled(&mut self) {
-        self.update_pending = false;
+    /// A batch handled the resend and any publishable increase.
+    pub(super) fn update_settled(&mut self, waiting: bool) {
+        self.update_pending = waiting;
         self.resend = false;
     }
 
@@ -422,9 +501,9 @@ impl Streams {
         self.recv_flow.update_written(value, now)
     }
 
-    /// `MAX_DATA` is no longer owed.
-    pub(in super::super) fn max_data_settled(&mut self) {
-        self.recv_flow.update_settled();
+    /// The outstanding part of a limited increase waits for a new grant.
+    pub(in super::super) fn max_data_settled(&mut self, waiting: bool) {
+        self.recv_flow.update_settled(waiting);
     }
 
     /// `MAX_DATA` was lost with a pipe.
@@ -502,6 +581,10 @@ impl Streams {
 
     // ---- session flow control ------------------------------------------------
 
+    pub(super) fn reuse_receive_credit_on_consumption(&mut self) {
+        self.recv_flow.release_point = ReleasePoint::Consumption;
+    }
+
     /// Bytes received on streams (see [`RecvFlow::received`]), `cap` the
     /// session receive buffer cap.
     pub(in super::super) fn credit_received(
@@ -522,6 +605,10 @@ impl Streams {
         self.recv_flow.consumed(cap, n, pressure);
     }
 
+    pub(in super::super) fn replace_protected_history(&mut self, previous: u64, current: u64) {
+        self.recv_flow.replace_protected_history(previous, current);
+    }
+
     /// Decides whether `MAX_DATA` is due.
     pub(in super::super) fn check_session_credit(&mut self) {
         self.recv_flow.check_credit();
@@ -537,7 +624,10 @@ impl Streams {
     /// bytes fall below half of it, or under
     /// the listener's memory pressure.
     pub(in super::super) fn growth_paused(&self) -> bool {
-        self.recv_flow.at_cap || self.memory_pressure
+        self.recv_flow.at_cap
+            || self.memory_pressure
+            || (self.recv_flow.release_point == ReleasePoint::Consumption
+                && self.recv_flow.buffered >= self.recv_flow.window / 2)
     }
 
     /// `increase` more bytes count against the session's receive credit.
@@ -626,7 +716,12 @@ impl Streams {
     /// `STOP_SENDING` on the local receiving part: data still buffered is
     /// discarded and counts as consumed, and an owed update is owed no
     /// more. `None` when the part is gone, stopped or terminal already.
-    pub(in super::super) fn stop_recv(&mut self, key: StreamKey, code: u64) -> Option<Stopped> {
+    pub(in super::super) fn stop_recv(
+        &mut self,
+        key: StreamKey,
+        code: u64,
+        store: &mut super::super::recv_store::ReceiveStore,
+    ) -> Option<Stopped> {
         let s = self.slab.get_mut(key)?;
         let local = s.local;
         let r = s.recv.as_mut()?;
@@ -634,7 +729,10 @@ impl Streams {
             return None;
         }
         r.cold_mut().stopped = Some(code);
-        let dropped = r.drop_all();
+        let dropped = r.drop_all(store);
+        r.discard_arrival_data();
+        self.recv_flow
+            .replace_protected_history(0, r.protected_history());
         r.read_offset = r.received.max(r.read_offset);
         r.contig = r.contig.max(r.read_offset);
         let was = std::mem::replace(&mut r.update_pending, false);
@@ -689,12 +787,12 @@ impl Streams {
 
     /// Writes `data` to a stream's sending part, copied into its buffer.
     #[inline]
-    pub(in super::super) fn write_slice(&mut self, key: StreamKey, data: &[u8]) -> Option<()> {
+    pub(in super::super) fn write_slice(&mut self, key: StreamKey, data: &[u8]) -> Option<usize> {
         let send = self.slab.get_mut(key)?.send.as_mut()?;
-        send.buf.push_slice(data, &mut self.chunks);
-        send.written += data.len() as u64;
-        self.send_flow.buffered += data.len() as u64;
-        Some(())
+        let n = send.buf.push_slice(data, &mut self.chunks);
+        send.written += n as u64;
+        self.send_flow.buffered += n as u64;
+        Some(n)
     }
 
     /// Writes `data` to a stream's sending part without copying it.
@@ -702,14 +800,16 @@ impl Streams {
     pub(in super::super) fn write_bytes(
         &mut self,
         key: StreamKey,
-        data: bytes::Bytes,
-    ) -> Option<()> {
+        data: super::super::Chunk,
+    ) -> Option<bool> {
         let n = data.len() as u64;
         let send = self.slab.get_mut(key)?.send.as_mut()?;
-        send.buf.push_bytes(data);
+        if !send.buf.push_bytes(data, &self.chunks) {
+            return Some(false);
+        }
         send.written += n;
         self.send_flow.buffered += n;
-        Some(())
+        Some(true)
     }
 }
 
@@ -726,6 +826,22 @@ mod tests {
         assert!(!credit_due(63 << 10, 256 << 10, 256 << 10, false));
         assert!(credit_due(64 << 10, 256 << 10, 256 << 10, false));
     }
+    #[test]
+    fn offsets_with_a_one_byte_fragment_leave_the_holes_committed() {
+        let window = 16 << 10;
+        let mut flow = RecvFlow::new(window);
+        // The only frame ends at the last advertised offset.
+        flow.used = window;
+        flow.received(window, 1, 1, 0);
+        assert_eq!(flow.unbacked_credit(), window - 1);
+        // Discarding that byte settles it. The remaining holes stay live.
+        flow.consumed(window, 1, false);
+        assert_eq!(flow.unbacked_credit(), window - 1);
+        // A terminal reset can now settle the previously fillable holes.
+        flow.received(window, 0, 0, window - 1);
+        assert_eq!(flow.unbacked_credit(), 0);
+    }
+
     /// SPEC.md Section 8.3 rule 4: while the unread buffered bytes stay
     /// below the cap, a byte's session credit is released when it is
     /// buffered, so data a stream leaves unread holds back nothing; bytes

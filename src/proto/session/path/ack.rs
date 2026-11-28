@@ -2,6 +2,8 @@
 //! `PIPE_ACK` generation, `PIPE_ACK` processing with RTT and delivery-rate
 //! sampling, and re-sending the information of suspect and failed pipes.
 
+use crate::PipeHalf;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::proto::frame::{Frame, PipeAck, PipeAckEntry};
@@ -27,6 +29,7 @@ const COMPLETE_SNAPSHOT: Duration = Duration::from_secs(1);
     reason = "independent state flags, not a mode that an enum would encode"
 )]
 pub(crate) struct AckState {
+    backlog: BTreeMap<u64, Backlog>,
     /// Our own `zmux_max_ack_delay` and `zmux_ack_threshold`.
     local_mad: Duration,
     threshold: u64,
@@ -52,9 +55,21 @@ pub(crate) struct AckState {
     frames: Vec<SentFrame>,
 }
 
+/// A credited byte already queued at the first observation and still unsent at the second
+/// proves continuous demand. `StreamKey` includes the slot generation.
+#[derive(Debug, Clone, Copy)]
+struct Backlog {
+    stream: StreamKey,
+    at: Instant,
+    end: u64,
+    connection_limit: u64,
+    generation: u64,
+}
+
 impl AckState {
     pub(in crate::proto::session) fn new(local_mad: Duration, threshold: u64) -> Self {
         Self {
+            backlog: BTreeMap::new(),
             local_mad,
             threshold,
             ack_now: false,
@@ -67,6 +82,14 @@ impl AckState {
             scratch: Vec::new(),
             frames: Vec::new(),
         }
+    }
+
+    pub(in crate::proto::session) fn invalidate_backlog_pipe(&mut self, id: u64) {
+        self.backlog.remove(&id);
+    }
+
+    pub(in crate::proto::session) fn invalidate_backlog(&mut self) {
+        self.backlog.clear();
     }
 
     /// Heap bytes held.
@@ -140,6 +163,7 @@ impl SessionCore {
         if self.expire_join(id, now).is_none()
             && self.att_mut(id).is_some_and(Attachment::confirm_peer)
         {
+            self.sync_pipe_health(id);
             self.push_event(CoreEvent::PipeAttached { pipe: PipeId(id) });
         }
     }
@@ -165,6 +189,7 @@ impl SessionCore {
         if !attached {
             self.note_attached(id, now);
         }
+        self.health_proof(id, PipeHalf::Inbound, None);
         // The answer to a PIPE_PING in the first record of a newly attached
         // pipe is a complete snapshot.
         let first_ping = rec.first_ping && id != 0;
@@ -315,6 +340,30 @@ impl SessionCore {
             && self.copy_pipe() == Some(pipe)
     }
 
+    /// The lane-zero record positions once reliable setup work has drained.
+    #[cfg(all(
+        feature = "test-hooks",
+        any(feature = "tokio", feature = "blocking"),
+        not(loom)
+    ))]
+    pub(crate) fn reliable_setup_end(&self, pipes: &[PipeId]) -> Option<Vec<u64>> {
+        let acks = self.mp.as_deref()?.acks();
+        if acks.copy_due().is_some() || self.ack_deadline().is_some() {
+            return None;
+        }
+        pipes
+            .iter()
+            .map(|&pipe| {
+                let out = self.out_ref(pipe.get())?;
+                (out.sent() != 0
+                    && !out.revalidating()
+                    && out.ping_wanted().is_none()
+                    && !self.wants_pipe_ack(pipe.get(), self.now))
+                .then(|| out.sent())
+            })
+            .collect()
+    }
+
     /// The pipe for the redundant copy of the snapshot.
     fn copy_pipe(&self) -> Option<u64> {
         let primary = self.mp().acks().primary;
@@ -386,7 +435,8 @@ impl SessionCore {
         let force = first || ((primary || pair_only) && self.mp().acks().complete_owed);
         let mut entries = std::mem::take(&mut self.mp_mut().acks_mut().scratch);
         let complete = self.snapshot(&mut entries, force, now);
-        let written = entries.is_empty() || Self::write_snapshot(&entries, w);
+        let written =
+            entries.is_empty() || Self::write_snapshot(&entries, w, first || pair_only || primary);
         self.mp_mut().acks_mut().scratch = entries;
         if !written {
             // The complete snapshot is still owed, at the start of the next
@@ -459,7 +509,7 @@ impl SessionCore {
     /// starts the pipe's next probe wait, and in a busy session the primary
     /// `PIPE_ACK` and its redundant copy (return-pipe liveness).
     fn liveness_ping(&mut self, pipe: u64, w: &mut Records<'_>, now: Instant) {
-        let t_suspect = self.out_ref(pipe).map(|o| self.limits(o).0);
+        let t_suspect = self.out_ref(pipe).map(|o| self.absolute_stall_limit(o));
         if let Some(o) = self.out_mut(pipe) {
             let quiet = t_suspect.unwrap_or_default().max(Duration::from_secs(1));
             o.check_liveness(quiet, now);
@@ -473,8 +523,9 @@ impl SessionCore {
     pub(in crate::proto::session) fn write_snapshot(
         entries: &[PipeAckEntry],
         w: &mut Records<'_>,
+        own: bool,
     ) -> bool {
-        if w.try_frame(&Frame::PipeAck(PipeAck::new(entries))) {
+        if w.try_frame_with_origin(&Frame::PipeAck(PipeAck::new(entries)), own) {
             return true;
         }
         // An entry takes at most 32 bytes; the frame header at most 16.
@@ -484,7 +535,7 @@ impl SessionCore {
         }
         entries
             .chunks(per)
-            .all(|c| w.try_frame(&Frame::PipeAck(PipeAck::new(c))))
+            .all(|c| w.try_frame_with_origin(&Frame::PipeAck(PipeAck::new(c)), own))
     }
 
     // ---- receiving PIPE_ACK --------------------------------------------------------
@@ -572,23 +623,30 @@ impl SessionCore {
         if !moved {
             return;
         }
-        o.pings_acked(lane, pos);
+        let acked_ping = o.pings_acked(lane, pos);
         if let Some(l) = o.lanes_mut() {
             l.clear_released();
         }
         // Bytes sent before the session last suspended give no samples.
         let heard = |b: &Batch| suspended_at.is_none_or(|s| b.time >= s) && heard(b.time);
         let ack = cum.map(|cum| o.mp_acked(cum, delay, peer_mad, quiet, heard, now));
+        if lane != 0 {
+            self.cancel_lane_open(super::super::PipeId(id).lane(lane));
+        }
         if let Some(ack) = &ack {
-            self.pace_ack(id, &ack.sample, now);
-            // A new minimum RTT moves the one-way delays.
-            if ack.sample.min_moved {
+            // The ACK may change eligibility and the one-way delays. Invalidate
+            // the views before delivery qualification or any other scheduler read.
+            if ack.unpenalized {
+                self.advance_pick_generation();
+            } else if ack.sample.min_moved {
                 self.views_changed();
             }
+            if ack.sample.delivery {
+                self.qualify_delivery(id, now);
+                self.publish_capacity(id, now);
+            }
+            self.pace_ack(id, &ack.sample, now);
             if ack.unpenalized {
-                // Usable again: eligibility and the standby takeover
-                // change, as at the end of a revalidation.
-                self.advance_pick_generation();
                 self.check_standby_takeover();
             }
             if ack.revalidated {
@@ -619,6 +677,7 @@ impl SessionCore {
             }
             self.ack_progress(id, now);
         }
+        self.health_proof(id, PipeHalf::Outbound, acked_ping);
         // The close may stop waiting for acknowledgements.
         self.recheck_close_wait();
         self.check_drained(id, now);
@@ -626,6 +685,133 @@ impl SessionCore {
         if self.state == crate::proto::session::State::Suspended {
             self.check_resume(now);
         }
+    }
+
+    /// Enroll under the session lock so an ACK racing installation is delivered once.
+    #[cfg(all(any(feature = "blocking", feature = "tokio"), not(loom)))]
+    pub(crate) fn watch_capacity(
+        &mut self,
+        id: PipeId,
+        observer: std::sync::Weak<dyn super::super::CapacityObserver>,
+        now: Instant,
+    ) {
+        if let Some(out) = self.out_mut(id.0) {
+            out.capacity_observer = Some(observer);
+            self.publish_capacity(id.0, now);
+        }
+    }
+
+    fn publish_capacity(&mut self, id: u64, now: Instant) {
+        let Some(out) = self.out_ref(id) else { return };
+        if out.capacity_credited {
+            return;
+        }
+        let Some(observer) = out
+            .capacity_observer
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return;
+        };
+        let Some(rate) = out
+            .est()
+            .ack_delivery
+            .filter(|rate| rate.load == crate::DeliveryLoad::Backlogged)
+        else {
+            return;
+        };
+        if self
+            .pipe_health(PipeId(id))
+            .is_some_and(|health| rate.current(now, &health))
+        {
+            self.out_mut(id).expect("same attachment").capacity_credited = true;
+            observer.capacity_sample(rate);
+        }
+    }
+
+    fn qualify_delivery(&mut self, id: u64, now: Instant) {
+        let Some(out) = self.out_ref(id) else { return };
+        let Some(sample) = out.est().ack_delivery.filter(|sample| sample.end == now) else {
+            return;
+        };
+        let share = self.atts.len() == 1
+            || self
+                .class()
+                .is_some_and(|class| self.att(id).is_some_and(|a| class.usable(a)));
+        let available = share
+            && self.shape_instance(id).is_none()
+            && !self.paced(out)
+            && out.est().rate_lo.is_none()
+            && self
+                .pipe_health(PipeId(id))
+                .is_some_and(|health| health.peer_attached)
+            && out.public_state() == crate::OutboundState::Active;
+        let generation = self.mp().picks().generation;
+        let flow = self.streams.send_flow();
+        let prev = self.mp().acks().backlog.get(&id).copied().filter(|w| {
+            available
+                && w.generation == generation
+                && flow.used < w.connection_limit
+                && self.streams.send(w.stream).is_some_and(|s| {
+                    s.cold().reset.is_none()
+                        && s.offset < w.end
+                        && s.offset.saturating_add(s.buf.len()) >= w.end
+                })
+                && self.unrestricted_delivery_stream(id, w.stream)
+        });
+        let proven = prev.is_some_and(|w| w.at <= sample.start)
+            && out.delivery_unrestricted(sample.delivered);
+        let witness = prev.or_else(|| {
+            if !available || flow.used >= flow.max {
+                return None;
+            }
+            self.streams.queue().keys().find_map(|key| {
+                let send = self.streams.send(key)?;
+                let end = send
+                    .offset
+                    .saturating_add(send.buf.len())
+                    .min(send.max_data);
+                (end > send.offset
+                    && send.cold().reset.is_none()
+                    && self.unrestricted_delivery_stream(id, key))
+                .then_some(Backlog {
+                    stream: key,
+                    at: now,
+                    end,
+                    connection_limit: flow.max,
+                    generation,
+                })
+            })
+        });
+        let witnesses = &mut self.mp_mut().acks_mut().backlog;
+        if let Some(witness) = witness {
+            witnesses.insert(id, witness);
+        } else {
+            witnesses.remove(&id);
+        }
+        if proven && let Some(out) = self.out_mut(id) {
+            out.confirm_delivery_load();
+        }
+    }
+
+    /// A fixed stream binding gives its pipe uncapped scheduling share.
+    /// A movable binding, a spreading quota or a custom answer cannot prove this.
+    pub(in crate::proto::session) fn unrestricted_delivery_stream(
+        &self,
+        pipe: u64,
+        key: StreamKey,
+    ) -> bool {
+        use crate::proto::session::Scheduler;
+        let policy = self.policy_for(key);
+        if self.atts.len() == 1 {
+            return !matches!(policy, Scheduler::Custom(_));
+        }
+        matches!(policy, Scheduler::Affinity)
+            && self.streams.send(key).is_some_and(|send| {
+                send.mp()
+                    .bound
+                    .is_some_and(|binding| binding.pipe == pipe && binding.move_to.is_none())
+            })
     }
 
     /// A retained frame was acknowledged.
@@ -690,7 +876,9 @@ impl SessionCore {
             && let Some(send) = s.send.as_mut()
         {
             let before = send.unacked();
-            send.mp_mut().ack(off, off + len);
+            let m = send.mp_mut();
+            m.open_acked |= off == 0;
+            m.ack(off, off + len);
             send.mp_mut().lost.remove(off, off + len);
             if fin {
                 send.mp_mut().fin_acked = true;
@@ -721,6 +909,7 @@ impl SessionCore {
             self.sync_holder(key);
             self.wake_send_waiters();
         }
+        self.acknowledge_repair(key);
         self.check_send_done(key);
     }
 
@@ -781,11 +970,12 @@ impl SessionCore {
             return;
         };
         o.take_reinjection(&mut frames);
+        self.release_repair_copies(id);
         if frames.is_empty() {
             self.mp_mut().acks_mut().frames = frames;
             return;
         }
-        self.stats.reinjections += 1;
+        self.mp_mut().counters.reinjections += 1;
         for f in frames.drain(..) {
             self.reinject_frame(f, now);
         }
@@ -795,6 +985,7 @@ impl SessionCore {
     pub(super) fn reinject_frame(&mut self, f: SentFrame, now: Instant) {
         match f {
             SentFrame::Stream { key, off, len, fin } => {
+                let repairs = self.mp.as_deref().expect("multipath").blocked().copies(key);
                 let Some(send) = self.streams.send_mut(key) else {
                     return;
                 };
@@ -820,21 +1011,19 @@ impl SessionCore {
                     // allocating.
                     let m = send.mp_mut();
                     let (acked, lost) = (&m.acked, &mut m.lost);
-                    let mut at = start;
-                    for (a, b) in acked.iter() {
-                        if b <= at {
-                            continue;
+                    for (mut a, b) in acked.gaps(start, end) {
+                        for copy in repairs {
+                            if copy.end <= a || copy.start >= b {
+                                continue;
+                            }
+                            if a < copy.start {
+                                lost.insert(a, copy.start);
+                            }
+                            a = a.max(copy.end);
                         }
-                        if a >= end {
-                            break;
+                        if a < b {
+                            lost.insert(a, b);
                         }
-                        if a > at {
-                            lost.insert(at, a);
-                        }
-                        at = at.max(b);
-                    }
-                    if at < end {
-                        lost.insert(at, end);
                     }
                 }
                 if fin && send.cold().reset.is_none() && !send.mp().fin_acked {
@@ -930,5 +1119,109 @@ impl SessionCore {
             }
         }
         let _ = now;
+    }
+}
+
+#[cfg(all(test, any(feature = "blocking", feature = "tokio"), not(loom)))]
+mod capacity_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::PipeId;
+    use crate::proto::session::{CapacityObserver, Scheduler, sched::tests::two_pipes};
+    use crate::{AckDelivery, DeliveryLoad};
+
+    #[derive(Default)]
+    struct Samples(Mutex<Vec<AckDelivery>>);
+
+    impl CapacityObserver for Samples {
+        fn capacity_sample(&self, sample: AckDelivery) {
+            self.0.lock().unwrap().push(sample);
+        }
+    }
+
+    #[test]
+    fn delivery_proves_fixed_backlog_on_each_unrestricted_path() {
+        let (mut session, first) = two_pipes(Scheduler::Affinity, Some(12_500_000), 4_096);
+        Arc::make_mut(&mut session.config).hooks.unpaced = true;
+        let second = session.open(crate::proto::frame::Dir::Bidi).unwrap();
+        assert_eq!(session.write(second, &[0; 4_096]).unwrap(), 4_096);
+        for (pipe, stream) in [(0, first), (2, second)] {
+            session.streams.send_mut(stream).unwrap().mp_mut().bound =
+                Some(crate::proto::session::policy::Binding {
+                    pipe,
+                    provisional: false,
+                    epoch: 0,
+                    move_to: None,
+                });
+        }
+        let first = session.now + Duration::from_secs(1);
+        let install = |session: &mut crate::proto::session::SessionCore, pipe, start, end| {
+            session.out_mut(pipe).unwrap().est_mut().ack_delivery = Some(AckDelivery {
+                start,
+                end,
+                delivered: 0,
+                bytes_per_second: 10_000,
+                valid_for: Duration::from_secs(10),
+                load: DeliveryLoad::Unknown,
+            });
+            session.qualify_delivery(pipe, end);
+            session
+                .out_ref(pipe)
+                .unwrap()
+                .est()
+                .ack_delivery
+                .unwrap()
+                .load
+        };
+        let before = first.checked_sub(Duration::from_secs(1)).unwrap();
+        for pipe in [0, 2] {
+            assert_eq!(
+                install(&mut session, pipe, before, first),
+                DeliveryLoad::Unknown
+            );
+        }
+        let next = first + Duration::from_secs(1);
+        for pipe in [0, 2] {
+            assert_eq!(
+                install(&mut session, pipe, first, next),
+                DeliveryLoad::Backlogged
+            );
+        }
+        let out = session.out_mut(2).unwrap();
+        out.batch_sent(0, 10, 1, Some(10));
+        out.note_delivery_restriction();
+        assert_eq!(
+            install(&mut session, 2, next, next + Duration::from_secs(1)),
+            DeliveryLoad::Unknown
+        );
+    }
+
+    #[test]
+    fn enrollment_credits_the_original_interval_once_even_across_observers() {
+        let (mut session, _) = two_pipes(Scheduler::Affinity, None, 0);
+        let start = session.now;
+        let end = start + Duration::from_secs(1);
+        let sample = AckDelivery {
+            start,
+            end,
+            delivered: 1500,
+            bytes_per_second: 1500,
+            valid_for: Duration::from_secs(10),
+            load: DeliveryLoad::Backlogged,
+        };
+        session.out_mut(0).unwrap().est_mut().ack_delivery = Some(sample);
+        let first = Arc::new(Samples::default());
+        let second = Arc::new(Samples::default());
+        for owner in [&first, &second] {
+            let sink: Arc<dyn CapacityObserver> = owner.clone();
+            session.watch_capacity(PipeId(0), Arc::downgrade(&sink), end);
+        }
+        assert_eq!(*first.0.lock().unwrap(), [sample]);
+        assert!(second.0.lock().unwrap().is_empty());
+        let out = session.out_mut(0).unwrap();
+        out.capacity_credited = false;
+        session.publish_capacity(0, end + sample.valid_for);
+        assert!(second.0.lock().unwrap().is_empty());
     }
 }

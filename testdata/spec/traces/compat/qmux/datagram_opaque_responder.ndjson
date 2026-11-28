@@ -1,0 +1,14 @@
+{"kind": "trace", "id": "compat.qmux.datagram_opaque_responder", "title": "Plain QMux Datagram Data is opaque in both directions", "profile": "zmux-small-dgram", "local_role": "responder", "overrides": {"tp": {"zmux_carrier_datagrams": null, "zmux_carrier_datagram_padding": null}, "test": {"datagram": {}}}, "refs": ["EXTENSIONS.md#6.2", "EXTENSIONS.md#6.8", "SPEC.md#13.2"], "findings": [], "groups": ["compat", "qmux"]}
+{"step": 1, "op": "pipe_up", "pipe": 0, "dir": "bidi", "via": "bootstrap", "channel": true}
+{"step": 2, "op": "expect_frames", "pipe": 0, "match": "first", "frames": [{"type": "QX_TRANSPORT_PARAMETERS", "params_include": {"max_idle_timeout": 30000, "initial_max_data": 8192, "initial_max_stream_data_bidi_local": 2048, "initial_max_stream_data_bidi_remote": 2048, "initial_max_stream_data_uni": 2048, "initial_max_streams_bidi": 4, "initial_max_streams_uni": 4, "reset_stream_at": null, "zmux_datagram_family": null, "zmux_goaway": null, "zmux_preamble": 512, "zmux_priority": null, "max_record_size": 65535, "zmux_pipe_ack": null, "zmux_max_lanes": {"max_lanes": 4, "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"}, "max_datagram_frame_size": 1200, "zmux_carrier_datagrams": null, "zmux_carrier_datagram_padding": null}, "grease": true}]}
+{"step": 3, "op": "peer_send", "pipe": 0, "records": [[{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "initial_max_data", "value": 8192}, {"id": "initial_max_stream_data_bidi_local", "value": 2048}, {"id": "initial_max_stream_data_bidi_remote", "value": 2048}, {"id": "initial_max_stream_data_uni", "value": 2048}, {"id": "initial_max_streams_bidi", "value": 4}, {"id": "initial_max_streams_uni", "value": 4}, {"id": "max_datagram_frame_size", "value": 1200}, {"id": 58, "raw": "abcd"}]}]], "hex": "27ff5153300d0a0d0a1e04026000050248000602480007024800080104090104200244b03a02abcd"}
+{"step": 4, "op": "expect_event", "event": "established", "fields": {"features": []}}
+{"step": 5, "op": "peer_datagram", "pipe": 0, "hex": "003000006e6174697665"}
+{"step": 6, "op": "api", "call": "recv_datagram", "args": {}, "expect": {"pending": true}}
+{"step": 7, "op": "peer_send", "pipe": 0, "records": [[{"type": "DATAGRAM", "data": "c0", "has_len": true}, {"type": "DATAGRAM", "data": "c0", "has_len": true}]], "hex": "063101c03101c0"}
+{"step": 8, "op": "api", "call": "recv_datagram", "args": {}, "expect": {"data": "c0"}}
+{"step": 9, "op": "api", "call": "recv_datagram", "args": {}, "expect": {"data": "c0"}}
+{"step": 10, "op": "api", "call": "send_datagram", "args": {"data": "6f7061717565"}, "expect": {"ok": true}}
+{"step": 11, "op": "expect_frames", "pipe": 0, "match": "contains", "frames": [{"type": "DATAGRAM", "data": "6f7061717565"}]}
+{"step": 12, "op": "advance", "ms": 1000}
+{"step": 13, "op": "expect_no_frames", "pipe": "*", "types": ["DATAGRAM_ACK"]}

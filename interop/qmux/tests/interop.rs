@@ -1,5 +1,5 @@
 //! Interoperability with an independent QMux implementation: the `qmux`
-//! crate 0.6.2 (draft-ietf-quic-qmux-02), as a plain QMux peer (the
+//! crate 0.7 (draft-ietf-quic-qmux-02), as a plain QMux peer (the
 //! QMux compatibility profile).
 //!
 //! A crate of its own, outside the zmux workspace, so that its
@@ -286,6 +286,10 @@ async fn establish(carrier: Carrier, zmux_client: bool) -> Pair {
 // Scenarios
 
 fn pattern(len: usize, seed: u8) -> Bytes {
+    pattern_vec(len, seed).into()
+}
+
+fn pattern_vec(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|i| {
             u32::try_from(i)
@@ -294,8 +298,7 @@ fn pattern(len: usize, seed: u8) -> Bytes {
                 .to_le_bytes()[1]
                 ^ seed
         })
-        .collect::<Vec<u8>>()
-        .into()
+        .collect()
 }
 
 const RESET_BY_ZMUX: u32 = 0x5a5a_0001;
@@ -330,7 +333,7 @@ async fn qmux_read_at_least(recv: &mut qmux::RecvStream, n: usize) -> usize {
 /// zmux opens, the `qmux` crate answers.
 async fn zmux_drives(z: &zmux::Session, q: &qmux::Session) {
     // 1. Bidirectional stream: 4 MiB echoed while it is being sent.
-    let data = pattern(BULK, 1);
+    let data = zmux::Chunk::from(pattern_vec(BULK, 1));
     let zmux_side = async {
         let (mut send, mut recv) = z.open_bi().await.unwrap();
         let writer = async {
@@ -338,7 +341,11 @@ async fn zmux_drives(z: &zmux::Session, q: &qmux::Session) {
             send.finish().unwrap();
         };
         let ((), back) = tokio::join!(writer, recv.read_to_end(2 * BULK));
-        assert_eq!(back.unwrap(), data, "bidirectional echo differs");
+        assert_eq!(
+            back.unwrap().as_slice(),
+            data.as_ref(),
+            "bidirectional echo differs"
+        );
     };
     let qmux_side = async {
         let (mut send, mut recv) = q.accept_bi().await.unwrap();
@@ -351,13 +358,16 @@ async fn zmux_drives(z: &zmux::Session, q: &qmux::Session) {
     tokio::join!(zmux_side, qmux_side);
 
     // 2. Unidirectional stream, answered on a unidirectional stream.
-    let data = pattern(UNI_BULK, 2);
+    let data = zmux::Chunk::from(pattern_vec(UNI_BULK, 2));
     let zmux_side = async {
         let mut send = z.open_uni().await.unwrap();
         send.write_chunk(data.clone()).await.unwrap();
         send.finish().unwrap();
         let mut back = z.accept_uni().await.unwrap();
-        assert_eq!(back.read_to_end(2 * UNI_BULK).await.unwrap(), data);
+        assert_eq!(
+            back.read_to_end(2 * UNI_BULK).await.unwrap().as_slice(),
+            data.as_ref()
+        );
     };
     let qmux_side = async {
         let mut recv = q.accept_uni().await.unwrap();
@@ -373,7 +383,9 @@ async fn zmux_drives(z: &zmux::Session, q: &qmux::Session) {
     let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
     let zmux_side = async {
         let (mut send, mut recv) = z.open_bi().await.unwrap();
-        send.write_chunk(pattern(100_000, 3)).await.unwrap();
+        send.write_chunk(zmux::Chunk::from(pattern_vec(100_000, 3)))
+            .await
+            .unwrap();
         seen_rx.await.unwrap();
         send.reset(VarInt::from_u32(RESET_BY_ZMUX)).unwrap();
         assert_eq!(recv.read_to_end(16).await.unwrap(), b"");
@@ -495,7 +507,7 @@ async fn qmux_drives(z: &zmux::Session, q: &qmux::Session) {
     let zmux_side = async {
         let (mut send, mut recv) = z.accept_bi().await.unwrap();
         assert_eq!(recv.read_to_end(16).await.unwrap(), b"x");
-        let chunk = Bytes::from(vec![9u8; 1024]);
+        let chunk = zmux::Chunk::from(vec![9u8; 1024]);
         let err = loop {
             if let Err(e) = send.write_chunk(chunk.clone()).await {
                 break e;
@@ -901,36 +913,23 @@ async fn duplex_zmux_server() {
     scenario(Carrier::Duplex, false, Closer::Zmux).await;
 }
 
-/// Interop case: zmux as client with `early_data`
-/// wrongly declaring the target a zmux endpoint. The target stops at the
-/// `PIPE_ACK` fence with `FRAME_ENCODING_ERROR`, its application sees no
-/// stream, and zmux reports `EarlyDataRejected`.
+/// A carrier with no resumption context establishes normally with a
+/// plain QMux peer even when early data is enabled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn early_data_wrongly_declared() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (dialed, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
-    let (dial_tcp, accept_tcp) = (dialed.unwrap(), accepted.unwrap().0);
-    let (out, inn) = (Tap::default(), Tap::default());
-    let mut cfg = zmux_config();
-    cfg.early_data = zmux::EarlyData::for_zmux_peer();
-    let client = zmux::Session::connect(tapped_tcp(dial_tcp, &out, &inn), cfg)
-        .await
-        .expect("returns before the peer's parameters");
-    let (mut send, _recv) = client.open_bi().await.unwrap();
-    send.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
-    let qcfg = qmux_config();
-    let transport = QmuxTransport::new(accept_tcp, qcfg.version, qcfg.max_record_size);
-    let target = qmux::Session::accept(transport, qcfg).await;
-    let closed = tokio::time::timeout(Duration::from_secs(10), client.closing())
-        .await
-        .expect("closed in time");
-    assert_eq!(closed, SessionError::EarlyDataRejected, "{closed:?}");
-    if let Ok(target) = target {
-        let accepted = tokio::time::timeout(Duration::from_millis(500), target.accept_bi()).await;
-        assert!(
-            !matches!(accepted, Ok(Ok(_))),
-            "the target's application saw no stream"
+async fn early_data_requires_carrier_resumption() {
+    tokio::time::timeout(RUN_TIMEOUT, async {
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let mut cfg = zmux_config();
+        cfg.early_data = zmux::EarlyData::default().with_carrier_early_data(true);
+        let (client, peer) = tokio::join!(
+            zmux::Session::connect(PipeIo::new(client), cfg),
+            qmux_establish(server, true),
         );
-    }
+        let client = client.unwrap();
+        assert!(client.is_plain_qmux_peer());
+        assert_eq!(client.early_data(), zmux::EarlyDataState::NotSent);
+        zmux_drives(&client, &peer).await;
+    })
+    .await
+    .expect("plain QMux exchange");
 }

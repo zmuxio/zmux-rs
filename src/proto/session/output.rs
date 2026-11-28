@@ -9,7 +9,7 @@ use super::ledger::Tag;
 use super::pipes::{BatchStart, OutPipe};
 use super::sched::Decision;
 use super::stream::{self, RecvState, SendPart, SendState, StreamKey};
-use super::tier::GateInputs;
+use super::tier::{Backlog, Gate, GateInputs};
 use super::tp::TpValues;
 use super::transmit::{COPY_THRESHOLD, TransmitBuf};
 use super::{
@@ -114,7 +114,10 @@ impl Pick for SinglePick {
         let Some((u, key)) = c.streams.pick() else {
             return Next::Stop;
         };
-        debug_assert_eq!(c.streams.queue().level(u).front(), Some(&key));
+        debug_assert_eq!(
+            c.streams.queue().level(u).front().map(|ready| ready.key),
+            Some(key)
+        );
         if self.offered {
             c.maybe_open_lane(pipe, key);
         }
@@ -148,13 +151,15 @@ impl Pick for LanePick {
                 .queue()
                 .level(u)
                 .iter()
-                .position(|&k| !self.skipped.contains(&k) && c.lane_for(o, k) == self.lane)
+                .position(|ready| {
+                    !self.skipped.contains(&ready.key) && c.lane_for(o, ready.key) == self.lane
+                })
                 .map(|i| (u, i))
         });
         let Some((u, i)) = found else {
             return Next::End;
         };
-        let key = c.streams.queue().level(u)[i];
+        let key = c.streams.queue().level(u)[i].key;
         c.maybe_open_lane(pipe, key);
         Next::Write(u, i)
     }
@@ -177,6 +182,7 @@ impl Pick for LanePick {
 /// it depends on, the bindings' loads, the backlog or a round-robin turn).
 struct MpPick<'a> {
     inputs: &'a mut GateInputs,
+    gate: (u64, Backlog, Option<Gate>),
     /// Directions passed over in this batch because what is left of the
     /// session credit is too little for their preamble: rare, and few.
     skipped: Vec<StreamKey>,
@@ -235,6 +241,12 @@ pub(crate) struct BatchLog {
 }
 
 impl BatchLog {
+    pub(super) fn has_streams(&self) -> bool {
+        self.txlog
+            .iter()
+            .any(|(_, frame)| matches!(frame, pipes::SentFrame::Stream { len, .. } if *len > 0))
+    }
+
     /// Heap bytes held.
     pub(super) fn heap_bytes(&self) -> usize {
         use std::mem::size_of;
@@ -290,17 +302,22 @@ impl SessionCore {
         self.ping.response_pending.is_some()
             || (self.ping.request_pending && self.ping.outstanding.is_none())
             || self.streams.control_pending()
+            || self.max_data_ready()
+            || [BIDI, UNI]
+                .into_iter()
+                .any(|d| self.peer_stream_growth_ready(d))
             || self.goaway().pending.is_some()
             || self.goaway().resend.is_some()
-            || self.dgram().send.iter().any(|o| {
-                self.datagram_pipe(o.flow).is_none() && !self.channel_takes(o.flow, o.data.len())
-            })
     }
 
     /// A credit update (`MAX_DATA`, `MAX_STREAMS`, `MAX_STREAM_DATA`) waits:
     /// a `PIPE_ACK` goes in the same batch.
     pub(super) fn credit_update_pending(&self) -> bool {
-        self.streams.credit_update_pending()
+        self.max_data_ready()
+            || self.streams.credit_update_pending()
+            || [BIDI, UNI]
+                .into_iter()
+                .any(|d| self.peer_stream_growth_ready(d))
     }
 
     /// Whether latency-sensitive work waits for pipe `id`'s next write
@@ -545,6 +562,10 @@ impl SessionCore {
         let carrier_max = self.out_ref(id).and_then(OutPipe::max_record);
         let max_record = carrier_max.map_or(max_record, |m| max_record.min(m));
         let mut w = Records::new(out, max_record);
+        if self.early_retains() {
+            w.provisional = Some(self.bootstrap_start());
+        }
+        w.cover_eligible = !parameters && !joined_first && self.cover_eligible(id);
         if self.shape.is_some() {
             w.shape = self.shape_lend(id, 0, max_record, now);
         }
@@ -608,7 +629,7 @@ impl SessionCore {
             }
             w.end_record();
             let eliciting = w.eliciting_end();
-            let records = self.shape_finish(w);
+            let records = self.shape_finish(&mut w);
             self.count_sent(out.len(), records);
             self.after_batch(id, out, eliciting, now);
             return if out.is_empty() {
@@ -644,12 +665,13 @@ impl SessionCore {
                 w.force(frame.encoded_len());
                 let _ = w.out.push_frame(&frame);
             }
-            let records = self.shape_finish(w);
+            let records = self.shape_finish(&mut w);
             self.count_sent(out.len(), records);
             self.after_batch(id, out, None, now);
             if let Some(p) = self.out_mut(id) {
                 p.close_written();
             }
+            self.set_pacing_deadline(id, None);
             // Linger from the time the close is written, on each pipe: a
             // slow pipe's close, written last, gets the whole linger too
             // (each pipe writes it once, so the total stays bounded).
@@ -659,23 +681,27 @@ impl SessionCore {
         }
         if shutdown {
             // A drained pipe or a failed one.
-            let records = self.shape_finish(w);
+            let records = self.shape_finish(&mut w);
             self.count_sent(out.len(), records);
             self.after_batch(id, out, None, now);
             if let Some(p) = self.out_mut(id) {
                 p.shutdown_written();
             }
+            self.set_pacing_deadline(id, None);
             return Transmit::Shutdown;
         }
         if self.early_open() && id == 0 {
-            // Early data: the fence, then openings and stream data within
-            // the floor.
-            if (self.opening_ready() || self.data_pending()) && self.write_fence(&mut w) {
+            // QMux carrier early data contains only STREAM frames.
+            if self.opening_ready() || self.data_pending() {
                 self.write_openings(&mut w);
-                self.write_stream_data(id, &mut w);
+                self.write_data(id, &mut w, false);
+                if w.traffic {
+                    self.note_early_streams_sent();
+                }
             }
         } else if self.state != State::Establishing {
             self.write_path_frames(id, &mut w, now);
+            self.write_datagram_acks(id, &mut w);
             let control = self.is_control_pipe(id);
             let data = self.pipe_takes_data(id);
             if control {
@@ -685,14 +711,10 @@ impl SessionCore {
                 }
                 self.write_stream_controls(&mut w, now);
             }
-            if data && !self.dgram().send.is_empty() {
-                self.write_datagrams(id, control, &mut w);
-            }
             if data {
-                // The carrier queue limiter paces stream data, reinjection
-                // and copies, never control frames.
+                // The carrier queue limiter paces data and reinjection.
                 self.pace_left = self.pacing_room(id, now);
-                self.write_stream_data(id, &mut w);
+                self.write_data(id, &mut w, true);
                 self.pace_left = None;
             }
             if control && self.control_pending() {
@@ -707,25 +729,11 @@ impl SessionCore {
             }
         }
         let activity = w.activity;
-        let traffic = w.traffic;
         let acked_activity = w.traffic || w.ping;
         if w.exchange {
             self.exchange_at = Some(now);
         }
-        w.end_record();
-        let eliciting = w.eliciting_end();
-        let records = self.shape_finish(w);
-        self.count_sent(out.len(), records);
-        self.after_batch(id, out, eliciting, now);
-        if traffic {
-            self.note_traffic(id, now);
-        }
-        // The bucket pays for the whole batch as the carrier takes it,
-        // framing and control frames included: R_p measures those bytes,
-        // and paying for the stream data alone would overrun the path by
-        // the rest and build a queue round by round. Control frames are
-        // never held back for it.
-        self.pace_sent(id, out.len() as u64, now);
+        self.finish_data_batch(id, &mut w, now);
         if self
             .mp
             .as_deref()
@@ -821,7 +829,7 @@ impl SessionCore {
             }
             w.force(frame.encoded_len());
             let _ = w.out.push_frame(&frame);
-            let records = self.shape_finish(w);
+            let records = self.shape_finish(&mut w);
             self.count_sent(out.len(), records);
             let len = out.stream_len();
             if let Some(l) = self.out_mut(id).and_then(OutPipe::lanes_mut) {
@@ -841,6 +849,7 @@ impl SessionCore {
         let mut w = Records::new(out, max_record);
         if self.shape.is_some() {
             w.shape = self.shape_lend(id, n, max_record, now);
+            w.cover_eligible = self.cover_eligible(id);
         }
         if w.blocked() {
             // The pipe's planned record waits for its delay.
@@ -848,26 +857,30 @@ impl SessionCore {
             return Transmit::Idle;
         }
         self.pace_left = self.pacing_room(id, now);
-        self.write_stream_data(id, &mut w);
+        self.write_data(id, &mut w, false);
         self.pace_left = None;
         if w.exchange {
             self.exchange_at = Some(now);
         }
-        let traffic = w.traffic;
-        w.end_record();
-        let eliciting = w.eliciting_end();
-        let records = self.shape_finish(w);
-        self.count_sent(out.len(), records);
-        self.after_batch(id, out, eliciting, now);
-        if traffic {
-            self.note_traffic(id, now);
-        }
-        self.pace_sent(id, out.len() as u64, now);
+        self.finish_data_batch(id, &mut w, now);
         if out.is_empty() {
             Transmit::Idle
         } else {
             Transmit::Data
         }
+    }
+
+    fn finish_data_batch(&mut self, pipe: u64, w: &mut Records<'_>, now: Instant) {
+        w.end_record();
+        let eliciting = w.eliciting_end();
+        let records = self.shape_finish(w);
+        self.count_sent(w.out.len(), records);
+        self.after_batch(pipe, w.out, eliciting, now);
+        if w.traffic {
+            self.note_traffic(pipe, now);
+        }
+        // The pacing bucket pays for every byte the carrier takes.
+        self.pace_sent(pipe, w.out.len() as u64, now);
     }
 
     /// Writes the credit copies owed by frames another pipe carried, with
@@ -883,7 +896,7 @@ impl SessionCore {
             let written = match kind {
                 mpath::CreditCopy::Session => {
                     let maximum = self.streams.recv_flow().limit_sent;
-                    w.try_frame(&Frame::MaxData(MaxData { maximum }))
+                    w.try_repeated_frame(&Frame::MaxData(MaxData { maximum }))
                         .then(|| self.log(w, pipes::SentFrame::MaxData))
                         .is_some()
                 }
@@ -892,7 +905,7 @@ impl SessionCore {
                         dir: dir_of_index(d),
                         maximum: self.streams.remote_dir(d).limit_sent,
                     });
-                    w.try_frame(&frame)
+                    w.try_repeated_frame(&frame)
                         .then(|| self.log(w, pipes::SentFrame::MaxStreams { dir: d }))
                         .is_some()
                 }
@@ -905,7 +918,7 @@ impl SessionCore {
                     match open {
                         Some((stream_id, maximum)) => {
                             let f = Frame::MaxStreamData(MaxStreamData { stream_id, maximum });
-                            w.try_frame(&f)
+                            w.try_repeated_frame(&f)
                                 .then(|| self.log(w, pipes::SentFrame::MaxStreamData { key }))
                                 .is_some()
                         }
@@ -1094,16 +1107,24 @@ impl SessionCore {
             return;
         }
         let f = self.streams.recv_flow();
-        if f.update_pending || f.resend {
-            let value = if f.update_pending {
-                self.session_credit_value(now)
+        let ready = self.max_data_ready();
+        if ready || f.resend {
+            let outstanding = f.update_pending;
+            let (value, waiting) = if ready {
+                self.reclaim_receive_space(false);
+                let wanted = self.session_credit_value(now);
+                let value = self.reserve_receive_credit(wanted);
+                (value, value < wanted && self.receive_credit.is_some())
             } else {
-                f.limit_sent
+                (f.limit_sent, outstanding)
             };
             let f = self.streams.recv_flow();
             if value > f.limit_sent || f.resend {
                 let value = value.max(f.limit_sent);
-                if !w.try_frame(&Frame::MaxData(MaxData { maximum: value })) {
+                if !w.try_frame_with_origin(
+                    &Frame::MaxData(MaxData { maximum: value }),
+                    value > f.limit_sent,
+                ) {
                     return;
                 }
                 self.log(w, pipes::SentFrame::MaxData);
@@ -1111,9 +1132,12 @@ impl SessionCore {
                     self.copy_credit(mpath::CreditCopy::Session);
                 }
             }
-            self.streams.max_data_settled();
+            self.streams.max_data_settled(waiting);
         }
         for d in [BIDI, UNI] {
+            if !self.goaway_announced() && self.peer_stream_growth_ready(d) {
+                self.grow_peer_stream_credit(d);
+            }
             let r = self.streams.remote_dir(d);
             if !r.update_pending && !r.resend {
                 continue;
@@ -1127,7 +1151,7 @@ impl SessionCore {
                     dir: dir_of_index(d),
                     maximum: value,
                 });
-                if !w.try_frame(&frame) {
+                if !w.try_frame_with_origin(&frame, raise) {
                     return;
                 }
                 self.log(w, pipes::SentFrame::MaxStreams { dir: d });
@@ -1141,7 +1165,10 @@ impl SessionCore {
         if f.blocked_pending || f.blocked_resend {
             let limit = f.max;
             if f.blocked_reported != Some(limit) || f.blocked_resend {
-                if !w.try_frame(&Frame::DataBlocked(DataBlocked { limit })) {
+                if !w.try_frame_with_origin(
+                    &Frame::DataBlocked(DataBlocked { limit }),
+                    f.blocked_reported != Some(limit),
+                ) {
                     return;
                 }
                 self.log(w, pipes::SentFrame::DataBlocked);
@@ -1160,7 +1187,7 @@ impl SessionCore {
                     dir: dir_of_index(d),
                     limit,
                 });
-                if !w.try_frame(&frame) {
+                if !w.try_frame_with_origin(&frame, ld.blocked_reported != Some(limit)) {
                     return;
                 }
                 self.log(w, pipes::SentFrame::StreamsBlocked { dir: d });
@@ -1178,7 +1205,7 @@ impl SessionCore {
                 max_uni: uni,
                 error_code: code,
             });
-            if !w.try_frame(&frame) {
+            if !w.try_repeated_frame(&frame) {
                 return;
             }
             self.log(w, pipes::SentFrame::GoAway);
@@ -1247,9 +1274,10 @@ impl SessionCore {
                 stream_id: id,
                 error_code: r.cold().stopped.unwrap_or(0),
             });
-            if !w.try_frame(&f) {
+            if !w.try_frame_with_origin(&f, !r.cold().stop_written) {
                 return Err(Full);
             }
+            r.cold_mut().stop_written = true;
             r.stop_pending = false;
             self.log(w, pipes::SentFrame::StopSending { key });
             self.note_activity(w);
@@ -1279,7 +1307,7 @@ impl SessionCore {
                         stream_id: id,
                         maximum: value,
                     });
-                    if !w.try_frame(&f) {
+                    if !w.try_frame_with_origin(&f, value > r.limit) {
                         return Err(Full);
                     }
                     let r = self.recv_mut(key);
@@ -1313,7 +1341,7 @@ impl SessionCore {
                 sequence: seq,
                 priority: p,
             });
-            if !w.try_frame(&f) {
+            if !w.try_frame_with_origin(&f, fresh) {
                 return Err(Full);
             }
             let s = self.stream_mut(key);
@@ -1452,11 +1480,8 @@ impl SessionCore {
             w.out.push_bytes(&pre[pre.len() - send.preamble_left..]);
         }
         let off = send.offset;
-        if off == 0
-            && let Some(m) = send.mp_in(mp)
-            && m.open_pipe.is_none()
-        {
-            m.open_pipe = Some(tx);
+        if let Some(m) = send.mp_in(mp) {
+            m.opening_sent(off, tx);
         }
         send.offset += len;
         send.preamble_left = 0;
@@ -1524,7 +1549,7 @@ impl SessionCore {
                 final_size,
             }),
         };
-        if !w.try_frame(&frame) {
+        if !w.try_frame_with_origin(&frame, !again) {
             return Err(Full);
         }
         if let Some(m) = send.mp.as_deref_mut() {
@@ -1619,19 +1644,75 @@ impl SessionCore {
         }
     }
 
-    /// The stream data of a batch: frames of the directions `pick` chooses
-    /// in turn, until the batch is full, the directions it may take have
-    /// nothing more, or session credit runs out.
-    pub(super) fn write_streams<P: Pick>(&mut self, pipe: u64, pick: &mut P, w: &mut Records<'_>) {
+    pub(super) fn spend_data_room(pace_left: &mut Option<u64>, w: &mut Records<'_>, bytes: u64) {
+        if let Some(left) = pace_left {
+            *left = left.saturating_sub(bytes);
+        }
+        w.spend(bytes);
+    }
+
+    pub(super) fn write_streams<P: Pick>(
+        &mut self,
+        pipe: u64,
+        pick: &mut P,
+        w: &mut Records<'_>,
+        datagram_limit: Option<usize>,
+    ) {
+        if let Some(limit) = datagram_limit {
+            self.write_scheduled::<P, true>(pipe, pick, w, limit);
+        } else {
+            self.write_scheduled::<P, false>(pipe, pick, w, 0);
+        }
+    }
+
+    /// Writes data in priority order, using the same round-robin turn order
+    /// for reliable directions and datagram flows sharing this writer.
+    fn write_scheduled<P: Pick, const DATAGRAMS: bool>(
+        &mut self,
+        pipe: u64,
+        pick: &mut P,
+        w: &mut Records<'_>,
+        datagram_limit: usize,
+    ) {
+        let mut streams_done = false;
         loop {
-            let (u, i) = match pick.next(self, pipe, w) {
-                Next::Write(u, i) => (u, i),
-                Next::End => break,
-                Next::Stop => return,
+            let stream = if streams_done {
+                None
+            } else {
+                match pick.next(self, pipe, w) {
+                    Next::Write(u, i) => Some((u, i, self.streams.queue().level(u)[i])),
+                    Next::End | Next::Stop => {
+                        if pick.passed_any() && self.write_credit_free(w, pick.decision()) {
+                            self.streams.stall_if_queued();
+                        }
+                        streams_done = true;
+                        None
+                    }
+                }
             };
-            let key = self.streams.queue().level(u)[i];
+            let datagram = if DATAGRAMS
+                && self.pace_left != Some(0)
+                && (!w.gate_out() || self.record_flow_budget(pipe).is_zero())
+            {
+                self.ready_record_datagram(pipe)
+            } else {
+                None
+            };
+            if let Some(datagram) = datagram
+                && stream.is_none_or(|(u, _, ready)| datagram.rank < (u, ready.turn))
+            {
+                if !self.write_record_datagram(pipe, w, datagram_limit, datagram) {
+                    break;
+                }
+                continue;
+            }
+            let Some((u, i, ready)) = stream else {
+                break;
+            };
+            let key = ready.key;
             let gate = pick.decision().and_then(|d| d.gate.as_ref());
-            match self.write_stream_frame(pipe, key, gate, w) {
+            let contested = datagram.is_some_and(|packet| packet.rank.0 == u);
+            match self.write_stream_frame(pipe, key, gate, w, contested) {
                 Step::Done => {
                     self.streams.dequeue_at(u, i);
                     self.after_stream_frame(key);
@@ -1646,9 +1727,8 @@ impl SessionCore {
                     self.note_credit_blocked(key);
                 }
                 Step::SessionBlocked => {
-                    // Blocked by session credit, at the limit or by a
-                    // preamble that does not fit in what is left: report it
-                    // once per limit.
+                    // Report each blocked limit once. If what remains is
+                    // too little for this preamble, others may still use it.
                     if let Some(limit) = self.streams.report_data_blocked()
                         && w.try_frame(&Frame::DataBlocked(DataBlocked { limit }))
                     {
@@ -1656,21 +1736,19 @@ impl SessionCore {
                         self.streams.data_blocked_written(limit);
                     }
                     if self.streams.send_flow().exhausted() {
-                        // Send what needs no credit and wait for MAX_DATA.
                         if self.write_credit_free(w, pick.decision()) {
                             self.streams.stall_if_queued();
                         }
-                        return;
+                        streams_done = true;
+                    } else {
+                        pick.pass(self, u, i, key);
                     }
-                    // Some credit is left, too little for this stream's
-                    // preamble: others may use it.
-                    pick.pass(self, u, i, key);
                 }
-                Step::Full | Step::Budget => return,
+                Step::Full | Step::Budget => streams_done = true,
             }
-        }
-        if pick.passed_any() && self.write_credit_free(w, pick.decision()) {
-            self.streams.stall_if_queued();
+            if streams_done && !DATAGRAMS {
+                break;
+            }
         }
     }
 
@@ -1688,31 +1766,52 @@ impl SessionCore {
     /// Stream data for pipe `pipe` in a multipath session: reinjected data
     /// first, then new data of the streams the scheduler places on the pipe, by urgency and round
     /// robin.
-    pub(super) fn write_stream_data_mp(&mut self, pipe: u64, w: &mut Records<'_>) {
+    pub(super) fn write_data_mp(
+        &mut self,
+        pipe: u64,
+        w: &mut Records<'_>,
+        datagram_limit: Option<usize>,
+    ) {
         // Redundant copies queued for the pipe go first.
         if !self.write_copies(pipe, w) {
             return;
         }
+        if self.streams.queue().is_empty()
+            && !self.opp_due(pipe, self.now)
+            && (datagram_limit.is_none() || self.ready_record_datagram(pipe).is_none())
+        {
+            return;
+        }
         let mut inputs = std::mem::take(&mut self.mp_mut().batch_mut().gate_inputs);
         inputs.reset();
-        self.write_new_data_mp(pipe, &mut inputs, w);
+        self.write_new_data_mp(pipe, &mut inputs, w, datagram_limit);
         self.mp_mut().batch_mut().gate_inputs = inputs;
     }
 
-    /// The chunks of [`Self::write_stream_data_mp`], one decision each
+    /// The chunks of [`Self::write_data_mp`], one decision each
     /// ([`MpPick`]).
-    fn write_new_data_mp(&mut self, pipe: u64, inputs: &mut GateInputs, w: &mut Records<'_>) {
-        // Bindings are re-evaluated once per batch.
-        let gate = self.gate_from(inputs);
+    fn write_new_data_mp(
+        &mut self,
+        pipe: u64,
+        inputs: &mut GateInputs,
+        w: &mut Records<'_>,
+        datagram_limit: Option<usize>,
+    ) {
+        // The binding refresh and first decision use the same snapshot
+        // unless refreshing the bindings changed a dependency.
+        let generation = self.mp().tiers().view_generation();
+        let backlog = self.waiting_data();
+        let gate = self.gate_from(inputs, backlog);
         self.refresh_bindings(gate.as_ref());
         self.prune_credit_blocked();
         let mut pick = MpPick {
             inputs,
+            gate: (generation, backlog, gate),
             skipped: Vec::new(),
             kept: None,
             at: (0, 0),
         };
-        self.write_streams(pipe, &mut pick, w);
+        self.write_streams(pipe, &mut pick, w, datagram_limit);
     }
 
     /// The next decision of a multipath batch, and what goes before new
@@ -1725,9 +1824,12 @@ impl SessionCore {
     )]
     fn next_mp(&mut self, pipe: u64, p: &mut MpPick<'_>, w: &mut Records<'_>) -> Next {
         loop {
-            // The gate of this decision: one per chunk.
-            let gate = self.gate_from(p.inputs);
             let generation = self.mp().tiers().view_generation();
+            let backlog = self.waiting_data();
+            if (generation, backlog) != (p.gate.0, p.gate.1) {
+                p.gate = (generation, backlog, self.gate_from(p.inputs, backlog));
+            }
+            let gate = p.gate.2;
             let mut d = match p.kept.take() {
                 Some((mut d, g)) if g == generation && d.gate == gate => {
                     d.renew();
@@ -1764,11 +1866,11 @@ impl SessionCore {
                 continue;
             }
             // Opportunistic copies of the data that blocks the window.
-            let copied = self.stats.bytes_opportunistic;
+            let copied = self.mp().counters.bytes_opportunistic;
             if !self.write_opportunistic(pipe, self.now, d.gate, w) {
                 return Next::Stop;
             }
-            if self.stats.bytes_opportunistic != copied {
+            if self.mp().counters.bytes_opportunistic != copied {
                 // The copies penalized a pipe: the new data goes by the
                 // pipes as they are now, under the same gate.
                 d = self.decision(pipe, d.gate);
@@ -1813,7 +1915,7 @@ impl SessionCore {
             .is_some_and(|o| o.lanes().is_some() || o.lanes_offered());
         while u < 8 {
             while i < self.streams.queue().level(u).len() {
-                let key = self.streams.queue().level(u)[i];
+                let key = self.streams.queue().level(u)[i].key;
                 if !skipped.is_empty() && skipped.contains(&key) {
                     i += 1;
                     continue;
@@ -1890,7 +1992,7 @@ impl SessionCore {
             .queue()
             .level(level)
             .iter()
-            .copied()
+            .map(|ready| ready.key)
             .find(|k| losing.contains(k))?;
         Some((level, key))
     }
@@ -1937,15 +2039,13 @@ impl SessionCore {
             return Step::Full;
         };
         let tx = self.tx;
-        if start == 0
-            && let Some(m) = self
-                .stream_mut(key)
-                .send
-                .as_mut()
-                .and_then(|s| s.mp.as_deref_mut())
+        if let Some(m) = self
+            .stream_mut(key)
+            .send
+            .as_mut()
+            .and_then(|s| s.mp.as_deref_mut())
         {
-            // A first batch may have carried the opening frame; this one is the record's.
-            m.open_pipe.get_or_insert(tx);
+            m.opening_sent(start, tx);
         }
         self.batch_stream_bytes += n;
         self.note_lane_frame(key);
@@ -1962,7 +2062,7 @@ impl SessionCore {
             send.mp_mut().fin_lost = false;
         }
         let more = send.has_pending();
-        self.stats.bytes_reinjected += n;
+        self.mp_mut().counters.bytes_reinjected += n;
         if more {
             Step::More { rotate: false }
         } else {
@@ -2023,14 +2123,12 @@ impl SessionCore {
             // which lets whole frames go.
             return Err(Full);
         }
-        let Some((room, _)) = w.stream_room(min_of, want).filter(|&(r, least)| r >= least) else {
+        let preamble = if start == 0 { usize_sat(base) } else { 0 };
+        let Some((room, _)) = w.stream_room(min_of, preamble, want) else {
             return Err(Full);
         };
         let n = want.min(room) as u64;
-        if let Some(left) = &mut self.pace_left {
-            *left = left.saturating_sub(n);
-        }
-        w.spend(n);
+        Self::spend_data_room(&mut self.pace_left, w, n);
         let fin = fin_ok && start + n == final_off;
         let header = StreamHeader {
             stream_id: id,
@@ -2041,7 +2139,6 @@ impl SessionCore {
             explicit_len: true,
         };
         w.stream_header(&header);
-        w.not_earned += header.encoded_len() as u64 + n;
         let send = self.stream_mut(key).send.as_mut().expect("present");
         let mut at = start;
         let stop = start + n;
@@ -2065,6 +2162,11 @@ impl SessionCore {
             } else {
                 // Held, as checked above.
                 let buf = &send.buf;
+                #[cfg(all(feature = "tokio", not(loom)))]
+                buf.visit_handoffs(off, len, |part| {
+                    w.out
+                        .track_handoff(part, super::splice_handoff::Medium::Stream);
+                });
                 w.out.push_with(len, |dst| {
                     let held = buf.copy_kept(off, dst);
                     debug_assert!(held, "copy of bytes not held");
@@ -2093,7 +2195,7 @@ impl SessionCore {
         for u in 0..8 {
             let mut i = 0;
             while i < self.streams.queue().level(u).len() {
-                let key = self.streams.queue().level(u)[i];
+                let key = self.streams.queue().level(u)[i].key;
                 let free = self.streams.get(key).is_some_and(|s| {
                     (s.id.is_some() || !preamble)
                         && s.send
@@ -2106,7 +2208,7 @@ impl SessionCore {
                 }
                 let tx = self.tx;
                 let gate = d.and_then(|d| d.gate.as_ref());
-                match self.write_stream_frame(tx, key, gate, w) {
+                match self.write_stream_frame(tx, key, gate, w, false) {
                     Step::Done => {
                         self.streams.dequeue_at(u, i);
                         self.after_stream_frame(key);
@@ -2127,6 +2229,7 @@ impl SessionCore {
         key: StreamKey,
         gate: Option<&super::tier::Gate>,
         w: &mut Records<'_>,
+        contested: bool,
     ) -> Step {
         let Some(s) = self.streams.get(key) else {
             return Step::Done;
@@ -2160,7 +2263,9 @@ impl SessionCore {
                 self.reject_unopened(key, stream::GoAwayFail::too_large(self.preamble_limit()));
                 return Step::Done;
             }
-            if w.stream_room(|_| need, need).is_none_or(|(r, _)| r < need) {
+            if w.stream_room(|_| need, need, need)
+                .is_none_or(|(r, _)| r < need)
+            {
                 return Step::Full;
             }
             // The identifier goes with the first frame: not assigned while the limiter holds back
@@ -2218,6 +2323,9 @@ impl SessionCore {
             // Only the reset is owed.
             self.streams.queue_ctrl(key);
             return Step::Done;
+        }
+        if contested {
+            cap = cap.min(u64::try_from(send.deficit.max(MIN_FRAGMENT_DEFICIT)).unwrap());
         }
         let mut available = send.preamble_left as u64 + send.buf.len();
         if let Some(r) = reliable {
@@ -2293,26 +2401,17 @@ impl SessionCore {
             // Stream bytes to send, and no room for them now.
             return Step::Full;
         }
-        if send.offset == 0
-            && let Some(m) = send.mp_in(mp)
-            && m.open_pipe.is_none()
-        {
-            m.open_pipe = Some(pipe);
-        }
         // At least the whole preamble, and no tiny fragment when a larger
         // one fits in the next record; never more than a record holds.
         let min_of = |max_data: usize| pre.max(usize_sat(credit).min(MIN_FRAGMENT).min(max_data));
         let Some((room, _)) = w
-            .stream_room(min_of, usize_sat(credit))
+            .stream_room(min_of, pre, usize_sat(credit))
             .filter(|&(r, least)| r >= least)
         else {
             return Step::Full;
         };
         let n = credit.min(room as u64);
-        if let Some(left) = &mut self.pace_left {
-            *left = left.saturating_sub(n);
-        }
-        w.spend(n);
+        Self::spend_data_room(&mut self.pace_left, w, n);
         let fin = fin_owed && n == available;
         let header = StreamHeader {
             stream_id: id,
@@ -2322,7 +2421,7 @@ impl SessionCore {
             explicit_offset: false,
             explicit_len: true,
         };
-        w.stream_header(&header);
+        w.original_stream_header(&header, usize_sat(n) - pre);
         w.exchange |= exchange;
         let mut left = usize_sat(n);
         if pre > 0 {
@@ -2335,8 +2434,8 @@ impl SessionCore {
         }
         let app = left as u64;
         while left > 0 {
-            let run = send.buf.front_len().min(left);
-            if run >= COPY_THRESHOLD {
+            let (run, share) = send.buf.front_for_write(left, COPY_THRESHOLD);
+            if share {
                 let chunk = send.buf.take_shared(run, retain, chunks);
                 left -= chunk.len();
                 w.out.push_shared(chunk);
@@ -2347,6 +2446,9 @@ impl SessionCore {
             }
         }
         let off = send.offset;
+        if let Some(m) = send.mp_in(mp) {
+            m.opening_sent(off, pipe);
+        }
         send.offset += n;
         send.open_want = false;
         send.deficit -= n.cast_signed();
@@ -2368,6 +2470,7 @@ impl SessionCore {
             self.note_lane_frame(key);
         }
         if mp {
+            self.replica_bytes(n, false);
             self.batch_stream_bytes += n;
             self.mp_mut().retain(n);
             self.log_new_data(w, key, off, n, fin);
@@ -2428,7 +2531,7 @@ impl SessionCore {
             if lost { Step::Budget } else { Step::Blocked }
         } else {
             Step::More {
-                rotate: rotate && incremental,
+                rotate: rotate && (incremental || contested),
             }
         }
     }
@@ -2588,8 +2691,13 @@ impl SessionCore {
         let mut sent = false;
         if let Some(send) = self.streams.send_mut(key) {
             send.pop_marks();
-            sent = send.sent_waiting && send.buf.is_empty() && send.preamble_left == 0;
-            send.sent_waiting &= !sent;
+            sent = send.preamble_left == 0
+                && send
+                    .sent_waiting
+                    .is_some_and(|through| send.offset.saturating_sub(send.base) >= through);
+            if sent {
+                send.sent_waiting = None;
+            }
         }
         self.sync_holder(key);
         self.wake_send_waiters();
@@ -2612,6 +2720,19 @@ impl SessionCore {
     }
 
     // ---- discarding -------------------------------------------------------------
+}
+
+/// Frames that earn wire credit and qualify as control activity.
+fn semantic_control(frame: &Frame<'_>) -> bool {
+    !matches!(
+        frame,
+        Frame::Padding(_)
+            | Frame::Stream(_)
+            | Frame::Datagram(_)
+            | Frame::ConnectionClose(_)
+            | Frame::PipeLane(_)
+            | Frame::PipeAck(_)
+    )
 }
 
 /// Builds records in a batch: frames go into records of at most
@@ -2641,8 +2762,14 @@ pub(super) struct Records<'a> {
     ping: bool,
     /// The pipe's shaping state, lent for the batch.
     pub(super) shape: Option<super::shape::ShapeTx>,
-    /// Padding, injections and copies written, which the batch does not earn.
-    pub(super) not_earned: u64,
+    record_own: u32,
+    extra_start: usize,
+    extra_len: usize,
+    record_data: bool,
+    record_control: bool,
+    pub(super) provisional: Option<u32>,
+    pub(super) cover: Option<super::shape::CoverOutcome>,
+    pub(super) cover_eligible: bool,
     /// A frame that cannot be split was longer than the record limit.
     pub(super) oversized: bool,
 }
@@ -2659,7 +2786,14 @@ impl<'a> Records<'a> {
             traffic: false,
             ping: false,
             shape: None,
-            not_earned: 0,
+            record_own: 0,
+            extra_start: 0,
+            extra_len: 0,
+            record_data: false,
+            record_control: false,
+            provisional: None,
+            cover: None,
+            cover_eligible: false,
             oversized: false,
         }
     }
@@ -2673,15 +2807,13 @@ impl<'a> Records<'a> {
                 let records = self.out.is_records();
                 t.prep(self.max_record, self.count == 0 || records, !records)
             }
-            Some(t) => t.cut_or(self.max_record),
-            None => self.max_record,
+            _ => self.max_record,
         }
     }
 
-    /// The batch takes no further record: one ended it (`flush`), or the
-    /// next waits for its plan's delay.
+    /// The next record waits for its plan's delay.
     fn closed(&self) -> bool {
-        self.shape.as_ref().is_some_and(|t| t.closed || t.delayed)
+        self.shape.as_ref().is_some_and(|t| t.delayed)
     }
 
     /// Whether the record that opens next waits for its plan's delay
@@ -2707,8 +2839,17 @@ impl<'a> Records<'a> {
 
     /// Ends the open record without a plan.
     pub(super) fn end_plain(&mut self) {
+        let body = self.out.record_len();
         if self.out.end_record() {
             self.count += 1;
+            self.out.attribute_record(
+                std::mem::take(&mut self.record_own),
+                std::mem::take(&mut self.record_data),
+                std::mem::take(&mut self.record_control),
+                body,
+                std::mem::take(&mut self.extra_start),
+                std::mem::take(&mut self.extra_len),
+            );
         }
     }
 
@@ -2734,15 +2875,20 @@ impl<'a> Records<'a> {
         let i = usize::try_from(self.eliciting?).ok()?;
         Some(
             self.out
-                .record_ends()
+                .records()
                 .get(i)
-                .copied()
-                .unwrap_or_else(|| self.out.stream_len()),
+                .map_or_else(|| self.out.stream_len(), |record| record.end),
         )
     }
 
     fn size_width(&self) -> usize {
         self.out.size_width(self.max_record)
+    }
+
+    pub(super) fn note_own(&mut self, n: usize, data: bool, control: bool) {
+        self.record_own += u32::try_from(n).expect("bounded frame");
+        self.record_data |= data;
+        self.record_control |= control;
     }
 
     /// Stream data bytes written: the gate's room shrinks.
@@ -2757,15 +2903,35 @@ impl<'a> Records<'a> {
 
     /// Ends the open record, if any; the next frame starts a new one.
     pub(super) fn end_record(&mut self) {
+        self.end_shaped_layout(0);
+        self.end_plain();
+    }
+
+    pub(super) fn end_shaped_layout(&mut self, tail: usize) {
         if let Some(t) = &mut self.shape
             && self.out.in_record()
         {
-            let len = self.out.record_len();
-            let avail = self.max_record.saturating_sub(len).min(self.out.room());
+            let len = self.out.record_len() + tail;
+            let avail = self
+                .max_record
+                .saturating_sub(len)
+                .min(self.out.room().saturating_sub(tail));
             let pad = t.end_record(len, avail);
-            self.padding(pad);
+            self.shaping_padding(pad);
         }
-        self.end_plain();
+    }
+
+    pub(super) fn shaping_padding(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let start = self.out.record_len();
+        if self.extra_len == 0 {
+            self.extra_start = start;
+        }
+        debug_assert_eq!(start, self.extra_start + self.extra_len);
+        self.extra_len += len;
+        self.padding(len);
     }
 
     /// Makes room for `n` frame bytes in one record, closing the open one
@@ -2788,7 +2954,7 @@ impl<'a> Records<'a> {
         }
         if self.out.in_record() {
             let len = self.out.record_len() + n;
-            if len <= self.cap() && self.out.room() >= n && len <= self.frames_bound(true) {
+            if len <= self.cap() && self.out.room() >= n {
                 return true;
             }
             self.end_record();
@@ -2796,44 +2962,11 @@ impl<'a> Records<'a> {
                 return false;
             }
         }
-        if self.blocked() {
-            return false;
-        }
-        if self.out.room() < self.size_width() + n {
-            return false;
-        }
-        // A planned record opens only where the batch holds its target
-        // size: cut short by the batch's end, its PADDING would be
-        // clamped. The first record of a batch opens anyway (a batch
-        // smaller than the target could never send it).
-        if n > self.frames_bound(false) {
+        if self.out.room() < self.size_width() + n || self.blocked() {
             return false;
         }
         self.out.begin_record(self.max_record);
         true
-    }
-
-    /// The most frames bytes the open record (`open`) or the next one may
-    /// hold so that its plan's padded target fits the batch's room:
-    /// 0 when the next record's target does not fit, so
-    /// that it opens in the next batch; unbounded unshaped, and in an
-    /// empty batch (one smaller than the target could never send it).
-    fn frames_bound(&self, open: bool) -> usize {
-        let Some(t) = &self.shape else {
-            return usize::MAX;
-        };
-        if self.out.is_empty() && !open {
-            return usize::MAX;
-        }
-        let total = if open {
-            self.out.record_len() + self.out.room()
-        } else {
-            self.out.room().saturating_sub(self.size_width())
-        };
-        // An open record whose target never fitted (the batch's first)
-        // takes what the batch holds.
-        t.frames_bound(total)
-            .unwrap_or(if open { usize::MAX } else { 0 })
     }
 
     /// Opens a record of its own for one frame of `n` bytes, more than
@@ -2842,10 +2975,10 @@ impl<'a> Records<'a> {
     /// room left for it.
     pub(super) fn own_record(&mut self, n: usize) -> bool {
         self.end_record();
-        if self.closed() || self.blocked() {
-            return false;
-        }
-        if !self.out.is_empty() && self.out.room() < self.out.size_width(n) + n {
+        if self.closed()
+            || (!self.out.is_empty() && self.out.room() < self.out.size_width(n) + n)
+            || self.blocked()
+        {
             return false;
         }
         self.out.begin_record(n);
@@ -2867,10 +3000,22 @@ impl<'a> Records<'a> {
     }
 
     pub(super) fn try_frame(&mut self, f: &Frame<'_>) -> bool {
-        if !self.ensure(f.encoded_len()) {
+        self.try_frame_with_origin(f, true)
+    }
+
+    pub(super) fn try_repeated_frame(&mut self, f: &Frame<'_>) -> bool {
+        self.try_frame_with_origin(f, false)
+    }
+
+    pub(super) fn try_frame_with_origin(&mut self, f: &Frame<'_>, own: bool) -> bool {
+        let frame_len = f.encoded_len();
+        if !self.ensure(frame_len) {
             return false;
         }
         let _ = self.out.push_frame(f);
+        if own && semantic_control(f) {
+            self.note_own(frame_len, false, true);
+        }
         if matches!(f, Frame::QxPing(_)) {
             self.ping = true;
         }
@@ -2880,19 +3025,18 @@ impl<'a> Records<'a> {
                 response: false,
                 ..
             }) | Frame::Padding(_)
+                | Frame::DatagramAck(_)
         ) {
             self.activity = true;
         }
-        if !matches!(
-            f,
-            Frame::Padding(_) | Frame::PipeAck(_) | Frame::ConnectionClose(_)
-        ) {
+        if f.is_ack_eliciting() {
             self.elicit();
         }
         if !matches!(
             f,
             Frame::Padding(_)
                 | Frame::PipeAck(_)
+                | Frame::DatagramAck(_)
                 | Frame::MaxData(_)
                 | Frame::MaxStreamData(_)
                 | Frame::MaxStreams(_)
@@ -2915,70 +3059,69 @@ impl<'a> Records<'a> {
         true
     }
 
-    /// Data room for a STREAM frame. `min_of` gives the least data the
-    /// frame takes in a record that holds at most the data bytes it is
-    /// given (the cut of that record, which a shaper may set lower for the
-    /// next record than for the open one); `want` is the data the frame
-    /// would take. The frame stays in the open record when at least its
-    /// least data fit there, or `want` bytes do; otherwise it starts a new
-    /// record, its least data taken anew for that record. Returns the data
-    /// bytes that fit after a header of [`MAX_STREAM_HEADER`] bytes, and the
-    /// least data of the record they go in; `None` when the batch is full
-    /// and no record is open.
+    /// Data room for a STREAM frame, keeping an indivisible preamble whole.
+    /// Rate debt can come only from that preamble. The ordinary fragment
+    /// preference yields when a gate has already opened on a smaller quantum.
     fn stream_room(
         &mut self,
         min_of: impl Fn(usize) -> usize,
+        preamble: usize,
         want: usize,
     ) -> Option<(usize, usize)> {
-        let want = MAX_STREAM_HEADER + want;
         let mut cap = self.cap();
-        if self.data_held() || self.closed() {
+        let limits = |records: &Self, cap| {
+            let room = records
+                .shape
+                .as_ref()
+                .and_then(|t| t.room)
+                .map_or(usize::MAX, usize_sat);
+            let least = preamble.max(min_of(cap - MAX_STREAM_HEADER).min(room));
+            let preferred = least.max(want.min(MIN_FRAGMENT).min(room));
+            (
+                preamble.max(room).saturating_add(MAX_STREAM_HEADER),
+                least,
+                preferred,
+            )
+        };
+        if self.closed() || want > 0 && (self.data_held() || self.gate_out()) {
             return None;
         }
-        let mut least = min_of(cap.min(self.max_record) - MAX_STREAM_HEADER);
-        let mut min = MAX_STREAM_HEADER + least;
         if self.out.in_record() {
-            let mut left = cap
+            let (gate, least, preferred) = limits(self, cap);
+            let left = cap
                 .saturating_sub(self.out.record_len())
                 .min(self.out.room())
-                .min(
-                    self.frames_bound(true)
-                        .saturating_sub(self.out.record_len()),
-                );
-            if let Some(r) = self.shape.as_ref().and_then(|t| t.room) {
-                left = left.min(usize_sat(r).saturating_add(MAX_STREAM_HEADER).max(min));
-            }
-            if left >= min.max(want.min(MAX_STREAM_HEADER + MIN_FRAGMENT)) {
+                .min(gate);
+            if left >= MAX_STREAM_HEADER + preferred {
                 return Some((left - MAX_STREAM_HEADER, least));
             }
             self.end_record();
             cap = self.cap();
-            if self.data_held() || self.closed() {
+            if self.closed() || want > 0 && (self.data_held() || self.gate_out()) {
                 return None;
             }
-            least = min_of(cap.min(self.max_record) - MAX_STREAM_HEADER);
-            min = MAX_STREAM_HEADER + least;
         }
-        let room = self.out.room().saturating_sub(self.size_width());
-        let mut fits = room
-            .min(cap.max(min).min(self.max_record))
-            .min(self.frames_bound(false));
-        if let Some(r) = self.shape.as_ref().and_then(|t| t.room) {
-            fits = fits.min(usize_sat(r).saturating_add(MAX_STREAM_HEADER).max(min));
-        }
-        if fits < min {
-            // The batch is full: no record is open, so nothing may be
-            // written (even a frame without data, such as a lone FIN).
+        let (gate, least, _) = limits(self, cap);
+        let fits = self
+            .out
+            .room()
+            .saturating_sub(self.size_width())
+            .min(cap)
+            .min(gate);
+        if fits < MAX_STREAM_HEADER + least {
             return None;
-        }
-        if min > cap
-            && cap < self.max_record
-            && let Some(t) = self.shape.as_mut()
-        {
-            t.count_clamped();
         }
         self.out.begin_record(self.max_record);
         Some((fits - MAX_STREAM_HEADER, least))
+    }
+
+    fn original_stream_header(&mut self, h: &StreamHeader, payload: usize) {
+        if payload > 0 {
+            self.note_own(payload, true, false);
+        } else if h.fin {
+            self.note_own(h.encoded_len(), false, true);
+        }
+        self.stream_header(h);
     }
 
     fn stream_header(&mut self, h: &StreamHeader) {
@@ -2989,19 +3132,59 @@ impl<'a> Records<'a> {
         self.out.push_with(n, |dst| h.encode(dst).unwrap_or(0));
     }
 
-    /// A datagram or stream payload: copied when small, referenced
-    /// otherwise.
-    pub(super) fn payload(&mut self, b: Bytes) {
-        if b.len() < COPY_THRESHOLD {
-            self.out.push_bytes(&b);
-        } else {
-            self.out.push_shared(b);
-        }
+    /// Raw datagrams contain externally owned views of unknown capacity.
+    pub(super) fn payload(&mut self, b: &[u8]) {
+        self.out.push_bytes(b);
     }
 
     /// Closes the open record; returns the number of records written.
-    pub(super) fn finish(mut self) -> u64 {
+    pub(super) fn finish(&mut self) -> u64 {
         self.end_record();
         self.count
+    }
+}
+
+#[cfg(all(test, any(feature = "tokio", feature = "blocking"), not(loom)))]
+mod receive_credit_tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_budget_does_not_lose_the_max_data_request() {
+        use crate::proto::memory::Ledger;
+        use crate::proto::session::{Config, UniCredit, memory, recv_store::ReceiveStore};
+
+        let config = Config {
+            initial_connection_receive_window: memory::MIN_INITIAL,
+            max_incoming_streams: 0,
+            max_incoming_uni_streams: UniCredit::Limit(0),
+            ..Config::default()
+        };
+        let initial = config.initial_connection_receive_window;
+        let half = 100;
+        let delta = 2 * half;
+        let extra = ReceiveStore::POSITION_COST * delta;
+        let ledger = Ledger::new(
+            Some(memory::minimum_listener_admission(&config) + extra),
+            None,
+        );
+        let hold = ledger.reserve(extra / 2).unwrap();
+        let now = Instant::now();
+        let mut core =
+            SessionCore::new_in(config.into(), Role::Client, None, now, Some(ledger), 0).unwrap();
+        core.streams.set_session_window(initial + delta);
+        core.streams.data_blocked_received(initial);
+        assert!(core.max_data_ready());
+
+        let mut transmit = TransmitBuf::default();
+        core.write_control(&mut Records::new(&mut transmit, 8192), now);
+        assert_eq!(core.streams.recv_flow().limit_sent, initial + half);
+        assert!(core.streams.recv_flow().update_pending);
+        assert!(!core.max_data_ready());
+
+        drop(hold);
+        assert!(core.max_data_ready());
+        core.write_control(&mut Records::new(&mut transmit, 8192), now);
+        assert_eq!(core.streams.recv_flow().limit_sent, initial + delta);
+        assert!(!core.streams.recv_flow().update_pending);
     }
 }

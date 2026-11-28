@@ -1,4 +1,0 @@
-{"machines": [
- {"start": 0, "states": [{"record": {"max_len": {"t": [[1, 200, 1400]]}, "pad": {"t": [[1, 0, 64]]}, "delay": {"t": [[1, 0, 2000]]}}}]},
- {"start": 0, "states": [{"enter": [{"op": "inject", "len": {"t": [[1, 50, 300]]}, "after": 10000}], "next": [{"on": "injected", "to": 0}]}]}
-]}

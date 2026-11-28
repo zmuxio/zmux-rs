@@ -3,10 +3,13 @@
 //! larger payloads that are referenced without copying.
 
 use std::io::IoSlice;
+use std::sync::{Mutex, PoisonError};
 
-use bytes::Bytes;
+use crate::util::CapacityPool;
+
+use super::Chunk;
 #[cfg(all(feature = "tokio", not(loom)))]
-use bytes::BytesMut;
+use super::ChunkBuffer;
 
 use crate::proto::codec::Writer;
 use crate::proto::error::EncodeError;
@@ -26,7 +29,7 @@ enum Part {
     /// Bytes of `buf`.
     Copied { start: usize, end: usize },
     /// A referenced payload.
-    Shared(Bytes),
+    Shared(Chunk),
 }
 
 /// A piece of a batch for a carrier that takes owned buffers
@@ -37,7 +40,7 @@ pub enum Piece<'a> {
     /// payloads).
     Copied(&'a [u8]),
     /// A payload the batch references, shared without copying.
-    Shared(Bytes),
+    Shared(Chunk),
 }
 
 /// Where a walk of a batch by [`TransmitBuf::take_pieces`] ended, so that
@@ -58,9 +61,72 @@ pub struct PieceCursor {
 /// The first allocation of the copied bytes of a batch.
 const FIRST_COPY: usize = 1024;
 
+/// Carrier progress at one immutable record boundary, using byte-stream offsets.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RecordWrite {
+    pub(crate) end: u64,
+    pub(super) own: u32,
+    pub(super) data: bool,
+    pub(super) control: bool,
+    body: u32,
+    extra_start: u32,
+    extra_len: u32,
+}
+
+impl RecordWrite {
+    pub(super) fn extra(self, messages: bool) -> u64 {
+        u64::from(self.extra_len) + self.extra_header(messages)
+    }
+
+    fn extra_header(self, messages: bool) -> u64 {
+        if messages || self.extra_len == 0 {
+            return 0;
+        }
+        let base = self.body - self.extra_len;
+        let base_size = if base == 0 {
+            0
+        } else {
+            varint::len(u64::from(base))
+        };
+        (varint::len(u64::from(self.body)) - base_size) as u64
+    }
+
+    pub(super) fn progress(self, messages: bool, before: u64, after: u64) -> (u64, u64) {
+        let head = varint::len(u64::from(self.body)) as u64;
+        let extra_head = self.extra_header(messages);
+        let pad_at = head + u64::from(self.extra_start);
+        let count = |prefix: u64| {
+            let growth = prefix.min(head).saturating_sub(head - extra_head);
+            prefix.saturating_sub(pad_at).min(u64::from(self.extra_len)) + growth
+        };
+        let extra = count(after) - count(before);
+        let synthetic = if messages {
+            after.min(head) - before.min(head)
+        } else {
+            0
+        };
+        (after - before - synthetic - extra, extra)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CoverWrite {
+    pub(super) start: u64,
+    pub(super) len: usize,
+    pub(super) request_id: u64,
+}
+
+#[derive(Debug)]
+pub(super) struct ShapeWrite {
+    pub(super) generation: Option<u64>,
+    pub(super) cover: Option<CoverWrite>,
+    pub(super) provisional: Option<u32>,
+    pub(super) dispatch: super::shape_ledger::Dispatch,
+}
+
 /// The storage of a small batch (a quiet pipe's record or two): its copied
 /// bytes, parts and record ends.
-type SmallStorage = (Vec<u8>, Vec<Part>, Vec<u64>);
+type SmallStorage = (Vec<u8>, Vec<Part>, Vec<RecordWrite>);
 
 /// Small batch storages a thread keeps for the next small batches: a quiet
 /// pipe frees its storage once its batch is written (no pipe holds one while
@@ -104,11 +170,40 @@ pub struct TransmitBuf {
     messages: Vec<usize>,
     /// The batch's length in byte-stream form at the end of each record
     /// (positions count messages in that form).
-    record_ends: Vec<u64>,
+    #[cfg(all(feature = "tokio", not(loom)))]
+    handoffs: std::collections::VecDeque<(
+        usize,
+        super::splice_handoff::HandoffSpan,
+        super::splice_handoff::Medium,
+    )>,
+    records: Vec<RecordWrite>,
+    pub(super) shape_write: Option<ShapeWrite>,
+    /// Previously reported byte-stream prefix.
+    pub(super) reported: u64,
+    pub(super) finalized: bool,
     stream_len: u64,
     /// Changes with every change of the parts, for [`PieceCursor`]
     /// (starts at 1: a default cursor is never current).
     version: u64,
+}
+
+// Larger batches return only their empty descriptor array here. Small
+// batches continue to reuse their complete storage together.
+static PART_STORAGE: Mutex<CapacityPool<Vec<Part>>> = Mutex::new(CapacityPool::new(DEFAULT_BATCH));
+
+fn give_parts(mut parts: Vec<Part>) {
+    parts.clear();
+    let bytes = parts.capacity() * size_of::<Part>();
+    PART_STORAGE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .give(bytes, parts);
+}
+
+impl Drop for TransmitBuf {
+    fn drop(&mut self) {
+        give_parts(std::mem::take(&mut self.parts));
+    }
 }
 
 impl Default for TransmitBuf {
@@ -131,7 +226,12 @@ impl TransmitBuf {
             record: None,
             framing: Framing::ByteStream,
             messages: Vec::new(),
-            record_ends: Vec::new(),
+            records: Vec::new(),
+            #[cfg(all(feature = "tokio", not(loom)))]
+            handoffs: std::collections::VecDeque::new(),
+            shape_write: None,
+            reported: 0,
+            finalized: false,
             stream_len: 0,
             version: 1,
         }
@@ -184,12 +284,21 @@ impl TransmitBuf {
 
     /// Empties the batch, releasing referenced payloads.
     pub fn clear(&mut self) {
+        self.clear_io();
+        self.records.clear();
+        #[cfg(all(feature = "tokio", not(loom)))]
+        self.handoffs.clear();
+        self.shape_write = None;
+        self.stream_len = 0;
+        self.reported = 0;
+        self.finalized = false;
+    }
+
+    pub(crate) fn clear_io(&mut self) {
         self.version += 1;
         self.buf.clear();
         self.parts.clear();
         self.messages.clear();
-        self.record_ends.clear();
-        self.stream_len = 0;
         self.len = 0;
         self.record = None;
     }
@@ -201,9 +310,14 @@ impl TransmitBuf {
         self.stream_len
     }
 
-    /// The byte-stream length at the end of each record of the batch.
-    pub(crate) fn record_ends(&self) -> &[u64] {
-        &self.record_ends
+    /// Record boundaries and protocol-owned byte attribution.
+    pub(crate) fn records(&self) -> &[RecordWrite] {
+        &self.records
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn has_committed_cover(&self) -> bool {
+        self.shape_write.as_ref().is_some_and(|s| s.cover.is_some())
     }
 
     /// On a message-framed pipe, the length of each
@@ -239,6 +353,7 @@ impl TransmitBuf {
         self.buf.capacity()
             + self.parts.capacity() * size_of::<Part>()
             + self.messages.capacity() * size_of::<usize>()
+            + self.records.capacity() * size_of::<RecordWrite>()
     }
 
     /// Whether the batch's storage is that of a small batch, which
@@ -255,7 +370,7 @@ impl TransmitBuf {
         self.clear();
         let buf = std::mem::take(&mut self.buf);
         let parts = std::mem::take(&mut self.parts);
-        let ends = std::mem::take(&mut self.record_ends);
+        let ends = std::mem::take(&mut self.records);
         self.messages = Vec::new();
         if buf.capacity() > 0 && buf.capacity() <= FIRST_COPY && parts.capacity() <= SMALL_PARTS {
             // The thread's own first, then the shared ones; a thread being
@@ -274,6 +389,8 @@ impl TransmitBuf {
             {
                 shared.push(spare);
             }
+        } else {
+            give_parts(parts);
         }
     }
 
@@ -297,8 +414,8 @@ impl TransmitBuf {
                 if self.parts.capacity() == 0 {
                     self.parts = parts;
                 }
-                if self.record_ends.capacity() == 0 {
-                    self.record_ends = ends;
+                if self.records.capacity() == 0 {
+                    self.records = ends;
                 }
                 if self.buf.capacity() >= total {
                     return;
@@ -364,7 +481,7 @@ impl TransmitBuf {
 
     /// Hands at most `max` bytes of the batch from byte `offset` on to
     /// `take`, piece by piece: built bytes as slices, referenced payloads
-    /// as shared [`Bytes`] without copying (for a carrier that takes owned
+    /// as shared [`Chunk`] without copying (for a carrier that takes owned
     /// buffers, such as a stream of another session). `take` returns the
     /// bytes of the piece it took; a piece taken in part ends the walk.
     /// Returns the bytes taken. The walk starts where `cursor` says the
@@ -431,9 +548,9 @@ impl TransmitBuf {
         offset: usize,
         max: usize,
         whole: bool,
-        out: &mut Vec<Bytes>,
-        scratch: &mut BytesMut,
-    ) -> usize {
+        out: &mut Vec<Chunk>,
+        scratch: &mut ChunkBuffer,
+    ) -> Option<usize> {
         // The bytes this call copies, reserved at once: the buffer's own
         // room when what the carriers took from it was released, else one
         // allocation of just that size, so that a carrier holding buffers
@@ -455,35 +572,35 @@ impl TransmitBuf {
         if let Some(b) = single.filter(|_| pieces == 1) {
             *cursor = probe;
             out.push(b);
-            return n;
+            return Some(n);
         }
         if whole {
             copied = n;
         }
-        *cursor = start;
-        debug_assert!(scratch.is_empty());
-        if !scratch.try_reclaim(copied) {
-            // Still referenced: a new buffer of this call's size (reserve
-            // would keep the size of the first one).
-            *scratch = BytesMut::with_capacity(copied);
+        if !scratch.prepare(copied) {
+            return None;
         }
+        *cursor = start;
+        debug_assert!(scratch.bytes.is_empty());
         let n = self.walk(cursor, offset, max, |i, skip, n| {
             let p = &self.parts[i];
             match p {
                 Part::Shared(b) if !whole => out.push(b.slice(skip..skip + n)),
                 _ => {
-                    scratch.extend_from_slice(&self.part_bytes(p)[skip..skip + n]);
+                    scratch
+                        .bytes
+                        .extend_from_slice(&self.part_bytes(p)[skip..skip + n]);
                     if !whole {
-                        out.push(scratch.split().freeze());
+                        out.push(scratch.publish());
                     }
                 }
             }
             n
         });
-        if whole && !scratch.is_empty() {
-            out.push(scratch.split().freeze());
+        if whole && !scratch.bytes.is_empty() {
+            out.push(scratch.publish());
         }
-        n
+        Some(n)
     }
 
     /// The bytes of part `p`.
@@ -601,7 +718,7 @@ impl TransmitBuf {
         }
         self.reserve(start + width);
         self.buf.resize(start + width, 0);
-        self.parts.push(Part::Copied {
+        self.push_part(Part::Copied {
             start,
             end: start + width,
         });
@@ -625,7 +742,10 @@ impl TransmitBuf {
         }
         let size_len = varint::len(body as u64);
         self.stream_len += (size_len + body) as u64;
-        self.record_ends.push(self.stream_len);
+        self.records.push(RecordWrite {
+            end: self.stream_len,
+            ..RecordWrite::default()
+        });
         if width == 0 {
             self.messages.push(body);
             return true;
@@ -640,6 +760,24 @@ impl TransmitBuf {
         true
     }
 
+    pub(super) fn attribute_record(
+        &mut self,
+        own: u32,
+        data: bool,
+        control: bool,
+        body: usize,
+        extra_start: usize,
+        extra_len: usize,
+    ) {
+        let record = self.records.last_mut().expect("closed record");
+        record.own = own;
+        record.data = data;
+        record.control = control;
+        record.body = u32::try_from(body).expect("bounded record");
+        record.extra_start = u32::try_from(extra_start).expect("bounded record");
+        record.extra_len = u32::try_from(extra_len).expect("bounded record");
+    }
+
     /// Extends the last copied part, or starts one, and returns the slice
     /// to fill.
     #[inline]
@@ -650,7 +788,7 @@ impl TransmitBuf {
         self.buf.resize(start + n, 0);
         match self.parts.last_mut() {
             Some(Part::Copied { end, .. }) if *end == start => *end = start + n,
-            _ => self.parts.push(Part::Copied {
+            _ => self.push_part(Part::Copied {
                 start,
                 end: start + n,
             }),
@@ -679,11 +817,64 @@ impl TransmitBuf {
         debug_assert_eq!(written, n);
     }
 
+    #[inline]
+    fn push_part(&mut self, part: Part) {
+        if self.parts.len() == self.parts.capacity() {
+            self.grow_parts();
+        }
+        self.parts.push(part);
+    }
+
+    #[cold]
+    fn grow_parts(&mut self) {
+        let capacity = self.parts.capacity().saturating_mul(2).max(4);
+        let bytes = capacity * size_of::<Part>();
+        let saved = PART_STORAGE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(bytes..=bytes);
+        let mut parts = saved.unwrap_or_else(|| Vec::with_capacity(capacity));
+        parts.append(&mut self.parts);
+        give_parts(std::mem::replace(&mut self.parts, parts));
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(super) fn track_handoff(
+        &mut self,
+        handoff: super::splice_handoff::HandoffSpan,
+        medium: super::splice_handoff::Medium,
+    ) {
+        debug_assert!(self.record.is_some());
+        self.handoffs
+            .push_back((self.records.len(), handoff, medium));
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(super) fn settle_handoffs(&mut self, accepted: u64, final_result: bool) {
+        while self.handoffs.front().is_some_and(|(index, _, _)| {
+            self.records
+                .get(*index)
+                .is_some_and(|record| record.end <= accepted)
+        }) {
+            let (_, handoff, medium) = self.handoffs.pop_front().expect("proved handoff");
+            handoff.handed_off(medium);
+        }
+        if final_result {
+            self.handoffs.clear();
+        }
+    }
+
     /// Appends a referenced payload.
-    pub(crate) fn push_shared(&mut self, payload: Bytes) {
+    pub(crate) fn push_shared(&mut self, payload: Chunk) {
+        #[cfg(all(feature = "tokio", not(loom)))]
+        let mut payload = payload;
+        #[cfg(all(feature = "tokio", not(loom)))]
+        if let Some(handoff) = payload.handoff.take() {
+            self.track_handoff(handoff, super::splice_handoff::Medium::Stream);
+        }
         self.version += 1;
         self.len += payload.len();
-        self.parts.push(Part::Shared(payload));
+        self.push_part(Part::Shared(payload));
     }
 }
 
@@ -695,7 +886,7 @@ mod tests {
         let mut b = TransmitBuf::default();
         for i in 0..20u8 {
             b.push_bytes(&[seed ^ i; 7]);
-            b.push_shared(Bytes::from(vec![seed.wrapping_add(i); 5000]));
+            b.push_shared(Chunk::from(vec![seed.wrapping_add(i); 5000]));
         }
         b
     }

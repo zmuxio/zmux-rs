@@ -4,7 +4,6 @@
 
 use std::time::{Duration, Instant};
 
-use zmux::helpers::PipePool;
 use zmux::proto::session::WindowIncrease;
 use zmux::test_hooks::resources;
 use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, Session};
@@ -100,7 +99,7 @@ fn tasks_and_threads_end_with_their_sessions() {
             }
         }
         let mut c = Config::default();
-        c.max_pipes = 4;
+        c.session_policy.limits.steady_attachments = 4;
         c.pipe_auth = PipeAuth::psk(*b"leaks-test-psk--0123456789abcdef").with_end_to_end();
         let listener = Listener::new(c.clone(), ListenerConfig::default())
             .expect("valid listener configuration");
@@ -122,26 +121,23 @@ fn tasks_and_threads_end_with_their_sessions() {
         };
         for i in 0..3 {
             let client = Session::connect(carrier(), c.clone()).await.unwrap();
-            let dial = carrier.clone();
-            let handle = zmux::helpers::maintain_pipes(
-                &client,
-                PipePool::new(2, move |_| std::future::ready(Ok(dial()))),
-            )
-            .expect("valid pool");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let controller = zmux::SessionController::new(zmux::ControllerOptions::new(
+                format!("leak-test-{i}"),
+                Vec::new(),
+            ))
+            .unwrap();
+            let handle = controller
+                .manage(&client, zmux::SessionTarget::default())
+                .unwrap();
+            let mut snapshots = handle.subscribe();
+            snapshots.changed().await.unwrap();
             assert!(resources().maintainers > maintainers);
             match i {
-                0 => drop(handle),
-                1 => handle.stop(),
-                _ => {
-                    client.close().await;
-                    drop(client);
-                    while !handle.is_finished() {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                    continue;
-                }
+                0 => controller.close(),
+                1 => handle.release().unwrap(),
+                _ => client.close().await,
             }
+            handle.done().await;
             client.close().await;
         }
         drop(listener);

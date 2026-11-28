@@ -18,7 +18,7 @@ const LIMIT: Duration = Duration::from_secs(10);
 
 fn config() -> Config {
     let mut config = Config::default();
-    config.max_pipes = 8;
+    config.session_policy.limits.steady_attachments = 8;
     config.pipe_auth =
         PipeAuth::psk(b"a pre-shared key, 16 bytes or more".to_vec()).with_end_to_end();
     config
@@ -74,7 +74,7 @@ async fn the_transform_sees_every_carrier_and_the_value_travels() {
         // A join: its own value, the session's unchanged.
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let pipe = client
-            .begin_add_pipe(PipeIo::from_tcp(tcp), PipeOptions::default())
+            .test_begin_join(PipeIo::from_tcp(tcp), PipeOptions::default())
             .unwrap();
         pipe.joined().await.unwrap();
         eventually(|| server.pipes().len() == 2).await;
@@ -192,7 +192,7 @@ async fn an_unknown_join_gets_no_answer() {
         let handled =
             tokio::spawn(async move { l.handle_pipe(PipeIo::new(tee), PipeHint::default()).await });
         let pipe = client
-            .begin_add_pipe(PipeIo::new(ours), PipeOptions::default())
+            .test_begin_join(PipeIo::new(ours), PipeOptions::default())
             .unwrap();
         let joined = tokio::time::timeout(Duration::from_secs(3), pipe.joined()).await;
         assert!(!matches!(joined, Ok(Ok(()))));

@@ -13,43 +13,23 @@ mod share;
 mod spare;
 
 use std::collections::{HashMap, VecDeque};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::BuildHasherDefault;
 
 use super::CoreEvent;
 use super::stream::{self, ChunkPool, Offer, RecvPart, SendPart, Slab, Stream, StreamKey};
 use super::{config, di};
+use crate::util::IdHasher;
 
+use flow::RemoteStage;
 pub(super) use flow::{LocalDir, RecvFlow, RemoteDir, SendFlow, Stopped};
 pub(super) use share::{SHARE_FLOOR, SendBuffer};
 use spare::Spare;
-
-/// A multiplicative hasher for stream identifiers.
-#[derive(Default, Clone, Copy)]
-struct IdHasher(u64);
-
-impl Hasher for IdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        }
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.0 = (n ^ (n >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    }
-}
 
 type IdMap = HashMap<u64, StreamKey, BuildHasherDefault<IdHasher>>;
 
 /// The stream layer's state.
 #[derive(Debug)]
 pub(crate) struct Streams {
-    /// The limit the first accept moves staged unidirectional credit to.
-    staged_target: u64,
     /// Released chunks of the send buffers, shared by the streams.
     chunks: ChunkPool,
     /// Streams that owe a `MAX_STREAM_DATA` update.
@@ -124,9 +104,13 @@ impl Streams {
         let mut chunks = ChunkPool::default();
         chunks.set_limit(send_buffer);
         let mut remote_dirs = stream_limits.map(RemoteDir::new);
-        remote_dirs[super::UNI].staged = staged_uni;
+        if staged_uni {
+            let uni = &mut remote_dirs[super::UNI];
+            uni.stage = RemoteStage::WaitingForAccept;
+            uni.target = config::STAGED_UNI_STREAMS.1;
+            uni.floor = uni.target;
+        }
         Self {
-            staged_target: config::STAGED_UNI_STREAMS.1,
             chunks,
             stream_updates: 0,
             slab: Slab::default(),
@@ -199,13 +183,6 @@ impl Streams {
         key: StreamKey,
     ) -> Option<(&mut Stream, &mut ChunkPool)> {
         Some((self.slab.get_mut(key)?, &mut self.chunks))
-    }
-
-    /// The stream for change, with the spare buffers its receive buffer
-    /// takes an emptied buffer from or gives one up to.
-    #[inline]
-    pub(super) fn stream_and_spare(&mut self, key: StreamKey) -> Option<(&mut Stream, &mut Spare)> {
-        Some((self.slab.get_mut(key)?, &mut self.spare))
     }
 
     /// Notes the stream as changed for the multipath ledger.
@@ -301,8 +278,7 @@ impl Streams {
     /// Control frames of the stream layer are pending: credit updates,
     /// BLOCKED reports, or frames of streams.
     pub(super) fn control_pending(&self) -> bool {
-        self.recv_flow.update_pending
-            || self.recv_flow.resend
+        self.recv_flow.resend
             || self.send_flow.blocked_pending
             || self.send_flow.blocked_resend
             || self
@@ -328,22 +304,28 @@ impl Streams {
                 .count();
             debug_assert_eq!(owed, self.stream_updates, "owed stream updates");
         }
-        self.recv_flow.update_pending
-            || self.remote_dirs.iter().any(|d| d.update_pending)
-            || self.stream_updates > 0
+        self.remote_dirs.iter().any(|d| d.update_pending) || self.stream_updates > 0
     }
 
     // ---- creating and discarding streams -------------------------------------
 
+    pub(super) fn set_write_domain(
+        &mut self,
+        domain: Option<std::sync::Arc<crate::proto::memory::Ledger>>,
+    ) {
+        self.chunks.domain = domain;
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(super) fn release_idle_write_roots(&mut self) {
+        self.slab.release_idle_sends();
+        self.chunks.clear_idle();
+        self.spare.release_send();
+    }
+
     /// A sending part with stream credit `max_data`, on a spare buffer.
     pub(super) fn new_send_part(&mut self, max_data: u64) -> SendPart {
         SendPart::with_buf(max_data, self.spare.send())
-    }
-
-    /// A receiving part with window `window` (growing up to `max_window`),
-    /// on a spare buffer.
-    pub(super) fn new_recv_part(&mut self, window: u64, max_window: u64) -> RecvPart {
-        RecvPart::with_buf(window, max_window, self.spare.recv())
     }
 
     /// Takes stream credit for a new local stream of type `d`: `false`
@@ -469,7 +451,7 @@ impl Streams {
         }
         if let Some(mut recv) = s.recv {
             self.spare.put_tuner(recv.tuner.take());
-            self.spare.put_recv(recv.buf.into_storage());
+            debug_assert_eq!(recv.held(), 0);
         }
     }
 
@@ -549,15 +531,48 @@ impl Streams {
 
     // ---- peer streams --------------------------------------------------------
 
+    pub(super) fn fund_peer_streams_in_batches(&mut self, targets: [u64; 2]) {
+        self.reuse_receive_credit_on_consumption();
+        for (remote, target) in self.remote_dirs.iter_mut().zip(targets) {
+            remote.floor = remote.initial;
+            remote.target = target;
+        }
+    }
+
+    pub(super) fn committed_peer_direction(&self, d: usize) -> u64 {
+        let r = &self.remote_dirs[d];
+        let issued = r.limit_sent.saturating_sub(r.discarded);
+        if r.goaway_sent.is_some() || r.limit_sent == config::MAX_STREAM_CREDIT {
+            return issued;
+        }
+        issued.max(r.initial).max(r.floor)
+    }
+
+    pub(super) fn peer_stream_growth(&mut self, d: usize, limit: u64) {
+        let remote = &mut self.remote_dirs[d];
+        if limit > remote.initial {
+            remote.initial = limit;
+            remote.update_pending = true;
+        }
+        if remote.activating() && remote.initial == remote.target {
+            remote.stage = RemoteStage::Active;
+            remote.floor = remote.target;
+        }
+    }
+
     /// The application asks for a peer stream of type `d` for the first
     /// time: staged credit is granted (when `grant`) and no longer staged.
     pub(super) fn unstage(&mut self, d: usize, grant: bool) {
         let r = &mut self.remote_dirs[d];
-        if r.staged {
-            r.staged = false;
-            if grant {
-                r.initial = self.staged_target;
+        debug_assert!(r.staged());
+        r.stage = RemoteStage::Active;
+        if grant {
+            if r.initial < r.floor {
+                r.initial = r.floor;
                 r.update_pending = true;
+            }
+            if r.initial < r.target {
+                r.stage = RemoteStage::Funding;
             }
         }
     }
@@ -592,7 +607,7 @@ impl Streams {
             return;
         };
         let recv = s.recv.as_ref();
-        if preamble && recv.is_none_or(|r| r.preamble_size.is_none()) {
+        if preamble && recv.is_none_or(|r| r.preamble_size().is_none()) {
             if recv.is_some_and(|r| r.cold().stopped.is_some()) {
                 s.offer = Offer::Rejected;
             }
@@ -609,23 +624,19 @@ impl Streams {
         }
     }
 
-    /// Raises the concurrency of the peer's streams of type `d` to `n`; owes
-    /// `MAX_STREAMS` when `grant`. It only grows; `false` when unchanged.
-    pub(in super::super) fn raise_remote(&mut self, d: usize, n: u64, grant: bool) -> bool {
+    /// Raises the concurrency of the peer's streams of type `d` to `n`.
+    pub(in super::super) fn raise_remote(&mut self, d: usize, n: u64) {
         let r = &mut self.remote_dirs[d];
-        if r.staged {
-            if n <= self.staged_target {
-                return false;
-            }
-            self.staged_target = n;
-            return true;
+        if n <= r.target {
+            return;
         }
-        if n <= r.initial {
-            return false;
+        r.target = n;
+        r.floor = n;
+        if !r.staged() {
+            r.initial = n;
+            r.stage = RemoteStage::Active;
+            r.update_pending = true;
         }
-        r.initial = n;
-        r.update_pending |= grant;
-        true
     }
 
     /// A peer stream of type `d` was discarded: its count returns to the
@@ -635,6 +646,10 @@ impl Streams {
         let r = &mut self.remote_dirs[d];
         r.discarded += 1;
         if raise {
+            let live = r.opened - r.discarded;
+            if !r.activating() && r.initial > r.floor && live < r.initial.div_ceil(2) {
+                r.initial -= 1;
+            }
             r.update_pending = true;
         }
     }
@@ -693,21 +708,30 @@ impl Streams {
     }
 }
 
+/// A ready stream and its turn among data of the same urgency.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadyStream {
+    pub(super) key: StreamKey,
+    pub(super) turn: u64,
+}
+
 /// The sending parts with data to send, by urgency (8 levels), in round
 /// robin within a level.
 #[derive(Debug, Default)]
 pub(crate) struct SendQueue {
     /// Allocated with the first part queued: a session that never sends
     /// holds none.
-    levels: Option<Box<[VecDeque<StreamKey>; 8]>>,
+    levels: Option<Box<[VecDeque<ReadyStream>; 8]>>,
     len: usize,
+    /// Issues turns in the shared stream and datagram send order.
+    last_turn: u64,
     /// Turns served at strict priority since a lower level was last
     /// served (anti-starvation).
     turns: u32,
 }
 
 /// The levels of a queue that never held a part.
-static NO_LEVELS: [VecDeque<StreamKey>; 8] = [const { VecDeque::new() }; 8];
+static NO_LEVELS: [VecDeque<ReadyStream>; 8] = [const { VecDeque::new() }; 8];
 
 impl SendQueue {
     /// Queued parts, all levels.
@@ -720,26 +744,27 @@ impl SendQueue {
     }
 
     /// The queue of urgency `u`.
-    pub(super) fn level(&self, u: usize) -> &VecDeque<StreamKey> {
+    pub(super) fn level(&self, u: usize) -> &VecDeque<ReadyStream> {
         &self.levels()[u]
     }
 
     /// The queues, by urgency.
-    pub(super) fn levels(&self) -> &[VecDeque<StreamKey>; 8] {
+    pub(super) fn levels(&self) -> &[VecDeque<ReadyStream>; 8] {
         self.levels.as_deref().unwrap_or(&NO_LEVELS)
     }
 
     /// Every queued part, by urgency and queue order.
     pub(super) fn keys(&self) -> impl Iterator<Item = StreamKey> + '_ {
-        self.levels().iter().flatten().copied()
+        self.levels().iter().flatten().map(|ready| ready.key)
     }
 
     /// Moves the part at index `i` of level `u` to the back of its level.
-    fn move_back(&mut self, u: usize, i: usize) {
+    fn move_back(&mut self, u: usize, i: usize, turn: u64) {
         if let Some(q) = self.levels.as_deref_mut().map(|l| &mut l[u])
-            && let Some(k) = q.remove(i)
+            && let Some(mut ready) = q.remove(i)
         {
-            q.push_back(k);
+            ready.turn = turn;
+            q.push_back(ready);
         }
     }
 
@@ -757,32 +782,37 @@ impl SendQueue {
         } else {
             first
         };
-        all[u].front().map(|&k| (u, k))
+        all[u].front().map(|ready| (u, ready.key))
     }
 
     /// Heap bytes held.
     fn heap_bytes(&self) -> usize {
         self.levels.as_ref().map_or(0, |l| {
-            size_of::<[VecDeque<StreamKey>; 8]>()
+            size_of::<[VecDeque<ReadyStream>; 8]>()
                 + l.iter()
-                    .map(|q| q.capacity() * size_of::<StreamKey>())
+                    .map(|q| q.capacity() * size_of::<ReadyStream>())
                     .sum::<usize>()
         })
     }
 
-    fn push(&mut self, u: usize, key: StreamKey) {
-        self.levels.get_or_insert_with(Box::default)[u].push_back(key);
+    fn push(&mut self, u: usize, ready: ReadyStream) {
+        self.levels.get_or_insert_with(Box::default)[u].push_back(ready);
         self.len += 1;
     }
 
     fn remove_at(&mut self, u: usize, i: usize) -> Option<StreamKey> {
         let k = self.levels.as_deref_mut()?[u].remove(i)?;
         self.len -= 1;
-        Some(k)
+        Some(k.key)
     }
 }
 
 impl Streams {
+    pub(super) fn next_send_turn(&mut self) -> u64 {
+        self.sched.last_turn += 1;
+        self.sched.last_turn
+    }
+
     /// The scheduling queues.
     #[inline]
     pub(super) fn queue(&self) -> &SendQueue {
@@ -810,19 +840,21 @@ impl Streams {
     /// Moves the part at index `i` of level `u` to the back of its level.
     #[inline]
     pub(super) fn move_back(&mut self, u: usize, i: usize) {
-        self.sched.move_back(u, i);
+        let turn = self.next_send_turn();
+        self.sched.move_back(u, i, turn);
     }
 
     /// Queues the sending part of `key` at urgency `u` (it has something
     /// to send and is not queued).
     pub(super) fn enqueue(&mut self, key: StreamKey, u: u8) {
+        let turn = self.next_send_turn();
         let Some(send) = self.slab.get_mut(key).and_then(|s| s.send.as_mut()) else {
             debug_assert!(false, "only a sending part is queued");
             return;
         };
         debug_assert!(send.queued.is_none());
         send.queued = Some(u);
-        self.sched.push(usize::from(u), key);
+        self.sched.push(usize::from(u), ReadyStream { key, turn });
         self.session_stalled = false;
     }
 
@@ -835,7 +867,11 @@ impl Streams {
 
     /// Takes `key` out of level `u`, wherever it is in it.
     pub(super) fn dequeue(&mut self, u: usize, key: StreamKey) {
-        let at = self.sched.level(u).iter().position(|&k| k == key);
+        let at = self
+            .sched
+            .level(u)
+            .iter()
+            .position(|ready| ready.key == key);
         debug_assert!(at.is_some(), "a queued part is in the level it names");
         if let Some(i) = at {
             self.sched.remove_at(u, i);

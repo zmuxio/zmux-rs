@@ -27,7 +27,7 @@ const MIB: usize = 1 << 20;
 
 fn config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"input-pending---0123456789abcdef").with_end_to_end();
     c.scheduler = Scheduler::SpreadEta;
     c
@@ -111,12 +111,12 @@ async fn bounded_share(pipes: usize, tcp: bool) -> f64 {
         let (a, b) = carriers(tcp, Some(&tl)).await;
         let l = listener.clone();
         tokio::spawn(async move { l.handle_pipe(b, PipeHint::default()).await });
-        client.begin_add_pipe(a, PipeOptions::default()).unwrap();
+        client.test_begin_join(a, PipeOptions::default()).unwrap();
     }
     let total = 64 * MIB;
     let (mut send, _) = client.open_bi().await.unwrap();
     let writer = tokio::spawn(async move {
-        let chunk = bytes::Bytes::from(vec![7u8; MIB]);
+        let chunk = zmux::Chunk::from(vec![7u8; MIB]);
         for _ in 0..total / MIB {
             send.write_chunk(chunk.clone()).await.unwrap();
         }

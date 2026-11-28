@@ -1,8 +1,8 @@
 //! HTTP streaming peer for the Java HTTP interop test: `server|client|bad KIND ADDR`,
-//! KIND `stream`, `split` (HTTP/1.1), `stream2`, `split2` (h2c).
+//! KIND `stream` (HTTP/1.1), `stream2` (h2c), `split` and `split2` (TLS).
 //!
 //! Prefix authentication key `right` (`bad` presents `wrong`), 30 s slots, skew 1.
-//! `server` serves HTTP/1.1 and h2c on ADDR whatever KIND, prints `READY <address>` (the bound one; port 0 picks a free port), echoes one
+//! `server` serves on ADDR and prints `READY <address>` (the bound one; port 0 picks a free port), echoes one
 //! stream per session (`SESSION <content>`) and answers other requests 418, printing
 //! `FALLBACK <target>`. `client` prints `OK ping`; `bad` prints `REFUSED <error>`.
 //!
@@ -34,7 +34,7 @@ async fn main() {
         ("server", "tls1" | "tls2" | "wsh2") => mp_server(addr, true).await,
         ("server", "behind") => mp_server(addr, false).await,
         ("client", "tls1" | "tls2" | "wsh2") => mp_client(kind, addr).await,
-        ("server", _) => server(addr).await,
+        ("server", _) => server(addr, kind.starts_with("split")).await,
         ("client" | "bad", _) => {
             client(
                 kind,
@@ -47,7 +47,7 @@ async fn main() {
     }
 }
 
-async fn server(addr: &str) {
+async fn server(addr: &str, tls: bool) {
     let fallback = zmux_http::Fallback::new(|req: zmux_http::FallbackRequest, _| async move {
         let target = req.uri().path().to_string();
         println!("FALLBACK {target}");
@@ -58,11 +58,10 @@ async fn server(addr: &str) {
     let listener = common::listener(b"right", None);
     let tcp = TcpListener::bind(addr).await.expect("bind");
     let local = tcp.local_addr().expect("local address");
-    tokio::spawn(zmux_http::serve(
-        listener.clone(),
-        tcp,
-        Options::default().with_fallback(fallback),
-    ));
+    let endpoint =
+        zmux_http::Endpoint::new(listener.clone(), Options::default().with_fallback(fallback))
+            .unwrap();
+    serve_http(endpoint, tcp, tls);
     println!("READY {local}");
     common::serve_sessions(listener).await;
 }
@@ -71,15 +70,45 @@ async fn client(kind: &str, addr: &str, key: &[u8]) {
     let options = Options::default().with_carrier_credential(Arc::new(common::auth(key)));
     let config = zmux::Config::default();
     let session = match kind {
-        "stream" => zmux_http::connect_http1(addr, &options, config).await,
-        "split" => zmux_http::connect_http1_split(addr, &options, config).await,
-        "stream2" | "split2" => match Http2Connection::connect(addr, options).await {
-            Ok(h2) if kind == "stream2" => h2.connect_session(config).await,
-            Ok(h2) => h2.connect_split_session(config).await,
-            Err(e) => {
-                println!("REFUSED {e}");
-                return;
+        "stream" => zmux_http::connect_http1(addr, &options, config)
+            .await
+            .map_err(std::io::Error::from),
+        "split" => {
+            let address = addr.to_owned();
+            let pipe = zmux_http::dial_http1_split_with(
+                move || {
+                    let address = address.clone();
+                    async move { tls_conn(&address, b"http/1.1").await }
+                },
+                addr,
+                &options.with_https(true),
+            )
+            .await;
+            match pipe {
+                Ok(pipe) => Session::connect(pipe, config)
+                    .await
+                    .map_err(std::io::Error::from),
+                Err(e) => Err(e),
             }
+        }
+        "stream2" => match Http2Connection::connect(addr, options).await {
+            Ok(h2) => h2
+                .connect_session(config)
+                .await
+                .map_err(std::io::Error::from),
+            Err(e) => Err(e),
+        },
+        "split2" => match tls_conn(addr, b"h2").await {
+            Ok(tls) => {
+                match Http2Connection::handshake(tls, addr, options.with_https(true)).await {
+                    Ok(h2) => h2
+                        .connect_split_session(config)
+                        .await
+                        .map_err(std::io::Error::from),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
         },
         other => panic!("unknown kind {other}"),
     };
@@ -100,11 +129,20 @@ async fn client(kind: &str, addr: &str, key: &[u8]) {
 async fn mp_server(addr: &str, tls: bool) {
     let listener = Listener::new(mp_config(), zmux::ListenerConfig::default()).expect("listener");
     let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default())
+        .unwrap()
         .with_websocket(zmux_websocket::Options::default());
     let tcp = TcpListener::bind(addr).await.expect("bind");
     let local = tcp.local_addr().expect("local address");
+    serve_http(endpoint, tcp, tls);
+    println!("READY {local}");
+    while let Some(session) = listener.accept().await {
+        tokio::spawn(echo_all(session));
+    }
+}
+
+fn serve_http(endpoint: zmux_http::Endpoint, tcp: TcpListener, tls: bool) {
     if tls {
-        let acceptor = tls_acceptor();
+        let acceptor = common::tls_acceptor();
         tokio::spawn(async move {
             endpoint
                 .serve_with(
@@ -119,96 +157,14 @@ async fn mp_server(addr: &str, tls: bool) {
     } else {
         tokio::spawn(endpoint.serve(tcp));
     }
-    println!("READY {local}");
-    while let Some(session) = listener.accept().await {
-        tokio::spawn(echo_all(session));
-    }
-}
-
-fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    let cert = zmux_testcert::self_signed(vec!["localhost".into(), "127.0.0.1".into()])
-        .expect("certificate");
-    let der = CertificateDer::from(cert.cert.der().to_vec());
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .expect("TLS 1.3")
-    .with_no_client_auth()
-    .with_single_cert(vec![der], key)
-    .expect("certificate");
-    server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    tokio_rustls::TlsAcceptor::from(Arc::new(server))
-}
-
-/// Accepts any server certificate: the peers' certificates are generated at start.
-#[derive(Debug)]
-struct AnyCert(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for AnyCert {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
 }
 
 /// A TLS 1.3 connection to `addr` offering `alpn`.
-async fn tls_conn(addr: &str, alpn: &[u8]) -> TlsConnection {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut c = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
-        .with_no_client_auth();
-    c.alpn_protocols = vec![alpn.to_vec()];
+async fn tls_conn(addr: &str, alpn: &[u8]) -> std::io::Result<TlsConnection> {
     let name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
-    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(c))
-        .connect(name, tcp)
-        .await
-        .expect("TLS handshake");
-    TlsConnection::new(tls)
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let tls = common::tls_connector(alpn).connect(name, tcp).await?;
+    Ok(TlsConnection::new(tls))
 }
 
 /// A WebSocket over an HTTP/2 extended `CONNECT` on a TLS connection of its own.
@@ -216,7 +172,7 @@ async fn ws_h2(addr: &str) -> std::io::Result<zmux::PipeIo> {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::Role;
-    let conn = tls_conn(addr, b"h2").await;
+    let conn = tls_conn(addr, b"h2").await?;
     let binding = conn.binding();
     let (mut sender, driver) =
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(conn))
@@ -261,14 +217,18 @@ async fn mp_client(kind: &str, addr: &str) {
         None
     } else {
         Some(
-            Http2Connection::handshake(tls_conn(addr, b"h2").await, addr, https.clone())
-                .await
-                .expect("HTTP/2"),
+            Http2Connection::handshake(
+                tls_conn(addr, b"h2").await.expect("TLS handshake"),
+                addr,
+                https.clone(),
+            )
+            .await
+            .expect("HTTP/2"),
         )
     };
     let dial = async || match &h2 {
         Some(h2) => h2.open_pipe().await,
-        None => zmux_http::dial_http1_over(tls_conn(addr, b"http/1.1").await, addr, &https).await,
+        None => zmux_http::dial_http1_over(tls_conn(addr, b"http/1.1").await?, addr, &https).await,
     };
     let session = Session::connect(dial().await.expect("dial"), config)
         .await
@@ -320,22 +280,51 @@ async fn join(
     io: std::io::Result<zmux::PipeIo>,
     mode: zmux::RecordMode,
 ) -> Option<Result<String, String>> {
+    use zmux::{
+        AttachmentSpec, AttemptReason, CarrierOpener, ChangeError, ChangeRequest, Directions,
+        MemberSpec,
+    };
+
     let io = match io {
         Ok(io) => io,
         Err(e) => return Some(Err(e.to_string())),
     };
-    let pipe = match session.begin_add_pipe(io, zmux::PipeOptions::new().with_record_mode(mode)) {
-        Ok(pipe) => pipe,
-        Err(zmux::PipeError::Deferred) => return None,
-        Err(e) => return Some(Err(e.to_string())),
+
+    let mut request = ChangeRequest::new(session.capacity(), Duration::from_secs(30));
+    request.add.push(MemberSpec {
+        candidate: None,
+        attachments: vec![AttachmentSpec::new(
+            Directions::BOTH,
+            zmux::PipeOptions::default().with_record_mode(mode),
+        )],
+    });
+    let change = match session.begin_change(request) {
+        Ok(change) => change,
+        Err(ChangeError::Capacity) => return None,
+        Err(error) => return Some(Err(error.to_string())),
     };
-    Some(
-        match tokio::time::timeout(Duration::from_secs(10), pipe.joined()).await {
-            Err(_) => Err("join timed out".to_owned()),
-            Ok(Err(e)) => Err(e.to_string()),
-            Ok(Ok(())) => Ok(mode_name(pipe.stats().and_then(|s| s.record_mode))),
-        },
-    )
+    let attempt = match change.start_member(0, CarrierOpener::prepared(vec![io])) {
+        Ok(attempt) => attempt,
+        Err(ChangeError::Capacity) => return None,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    let result = attempt.wait().await;
+    if result.reason != AttemptReason::Confirmed {
+        return Some(Err(result.error.map_or_else(
+            || format!("join: {:?}", result.reason),
+            |e| e.to_string(),
+        )));
+    }
+    if let Err(error) = change.commit() {
+        return Some(Err(error.to_string()));
+    }
+    let mode = result
+        .pipes
+        .first()
+        .and_then(|&id| session.pipe(id))
+        .and_then(|p| p.stats())
+        .and_then(|s| s.record_mode);
+    Some(Ok(mode_name(mode)))
 }
 
 /// The session configuration of the TLS peers: multipath with a pre-shared
@@ -344,7 +333,7 @@ async fn join(
 #[must_use]
 pub fn mp_config() -> zmux::Config {
     let mut c = zmux::Config::multipath(zmux::PipeAuth::psk([7u8; 32]).with_end_to_end());
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.allow_record_mode = Some(zmux::AllowRecordMode::new(|c, mode, _| {
         mode == zmux::RecordMode::Sealed
             || mode == zmux::RecordMode::Bound && c.secure && c.has_exporter

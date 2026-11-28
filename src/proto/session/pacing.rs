@@ -42,8 +42,17 @@ impl SessionCore {
     /// is paced gets its limiter here.
     pub(super) fn pacing_room(&mut self, id: u64, now: Instant) -> Option<u64> {
         let paced = self.out_ref(id).is_some_and(|o| self.paced(o));
-        self.out_mut(id)?.set_paced(paced, now);
-        let o = self.out_ref(id).filter(|o| self.paced(o))?;
+        if !paced {
+            if let Some(out) = self.out_mut(id)
+                && out.limiter().is_some()
+            {
+                out.set_paced(false, now);
+                self.set_pacing_deadline(id, None);
+            }
+            return None;
+        }
+        self.out_mut(id)?.set_paced(true, now);
+        let o = self.out_ref(id)?;
         let p = self.pacing_params();
         Some(
             o.limiter()?
@@ -60,18 +69,20 @@ impl SessionCore {
         let Some(i) = self.att_index(id) else {
             return;
         };
-        let paced = self.atts.at(i).out().is_some_and(|o| self.paced(o));
-        if let Some(o) = self.atts.at_mut(i).out_mut().filter(|_| paced) {
+        let out = self.atts.at(i).out();
+        if out.is_some_and(|o| self.paced(o) && !o.writes_ended()) {
+            let out = self.atts.at_mut(i).out_mut().expect("paced pipe");
             let ev = AckEvent {
                 sample,
-                acked: o.acked(),
-                sent: o.eliciting_end().max(o.acked()),
-                held: o.held_out(now),
+                acked: out.acked(),
+                sent: out.eliciting_end().max(out.acked()),
+                held: out.held_out(now),
             };
-            o.set_paced(true, now);
-            if let Some((limiter, est)) = o.limiter_parts() {
-                limiter.on_ack(now, &ev, est, &p);
-            }
+            out.set_paced(true, now);
+            let deadline = out
+                .limiter_parts()
+                .and_then(|(limiter, est)| limiter.on_ack(now, &ev, est, &p));
+            self.set_pacing_deadline(id, deadline);
         }
         // The estimators and the limiter's rate bound took the
         // acknowledgement.
@@ -85,35 +96,50 @@ impl SessionCore {
         let Some(i) = self.att_index(id) else {
             return;
         };
-        let paced = self.atts.at(i).out().is_some_and(|o| self.paced(o));
-        if let Some(o) = self.atts.at_mut(i).out_mut().filter(|_| paced) {
-            o.set_paced(true, now);
-            let in_flight = o.limiter_in_flight(now);
-            if let Some((limiter, est)) = o.limiter_parts() {
+        let out = self.atts.at(i).out();
+        if out.is_some_and(|o| self.paced(o) && !o.writes_ended()) {
+            let out = self.atts.at_mut(i).out_mut().expect("paced pipe");
+            out.set_paced(true, now);
+            let in_flight = out.limiter_in_flight(now);
+            let deadline = out.limiter_parts().and_then(|(limiter, est)| {
                 limiter.on_sent(now, bytes, est, &p);
-                limiter.refresh(now, in_flight, est, &p);
-            }
+                limiter.refresh(now, in_flight, est, &p)
+            });
+            self.set_pacing_deadline(id, deadline);
+        }
+    }
+
+    /// Updates the pipe's only pacing appointment.
+    pub(super) fn set_pacing_deadline(&mut self, id: u64, at: Option<Instant>) {
+        if at.is_some() {
+            self.pacing_timers.get_or_insert_default().set(id, at);
+        } else if let Some(timers) = &mut self.pacing_timers {
+            timers.set(id, None);
         }
     }
 
     /// The earliest moment a held pipe may send again.
     pub(super) fn pacing_deadline(&self) -> Option<Instant> {
-        self.atts
-            .iter()
-            .filter_map(|a| a.out()?.limiter_release())
-            .min()
+        self.pacing_timers.as_deref()?.next()
     }
 
-    /// Timers: pipes whose release time came are no longer held.
+    /// Updates only pipes whose bucket was due for a refill.
     pub(super) fn pacing_timeout(&mut self, now: Instant) {
-        let p = self.pacing_params();
-        for o in self.atts.outs_mut() {
-            if o.limiter_release().is_some_and(|t| t <= now) {
-                let in_flight = o.limiter_in_flight(now);
-                if let Some((limiter, est)) = o.limiter_parts() {
-                    limiter.refresh(now, in_flight, est, &p);
-                }
-            }
+        if self.pacing_deadline().is_none_or(|at| at > now) {
+            return;
+        }
+        let params = self.pacing_params();
+        while let Some((_, id)) = self.pacing_timers.as_mut().and_then(|q| q.take_due(now)) {
+            let deadline = self
+                .out_mut(id)
+                .filter(|out| !out.writes_ended())
+                .and_then(|out| {
+                    let in_flight = out.limiter_in_flight(now);
+                    let (limiter, est) = out.limiter_parts()?;
+                    limiter.refresh(now, in_flight, est, &params)
+                });
+            debug_assert!(deadline.is_none_or(|at| at > now));
+            self.set_pacing_deadline(id, deadline);
         }
     }
 }

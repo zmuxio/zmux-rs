@@ -416,7 +416,7 @@ fn parse_v1(buf: &[u8]) -> ProxyHeader {
     match parts.next() {
         Some("UNKNOWN") => ProxyHeader::Complete { len, source: None },
         Some(proto @ ("TCP4" | "TCP6")) => {
-            let (Some(src), Some(_dst), Some(sport), Some(_dport), None) = (
+            let (Some(src), Some(_dst), Some(sport), Some(_dport), Option::None) = (
                 parts.next(),
                 parts.next(),
                 parts.next(),

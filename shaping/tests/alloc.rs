@@ -31,11 +31,11 @@ const DEF: &str = r#"{"tables":{"a":[[3,100,1400],[1,0,0],[1,4000,9000]]},"machi
   {"record":{"target":{"t":"a"},"pad_multiple":{"t":[[1,16,64]],"scope":"pipe"},"delay":{"t":[[1,0,0],[1,1,5]]}},
    "enter":[{"op":"set","slot":0,"value":3},{"op":"timer","slot":0,"after":{"t":[[1,10,100]]}},
             {"op":"inject","after":1000,"len":{"t":"a"}},{"op":"rate","rate":100000}],
-   "next":[{"on":"record_out","to":1,"if":{"what":"seq","cmp":"ge","value":2},"prob":500000}]},
+   "next":[{"on":"record_plan","to":1,"if":{"what":"seq","cmp":"ge","value":2},"prob":500000}]},
   {"record":{"max_len":1200},
    "enter":[{"op":"sub","slot":0,"value":1},{"op":"weight","value":{"t":[[1,1,9]]}}],
-   "next":[{"on":"timer","slot":0,"to":0},{"on":"record_in","to":0},{"on":"record_out","to":0,"prob":100000}]}]},
- {"start":0,"states":[{"record":{"pad":{"t":[[1,0,16]]}},"next":[{"on":"injected","to":0}]}]}]}"#;
+   "next":[{"on":"timer","slot":0,"to":0},{"on":"outbound","to":0},{"on":"record_plan","to":0,"prob":100000}]}]},
+ {"start":0,"states":[{"record":{"pad":{"t":[[1,0,16]]}},"next":[{"on":"injection_accepted","to":0}]}]}]}"#;
 
 #[test]
 fn plans_and_events_do_not_allocate() {
@@ -49,10 +49,14 @@ fn plans_and_events_do_not_allocate() {
             &RecordView::new(PipeId::new(0), 0, 0, 16382, *now),
             &mut plan,
         );
-        for kind in [EventKind::Wake, EventKind::Injected, EventKind::RecordIn] {
+        for kind in [
+            EventKind::Timer,
+            EventKind::InjectionAccepted,
+            EventKind::Outbound,
+        ] {
             let mut fx = Effects::default();
             m.on_event(
-                &Event::new(kind, PipeId::new(0), *now).with_len(100, false),
+                &Event::new(kind, PipeId::new(0), *now).with_len(100),
                 &mut fx,
             );
         }

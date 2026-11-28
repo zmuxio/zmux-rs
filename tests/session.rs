@@ -230,9 +230,9 @@ async fn preamble_and_priority_reach_the_peer() {
 async fn datagrams_both_ways() {
     let (client, server) = pair_with(datagram_config(), datagram_config()).await;
     // The datagram size limit: the peer's 65535-byte limits less the
-    // frame type and Flow 0, beyond this endpoint's 16 KiB records.
-    assert_eq!(client.max_datagram_size(), Some(65533));
-    for len in [65533, 1500, 9000, 16380, 65533] {
+    // frame type, Sequence and Flow 0, beyond this endpoint's 16 KiB records.
+    assert_eq!(client.max_datagram_size(), Some(65532));
+    for len in [65532, 1500, 9000, 16380, 65532] {
         let packet = Bytes::from(vec![len as u8; len]);
         client.send_datagram(packet.clone()).unwrap();
         assert_eq!(server.read_datagram().await.unwrap(), packet);
@@ -250,12 +250,10 @@ async fn datagrams_both_ways() {
     // Stream datagrams.
     let (mut send, _recv) = client.open_bi().await.unwrap();
     send.write_all(b"open").await.unwrap();
-    // The Flow counts at its largest until the stream has its ID, which
-    // the driver gives it when it sends the stream's first frame: the peer
-    // accepting the stream shows that it has one.
+    // The peer accepting the stream confirms its Flow identifier.
     let (_ssend, srecv) = server.accept_bi().await.unwrap();
     assert!(send.id().is_some());
-    assert_eq!(send.max_datagram_size(5), Some(65532));
+    assert_eq!(send.max_datagram_size(5), Some(65531));
     send.send_datagram(5, Bytes::from_static(b"on-stream"))
         .unwrap();
     let d = srecv.read_datagram().await.unwrap();
@@ -317,6 +315,74 @@ async fn graceful_shutdown_waits_for_streams() {
 }
 
 #[tokio::test]
+async fn shutdown_after_tcp_echo_drains_with_live_handles() {
+    use tokio::net::{TcpListener, TcpStream};
+
+    let watchdog = Duration::from_secs(10);
+    tokio::time::timeout(watchdog, async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client_socket, server_socket) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let mut config = Config::default();
+        config.test_hooks().linger_timeout = Some(2 * watchdog);
+        let (client, server) = tokio::join!(
+            Session::connect(PipeIo::from_tcp(client_socket.unwrap()), config.clone()),
+            Session::accept(PipeIo::from_tcp(server_socket.unwrap().0), config),
+        );
+        let (client, server) = (client.unwrap(), server.unwrap());
+        let (mut send, mut recv) = client.open_bi().await.unwrap();
+        send.write_all(b"echo before close").await.unwrap();
+        send.finish().unwrap();
+        let (mut reply, mut input) = server.accept_bi().await.unwrap();
+        let mut echo = [0; 4];
+        AsyncReadExt::read_exact(&mut input, &mut echo)
+            .await
+            .unwrap();
+        reply.write_all(&echo).await.unwrap();
+        reply.finish().unwrap();
+        assert_eq!(recv.read_to_end(8).await.unwrap(), b"echo");
+        send.stopped().await.unwrap();
+        reply.stopped().await.unwrap();
+
+        let read_drain = async {
+            let expected = SessionError::ApplicationClosed {
+                code: VarInt::ZERO,
+                reason: Bytes::new(),
+                remote: true,
+            };
+            assert_eq!(server.closing().await, expected);
+            let mut closed = std::pin::pin!(server.closed());
+            std::future::poll_fn(|cx| {
+                assert!(
+                    closed.as_mut().poll(cx).is_pending(),
+                    "the unread request holds the read drain"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(input.read_to_end(32).await.unwrap(), b" before close");
+            assert_eq!(closed.await, expected);
+        };
+        let (shutdown, ()) = tokio::join!(client.shutdown(VarInt::ZERO, b""), read_drain);
+        shutdown.unwrap();
+        assert_eq!(
+            client.closed().await,
+            SessionError::ApplicationClosed {
+                code: VarInt::ZERO,
+                reason: Bytes::new(),
+                remote: false,
+            }
+        );
+        // FIN completion and reading EOF release the drain even with live handles.
+        drop((send, recv, reply, input));
+    })
+    .await
+    .expect("TCP shutdown and read drain complete");
+}
+
+#[tokio::test]
 async fn ping_measures_rtt() {
     let (client, _server) = pair().await;
     // In-memory pipes report no carrier RTT: the first record carried a
@@ -374,7 +440,9 @@ async fn echo_over_tcp() {
         .unwrap();
     let (mut s, mut r) = client.open_bi().await.unwrap();
     let data: Vec<u8> = (0..3_000_000u32).map(|i| i as u8).collect();
-    s.write_chunk(Bytes::from(data.clone())).await.unwrap();
+    s.write_chunk(zmux::Chunk::from(data.clone()))
+        .await
+        .unwrap();
     s.finish().unwrap();
     assert_eq!(r.read_to_end(1 << 24).await.unwrap(), data);
     let _session = srv.await.unwrap();
@@ -444,19 +512,19 @@ async fn chunked_io_and_received_reset() {
     let (mut send, _recv) = client.open_bi().await.unwrap();
     let id = send.pin_id().unwrap();
     let mut chunks = [
-        Bytes::from_static(b"one "),
-        Bytes::new(),
-        Bytes::from(vec![7u8; 100_000]),
+        zmux::Chunk::from_static(b"one "),
+        zmux::Chunk::new(),
+        zmux::Chunk::from(vec![7u8; 100_000]),
     ];
     let w = send.write_chunks(&mut chunks).await.unwrap();
     assert!(w.bytes > 0);
     let (_ssend, mut srecv) = server.accept_bi().await.unwrap();
     assert_eq!(srecv.pin_id().unwrap(), id);
     let mut got = 0;
-    let mut bufs = vec![Bytes::new(); 4];
+    let mut bufs = vec![zmux::Chunk::new(); 4];
     while got < w.bytes {
         let n = srecv.read_chunks(&mut bufs).await.unwrap().unwrap();
-        got += bufs[..n].iter().map(Bytes::len).sum::<usize>();
+        got += bufs[..n].iter().map(zmux::Chunk::len).sum::<usize>();
     }
     send.reset(VarInt::from_u32(3)).unwrap();
     assert_eq!(srecv.received_reset().await, Ok(Some(VarInt::from_u32(3))));
@@ -476,7 +544,7 @@ async fn chunked_io_and_received_reset() {
 #[tokio::test]
 async fn multipath_configuration_errors_are_reported() {
     let mut no_auth = Config::default();
-    no_auth.max_pipes = 8;
+    no_auth.session_policy.limits.steady_attachments = 8;
     let (a, _b) = tokio::io::duplex(1024);
     assert!(matches!(
         Session::connect(PipeIo::new(a), no_auth).await,
@@ -603,7 +671,7 @@ async fn protocols_negotiate_the_accepting_sides_preference() {
 #[tokio::test]
 async fn a_shaper_pads_the_records_of_a_session() {
     use std::sync::Arc;
-    use zmux::shaping::{Caps, Factory, RecordPlan, RecordView, Shaper};
+    use zmux::shaping::{Caps, Factory, RecordPlan, RecordView, RuntimeReason, Shaper};
     struct Pad;
     impl Shaper for Pad {
         fn capabilities(&self) -> Caps {
@@ -620,14 +688,24 @@ async fn a_shaper_pads_the_records_of_a_session() {
         }
     }
     let (client, server) = pair().await;
-    client.set_shaper(Some(Arc::new(F)), None);
+    client.set_shaper(Some(Arc::new(F)), None).unwrap();
     let (mut send, _recv) = client.open_bi().await.unwrap();
     send.write_all(b"0123456789").await.unwrap();
     send.finish().unwrap();
     let (_s, mut recv) = server.accept_bi().await.unwrap();
     assert_eq!(recv.read_to_end(100).await.unwrap(), b"0123456789");
+    // The peer has received the FIN. Wait for the local writer to report
+    // completion before reading the ledger, including when the carrier woke
+    // the peer before returning from its write.
+    client.close().await;
     let st = client.shaping_stats();
-    assert!(st.wire_spent >= 900, "{st:?}");
+    assert_eq!(st.wire_spent, 0, "{st:?}");
+    assert_eq!(st.ledger.measured_bytes, 540, "{st:?}");
+    assert_eq!(st.ledger.policy.unwrap().allowance_bytes, 540, "{st:?}");
+    assert!(
+        st.runtime_reasons[RuntimeReason::OverheadLimit as usize] > 0,
+        "{st:?}"
+    );
 }
 
 /// Delays the first record of each pipe it shapes, or every record.

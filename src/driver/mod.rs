@@ -41,6 +41,8 @@
 mod accept;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 mod account;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub(crate) mod accounting;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod admission;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
@@ -51,18 +53,24 @@ pub(crate) use attachment::attachment_footprint;
 pub(crate) mod blocking;
 #[cfg(all(feature = "blocking", not(loom)))]
 pub(crate) mod blocking_listen;
-#[cfg(all(feature = "tokio", not(loom)))]
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub(crate) mod cache;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub(crate) mod capacity_change;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 mod carrier_stats;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod channel;
-#[cfg(all(feature = "tokio", not(loom)))]
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub(crate) mod choice;
 #[cfg(all(feature = "test-hooks", feature = "tokio", not(loom)))]
 pub(crate) mod conformance;
 #[cfg(all(feature = "blocking", not(loom)))]
 mod context;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub(crate) mod controller;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+mod deadline;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 mod engine;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
@@ -83,6 +91,8 @@ pub(crate) mod packet;
 mod precise;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub(crate) mod resources;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub(crate) mod retry;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub(crate) mod sealed;
 #[cfg(all(feature = "blocking", not(loom)))]
@@ -130,11 +140,15 @@ use crate::proto::params::Role;
 pub(crate) use crate::proto::session::{GoAway, SessionEvent as Event};
 
 /// The read buffer of a pipe: at least `max_record_size + 4` (65539).
-/// Received data references it, so a read buffer is reclaimed only once
-/// its data was read: a larger one keeps the reads of a bulk transfer
-/// large (256 KiB against 128: multipath 8 to 11 % and single-pipe
-/// zero-copy bulk 8 % more throughput on Linux, at less CPU per byte).
-pub(crate) const READ_BUFFER: usize = 256 * 1024;
+/// A byte-stream buffer fits a complete record even with its length prefix.
+pub(crate) const READ_BUFFER: usize = crate::proto::receive::MAX_CLASS;
+
+/// A whole message plus one byte, so a carrier can expose an oversized record.
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+const MESSAGE_READ: usize = {
+    assert!(crate::proto::params::ZMUX_MAX_RECORD_SIZE == u16::MAX as u64);
+    u16::MAX as usize + 1
+};
 
 /// A pipe idle this long frees its buffers.
 #[cfg(any(feature = "tokio", feature = "blocking"))]
@@ -144,36 +158,19 @@ pub(crate) const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_s
 /// pipe gives its buffer back and
 /// the next read after idleness takes one, so quiet sessions neither hold
 /// a read buffer nor allocate and zero a read buffer for each record. At most
-/// [`read_pool::KEEP`] are kept.
+/// 8 MiB of receive storage is kept across byte and message buffers.
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub(crate) mod read_pool {
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use bytes::BytesMut;
 
+    use crate::proto::receive;
     use crate::proto::session::Backing;
-
-    /// Buffers kept for reuse (4 MiB).
-    pub(crate) const KEEP: usize = 16;
-
-    static POOL: Mutex<Vec<BytesMut>> = Mutex::new(Vec::new());
-
-    /// The identifier of the next buffer handed out: they grow with every
-    /// buffer, as received data that references one needs
-    /// ([`crate::proto::session::SessionCore::receive_shared`]).
-    static NEXT: AtomicU64 = AtomicU64::new(1);
 
     /// An empty read buffer of [`super::READ_BUFFER`] bytes' capacity, and
     /// its identity.
     pub(crate) fn take() -> (BytesMut, Backing) {
-        let reused = POOL.lock().ok().and_then(|mut p| p.pop());
-        let mut buf = reused.unwrap_or_else(|| BytesMut::with_capacity(super::READ_BUFFER));
-        buf.clear();
-        let backing = Backing {
-            id: NEXT.fetch_add(1, Ordering::Relaxed),
-            size: buf.capacity(),
-        };
+        let buf = receive::take_streaming(super::READ_BUFFER);
+        let backing = Backing::new(buf.capacity());
         (buf, backing)
     }
 
@@ -186,50 +183,41 @@ pub(crate) mod read_pool {
         buf
     }
 
-    /// Gives a buffer back, unless received data still references it.
-    pub(crate) fn give(mut buf: BytesMut) {
-        buf.clear();
-        if !buf.try_reclaim(super::READ_BUFFER) || buf.capacity() < super::READ_BUFFER {
-            return;
-        }
-        if let Ok(mut p) = POOL.lock()
-            && p.len() < KEEP
-        {
-            p.push(buf);
-        }
-    }
-
-    /// Buffers in the pool now.
-    #[cfg(feature = "test-hooks")]
-    pub(crate) fn len() -> usize {
-        POOL.lock().map_or(0, |p| p.len())
+    /// Gives a buffer back, ready to reuse once received data releases it.
+    pub(crate) fn give(buf: BytesMut, capacity: usize) {
+        receive::give_streaming(buf, capacity);
     }
 
     /// A fresh identity for `buf`, a buffer that was reclaimed or grown
     /// in place.
     #[cfg(feature = "tokio")]
     pub(crate) fn renew(buf: &BytesMut) -> Backing {
-        Backing {
-            id: NEXT.fetch_add(1, Ordering::Relaxed),
-            size: buf.capacity(),
-        }
+        Backing::new(buf.capacity())
     }
 }
 
 /// The stack buffer an idle pipe reads into before it allocates its read
 /// buffer again.
 #[cfg(any(feature = "tokio", feature = "blocking"))]
-pub(crate) const IDLE_READ: usize = 4096;
+pub(crate) const IDLE_READ: usize = crate::proto::receive::MIN_CLASS;
 
 /// Maximum cleanup time for a carrier after a completed setup decision.
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub(crate) const DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The end of listener setup, or no deadline when it exceeds the clock range.
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
-#[cfg_attr(feature = "tokio", doc(hidden))]
+fn sealed_failure(f: crate::proto::seal::SealedFailure) -> std::io::Error {
+    use crate::proto::seal::SealedFailure;
+    match f {
+        SealedFailure::Invalid => std::io::ErrorKind::InvalidData.into(),
+        SealedFailure::Cut => std::io::ErrorKind::UnexpectedEof.into(),
+    }
+}
+
+/// The end of listener setup, or no deadline when it exceeds the clock range.
+#[cfg(all(feature = "tokio", not(loom)))]
+#[doc(hidden)]
 #[must_use]
-#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
 pub fn handshake_deadline(
     start: std::time::Instant,
     limit: std::time::Duration,
@@ -360,6 +348,8 @@ pub use crate::proto::session::PipeDirection;
 pub struct DialRequest {
     /// The halves the carrier provides.
     pub direction: PipeDirection,
+    /// Set when the dial was called through the session's redial hook.
+    pub redial: Option<crate::RedialAttempt>,
 }
 
 impl DialRequest {
@@ -372,7 +362,10 @@ impl DialRequest {
     /// A request for a carrier of `direction`.
     #[must_use]
     pub fn new(direction: PipeDirection) -> Self {
-        Self { direction }
+        Self {
+            direction,
+            redial: None,
+        }
     }
 }
 
@@ -380,14 +373,6 @@ impl DialRequest {
 /// send early data; without a listener it may become the accepting side,
 /// which cannot resume.
 pub(crate) fn check_peer(config: &crate::Config) -> Result<(), crate::ConnectError> {
-    if config.early_data.zmux_peer {
-        return Err(crate::ConnectError::InvalidConfig(
-            crate::InvalidConfig::new(
-                "early_data",
-                "needs a role that does not depend on the peer: not with role auto",
-            ),
-        ));
-    }
     if config.resume_timeout.is_some() {
         return Err(crate::ConnectError::InvalidConfig(
             crate::InvalidConfig::new(
@@ -485,4 +470,18 @@ pub(crate) fn accept_backs_off(e: &std::io::Error) -> bool {
         e.kind(),
         K::ConnectionAborted | K::ConnectionReset | K::Interrupted | K::WouldBlock
     )
+}
+
+/// Refuses a configuration that offers multipath to a session without a
+/// listener.
+pub(crate) fn check_accept(config: &crate::Config) -> Result<(), crate::ConnectError> {
+    if config.offers_multipath() {
+        return Err(crate::ConnectError::InvalidConfig(
+            crate::InvalidConfig::new(
+                "session_policy.limits",
+                "a session accepted without a listener cannot accept joins: multipath needs a Listener",
+            ),
+        ));
+    }
+    Ok(())
 }

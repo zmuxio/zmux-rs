@@ -5,12 +5,13 @@
 //! session `send_buffer` bounds the written-but-unreleased bytes of all
 //! stream directions together (unsent on a single pipe, unacknowledged in a
 //! multipath session, where the buffer grows to the retransmit budget up to
-//! `send_buffer_max`). Every direction may always hold 64 KiB. A direction
+//! `send_buffer_max`). A direction can use its 64 KiB floor while the
+//! aggregate remains below the configured maximum. A direction
 //! within that floor and with no write waiting keeps what it holds; the
 //! other n directions share the rest: each may hold max(64 KiB,
 //! (`send_buffer` - the small holdings) / n). A message of up to 64 KiB is
-//! never blocked behind bulk data, bulk streams progress at similar rates,
-//! and a small message stream does not halve a bulk stream's share.
+//! eligible before bulk traffic below the hard cap, and a small message
+//! stream does not halve a bulk stream's share.
 //!
 //! **Waiting data** (the age test of tier
 //! saturation). Each sending part keeps write marks (end offset, time),
@@ -49,6 +50,7 @@ const MARK_MERGE: Duration = Duration::from_millis(1);
 #[derive(Debug, Clone, Copy)]
 pub(in super::super) struct SendBuffer {
     pub(in super::super) total: u64,
+    pub(in super::super) hard: u64,
     pub(in super::super) retained: Option<u64>,
 }
 
@@ -143,9 +145,12 @@ impl Streams {
         let share = SHARE_FLOOR.max(total.saturating_sub(small) / n.max(1));
         let own = send.cold().send_limit.unwrap_or(total);
         let stream_room = own.min(share).saturating_sub(held);
-        let session_room = total.saturating_sub(self.session_held(buffer));
+        let session_held = self.session_held(buffer);
+        let session_room = total.saturating_sub(session_held);
         let floor_room = SHARE_FLOOR.min(own).saturating_sub(held);
-        stream_room.min(session_room.max(floor_room))
+        stream_room
+            .min(session_room.max(floor_room))
+            .min(buffer.hard.saturating_sub(session_held))
     }
 
     /// Written-but-unreleased bytes of the session.
@@ -158,6 +163,9 @@ impl Streams {
     /// its share, and its floor while the session buffer is full.
     pub(in super::super) fn room_below(&self, buffer: SendBuffer) -> u64 {
         let total = buffer.total;
+        if self.session_held(buffer) >= buffer.hard {
+            return 0;
+        }
         let n = self.send_holders.max(1);
         let share = SHARE_FLOOR.max(total.saturating_sub(self.small_held) / n);
         match total.saturating_sub(self.session_held(buffer)) {

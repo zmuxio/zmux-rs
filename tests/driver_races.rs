@@ -22,19 +22,23 @@
 )]
 
 mod common;
+#[path = "common/pending.rs"]
+mod pending;
 
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
 use common::{Rng, connect, relay, small_windows, tcp, watchdog};
+use pending::{is_pending, poll_once};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
+use zmux::Chunk;
 use zmux::sched::Scheduler;
 use zmux::{
     Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, RecvStream,
@@ -47,11 +51,13 @@ async fn async_watch<T>(secs: u64, what: &str, f: impl Future<Output = T>) -> T 
     watchdog(secs, what, f).await
 }
 
-impl Rng {
-    /// A short timeout for a cancellation: 0 to `max_us` microseconds.
-    fn timeout(&mut self, max_us: u64) -> Duration {
-        Duration::from_micros(self.below(max_us + 1))
-    }
+async fn transfers_started(mut progress: mpsc::Receiver<()>, count: usize, description: &str) {
+    watchdog(30, description, async {
+        for _ in 0..count {
+            progress.recv().await.expect("a transfer started");
+        }
+    })
+    .await;
 }
 
 async fn tcp_pair(client: Config, server: Config) -> (Session, Session) {
@@ -113,25 +119,20 @@ async fn echo_once(session: &Session, len: usize, seed: u8) {
     assert!(got == data, "echoed data differs");
 }
 
-/// One random operation with a random cancellation.
-/// Streams the random operations opened (so that a storm that only timed
-/// out is noticed).
-static OPENED: AtomicUsize = AtomicUsize::new(0);
-
+/// Chooses an operation and cancels it at its first pending poll.
 async fn random_op(session: &Session, rng: &mut Rng, kept: &mut Vec<(SendStream, RecvStream)>) {
-    let t = rng.timeout(3000);
     match rng.below(9) {
         0 => {
             // Open, write, read some of the echo; each step cancellable.
-            if let Ok(Ok((mut send, mut recv))) = tokio::time::timeout(t, session.open_bi()).await {
-                OPENED.fetch_add(1, Ordering::Relaxed);
+            if let Poll::Ready(Ok((mut send, mut recv))) = poll_once(pin!(session.open_bi())).await
+            {
                 let data = vec![7u8; 1 + rng.below(48 * 1024) as usize];
-                let _ = tokio::time::timeout(rng.timeout(3000), send.write_all(&data)).await;
+                let _ = poll_once(pin!(send.write_all(&data))).await;
                 if rng.below(2) == 0 {
                     let _ = send.finish();
                 }
                 let mut buf = vec![0u8; 8 * 1024];
-                let _ = tokio::time::timeout(rng.timeout(3000), recv.read(&mut buf)).await;
+                let _ = poll_once(pin!(recv.read(&mut buf))).await;
                 if rng.below(4) == 0 && kept.len() < 8 {
                     kept.push((send, recv));
                 }
@@ -141,43 +142,43 @@ async fn random_op(session: &Session, rng: &mut Rng, kept: &mut Vec<(SendStream,
             if let Ok((mut send, mut recv)) = session.try_open_bi() {
                 let _ = send.write_all(b"try").await;
                 let _ = send.finish();
-                let _ = tokio::time::timeout(t, recv.read_to_end(1 << 16)).await;
+                let _ = poll_once(pin!(recv.read_to_end(1 << 16))).await;
             }
         }
         2 => {
-            if let Ok(Ok(mut send)) = tokio::time::timeout(t, session.open_uni()).await {
-                let chunk = Bytes::from(vec![1u8; 1 + rng.below(32 * 1024) as usize]);
-                let _ = tokio::time::timeout(rng.timeout(3000), send.write_chunk(chunk)).await;
+            if let Poll::Ready(Ok(mut send)) = poll_once(pin!(session.open_uni())).await {
+                let chunk = Chunk::from(vec![1u8; 1 + rng.below(32 * 1024) as usize]);
+                let _ = poll_once(pin!(send.write_chunk(chunk))).await;
                 if rng.below(2) == 0 {
                     let _ = send.finish();
                 }
             }
         }
         3 => {
-            let _ = tokio::time::timeout(t, session.closing()).await;
+            let _ = poll_once(pin!(session.closing())).await;
         }
         4 => {
-            let _ = tokio::time::timeout(t, session.accept_bi()).await;
+            let _ = poll_once(pin!(session.accept_bi())).await;
         }
         5 => {
-            let _ = tokio::time::timeout(t, session.accept_uni()).await;
+            let _ = poll_once(pin!(session.accept_uni())).await;
         }
         6 => {
-            let _ = tokio::time::timeout(t, session.next_event()).await;
+            let _ = poll_once(pin!(session.next_event())).await;
         }
         7 => {
             // Waits on a stream kept from earlier: stopped, read, write.
             if let Some((send, recv)) = kept.last_mut() {
                 match rng.below(3) {
                     0 => {
-                        let _ = tokio::time::timeout(t, send.stopped()).await;
+                        let _ = poll_once(pin!(send.stopped())).await;
                     }
                     1 => {
                         let mut buf = [0u8; 512];
-                        let _ = tokio::time::timeout(t, recv.read(&mut buf)).await;
+                        let _ = poll_once(pin!(recv.read(&mut buf))).await;
                     }
                     _ => {
-                        let _ = tokio::time::timeout(t, send.write(&[3u8; 4096])).await;
+                        let _ = poll_once(pin!(send.write(&[3u8; 4096]))).await;
                     }
                 }
             }
@@ -192,7 +193,7 @@ async fn random_op(session: &Session, rng: &mut Rng, kept: &mut Vec<(SendStream,
     }
 }
 
-/// Many tasks run random operations, each cancelled at a random point, on
+/// Many tasks run a seeded mix of operations and cancellations on
 /// one session with few streams and small windows. Afterwards the session
 /// still works (no wait queue was left wedged by a cancelled waiter), and
 /// closing it ends both sides.
@@ -209,6 +210,7 @@ async fn random_cancellation_storm() {
                 let s = client.clone();
                 tokio::spawn(async move {
                     let mut rng = Rng::new(i + 1);
+                    echo_once(&s, 512, i as u8).await;
                     let mut kept = Vec::new();
                     for _ in 0..60 {
                         random_op(&s, &mut rng, &mut kept).await;
@@ -221,10 +223,6 @@ async fn random_cancellation_storm() {
         }
     })
     .await;
-    assert!(
-        OPENED.load(Ordering::Relaxed) > 50,
-        "the storm opened too little"
-    );
     // No queue was left wedged: openers and plain echoes still go through.
     watchdog(20, "echo after the storm", async {
         for i in 0..4 {
@@ -258,25 +256,28 @@ async fn carrier_eof_mid_batch() {
     .unwrap();
     let server = server.await.unwrap();
     let server_task = serve(server.clone());
+    let (transferred, progress) = mpsc::channel(6);
     let jobs: Vec<_> = (0..6)
         .map(|i| {
             let s = client.clone();
+            let transferred = transferred.clone();
             tokio::spawn(async move {
-                let Ok((mut send, mut recv)) = s.open_bi().await else {
-                    return;
-                };
+                let (mut send, mut recv) = s.open_bi().await.unwrap();
                 let w = tokio::spawn(async move {
                     let data = vec![i as u8; 64 * 1024];
                     while send.write_all(&data).await.is_ok() {}
                 });
                 let mut buf = vec![0u8; 64 * 1024];
+                assert!(recv.read(&mut buf).await.unwrap().is_some());
+                transferred.send(()).await.unwrap();
                 while let Ok(Some(_)) = recv.read(&mut buf).await {}
                 let _ = w.await;
             })
         })
         .collect();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    cut.store(true, Ordering::SeqCst);
+    drop(transferred);
+    transfers_started(progress, jobs.len(), "echoes before cutting the carrier").await;
+    cut.send(()).expect("the relay is forwarding traffic");
     watchdog(40, "transfers after the carrier ended", async {
         for j in jobs {
             j.await.expect("no panic");
@@ -412,16 +413,22 @@ fn session_task_dropped_with_its_runtime() {
     });
     let server = main.block_on(server).unwrap();
     let (send, mut recv) = main.block_on(client.open_bi()).unwrap();
+    let (waiting, registered) = oneshot::channel();
     let waits = {
         let c = client.clone();
         main.spawn(async move {
             let mut buf = [0u8; 8];
-            let read = recv.read(&mut buf).await;
-            let accept = c.accept_bi().await;
+            let mut read = pin!(recv.read(&mut buf));
+            let mut accept = pin!(c.accept_bi());
+            assert!(is_pending(read.as_mut()).await);
+            assert!(is_pending(accept.as_mut()).await);
+            waiting.send(()).unwrap();
+            let (read, accept) = tokio::join!(read, accept);
             (read.is_err(), accept.is_err())
         })
     };
-    main.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+    main.block_on(async_watch(30, "waits registered", registered))
+        .unwrap();
     // The client's session task goes with its runtime.
     drop(side);
     let (read, accept) = main
@@ -445,7 +452,7 @@ fn session_task_dropped_with_its_runtime() {
 
 fn mp_config() -> Config {
     let mut c = small_windows(Config::default());
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"driver-race-psk-0123456789abcdef").with_end_to_end();
     c.scheduler = Scheduler::SpreadEta;
     c.liveness.suspect_floor = Duration::from_millis(100);
@@ -491,60 +498,72 @@ async fn multipath_pipe_loss_under_concurrency() {
     assert_eq!(client.multipath(), zmux::Multipath::InUse);
     let server = watchdog(5, "listener accepts", accepted).await.unwrap();
     let (raddr, cut) = relay(target).await;
-    client
-        .begin_add_pipe(
+    let relayed = client
+        .test_begin_join(
             PipeIo::from_tcp(TcpStream::connect(raddr).await.unwrap()),
             PipeOptions::default(),
         )
         .unwrap();
     let third = client
-        .begin_add_pipe(
+        .test_begin_join(
             PipeIo::from_tcp(TcpStream::connect(target).await.unwrap()),
             PipeOptions::default(),
         )
         .unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
+    watchdog(30, "relayed pipe attached", relayed.attached())
+        .await
+        .unwrap();
+    watchdog(30, "third pipe attached", third.attached())
+        .await
+        .unwrap();
+
+    let recovered = Arc::new(AtomicBool::new(false));
+    let (transferred, progress) = mpsc::channel(12);
     let jobs: Vec<_> = (0..12u8)
         .map(|i| {
             let s = client.clone();
-            let stop = stop.clone();
+            let recovered = recovered.clone();
+            let transferred = transferred.clone();
             tokio::spawn(async move {
-                let mut rng = Rng::new(u64::from(i) + 50);
-                let mut n = 0usize;
-                while !stop.load(Ordering::SeqCst) {
-                    if i % 4 == 3 {
-                        // Cancelled part-way.
-                        let _ =
-                            tokio::time::timeout(rng.timeout(5000), echo_once(&s, 256 * 1024, i))
-                                .await;
-                    } else {
-                        echo_once(&s, 256 * 1024, i).await;
-                    }
-                    n += 1;
+                if i % 4 == 3 {
+                    // Drop an exchange after it has been polled.
+                    let _ = is_pending(pin!(echo_once(&s, 256 * 1024, i))).await;
                 }
-                n
+                echo_once(&s, 256 * 1024, i).await;
+                transferred.send(()).await.unwrap();
+                while !recovered.load(Ordering::SeqCst) {
+                    echo_once(&s, 256 * 1024, i).await;
+                }
+                echo_once(&s, 256 * 1024, i).await;
             })
         })
         .collect();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    cut.store(true, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let _ = third.abort();
-    let _ = client.begin_add_pipe(
-        PipeIo::from_tcp(TcpStream::connect(target).await.unwrap()),
-        PipeOptions::default(),
-    );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    stop.store(true, Ordering::SeqCst);
-    let echoes = watchdog(60, "echoes over the remaining pipes", async {
-        let mut total = 0;
+    drop(transferred);
+    transfers_started(
+        progress,
+        jobs.len(),
+        "transfers before cutting the relayed pipe",
+    )
+    .await;
+    cut.send(()).expect("the relay is forwarding traffic");
+    let _ = watchdog(30, "relayed pipe closed", relayed.closed()).await;
+    third.abort().unwrap();
+    let replacement = client
+        .test_begin_join(
+            PipeIo::from_tcp(TcpStream::connect(target).await.unwrap()),
+            PipeOptions::default(),
+        )
+        .unwrap();
+    watchdog(30, "replacement attached", replacement.attached())
+        .await
+        .unwrap();
+    recovered.store(true, Ordering::SeqCst);
+    watchdog(60, "echoes after carrier replacement", async {
         for j in jobs {
-            total += j.await.expect("no panic");
+            j.await.expect("no panic");
         }
-        total
     })
     .await;
-    assert!(echoes > 12, "{echoes} echoes");
     client.close().await;
     watchdog(10, "server sees the close", server.closing()).await;
 }
@@ -565,36 +584,33 @@ async fn send_capacity_waits_end_on_credit_stop_close_and_cancellation() {
         let (_ss, mut sr) = server.accept_bi().await.unwrap();
 
         let before = client.debug_tables().waits;
-        let cancelled =
-            tokio::time::timeout(Duration::from_millis(20), send.wait_send_capacity(1)).await;
-        assert!(cancelled.is_err(), "no credit yet");
+        {
+            let mut cancelled = pin!(send.wait_send_capacity(1));
+            assert!(is_pending(cancelled.as_mut()).await, "no credit yet");
+        }
         assert_eq!(client.debug_tables().waits, before, "the wait left");
 
-        let read = async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        let got = {
+            let mut waiting = pin!(send.wait_send_capacity(1));
+            assert!(is_pending(waiting.as_mut()).await);
             let mut buf = vec![0u8; window as usize];
             sr.read_exact(&mut buf).await.unwrap();
+            waiting.await.unwrap()
         };
-        let (got, ()) = tokio::join!(send.wait_send_capacity(1), read);
-        let got = got.unwrap();
         assert!(got > 0 && got == send.send_capacity(), "{got}");
 
         send.write_all(&vec![2; got as usize]).await.unwrap();
-        let stop = async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            sr.stop(VarInt::from_u32(9)).unwrap();
-        };
-        let (stopped, ()) = tokio::join!(send.wait_send_capacity(1), stop);
-        assert!(stopped.is_err(), "{stopped:?}");
+        let mut stopped = pin!(send.wait_send_capacity(1));
+        assert!(is_pending(stopped.as_mut()).await);
+        sr.stop(VarInt::from_u32(9)).unwrap();
+        assert!(stopped.await.is_err());
 
         let (mut send2, _recv2) = client.open_bi().await.unwrap();
         send2.write_all(&vec![3; window as usize]).await.unwrap();
-        let close = async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            server.close().await;
-        };
-        let (closed, ()) = tokio::join!(send2.wait_send_capacity(1), close);
-        assert!(closed.is_err(), "{closed:?}");
+        let mut closed = pin!(send2.wait_send_capacity(1));
+        assert!(is_pending(closed.as_mut()).await);
+        server.close().await;
+        assert!(closed.await.is_err());
     })
     .await;
 }

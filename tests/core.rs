@@ -296,10 +296,15 @@ fn application_bytes_count_payload_once_and_never_what_was_discarded() {
     for _ in 0..3 {
         let permit = zmux::Permit::try_acquire(&*send_budget, 400, 400);
         let queued =
-            p.a.send_datagram(Bytes::from_static(&[3; 400]), permit.is_some(), p.now)
-                .unwrap();
-        if let (Some(mut permit), true) = (permit, queued) {
+            p.a.send_datagram(Bytes::from_static(&[3; 400]), permit.is_some(), p.now);
+        if let Some(mut permit) = permit {
+            queued.unwrap();
             permit.consume(400);
+        } else {
+            assert_eq!(
+                queued,
+                Err(zmux::DatagramError::Dropped(zmux::DatagramDrop::Limiter))
+            );
         }
     }
     // Two taken; the third refused, nothing taken.
@@ -549,7 +554,7 @@ fn a_ping_whose_response_is_late_asks_again() {
         }
         p.out.copy_to_vec(&mut wire);
     }
-    assert_ne!(wire, Vec::new());
+    assert_ne!(wire, b"");
     p.now += Duration::from_millis(1500);
     p.a.handle_timeout(p.now);
     p.b.handle_timeout(p.now);
@@ -682,10 +687,8 @@ fn datagram_pair() -> Pair {
 
 /// Sends `len` bytes from A and returns what B received.
 fn datagram_through(p: &mut Pair, len: usize) -> Option<usize> {
-    assert!(
-        p.a.send_datagram(Bytes::from(vec![7; len]), true, p.now)
-            .unwrap()
-    );
+    p.a.send_datagram(Bytes::from(vec![7; len]), true, p.now)
+        .unwrap();
     p.pump();
     p.b.recv_datagram(p.now).unwrap().map(|d| d.len())
 }
@@ -716,10 +719,8 @@ fn the_largest_datagram_reported_is_exactly_the_largest_delivered() {
 fn a_datagram_no_carrier_takes_any_more_is_dropped_without_holding_the_queue() {
     let mut p = datagram_pair();
     let max = p.a.max_datagram_size().unwrap();
-    assert!(
-        p.a.send_datagram(Bytes::from(vec![1; max]), true, p.now)
-            .unwrap()
-    );
+    p.a.send_datagram(Bytes::from(vec![1; max]), true, p.now)
+        .unwrap();
     // The carrier's records shrink before its turn.
     p.a.set_pipe_max_record(P0, 8192).unwrap();
     assert_eq!(datagram_through(&mut p, 10), Some(10));

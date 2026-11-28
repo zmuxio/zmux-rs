@@ -322,15 +322,9 @@ impl Attachments {
         self.list.first_mut()
     }
 
-    /// The ID of the first attachment after `id`.
-    pub(crate) fn next_after(&self, id: u64) -> Option<u64> {
-        let i = self.list.partition_point(|a| a.id() <= id);
-        self.list.get(i).map(Attachment::id)
-    }
-
     /// Inserts `att` in identifier order; returns its position. The list
     /// grows by one: attachments come rarely and are bounded by
-    /// `max_pipes`, and a quiet session holds no room for more.
+    /// the attachment envelope, and a quiet session holds no room for more.
     pub(crate) fn insert(&mut self, att: Attachment) -> usize {
         let pos = self.list.partition_point(|a| a.id() < att.id());
         self.list.reserve_exact(1);

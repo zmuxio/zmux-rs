@@ -5,7 +5,7 @@
 
 use std::io;
 
-use http::header::{CONTENT_LENGTH, HeaderName, TRANSFER_ENCODING, UPGRADE};
+use http::header::{CONTENT_LENGTH, HeaderName, TRANSFER_ENCODING};
 use http::{HeaderMap, Method, Version};
 
 /// The request field that pairs the uplink `POST` and the downlink `GET`
@@ -14,31 +14,6 @@ use http::{HeaderMap, Method, Version};
 /// the same ([`crate::Options::pair_field`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PairField(HeaderName);
-
-/// Fields with a meaning of their own that a pairing field must not take
-/// over (lower case); prefixes in [`RESERVED_PREFIXES`].
-const RESERVED: &[&str] = &[
-    "content-length",
-    "content-type",
-    "content-encoding",
-    "transfer-encoding",
-    "host",
-    "connection",
-    "upgrade",
-    "keep-alive",
-    "te",
-    "trailer",
-    "authorization",
-    "cookie",
-    "expect",
-    "date",
-    "early-data",
-    "forwarded",
-    "via",
-    "location",
-    "origin",
-];
-const RESERVED_PREFIXES: &[&str] = &["proxy-", "sec-websocket-", "x-forwarded-"];
 
 impl PairField {
     /// The field `name`: a header field name that no protocol field of
@@ -56,21 +31,25 @@ impl PairField {
                 format!("pairing field {name:?} {why}"),
             )
         };
-        let field = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| invalid("is not a header field name"))?;
-        let l = field.as_str();
-        if RESERVED.contains(&l)
-            || l.eq_ignore_ascii_case(zmux::PREFIX_AUTH_HEADER)
-            || RESERVED_PREFIXES.iter().any(|p| l.starts_with(p))
-        {
-            return Err(invalid("is reserved"));
-        }
-        Ok(Self(field))
+        zmux::proto::prefix_auth::check_custom_header(name).map_err(invalid)?;
+        HeaderName::from_bytes(name.as_bytes())
+            .map(Self)
+            .map_err(|_| invalid("is not a header field name"))
     }
 
     /// The field's name.
     pub fn name(&self) -> &HeaderName {
         &self.0
+    }
+
+    pub(crate) fn check_ticket_header(&self, header: Option<&str>) -> io::Result<()> {
+        if header.is_some_and(|name| name.eq_ignore_ascii_case(self.0.as_str())) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the prefix-authentication header conflicts with the HTTP pairing field",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -132,11 +111,15 @@ pub fn classify_head(
     protocol: Option<&str>,
     pair: &PairField,
 ) -> Option<RequestClass> {
+    if zmux_http_head::websocket(method, version, headers, protocol)
+        != zmux_http_head::WebSocket::Other
+    {
+        return Some(RequestClass::WebSocket);
+    }
     // A field with an empty value is no pairing field.
     let pair = headers.get(pair.name()).is_some_and(|v| !v.is_empty());
     if *method == Method::CONNECT {
         return match protocol {
-            Some(p) if p.eq_ignore_ascii_case("websocket") => Some(RequestClass::WebSocket),
             Some(p)
                 if p.eq_ignore_ascii_case("webtransport")
                     || p.eq_ignore_ascii_case("webtransport-h3") =>
@@ -147,11 +130,6 @@ pub fn classify_head(
         };
     }
     if *method == Method::GET {
-        if version <= Version::HTTP_11
-            && tokens(headers, UPGRADE).any(|t| t.eq_ignore_ascii_case("websocket"))
-        {
-            return Some(RequestClass::WebSocket);
-        }
         return pair.then_some(RequestClass::Downlink);
     }
     if *method != Method::POST {
@@ -186,16 +164,6 @@ pub fn classify(parts: &http::request::Parts, pair: &PairField) -> Option<Reques
 #[must_use]
 pub fn forwarded_early_data(headers: &HeaderMap) -> bool {
     zmux::adapter::forwarded_early_data(headers)
-}
-
-/// The comma-separated tokens of every `name` field.
-fn tokens(headers: &HeaderMap, name: HeaderName) -> impl Iterator<Item = &str> {
-    headers
-        .get_all(name)
-        .into_iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
 }
 
 #[cfg(test)]

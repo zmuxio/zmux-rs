@@ -233,7 +233,7 @@ fn batch() -> Vec<u8> {
     out
 }
 
-fn tally(event: Event<'_>, data: &mut u64, records: &mut u64) {
+fn tally(event: &Event<'_>, data: &mut u64, records: &mut u64) {
     match event {
         Event::Frame(Frame::Stream(s)) => *data += s.data.len() as u64,
         Event::RecordEnd { .. } => *records += 1,
@@ -248,7 +248,7 @@ fn parse(reader: &mut RecordReader, bytes: &[u8], read_size: usize) -> (u64, u64
     for chunk in bytes.chunks(read_size) {
         let mut input = chunk;
         while let Some(event) = reader.read(&mut input, &Gates::ALL).unwrap() {
-            tally(event, &mut data, &mut records);
+            tally(&event, &mut data, &mut records);
         }
     }
     (data, records)
@@ -272,7 +272,7 @@ fn parse_in_place(
         filled += n;
         let mut input = &buf[..filled];
         while let Some(event) = reader.read_complete(&mut input, &Gates::ALL).unwrap() {
-            tally(event, &mut data, &mut records);
+            tally(&event, &mut data, &mut records);
         }
         let left = input.len();
         buf.copy_within(filled - left..filled, 0);
@@ -356,7 +356,7 @@ mod join;
 mod core_bulk {
     use std::time::{Duration, Instant};
 
-    use bytes::Bytes;
+    use zmux::Chunk;
     use zmux::proto::frame::Dir;
     use zmux::proto::record::Framing;
     use zmux::proto::session::{Config, PipeId, Role, SessionCore, StreamKey};
@@ -398,7 +398,7 @@ mod core_bulk {
         send: StreamKey,
         recv: &mut Option<StreamKey>,
         total: usize,
-        shared: Option<&Bytes>,
+        shared: Option<&Chunk>,
     ) -> (usize, u64) {
         let data = [7u8; 16 * 1024];
         let mut sink = [0u8; 16 * 1024];
@@ -511,7 +511,7 @@ mod core_bulk {
         let _serial = crate::serial();
         let mut p = pair();
         let send = p.a.open(Dir::Uni).unwrap();
-        let chunk = Bytes::from(vec![9u8; 256 * 1024]);
+        let chunk = Chunk::from(vec![9u8; 256 * 1024]);
         // A clone makes the buffer shared, so slicing it allocates nothing.
         let shared = chunk.clone();
         let mut recv = None;
@@ -535,7 +535,7 @@ mod core_bulk {
         send: StreamKey,
         recv: &mut Option<StreamKey>,
         total: usize,
-        shared: &Bytes,
+        shared: &Chunk,
     ) {
         let mut read = 0;
         while read < total {
@@ -553,7 +553,7 @@ mod core_bulk {
         let mut p = pair();
         assert!(p.a.features().pipe_ack && p.b.features().pipe_ack);
         let send = p.a.open(Dir::Uni).unwrap();
-        let shared = Bytes::from(vec![9u8; 256 * 1024]);
+        let shared = Chunk::from(vec![9u8; 256 * 1024]);
         let mut recv = None;
         ticking_transfer(&mut p, send, &mut recv, 64 << 20, &shared);
         let ((), n) =
@@ -594,7 +594,7 @@ mod core_multipath {
 
     fn config(policy: &Scheduler) -> Config {
         let mut c = Config::default();
-        c.max_pipes = 4;
+        c.session_policy.limits.steady_attachments = 4;
         c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
         c.scheduler = policy.clone();
         c.max_idle_timeout = Some(Duration::from_secs(600));
@@ -976,7 +976,7 @@ mod sealed_records {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
 
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::io::AsyncWrite;
     use zmux::proto::seal::{Opener, Sealer, aes_256_gcm, chacha20_poly1305};
 
     use super::{allocations, serial};
@@ -1015,21 +1015,19 @@ mod sealed_records {
     /// One record written and read back through the tokio driver's Sealed
     /// halves, polled on this thread.
     fn tokio_round(
-        r: &mut Pin<Box<dyn AsyncRead + Send>>,
+        r: &mut zmux::test_hooks::SealedReadHalf,
         w: &mut Pin<Box<dyn AsyncWrite + Send>>,
         data: &[u8],
-        out: &mut [u8],
     ) {
         let mut cx = Context::from_waker(Waker::noop());
         let Poll::Ready(Ok(n)) = w.as_mut().poll_write(&mut cx, data) else {
             panic!("the record was not taken")
         };
         assert_eq!(n, data.len());
-        let mut rb = ReadBuf::new(out);
-        let Poll::Ready(Ok(())) = r.as_mut().poll_read(&mut cx, &mut rb) else {
+        let Poll::Ready(Ok(Some(record))) = r.poll_record(&mut cx) else {
             panic!("the record was not read")
         };
-        assert_eq!(rb.filled().len(), data.len());
+        assert_eq!(record.as_ref(), data);
     }
 
     /// In the steady state the tokio driver's Sealed records allocate
@@ -1042,14 +1040,13 @@ mod sealed_records {
         let (mut r, _) = zmux::test_hooks::tokio_sealed_halves(far, pair(aes_256_gcm()).0, o);
         let (_, mut w) = zmux::test_hooks::tokio_sealed_halves(near, s, pair(aes_256_gcm()).1);
         let data = vec![9; RECORD];
-        let mut out = vec![0; 1 << 16];
         // Warm-up: the first unit's buffer and the pipe's.
         for _ in 0..4 {
-            tokio_round(&mut r, &mut w, &data, &mut out);
+            tokio_round(&mut r, &mut w, &data);
         }
         let ((), n) = allocations(|| {
             for _ in 0..64 {
-                tokio_round(&mut r, &mut w, &data, &mut out);
+                tokio_round(&mut r, &mut w, &data);
             }
         });
         assert_eq!(n, 0);
@@ -1086,15 +1083,14 @@ mod sealed_records {
         let ring = Ring(Arc::new(Mutex::new(VecDeque::with_capacity(4 * RECORD))));
         let (mut r, mut w) = zmux::test_hooks::blocking_sealed_halves(ring.clone(), ring, s, o);
         let data = vec![9; RECORD];
-        let mut out = vec![0; 1 << 16];
         for _ in 0..4 {
             w.write_all(&data).unwrap();
-            assert_eq!(r.read(&mut out).unwrap(), RECORD);
+            assert_eq!(r.read_record().unwrap().unwrap().as_ref(), data);
         }
         let ((), n) = allocations(|| {
             for _ in 0..64 {
                 w.write_all(&data).unwrap();
-                assert_eq!(r.read(&mut out).unwrap(), RECORD);
+                assert_eq!(r.read_record().unwrap().unwrap().as_ref(), data);
             }
         });
         assert_eq!(n, 0);
@@ -1197,18 +1193,21 @@ mod steady_state {
             Framing::Records,
             Opener::new(aes_256_gcm(), key.to_vec()),
             Vec::new(),
+            None,
         );
         let plain = vec![3u8; 8 * 1024];
-        let mut out = vec![0u8; 16 * 1024];
-        let mut round = |w: &mut SealedWriter, r: &mut SealedReader| {
+        let round = |w: &mut SealedWriter, r: &mut SealedReader| {
             w.seal(&plain).unwrap();
             let unit = w.pending().clone();
             let space = r.space();
             space[..unit.len()].copy_from_slice(&unit);
-            r.filled(unit.len());
+            r.filled(unit.len()).unwrap();
             w.wrote(unit.len()).unwrap();
             drop(unit);
-            assert!(matches!(r.read(&mut out), Ok(SealedRead::Data(n)) if n == plain.len()));
+            let SealedRead::Record(record) = r.read().unwrap() else {
+                panic!("record not available");
+            };
+            assert_eq!(record.as_ref(), plain);
         };
         for _ in 0..4 {
             round(&mut w, &mut r);

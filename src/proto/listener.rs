@@ -18,12 +18,12 @@ use crate::proto::seal::join::JoinHello;
 use crate::proto::varint;
 
 /// A change of a listener's memory pressure: it
-/// started (the sessions' charges went above the budget) or ended (they
+/// started (the charges reached the budget) or ended (they
 /// fell below three quarters of it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MemoryPressure {
-    /// The sum of the sessions' charges, in bytes, when it changed.
+    /// The sum of the charges, in bytes, at the transition.
     pub used: u64,
     /// The budget in effect (0 once it was made unlimited).
     pub budget: u64,
@@ -91,22 +91,25 @@ pub struct ListenerLimits {
     /// since a split bootstrap holds two slots and an exchange carrier's
     /// further requests compete with the request that created it.
     pub max_pending_per_source: usize,
-    /// Unconfirmed carriers per session: joins that passed authentication and wait for the
-    /// joiner's confirmation (default 4). A new authenticated Hello of a session at the bound
-    /// closes the one Unconfirmed longest first and is never refused for lack of room.
-    pub max_pending_per_session: usize,
     /// Suspended sessions held at once (default 1024).
     pub max_suspended: usize,
     /// The first record or Hello must arrive within this (default 2 s).
     pub first_record_timeout: Duration,
-    /// Bytes the sessions may hold together (default 1 GiB; `None` is
+    /// Budget shared by the listener, its carriers and its sessions (default 1 GiB; `None` is
     /// unlimited), in place of their own
-    /// [`Config::memory_budget`](crate::Config#structfield.memory_budget):
-    /// above it sessions grant no new credit, new sessions and pipes are
-    /// refused and the suspended sessions are closed, until the sum falls
-    /// below three quarters of it. A change applies at once, as if the sum
-    /// crossed the new bound.
+    /// [`Config::memory_budget`](crate::Config#structfield.memory_budget).
+    /// Pressure starts when less than one minimum admission remains. It
+    /// limits new work and closes suspended sessions. Pressure ends once
+    /// the sum falls below three quarters of the budget and there is room
+    /// for a minimum admission. A new limit must cover existing charges.
     pub memory_budget: Option<u64>,
+    /// Physical bytes a session may add to its receive-position grant above
+    /// the amount admitted at bootstrap. Zero uses a quarter of the current
+    /// listener budget (unlimited if the listener budget is unlimited).
+    /// A negative value removes the per-session cap. Changes apply to new
+    /// grants, and the listener's shared budget still applies. Under
+    /// pressure the listener favors smaller receive-position grants.
+    pub session_receive_growth_limit: i64,
 }
 
 impl Default for ListenerLimits {
@@ -114,10 +117,10 @@ impl Default for ListenerLimits {
         Self {
             max_pending: Some(DEFAULT_MAX_PENDING),
             max_pending_per_source: 8,
-            max_pending_per_session: 4,
             max_suspended: 1024,
             first_record_timeout: DEFAULT_FIRST_RECORD_TIMEOUT,
             memory_budget: Some(super::session::DEFAULT_MEMORY_BUDGET),
+            session_receive_growth_limit: 0,
         }
     }
 }
@@ -126,11 +129,8 @@ impl ListenerLimits {
     /// Checks the limits as creating a listener does.
     pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
         let e = crate::InvalidConfig::new;
-        if self.max_pending == Some(0) || self.max_pending_per_session == 0 {
-            return Err(e(
-                "ListenerLimits::max_pending",
-                "max_pending and max_pending_per_session must be at least 1",
-            ));
+        if self.max_pending == Some(0) {
+            return Err(e("ListenerLimits::max_pending", "must be at least 1"));
         }
         if self.max_pending_per_source < 2 {
             return Err(e(
@@ -218,6 +218,7 @@ pub struct ListenerConfig {
     /// Hello, an Establish a transform refused. Unset is
     /// [`RejectAction::default_for`]: an Establish refused before
     /// authentication is stalled, a Join closed. No verdict sends anything.
+    /// Use the same action for every refusal cause at a given entry and stage.
     pub on_reject: Option<OnReject>,
     /// Chooses the [`Config`](crate::Config) of each new session (not of a
     /// join); unset, the listener's.
@@ -291,6 +292,7 @@ pub struct RejectError {
     pub reason: &'static str,
     /// The underlying error, such as a gate's ([`std::error::Error::source`]).
     pub err: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
+    establish: bool,
 }
 
 impl RejectError {
@@ -306,6 +308,20 @@ impl RejectError {
             record_mode,
             reason,
             err: None,
+            establish: false,
+        }
+    }
+
+    /// A refusal during Establish, including before the Profile is known.
+    #[must_use]
+    pub fn establish(
+        profile: Option<u64>,
+        record_mode: Option<crate::proto::seal::RecordMode>,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            establish: true,
+            ..Self::new(profile, record_mode, reason)
         }
     }
 
@@ -396,13 +412,13 @@ pub enum RejectAction {
 
 impl RejectAction {
     /// The answer without [`ListenerConfig::on_reject`]: `Stall` for an
-    /// Establish (a Profile other than 2), `Close` for a Join and for a
-    /// refusal that named no Profile.
+    /// Establish, `Close` for a Join or an unclassified carrier.
     #[must_use]
     pub fn default_for(info: &RejectInfo) -> Self {
-        match info.profile {
-            Some(p) if p != 2 => Self::Stall,
-            _ => Self::Close,
+        if info.error.establish || info.profile.is_some_and(|profile| profile != 2) {
+            Self::Stall
+        } else {
+            Self::Close
         }
     }
 }
@@ -676,9 +692,6 @@ struct Pending {
     buf: Vec<u8>,
     /// The first record or Hello arrived.
     first: bool,
-    /// The session's locator once a verified Hello made it Unconfirmed, with the order in
-    /// which carriers became Unconfirmed.
-    unconfirmed: Option<(Vec<u8>, u64)>,
 }
 
 /// A held slot: its source, and its place among the stalls while stalled.
@@ -743,8 +756,6 @@ pub struct ListenerCore {
     stall_seq: u64,
     /// The next slot.
     next_slot: u64,
-    /// The order of the next carrier to become Unconfirmed.
-    unconfirmed_seq: u64,
     /// New sessions not accepted yet ([`ListenerCore::reserve_unaccepted`]).
     unaccepted: usize,
     bootstrap: BootstrapGate,
@@ -862,7 +873,6 @@ impl ListenerCore {
             stalls: BTreeMap::new(),
             stall_seq: 0,
             next_slot: 1,
-            unconfirmed_seq: 0,
             unaccepted: 0,
             bootstrap: BootstrapGate::Open,
         }
@@ -976,8 +986,8 @@ impl ListenerCore {
 
     /// Replaces the limits in the configuration; invalid ones change
     /// nothing. The pending bounds apply to new carriers and the next
-    /// decisions on held ones, closing none; `max_pending_per_session` to
-    /// the next join; `first_record_timeout` to carriers opened after it.
+    /// decisions on held ones, closing none. `first_record_timeout` applies
+    /// to carriers opened after it.
     /// `max_suspended` is the driver's to enforce.
     pub fn set_limits(&mut self, limits: ListenerLimits) -> Result<(), crate::InvalidConfig> {
         limits.validate()?;
@@ -1036,7 +1046,6 @@ impl ListenerCore {
             },
             buf: Vec::new(),
             first: false,
-            unconfirmed: None,
         });
         id
     }
@@ -1297,42 +1306,10 @@ impl ListenerCore {
         }
     }
 
-    /// A verified Hello of the session named `locator` is Unconfirmed. When the session
-    /// already held its bound ([`ListenerLimits::max_pending_per_session`]), the carrier
-    /// that became Unconfirmed first, never this one, MUST be closed as a failed join, and
-    /// the new Hello is never refused for lack of room; below the bound nothing is evicted.
-    /// Returns the carrier to close.
-    pub fn unconfirmed(&mut self, id: CarrierId, locator: &[u8]) -> Option<CarrierId> {
-        let i = self.find(id)?;
-        let seq = self.unconfirmed_seq;
-        self.unconfirmed_seq += 1;
-        self.pending[i].unconfirmed = Some((locator.to_vec(), seq));
-        let of = |p: &Pending| {
-            p.unconfirmed
-                .as_ref()
-                .filter(|(l, _)| l.as_slice() == locator)
-                .map(|&(_, seq)| seq)
-        };
-        if self.pending.iter().filter_map(of).count() <= self.config.limits.max_pending_per_session
-        {
-            return None;
-        }
-        let (i, _) = self
-            .pending
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.id != id)
-            .filter_map(|(i, p)| of(p).map(|seq| (i, seq)))
-            .min_by_key(|&(_, seq)| seq)?;
-        self.remove(i)
-    }
-
     /// The carrier left the listener (attached, rejected or closed); a
-    /// slot it was opened with is released.
-    pub fn done(&mut self, id: CarrierId) {
-        if let Some(i) = self.find(id) {
-            self.remove(i);
-        }
+    /// slot it was opened with is released. Returns whether it was pending.
+    pub fn done(&mut self, id: CarrierId) -> bool {
+        self.find(id).and_then(|i| self.remove(i)).is_some()
     }
 
     fn remove(&mut self, i: usize) -> Option<CarrierId> {
@@ -1566,45 +1543,6 @@ impl LaneProbe {
             Verdict::Accept(FirstRecord::Lane) => lane_message(message),
             _ => Classified::Reject,
         }
-    }
-}
-
-/// The memory budget of a listener's sessions: above
-/// the budget sessions behave as if at their buffer cap; normal operation
-/// resumes below three quarters of it.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MemoryBudget {
-    pressure: bool,
-}
-
-impl MemoryBudget {
-    /// A budget not under pressure.
-    #[must_use]
-    pub fn new() -> Self {
-        Self { pressure: false }
-    }
-
-    /// Updates with the bytes the sessions hold and the budget in effect
-    /// (`None`: unlimited, which ends pressure); returns the new pressure
-    /// state when it changed.
-    pub fn update(&mut self, used: u64, budget: Option<u64>) -> Option<bool> {
-        let next = budget.is_some_and(|budget| {
-            if self.pressure {
-                used >= budget / 4 * 3
-            } else {
-                used > budget
-            }
-        });
-        (next != self.pressure).then(|| {
-            self.pressure = next;
-            next
-        })
-    }
-
-    /// Whether the sessions are above the budget.
-    #[must_use]
-    pub fn pressure(&self) -> bool {
-        self.pressure
     }
 }
 
@@ -2023,28 +1961,6 @@ mod tests {
         }
     }
 
-    /// Beyond the session's limit the carrier Unconfirmed longest goes, by when it became
-    /// Unconfirmed and not by when it arrived, and never the Hello that went over it.
-    #[test]
-    fn the_longest_unconfirmed_is_evicted() {
-        let mut l = ListenerCore::new(ListenerConfig::default());
-        let now = Instant::now();
-        let ids: Vec<_> = (0..6)
-            .map(|n| {
-                let (slot, _) = taken(l.enter(n));
-                l.open(Some(slot), Framing::ByteStream, now)
-            })
-            .collect();
-        // The first to arrive is the slowest to be verified.
-        for &id in &ids[1..5] {
-            assert_eq!(l.unconfirmed(id, b"s"), None);
-        }
-        assert_eq!(l.unconfirmed(ids[0], b"s"), Some(ids[1]));
-        // Another session's Unconfirmed carriers are not counted.
-        assert_eq!(l.unconfirmed(ids[5], b"t"), None);
-        assert_eq!(l.pending(), 5);
-    }
-
     #[test]
     fn source_keys() {
         let c = ListenerConfig::default();
@@ -2098,17 +2014,5 @@ mod tests {
         let now = Instant::now();
         let id = l.open(None, Framing::ByteStream, now);
         assert_eq!(l.data(id, b"GET / HTTP/1.1\r\n", now), Classified::Reject);
-    }
-
-    #[test]
-    fn memory_budget_hysteresis() {
-        let mut m = MemoryBudget::new();
-        let b = Some(1000);
-        assert_eq!(m.update(900, b), None);
-        assert_eq!(m.update(1001, b), Some(true));
-        assert_eq!(m.update(800, b), None);
-        assert_eq!(m.update(700, b), Some(false));
-        assert_eq!(m.update(1001, b), Some(true));
-        assert_eq!(m.update(1001, None), Some(false), "unlimited ends it");
     }
 }

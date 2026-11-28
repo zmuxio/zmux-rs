@@ -312,6 +312,38 @@ where
 
 const REFUSED: &[u8] = b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
+#[tokio::test]
+async fn refused_stream_keeps_its_read_half_until_client_eof() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, (server, _)) =
+            tokio::try_join!(TcpStream::connect(addr), listener.accept()).unwrap();
+        let proxy = tokio::spawn(serve(Profile::WEBSOCKET_ONLY, server, addr));
+        let (mut response, mut upload) = client.into_split();
+        upload
+            .write_all(
+                b"POST /zmux HTTP/1.1\r\nhost: localhost\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        response.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, REFUSED);
+        assert!(
+            !proxy.is_finished(),
+            "the proxy must still be draining the upload"
+        );
+
+        upload.write_all(b"5\r\nhello\r\n0\r\n\r\n").await.unwrap();
+        upload.shutdown().await.unwrap();
+        proxy.await.unwrap().unwrap();
+    })
+    .await
+    .expect("proxy refusal scenario timed out");
+}
+
 async fn serve(profile: Profile, client: TcpStream, origin: SocketAddr) -> io::Result<()> {
     let (cr, mut cw) = client.into_split();
     let mut cr = Buffered::new(cr);
@@ -325,6 +357,10 @@ async fn serve(profile: Profile, client: TcpStream, origin: SocketAddr) -> io::R
         };
         if refused {
             cw.write_all(REFUSED).await?;
+            cw.shutdown().await?;
+            // A streaming client may still be uploading. Keep the read half
+            // open so unread TCP data cannot reset the refusal response.
+            tokio::io::copy(&mut cr.r, &mut tokio::io::sink()).await?;
             return Ok(());
         }
         let upstream = TcpStream::connect(origin).await?;

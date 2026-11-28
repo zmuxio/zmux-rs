@@ -1,81 +1,126 @@
-//! Local limits and a candidate's budget, read from JSON.
+//! Local limits and a candidate's budget, parsed from JSON.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use zmux::shaping::{
-    Account, Budget, Limits, MAX_ACCOUNT_INITIAL, MAX_ACCOUNT_RATE, ShapingBudget,
+    Account, Budget, Limits, MAX_ACCOUNT_INITIAL, MAX_ACCOUNT_RATE, ProfileLimits, ShapingBudget,
 };
 
 use crate::error::{Error, err};
-use crate::json::{Json, parse};
+use crate::json::{Json, known, parse};
 use crate::value::{BUDGET_SCOPES, Family, Reader, Sampler, Value, int, parse_value, to_u64};
 
-const TIME: i128 = 1_000_000_000_000_000;
-
-fn known(x: &Json, allowed: &[&str], what: &str) -> Result<(), Error> {
-    let Json::Obj(m) = x else {
-        return Err(err("type", what.to_owned()));
-    };
-    if let Some((k, _)) = m.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
-        return Err(err("unknown_member", format!("{what}.{k}")));
-    }
-    Ok(())
-}
+const TIME: u64 = 1_000_000_000_000_000;
+const ACCOUNT: [(&str, Family, u64); 4] = [
+    ("ceiling", Family::Counter, MAX_ACCOUNT_INITIAL),
+    ("initial", Family::Counter, MAX_ACCOUNT_INITIAL),
+    ("per_mb", Family::Rate, MAX_ACCOUNT_RATE),
+    ("per_sec", Family::Rate, MAX_ACCOUNT_RATE),
+];
 
 /// A candidate's parsed budget.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BudgetDef {
-    /// `initial`, `per_mb`, `per_sec`; `None`: no `wire` member.
-    wire: Option<[Option<Value>; 3]>,
-    pub(crate) max_delay: Option<Duration>,
+    wire: Option<[Value; 4]>,
+    pub(crate) profile: Option<ProfileLimits>,
+    no_injection: bool,
 }
 
-const WIRE: [(&str, Family); 3] = [
-    ("initial", Family::Counter),
-    ("per_mb", Family::Rate),
-    ("per_sec", Family::Rate),
-];
+fn account<T>(
+    wire: &Json,
+    parse: impl Fn(&Json, &str, Family, u64) -> Result<T, Error>,
+    default: impl Fn() -> T,
+) -> Result<[T; 4], Error> {
+    known(wire, &["ceiling", "initial", "per_mb", "per_sec"], "wire")?;
+    member(wire, "ceiling")?;
+    let mut fields = ACCOUNT.into_iter().map(|(k, family, max)| {
+        wire.get(k)
+            .map_or_else(|| Ok(default()), |v| parse(v, k, family, max))
+    });
+    Ok([
+        fields.next().expect("ceiling")?,
+        fields.next().expect("initial")?,
+        fields.next().expect("per_mb")?,
+        fields.next().expect("per_sec")?,
+    ])
+}
+
+fn member<'a>(x: &'a Json, k: &str) -> Result<&'a Json, Error> {
+    x.get(k).ok_or_else(|| err("type", format!("missing {k}")))
+}
+
+fn number(x: &Json, key: &str, max: u64) -> Result<u64, Error> {
+    let n = int(x).ok_or_else(|| err("type", key))?;
+    if !(0..=i128::from(max)).contains(&n) {
+        return Err(err("range", format!("{key}: {n}")));
+    }
+    Ok(to_u64(n))
+}
+
+fn profile(x: &Json) -> Result<ProfileLimits, Error> {
+    known(
+        x,
+        &[
+            "window_seconds",
+            "extra_bytes_ppm",
+            "floor_bytes",
+            "max_added_delay",
+        ],
+        "profile",
+    )?;
+    let required = |key| member(x, key);
+    let window = number(
+        required("window_seconds")?,
+        "window_seconds",
+        u64::from(u32::MAX),
+    )?;
+    if window == 0 {
+        return Err(err("range", "window_seconds"));
+    }
+    let floor = number(required("floor_bytes")?, "floor_bytes", MAX_ACCOUNT_INITIAL)?;
+    let ppm = number(required("extra_bytes_ppm")?, "extra_bytes_ppm", 1_000_000)?;
+    let delay = number(required("max_added_delay")?, "max_added_delay", TIME)?;
+    Ok(ProfileLimits::new(
+        u32::try_from(window).expect("window"),
+        u32::try_from(ppm).expect("ppm"),
+        floor,
+        Duration::from_micros(delay),
+    ))
+}
 
 pub(crate) fn parse_budget(x: &Json, reader: &Reader<'_>) -> Result<BudgetDef, Error> {
-    known(x, &["wire", "max_delay"], "budget")?;
-    let mut b = BudgetDef::default();
-    if let Some(w) = x.get("wire") {
-        known(w, &["initial", "per_mb", "per_sec"], "wire")?;
-        let mut vals = [None, None, None];
-        for (slot, (k, fam)) in vals.iter_mut().zip(WIRE) {
-            if let Some(v) = w.get(k) {
-                *slot = Some(parse_value(v, fam, reader, BUDGET_SCOPES, k)?);
+    known(x, &["wire", "profile", "no_injection"], "budget")?;
+    let wire = x
+        .get("wire")
+        .map(|w| {
+            let values = account(
+                w,
+                |v, k, family, _| parse_value(v, family, reader, BUDGET_SCOPES, k),
+                || Value::constant(0),
+            )?;
+            if values[1].upper() > values[0].lower() {
+                return Err(err("range", "sampled initial can exceed ceiling"));
             }
-        }
-        b.wire = Some(vals);
-    }
-    if let Some(v) = x.get("max_delay") {
-        let n = int(v).ok_or_else(|| err("type", "max_delay"))?;
-        if !(1..=TIME).contains(&n) {
-            return Err(err("range", format!("max_delay: {n}")));
-        }
-        b.max_delay = Some(Duration::from_micros(to_u64(n)));
-    }
-    Ok(b)
+            Ok(values)
+        })
+        .transpose()?;
+    Ok(BudgetDef {
+        wire,
+        profile: x.get("profile").map(profile).transpose()?,
+        no_injection: switch(x, "no_injection")?,
+    })
 }
 
 impl BudgetDef {
-    /// One session's budget: `initial`, `per_mb`, `per_sec` in order. A wire of zeros
-    /// allows no injection.
     fn draw(&self, s: &mut Sampler) -> Budget {
-        let mut wire = Account::default();
-        let mut none = false;
-        if let Some([a, b, c]) = &self.wire {
-            let mut d = |v: &Option<Value>| v.as_ref().map_or(0, |v| s.draw(v));
-            let (initial, per_mb, per_sec) = (d(a), d(b), d(c));
-            wire = Account::new(initial, per_mb, per_sec);
-            none = wire.is_unset();
-        }
-        Budget::new(wire, self.max_delay, none)
+        let wire = self.wire.as_ref().map(|fields| {
+            let [ceiling, initial, per_mb, per_sec] = std::array::from_fn(|i| s.draw(&fields[i]));
+            Account::new(ceiling, initial, per_mb, per_sec)
+        });
+        Budget::new(wire, self.profile, self.no_injection)
     }
 
-    /// The source of budgets of a compiled candidate, drawing from `s`.
     pub(crate) fn source(self, s: Sampler) -> ShapingBudget {
         let s = Arc::new(Mutex::new(s));
         ShapingBudget::new(move || {
@@ -85,69 +130,38 @@ impl BudgetDef {
     }
 }
 
-fn switch(x: &Json, key: &str) -> Result<bool, Error> {
+pub(crate) fn switch(x: &Json, key: &str) -> Result<bool, Error> {
     match x.get(key) {
         None => Ok(false),
         Some(Json::Bool(b)) => Ok(*b),
-        Some(_) => Err(err("type", key.to_owned())),
+        Some(_) => Err(err("type", key)),
     }
 }
 
-/// Reads local limits: a JSON object with `wire` (integer `initial` in \[0, 2^53\], `per_mb`
-/// and `per_sec` in \[0, 2^43\]), `max_delay` (microseconds up to 10^15, 0 the default and a
-/// negative number no bound) and the switches `no_padding`, `no_pause` and `no_injection`.
-/// A wire of zeros means `no_injection`. An absent or `null` member is its default.
+/// Loads local shaping limits from a development profile.
 ///
 /// # Errors
 ///
-/// Fails if `json` is not valid JSON, has an unknown member, or a member has the wrong
-/// type or is out of range.
+/// Returns an error for malformed, unsupported or out-of-range fields.
 pub fn parse_limits(json: &[u8]) -> Result<Limits, Error> {
     let x = parse(json)?;
     known(
         &x,
-        &[
-            "wire",
-            "max_delay",
-            "no_padding",
-            "no_pause",
-            "no_injection",
-        ],
+        &["wire", "profile", "no_padding", "no_pause", "no_injection"],
         "limits",
     )?;
-    let mut l = Limits::default();
-    l.no_padding = switch(&x, "no_padding")?;
-    l.no_pause = switch(&x, "no_pause")?;
-    l.no_injection = switch(&x, "no_injection")?;
-    if let Some(w) = x.get("wire") {
-        known(w, &["initial", "per_mb", "per_sec"], "wire")?;
-        let read = |k: &str, max: u64| -> Result<u64, Error> {
-            let Some(v) = w.get(k) else {
-                return Ok(0);
-            };
-            let n = int(v).ok_or_else(|| err("type", k.to_owned()))?;
-            if n < 0 || n > i128::from(max) {
-                return Err(err("range", format!("{k}: {n}")));
-            }
-            Ok(to_u64(n))
-        };
-        l.wire = Account::new(
-            read("initial", MAX_ACCOUNT_INITIAL)?,
-            read("per_mb", MAX_ACCOUNT_RATE)?,
-            read("per_sec", MAX_ACCOUNT_RATE)?,
-        );
-        l.no_injection |= l.wire.is_unset();
-    }
-    if let Some(v) = x.get("max_delay") {
-        let n = int(v).ok_or_else(|| err("type", "max_delay"))?;
-        if n > TIME {
-            return Err(err("range", format!("max_delay: {n}")));
+    let mut limits = Limits::default();
+    limits.no_padding = switch(&x, "no_padding")?;
+    limits.no_pause = switch(&x, "no_pause")?;
+    limits.no_injection = switch(&x, "no_injection")?;
+    limits.profile = x.get("profile").map(profile).transpose()?;
+    if let Some(wire) = x.get("wire") {
+        let [ceiling, initial, per_mb, per_sec] =
+            account(wire, |v, k, _, max| number(v, k, max), || 0)?;
+        if initial > ceiling {
+            return Err(err("range", "initial exceeds ceiling"));
         }
-        l.max_delay = match n {
-            0 => Limits::default().max_delay,
-            n if n < 0 => None,
-            n => Some(Duration::from_micros(to_u64(n))),
-        };
+        limits.wire = Some(Account::new(ceiling, initial, per_mb, per_sec));
     }
-    Ok(l)
+    Ok(limits)
 }

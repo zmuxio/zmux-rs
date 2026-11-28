@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zmux::shaping::{
-    Caps, Effects, Event, EventKind, Factory, Gate, Injection, Meters, RecordPlan, RecordView,
-    ShapedPipe, Shaper, wire_ppm,
+    Caps, DatagramPlan, DatagramView, Effects, Event, EventKind, Factory, Gate, Injection, Meters,
+    ProfileLimits, RecordPlan, RecordView, ShapedPipe, Shaper, UnitPlan, gate_wait, wire_ppm,
 };
 
 use crate::error::{Error, err};
-use crate::json::{Json, parse};
+use crate::json::{Json, known, parse};
+use crate::limits::{parse_budget, switch};
 use crate::random::{OsSeeded, Source};
 use crate::value::{
     ALL_SCOPES, Family, Reader, Sampler, Scope, Value, idx32, int, parse_value, to_u32, to_usize,
@@ -136,11 +137,11 @@ impl Options {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Trigger {
-    RecordOut,
-    RecordIn,
-    PaddingIn,
-    Injected,
-    InjectDropped,
+    RecordPlan,
+    DatagramPlan,
+    Outbound,
+    InjectionAccepted,
+    InjectionRejected,
     Enter,
     StreamOpen,
     StreamEnd,
@@ -166,7 +167,7 @@ enum What {
     WireLeft,
     StallLeft,
     WireSpent,
-    SentBytes,
+    EarnedBytes,
     WirePpm,
 }
 
@@ -230,6 +231,7 @@ struct Record {
 #[derive(Debug, Clone, Default)]
 struct State {
     record: Option<Record>,
+    datagram: Option<Record>,
     enter: Vec<Action>,
     next: Vec<Transition>,
 }
@@ -240,16 +242,6 @@ pub(crate) struct Machine {
     counters: u32,
     timers: u32,
     states: Vec<State>,
-}
-
-fn known(x: &Json, allowed: &[&str], what: &str) -> Result<(), Error> {
-    let Json::Obj(m) = x else {
-        return Err(err("type", what.to_owned()));
-    };
-    match m.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
-        Some((k, _)) => Err(err("unknown_member", format!("{what}.{k}"))),
-        None => Ok(()),
-    }
 }
 
 fn req<'a>(x: &'a Json, k: &str, what: &str) -> Result<&'a Json, Error> {
@@ -295,7 +287,7 @@ impl Ctx<'_, '_> {
 
     fn state(&self, x: &Json) -> Result<State, Error> {
         let limits = &self.reader.limits;
-        known(x, &["record", "enter", "next"], "state")?;
+        known(x, &["record", "datagram", "enter", "next"], "state")?;
         let mut st = State::default();
         if let Some(r) = x.get("record") {
             known(
@@ -329,6 +321,16 @@ impl Ctx<'_, '_> {
                 pad: self.opt(r, "pad", Family::Length)?,
                 delay: self.opt(r, "delay", Family::Time)?,
                 flush,
+            });
+        }
+        if let Some(r) = x.get("datagram") {
+            known(r, &["pad_to", "pad_multiple", "pad", "delay"], "datagram")?;
+            st.datagram = Some(Record {
+                pad_to: self.opt(r, "pad_to", Family::Length)?,
+                pad_multiple: self.opt(r, "pad_multiple", Family::Length)?,
+                pad: self.opt(r, "pad", Family::Length)?,
+                delay: self.opt(r, "delay", Family::Time)?,
+                ..Record::default()
             });
         }
         if let Some(e) = x.get("enter") {
@@ -456,11 +458,11 @@ impl Ctx<'_, '_> {
             "zero" => Trigger::Zero(slot(x, self.counters, "zero")?),
             other => {
                 let t = match other {
-                    "record_out" => Trigger::RecordOut,
-                    "record_in" => Trigger::RecordIn,
-                    "padding_in" => Trigger::PaddingIn,
-                    "injected" => Trigger::Injected,
-                    "inject_dropped" => Trigger::InjectDropped,
+                    "record_plan" => Trigger::RecordPlan,
+                    "datagram_plan" => Trigger::DatagramPlan,
+                    "outbound" => Trigger::Outbound,
+                    "injection_accepted" => Trigger::InjectionAccepted,
+                    "injection_rejected" => Trigger::InjectionRejected,
                     "enter" => Trigger::Enter,
                     "stream_open" => Trigger::StreamOpen,
                     "stream_end" => Trigger::StreamEnd,
@@ -489,7 +491,7 @@ impl Ctx<'_, '_> {
         };
         let what = match w.as_str() {
             "counter" => What::Counter(slot(c, self.counters, "if")?),
-            "len" | "seq" | "wire_left" | "stall_left" | "wire_spent" | "sent_bytes"
+            "len" | "seq" | "wire_left" | "stall_left" | "wire_spent" | "earned_bytes"
             | "wire_ppm" => {
                 if c.get("slot").is_some() {
                     return Err(err("unknown_member", "if.slot"));
@@ -500,7 +502,7 @@ impl Ctx<'_, '_> {
                     "wire_left" => What::WireLeft,
                     "stall_left" => What::StallLeft,
                     "wire_spent" => What::WireSpent,
-                    "sent_bytes" => What::SentBytes,
+                    "earned_bytes" => What::EarnedBytes,
                     _ => What::WirePpm,
                 }
             }
@@ -620,8 +622,8 @@ impl Machine {
                 t,
                 Trigger::Enter
                     | Trigger::Zero(_)
-                    | Trigger::Injected
-                    | Trigger::InjectDropped
+                    | Trigger::InjectionAccepted
+                    | Trigger::InjectionRejected
                     | Trigger::Timer(_)
             )
         };
@@ -694,6 +696,64 @@ fn on_cycle(adj: &[Vec<usize>]) -> Vec<bool> {
     out
 }
 
+/// Recovery requirements independent of the session's preamble policy.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GateBounds {
+    wait: Duration,
+    slowest: Option<u64>,
+}
+
+impl GateBounds {
+    fn collect(machines: &[Machine]) -> Self {
+        let mut bounds = Self::default();
+        for action in machines
+            .iter()
+            .flat_map(|m| &m.states)
+            .flat_map(|s| &s.enter)
+        {
+            let Action::Rate { rate, burst } = action else {
+                continue;
+            };
+            let default_burst = zmux::proto::record::ZMUX_MAX_RECORD_SIZE;
+            let burst = burst.as_ref().map_or(default_burst, |burst| {
+                burst
+                    .reachable()
+                    .map(|(lo, hi)| if lo == 0 { hi.max(default_burst) } else { hi })
+                    .max()
+                    .unwrap_or(0)
+            });
+            for (lo, hi) in rate.reachable().filter(|&(_, hi)| hi != 0) {
+                let lo = lo.max(1);
+                bounds.slowest = Some(bounds.slowest.map_or(lo, |rate| rate.min(lo)));
+                bounds.wait = bounds.wait.max(gate_wait(lo, burst, 0));
+                let next_quantum = lo.div_ceil(1000) * 1000;
+                if next_quantum <= hi {
+                    bounds.wait = bounds.wait.max(gate_wait(next_quantum, burst, 0));
+                }
+            }
+        }
+        bounds
+    }
+
+    pub(crate) fn check(machines: &[Machine], profile: ProfileLimits) -> Result<Self, Error> {
+        let bounds = Self::collect(machines);
+        if bounds.wait > profile.max_added_delay {
+            return Err(err(
+                "conflict",
+                format!("rate and burst require {:?} of added delay", bounds.wait),
+            ));
+        }
+        Ok(bounds)
+    }
+
+    pub(crate) fn for_preamble(self, preamble: u64) -> Duration {
+        self.wait.max(
+            self.slowest
+                .map_or(Duration::ZERO, |rate| gate_wait(rate, 0, preamble)),
+        )
+    }
+}
+
 pub(crate) struct Program {
     machines: Vec<Machine>,
     caps: Caps,
@@ -704,9 +764,10 @@ pub(crate) struct Program {
     queue: usize,
     shared: Vec<u64>,
     options: Options,
+    gate_bounds: GateBounds,
 }
 
-/// Settles the `shared` values and places the `pipe` ones, in the order of the contract.
+/// Settles the `shared` values and places the `pipe` ones, in definition order.
 fn settle(machines: &mut [Machine], s: &mut Sampler, shared: &mut Vec<u64>) -> usize {
     let mut slots = 0;
     let mut one = |v: &mut Value| {
@@ -719,7 +780,7 @@ fn settle(machines: &mut [Machine], s: &mut Sampler, shared: &mut Vec<u64>) -> u
     };
     for m in machines {
         for st in &mut m.states {
-            if let Some(r) = &mut st.record {
+            for r in [&mut st.record, &mut st.datagram].into_iter().flatten() {
                 for v in [
                     &mut r.target,
                     &mut r.max_len,
@@ -754,21 +815,30 @@ fn settle(machines: &mut [Machine], s: &mut Sampler, shared: &mut Vec<u64>) -> u
 
 pub(crate) fn compile(
     mut machines: Vec<Machine>,
+    include_control: bool,
     s: &mut Sampler,
     shared: &mut Vec<u64>,
     options: Options,
+    gate_bounds: GateBounds,
 ) -> Program {
     let first = shared.len();
     let pipe_slots = settle(&mut machines, s, shared);
     let mut caps = Caps::PLAN;
+    if include_control {
+        caps = caps | Caps::INCLUDE_CONTROL;
+    }
     // No enter or zero cycle: a drain enters a state at most once.
     let mut queue = 0;
     for m in &machines {
         queue += 1;
         for st in &m.states {
+            if st.datagram.is_some() {
+                caps = caps | Caps::DATAGRAM_PLAN;
+            }
             for t in &st.next {
                 match t.on {
-                    Trigger::RecordIn | Trigger::PaddingIn => caps = caps | Caps::RECORD_IN,
+                    Trigger::Outbound => caps = caps | Caps::OUTBOUND,
+                    Trigger::DatagramPlan => caps = caps | Caps::DATAGRAM_PLAN,
                     Trigger::StreamOpen | Trigger::StreamEnd => caps = caps | Caps::STREAMS,
                     _ => {}
                 }
@@ -791,6 +861,7 @@ pub(crate) fn compile(
         shared: shared[first..].to_vec(),
         machines,
         options,
+        gate_bounds,
     }
 }
 
@@ -814,20 +885,34 @@ impl MachineFactory {
     pub fn from_json(b: &[u8], options: Options) -> Result<Self, Error> {
         options.limits.input(b.len())?;
         let doc = parse(b)?;
-        known(&doc, &["machines", "tables"], "definition")?;
+        known(
+            &doc,
+            &["machines", "tables", "include_control", "budget"],
+            "definition",
+        )?;
         let tables = doc.get("tables");
         if tables.is_some_and(|t| !matches!(t, Json::Obj(_))) {
             return Err(err("type", "tables"));
         }
         let reader = Reader::new(tables, options.limits);
         let machines = parse_machines(req(&doc, "machines", "definition")?, &reader)?;
+        let budget = doc
+            .get("budget")
+            .map(|budget| parse_budget(budget, &reader))
+            .transpose()?;
+        let profile = budget
+            .and_then(|b| b.profile)
+            .unwrap_or(ProfileLimits::LIGHTWEIGHT);
+        let gate_bounds = GateBounds::check(&machines, profile)?;
         let mut s = options.sampler();
         let mut shared = Vec::new();
         Ok(Self(Arc::new(compile(
             machines,
+            switch(&doc, "include_control")?,
             &mut s,
             &mut shared,
             options,
+            gate_bounds,
         ))))
     }
 
@@ -851,6 +936,10 @@ impl MachineFactory {
 }
 
 impl Factory for MachineFactory {
+    fn required_gate_wait(&self, preamble: u64) -> Duration {
+        self.0.gate_bounds.for_preamble(preamble)
+    }
+
     fn shaper(&self, _: &ShapedPipe) -> Option<Box<dyn Shaper>> {
         Some(Box::new(MachineFactory::shaper(self)))
     }
@@ -878,7 +967,10 @@ struct Run {
     tm_at: Vec<u32>,
     ctr: Vec<u64>,
     tm: Vec<Option<u64>>,
-    inj: Vec<Option<(u64, usize)>>,
+    injection: Option<Injection>,
+    injection_owner: u32,
+    request_seq: u64,
+    can_inject: bool,
     rate: Vec<(u64, u64)>,
     weight: Vec<u32>,
     kept: Vec<Option<u64>>,
@@ -890,7 +982,6 @@ struct Run {
     meters: Meters,
     now: u64,
     stop: bool,
-    surfaced: Option<usize>,
     last_inject: Option<Injection>,
     last_wake: Option<u64>,
     last_gate: Gate,
@@ -925,7 +1016,10 @@ impl MachineShaper {
                 tm_at,
                 ctr: vec![0; p.counters],
                 tm: vec![None; p.timers],
-                inj: vec![None; n],
+                injection: None,
+                injection_owner: 0,
+                request_seq: 0,
+                can_inject: false,
                 rate: vec![(0, 0); n],
                 weight: vec![0; n],
                 kept: vec![None; p.pipe_slots],
@@ -934,10 +1028,9 @@ impl MachineShaper {
                 pause_until: 0,
                 seq: 0,
                 len: 0,
-                meters: Meters::new(u64::MAX, u64::MAX, 0, 0),
+                meters: Meters::new(0, u64::MAX, 0, 0),
                 now: 0,
                 stop: false,
-                surfaced: None,
                 last_inject: None,
                 last_wake: None,
                 last_gate: Gate::default(),
@@ -1037,8 +1130,8 @@ impl Run {
             What::WireLeft => self.meters.wire_left,
             What::StallLeft => self.meters.stall_left,
             What::WireSpent => self.meters.wire_spent,
-            What::SentBytes => self.meters.sent_bytes,
-            What::WirePpm => wire_ppm(self.meters.wire_spent, self.meters.sent_bytes),
+            What::EarnedBytes => self.meters.earned_bytes,
+            What::WirePpm => wire_ppm(self.meters.wire_spent, self.meters.earned_bytes),
         };
         let y = self.val(&c.value);
         match c.cmp {
@@ -1077,12 +1170,19 @@ impl Run {
     fn act(&mut self, m: u32, action: &Action) {
         let i = m as usize;
         match action {
-            Action::Inject { after, len } => {
+            Action::Inject { after, len } if self.can_inject => {
                 let after = self.val(after);
                 let len = self.val(len);
-                self.inj[i] = Some((self.now.saturating_add(after), to_usize(len)));
+                self.request_seq = self.request_seq.wrapping_add(1).max(1);
+                self.injection = Some(Injection::new(
+                    self.request_seq,
+                    self.now.saturating_add(after),
+                    to_usize(len),
+                ));
+                self.injection_owner = m;
             }
-            Action::InjectCancel => self.inj[i] = None,
+            Action::InjectCancel if self.injection_owner == m => self.injection = None,
+            Action::Inject { .. } | Action::InjectCancel | Action::Restart => {}
             Action::Pause { after } => {
                 let after = self.val(after);
                 self.pause_until = self.pause_until.max(self.now.saturating_add(after));
@@ -1117,27 +1217,14 @@ impl Run {
                 }
             }
             Action::Stop => self.stop = true,
-            Action::Restart => {}
         }
     }
 
     /// What changed since the last entrance.
     fn effects(&mut self, out: &mut Effects) {
-        let mut best: Option<usize> = None;
-        for (m, x) in self.inj.iter().enumerate() {
-            if let Some((at, _)) = x
-                && best.is_none_or(|b| self.inj[b].is_some_and(|(t, _)| *at < t))
-            {
-                best = Some(m);
-            }
-        }
-        self.surfaced = best;
-        let inject = best
-            .and_then(|b| self.inj[b])
-            .map(|(at, len)| Injection::new(at, len));
-        if inject != self.last_inject {
-            out.inject = Some(inject);
-            self.last_inject = inject;
+        if self.injection != self.last_inject {
+            out.inject = Some(self.injection);
+            self.last_inject = self.injection;
         }
         let wake = self.tm.iter().flatten().copied().min();
         if wake != self.last_wake {
@@ -1168,20 +1255,14 @@ impl Run {
         }
     }
 
-    fn plan_record(&mut self, r: &Record, plan: &mut RecordPlan) {
-        let mut cut = None;
-        if let Some(v) = &r.target {
-            let t = to_usize(self.val(v));
-            cut = Some(t);
-            plan.pad_to = plan.pad_to.max(t);
-        } else if let Some(v) = &r.max_len {
-            cut = Some(to_usize(self.val(v)));
-        }
-        if let Some(c) = cut.filter(|c| *c != 0)
-            && (plan.max_len == 0 || c < plan.max_len)
-        {
-            plan.max_len = c;
-        }
+    fn draw_unit(&mut self, r: &Record, plan: &mut UnitPlan) -> usize {
+        let cut = if let Some(v) = &r.target {
+            let size = to_usize(self.val(v));
+            plan.pad_to = plan.pad_to.max(size);
+            size
+        } else {
+            r.max_len.as_ref().map_or(0, |v| to_usize(self.val(v)))
+        };
         if let Some(v) = &r.pad_to {
             plan.pad_to = plan.pad_to.max(to_usize(self.val(v)));
         }
@@ -1197,11 +1278,15 @@ impl Run {
         if let Some(v) = &r.delay {
             plan.delay = plan.delay.max(Duration::from_micros(self.val(v)));
         }
-        plan.flush |= r.flush;
+        cut
     }
 }
 
 impl Shaper for MachineShaper {
+    fn required_gate_wait(&self, preamble: u64) -> Duration {
+        self.p.gate_bounds.for_preamble(preamble)
+    }
+
     fn capabilities(&self) -> Caps {
         self.p.caps
     }
@@ -1210,21 +1295,45 @@ impl Shaper for MachineShaper {
         let Self { p, run } = self;
         run.now = view.now;
         run.meters = view.meters;
+        let mut unit = UnitPlan::default();
         for (m, def) in p.machines.iter().enumerate() {
             if let Some(r) = &def.states[run.cur[m] as usize].record {
-                run.plan_record(r, plan);
+                let cut = run.draw_unit(r, &mut unit);
+                if cut != 0 && (plan.max_len == 0 || cut < plan.max_len) {
+                    plan.max_len = cut;
+                }
+                plan.flush |= r.flush;
             }
         }
-        run.fire(p, Trigger::RecordOut, 0, None);
+        plan.pad_to = unit.pad_to;
+        plan.pad_multiple = unit.pad_multiple;
+        plan.pad = unit.pad;
+        plan.delay = unit.delay;
+        run.fire(p, Trigger::RecordPlan, 0, None);
         run.seq += 1;
         plan.stop = run.stop;
         run.effects(&mut plan.effects);
+    }
+
+    fn plan_datagram(&mut self, view: &DatagramView, plan: &mut DatagramPlan) {
+        let Self { p, run } = self;
+        run.now = view.now;
+        run.meters = view.meters;
+        for (m, def) in p.machines.iter().enumerate() {
+            if let Some(r) = &def.states[run.cur[m] as usize].datagram {
+                run.draw_unit(r, &mut plan.unit);
+            }
+        }
+        run.fire(p, Trigger::DatagramPlan, view.len as u64, None);
+        run.effects(&mut plan.effects);
+        plan.effects.stop = run.stop;
     }
 
     fn on_event(&mut self, e: &Event, r: &mut Effects) {
         let Self { p, run } = self;
         run.now = e.now;
         run.meters = e.meters;
+        run.can_inject = matches!(e.kind, EventKind::Outbound | EventKind::Timer);
         match e.kind {
             EventKind::Start => {
                 for (m, def) in p.machines.iter().enumerate() {
@@ -1232,23 +1341,18 @@ impl Shaper for MachineShaper {
                 }
                 run.drain(p);
             }
-            EventKind::RecordIn if e.padding_only => {
-                run.fire(p, Trigger::PaddingIn, e.len as u64, None);
-            }
-            EventKind::RecordIn => run.fire(p, Trigger::RecordIn, e.len as u64, None),
-            EventKind::Injected => {
-                if let Some(m) = run.surfaced {
-                    run.inj[m] = None;
-                }
-                run.fire(p, Trigger::Injected, e.len as u64, None);
-            }
-            EventKind::InjectDropped => {
-                if let Some(m) = run.surfaced {
-                    run.inj[m] = None;
-                    run.fire(p, Trigger::InjectDropped, 0, Some(idx32(m)));
+            EventKind::Outbound => run.fire(p, Trigger::Outbound, e.len as u64, None),
+            EventKind::InjectionAccepted | EventKind::InjectionRejected => {
+                if run.injection.is_some_and(|req| req.id == e.request_id) {
+                    run.injection = None;
+                    if e.kind == EventKind::InjectionAccepted {
+                        run.fire(p, Trigger::InjectionAccepted, e.len as u64, None);
+                    } else {
+                        run.fire(p, Trigger::InjectionRejected, 0, Some(run.injection_owner));
+                    }
                 }
             }
-            EventKind::Wake => {
+            EventKind::Timer => {
                 let mut due = std::mem::take(&mut run.due);
                 due.clear();
                 for (m, def) in p.machines.iter().enumerate() {
@@ -1273,6 +1377,7 @@ impl Shaper for MachineShaper {
             EventKind::StreamEnd => run.fire(p, Trigger::StreamEnd, 0, None),
             _ => return,
         }
+        run.can_inject = false;
         run.effects(r);
         r.stop = run.stop;
     }
@@ -1340,7 +1445,7 @@ mod size_tests {
         let segs = vec!["[1,1,2]"; 2000].join(",");
         let refs = vec![r#"{"t":"a"}"#; refs].join(",");
         format!(
-            r#"{{"tables":{{"a":[{segs}]}},"kinds":{{"default":[{{"pool":{{"dial_after":[{refs}]}}}}]}}}}"#
+            r#"{{"schema":2,"tables":{{"a":[{segs}]}},"kinds":{{"default":[{{"pool":{{"dial_after":[{refs}]}}}}]}}}}"#
         )
     }
 
@@ -1402,7 +1507,7 @@ mod size_tests {
         let doc = format!(
             r#"{{"machines":[{{"start":0,"states":[{{"enter":[{actions}],"next":[{}]}},{states}]}}]}}"#,
             (1..=1000)
-                .map(|i| format!(r#"{{"on":"record_out","to":{i}}}"#))
+                .map(|i| format!(r#"{{"on":"record_plan","to":{i}}}"#))
                 .collect::<Vec<_>>()
                 .join(",")
         );
@@ -1428,7 +1533,7 @@ mod size_tests {
             .map(|i| format!(r#""{i}":[[1,1,2]]"#))
             .collect();
         let doc = format!(
-            r#"{{"tables":{{{}}},"kinds":{{"default":[{{}}]}}}}"#,
+            r#"{{"schema":2,"tables":{{{}}},"kinds":{{"default":[{{}}]}}}}"#,
             members.join(",")
         );
         let t0 = std::time::Instant::now();

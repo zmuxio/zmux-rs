@@ -38,10 +38,24 @@ fn early() -> Config {
     c
 }
 
+fn plain_early() -> Config {
+    use zmux::proto::params::TransportParameters;
+
+    let mut config = early();
+    config.test_hooks().transport_parameters = Some(TransportParameters {
+        initial_max_data: Some(1 << 20),
+        initial_max_stream_data_bidi_local: Some(1 << 16),
+        initial_max_stream_data_bidi_remote: Some(1 << 16),
+        initial_max_streams_bidi: Some(16),
+        ..TransportParameters::default()
+    });
+    config
+}
+
 /// Carrier early data in a session offering multipath (PSK joins).
 fn early_multipath() -> Config {
     let mut c = early();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth =
         zmux::PipeAuth::psk(b"zero-rtt test pre-shared key 012".to_vec()).with_end_to_end();
     c
@@ -56,42 +70,43 @@ fn early_resume() -> Config {
     c
 }
 
-/// A server on `addr` (any port when 0) that accepts 0-RTT for sessions
-/// allowing carrier early data.
-fn server(
-    t: &Tls,
-    addr: std::net::SocketAddr,
-    opts: &Options,
-    cfg: fn() -> Config,
-) -> (quinn::Endpoint, Listener) {
-    let tls = rustls::ServerConfig::builder_with_provider(provider())
+fn server_tls(t: &Tls) -> rustls::ServerConfig {
+    rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![t.der.clone()], PrivateKeyDer::Pkcs8(t.key.clone_key()))
-        .unwrap();
-    let config = zmux_quinn::server_config(tls, opts).unwrap();
-    // A fixed address may still be held for a moment by the tasks of a
-    // server just closed on it.
-    let mut tries = 0;
-    let ep = loop {
-        match quinn::Endpoint::server(config.clone(), addr) {
-            Ok(ep) => break ep,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 100 => {
-                tries += 1;
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => panic!("bind {addr}: {e}"),
-        }
-    };
+        .unwrap()
+}
+
+fn server_config(t: &Tls, opts: &Options) -> quinn::ServerConfig {
+    zmux_quinn::server_config(server_tls(t), opts).unwrap()
+}
+
+fn serve(
+    endpoint: &quinn::Endpoint,
+    opts: &Options,
+    cfg: fn() -> Config,
+) -> (Listener, tokio::task::JoinHandle<()>) {
     let listener =
         Listener::new(cfg(), ListenerConfig::default()).expect("valid listener configuration");
-    tokio::spawn(zmux_quinn::serve(
+    let serving = tokio::spawn(zmux_quinn::serve(
         listener.clone(),
-        ep.clone(),
+        endpoint.clone(),
         opts.clone(),
     ));
-    (ep, listener)
+    (listener, serving)
+}
+
+fn server(
+    t: &Tls,
+    opts: &Options,
+    cfg: fn() -> Config,
+) -> (quinn::Endpoint, Listener, tokio::task::JoinHandle<()>) {
+    let endpoint =
+        quinn::Endpoint::server(server_config(t, opts), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let (listener, serving) = serve(&endpoint, opts, cfg);
+    (endpoint, listener, serving)
 }
 
 fn client(t: &Tls, opts: &Options) -> quinn::Endpoint {
@@ -151,20 +166,21 @@ async fn resumed_connections_send_and_accept_0rtt() {
     let t = tls();
     let memory = ParameterMemory::new();
     let opts = Options::default().with_zero_rtt(memory.clone());
-    let (ep, listener) = server(&t, "127.0.0.1:0".parse().unwrap(), &opts, early);
+    let (ep, listener, serving) = server(&t, &opts, plain_early);
     let addr = ep.local_addr().unwrap();
     let c_ep = client(&t, &opts);
     // A full handshake: the server's parameters are kept.
-    let (first, report) = zmux_quinn::connect_with_report(&c_ep, addr, "localhost", &opts, early())
-        .await
-        .unwrap();
+    let (first, report) =
+        zmux_quinn::connect_with_report(&c_ep, addr, "localhost", &opts, plain_early())
+            .await
+            .unwrap();
     assert!(!report.sent() && report.accepted().is_none());
     assert!(!exchange(&first, &listener, b"first").await);
     assert!(memory.get("localhost").is_some());
     first.close().await;
     // Resumed: the request goes as 0-RTT data.
     let (second, report) =
-        zmux_quinn::connect_with_report(&c_ep, addr, "localhost", &opts, early())
+        zmux_quinn::connect_with_report(&c_ep, addr, "localhost", &opts, plain_early())
             .await
             .unwrap();
     // The handshake may complete before the application takes the stream.
@@ -173,21 +189,36 @@ async fn resumed_connections_send_and_accept_0rtt() {
     settled(&report, true);
     second.close().await;
     listener.close();
+    serving.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_0rtt_is_sent_again_and_no_stream_fails() {
-    rejected_0rtt_sent_again(early).await;
+    rejected_0rtt_sent_again(plain_early).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rejected_0rtt_is_sent_again_with_multipath() {
-    rejected_0rtt_sent_again(early_multipath).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_rejected_0rtt_is_sent_again_with_resume() {
-    rejected_0rtt_sent_again(early_resume).await;
+async fn zmux_family_cannot_authorize_0rtt() {
+    let t = tls();
+    for config in [early, early_multipath, early_resume] {
+        let memory = ParameterMemory::new();
+        let opts = Options::default().with_zero_rtt(memory.clone());
+        let (ep, listener, serving) = server(&t, &opts, config);
+        let addr = ep.local_addr().unwrap();
+        let c_ep = client(&t, &opts);
+        for _ in 0..2 {
+            let (session, report) =
+                zmux_quinn::connect_with_report(&c_ep, addr, "localhost", &opts, config())
+                    .await
+                    .unwrap();
+            assert!(!report.sent());
+            assert!(!exchange(&session, &listener, b"same family").await);
+            assert!(memory.get("localhost").is_none());
+            session.close().await;
+        }
+        listener.close();
+        serving.await.unwrap();
+    }
 }
 
 /// A server that cannot read the ticket rejects the 0-RTT data.
@@ -195,7 +226,7 @@ async fn rejected_0rtt_sent_again(cfg: fn() -> Config) {
     let t = tls();
     let memory = ParameterMemory::new();
     let opts = Options::default().with_zero_rtt(memory.clone());
-    let (ep, listener) = server(&t, "127.0.0.1:0".parse().unwrap(), &opts, cfg);
+    let (ep, listener, serving) = server(&t, &opts, cfg);
     let addr = ep.local_addr().unwrap();
     let c_ep = client(&t, &opts);
     let first = zmux_quinn::connect(&c_ep, addr, "localhost", &opts, cfg())
@@ -203,13 +234,13 @@ async fn rejected_0rtt_sent_again(cfg: fn() -> Config) {
         .unwrap();
     exchange(&first, &listener, b"first").await;
     first.close().await;
+    first.closed().await;
     listener.close();
-    ep.close(0u32.into(), b"");
+    serving.await.unwrap();
     ep.wait_idle().await;
-    drop(ep);
-    // A new server on the same address cannot read the old ticket: it
-    // rejects the 0-RTT data.
-    let (_ep2, listener2) = server(&t, addr, &opts, cfg);
+    // The fresh server configuration cannot read the old ticket.
+    ep.set_server_config(Some(server_config(&t, &opts)));
+    let (listener2, serving) = serve(&ep, &opts, cfg);
     let (second, report) = zmux_quinn::connect_with_report(&c_ep, addr, "localhost", &opts, cfg())
         .await
         .unwrap();
@@ -217,6 +248,7 @@ async fn rejected_0rtt_sent_again(cfg: fn() -> Config) {
     settled(&report, false);
     second.close().await;
     listener2.close();
+    serving.await.unwrap();
 }
 
 #[test]
@@ -311,17 +343,7 @@ impl Store {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resumed_session_whose_0rtt_is_refused_carries_early_streams_once() {
-    refused_carries_early_streams_once(early).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_0rtt_with_multipath_carries_early_streams_once() {
-    refused_carries_early_streams_once(early_multipath).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_0rtt_with_resume_carries_early_streams_once() {
-    refused_carries_early_streams_once(early_resume).await;
+    refused_carries_early_streams_once(plain_early).await;
 }
 
 /// A server that resumes the TLS session but refuses its early data.
@@ -402,23 +424,146 @@ async fn refused_carries_early_streams_once(cfg: fn() -> Config) {
     }
     assert_eq!(fin_r.read_to_end(16).await.unwrap(), b"ok");
     assert_eq!(open_r.read_to_end(16).await.unwrap(), b"ok");
-    // Nothing arrived twice: no further stream, no second session.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), server.accept_bi())
-            .await
-            .is_err()
-    );
-    // `accept` ends only by a session (the listener stays open): the
-    // timeout is the one way to see none.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), b.accept())
-            .await
-            .is_err()
-    );
     settled(&report, false);
     second.close().await;
+    tokio::time::timeout(Duration::from_secs(60), server.closed())
+        .await
+        .expect("the server did not see the close");
+    assert!(server.accept_bi().await.is_err(), "a stream arrived twice");
+    assert_eq!(b.stats().sessions, 1, "a second session arrived");
     // `b` resumed the session of `a`; it was not a full handshake.
     assert_eq!(resumed.load(Ordering::Relaxed), 1);
     a.close();
     b.close();
+}
+
+#[path = "../../test-support/ticket.rs"]
+mod ticket;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_ticket_adoption_reports_missing_early_data_tracking() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let t = tls();
+        let tls = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls(&t)).unwrap();
+        let endpoint = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(tls)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let mut opts = Options::default();
+        opts.windows = opts
+            .windows
+            .with_established_receive_window(opts.windows.receive_window());
+        let dialer = client(&t, &opts);
+        let connecting = dialer
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let joining = async { endpoint.accept().await.unwrap().await.unwrap() };
+        let (client, conn) = tokio::join!(connecting, joining);
+        let _client = client.unwrap();
+        let (_, verifier) = ticket::fixture(zmux::PrefixBinding::Encrypted);
+        let mut limits = ListenerConfig::default();
+        limits.admission = Some(zmux::Admission::prefix_auth(
+            verifier,
+            zmux::PrefixRejection::Close,
+        ));
+        let listener = Listener::new(Config::default(), limits).unwrap();
+        let error = zmux_quinn::adopt_connection(&listener, conn, &opts)
+            .err()
+            .expect("untracked QUIC metadata must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("requires track_server_early_data")
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_ticket_refuses_quic_early_data_after_the_handshake() {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        let t = tls();
+        let opts = Options::default().with_zero_rtt(ParameterMemory::new());
+        let (endpoint, plain, serving) = server(&t, &opts, plain_early);
+        let addr = endpoint.local_addr().unwrap();
+        let client_ep = client(&t, &opts);
+        let one = zmux_quinn::connect(&client_ep, addr, "localhost", &opts, plain_early())
+            .await
+            .unwrap();
+        exchange(&one, &plain, b"obtain a resumption ticket").await;
+        one.close().await;
+        plain.close();
+        serving.await.unwrap();
+
+        let (presenter, verifier) = ticket::fixture(zmux::PrefixBinding::Encrypted);
+        let token = presenter
+            .token(&zmux::CarrierInfo::new().with_encrypted())
+            .unwrap();
+        let (reported, mut report) = tokio::sync::mpsc::unbounded_channel();
+        let mut limits = ListenerConfig::default();
+        limits.admission = Some(zmux::Admission::prefix_auth(
+            verifier,
+            zmux::PrefixRejection::Fallback,
+        ));
+        limits.fallback = Some(zmux::Fallback::new(move |carrier| {
+            let reported = reported.clone();
+            async move {
+                let conn = zmux_quinn::takeover_connection(&carrier).unwrap();
+                let early = carrier.info().is_early_data();
+                let prefix = carrier.replayed().to_vec();
+                carrier.detach().unwrap();
+                reported
+                    .send((early, prefix, conn, carrier.into_pipe()))
+                    .unwrap();
+            }
+        }));
+        let protected = Listener::new(Config::default(), limits).unwrap();
+        let (resumed, settled) = client_ep
+            .connect(addr, "localhost")
+            .unwrap()
+            .into_0rtt()
+            .unwrap_or_else(|_| panic!("missing QUIC resumption ticket"));
+        let (mut send, _recv) = resumed.open_bi().await.unwrap();
+        send.write_all(&token).await.unwrap();
+        // Keep the server from completing the handshake before the test
+        // actually sends a 0-RTT stream frame.
+        while resumed.stats().frame_tx.stream == 0 {
+            tokio::task::yield_now().await;
+        }
+        let serving = tokio::spawn(zmux_quinn::serve(protected.clone(), endpoint, opts.clone()));
+        assert!(settled.await);
+        let (early, replayed, server, _first_pipe) = report.recv().await.unwrap();
+        assert!(early);
+        assert_eq!(replayed, token.to_vec());
+
+        // Hand the same connection back for its next stream. A 1-RTT
+        // presentation must pass even after actually receiving early bytes.
+        let options = opts.clone().with_windows(
+            opts.windows
+                .with_established_receive_window(opts.windows.receive_window()),
+        );
+        let service = zmux_quinn::adopt_connection(&protected, server, &options)
+            .unwrap()
+            .unwrap();
+        let pipe = zmux_quinn::Carrier::new(resumed, &options)
+            .unwrap()
+            .open_pipe_with_prefix(&token)
+            .await
+            .unwrap();
+        let session = Session::connect(pipe, Config::default()).await.unwrap();
+        assert_eq!(
+            protected.accept().await.unwrap().bound_prefix_principal(),
+            None
+        );
+        session.close().await;
+        service.stop_admission();
+        service.admission_stopped().await;
+        protected.close();
+        serving.await.unwrap();
+    })
+    .await
+    .unwrap();
 }

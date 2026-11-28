@@ -194,96 +194,104 @@
       "steps": 7
     },
     {
-      "id": "core.handshake.early_data_floor",
-      "file": "fixtures/traces/core/handshake/early_data_floor.ndjson",
-      "title": "With the peer declared a zmux endpoint, stream data goes out before the peer's parameters, behind the PIPE_ACK fence and within the floor (4096 bytes a stream)",
+      "id": "core.handshake.application_waits_for_family",
+      "file": "fixtures/traces/core/handshake/application_waits_for_family.ndjson",
+      "title": "A bootstrap sends application frames only after same-family confirmation",
       "refs": [
         "SPEC.md#6.1.2",
-        "SPEC.md#5.1"
+        "SPEC.md#5.5"
       ],
       "findings": [],
       "profile": "zmux-small",
       "steps": 8
     },
     {
-      "id": "core.handshake.early_data_floor_limits",
-      "file": "fixtures/traces/core/handshake/early_data_floor_limits.ndjson",
-      "title": "Under the floor at most four bidirectional streams carry early data, 4096 bytes each and 16384 in all; the rest waits for the peer's parameters",
+      "id": "core.handshake.missing_datagram_family_initiator",
+      "file": "fixtures/traces/core/handshake/missing_datagram_family_initiator.ndjson",
+      "title": "Incompatible bootstrap parameters stop coalesced stream data",
       "refs": [
+        "SPEC.md#5.5",
+        "EXTENSIONS.md#6.2",
         "SPEC.md#6.1.2"
       ],
       "findings": [],
       "profile": "zmux-small",
-      "steps": 15
-    },
-    {
-      "id": "core.handshake.early_data_plain_peer_rejected",
-      "file": "fixtures/traces/core/handshake/early_data_plain_peer_rejected.ndjson",
-      "title": "A peer declared zmux that turns out to be a plain QMux peer has rejected the early data at the fence: the endpoint closes with NO_ERROR and reports early data rejected",
-      "refs": [
-        "SPEC.md#6.1.2",
-        "SPEC.md#13.1"
-      ],
-      "findings": [],
-      "profile": "zmux-small",
-      "steps": 7
-    },
-    {
-      "id": "core.handshake.early_data_no_streams_rejected",
-      "file": "fixtures/traces/core/handshake/early_data_no_streams_rejected.ndjson",
-      "title": "A zmux peer that accepts no bidirectional streams has rejected early data at the first STREAM frame",
-      "refs": [
-        "SPEC.md#6.1.2"
-      ],
-      "findings": [],
-      "profile": "zmux-small",
-      "steps": 7
-    },
-    {
-      "id": "core.handshake.early_data_peer_below_floor",
-      "file": "fixtures/traces/core/handshake/early_data_peer_below_floor.ndjson",
-      "title": "After sending early data, a zmux peer whose parameters are below the floor is a TRANSPORT_PARAMETER_ERROR",
-      "refs": [
-        "SPEC.md#6.1.2"
-      ],
-      "findings": [],
-      "profile": "zmux-small",
-      "steps": 6
-    },
-    {
-      "id": "core.handshake.early_data_not_with_role_auto",
-      "file": "fixtures/traces/core/handshake/early_data_not_with_role_auto.ndjson",
-      "title": "An endpoint whose role depends on the peer (role auto) sends no early data",
-      "refs": [
-        "SPEC.md#6.1.2",
-        "EXTENSIONS.md#2.3"
-      ],
-      "findings": [],
-      "profile": "zmux-role-auto",
       "steps": 5
     },
     {
-      "id": "core.handshake.early_data_received",
-      "file": "fixtures/traces/core/handshake/early_data_received.ndjson",
-      "title": "Early data from a zmux peer, behind its fence in the record of its parameters, is processed like any data; the fence's Position 0 is ignored",
+      "id": "core.handshake.missing_datagram_family_responder",
+      "file": "fixtures/traces/core/handshake/missing_datagram_family_responder.ndjson",
+      "title": "Incompatible bootstrap parameters stop coalesced stream data",
       "refs": [
+        "SPEC.md#5.5",
+        "EXTENSIONS.md#6.2",
         "SPEC.md#6.1.2"
       ],
       "findings": [],
       "profile": "zmux-small",
-      "steps": 7
+      "steps": 5
     },
     {
-      "id": "core.handshake.early_fence_stops_peer_without_pipe_ack",
-      "file": "fixtures/traces/core/handshake/early_fence_stops_peer_without_pipe_ack.ndjson",
-      "title": "Where PIPE_ACK is not in use the fence is an unknown frame: the session closes before the early STREAM frame after it is processed",
+      "id": "core.handshake.retired_datagram_parameter_initiator",
+      "file": "fixtures/traces/core/handshake/retired_datagram_parameter_initiator.ndjson",
+      "title": "Incompatible bootstrap parameters stop coalesced stream data",
+      "refs": [
+        "SPEC.md#5.5",
+        "EXTENSIONS.md#6.2",
+        "SPEC.md#6.1.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 5
+    },
+    {
+      "id": "core.handshake.retired_datagram_parameter_responder",
+      "file": "fixtures/traces/core/handshake/retired_datagram_parameter_responder.ndjson",
+      "title": "Incompatible bootstrap parameters stop coalesced stream data",
+      "refs": [
+        "SPEC.md#5.5",
+        "EXTENSIONS.md#6.2",
+        "SPEC.md#6.1.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 5
+    },
+    {
+      "id": "core.handshake.family_carrier_early_application",
+      "file": "fixtures/traces/core/handshake/family_carrier_early_application.ndjson",
+      "title": "Carrier early application data from a same-family peer is rejected",
       "refs": [
         "SPEC.md#6.1.2",
-        "SPEC.md#4.1"
+        "SPEC.md#5.5"
       ],
       "findings": [],
       "profile": "zmux-small",
       "steps": 4
+    },
+    {
+      "id": "compat.qmux.remembered_early_data",
+      "file": "fixtures/traces/compat/qmux/remembered_early_data.ndjson",
+      "title": "Remembered plain QMux 0-RTT stays opaque",
+      "refs": [
+        "SPEC.md#6.1.2",
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "compat.qmux.receive_early_data",
+      "file": "fixtures/traces/compat/qmux/receive_early_data.ndjson",
+      "title": "A plain QMux client can send 0-RTT STREAM data",
+      "refs": [
+        "SPEC.md#6.1.2",
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 5
     },
     {
       "id": "core.handshake.timeout",
@@ -2261,20 +2269,35 @@
       "steps": 8
     },
     {
-      "id": "ext.datagram.opaque_without_flows",
-      "file": "fixtures/traces/ext/datagram/opaque_without_flows.ndjson",
-      "title": "Without flows, datagram data is opaque",
+      "id": "compat.qmux.datagram_opaque_initiator",
+      "file": "fixtures/traces/compat/qmux/datagram_opaque_initiator.ndjson",
+      "title": "Plain QMux Datagram Data is opaque in both directions",
       "refs": [
-        "EXTENSIONS.md#6.1"
+        "EXTENSIONS.md#6.2",
+        "EXTENSIONS.md#6.8",
+        "SPEC.md#13.2"
       ],
       "findings": [],
       "profile": "zmux-small-dgram",
-      "steps": 6
+      "steps": 13
+    },
+    {
+      "id": "compat.qmux.datagram_opaque_responder",
+      "file": "fixtures/traces/compat/qmux/datagram_opaque_responder.ndjson",
+      "title": "Plain QMux Datagram Data is opaque in both directions",
+      "refs": [
+        "EXTENSIONS.md#6.2",
+        "EXTENSIONS.md#6.8",
+        "SPEC.md#13.2"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 13
     },
     {
       "id": "ext.datagram.not_advertised",
       "file": "fixtures/traces/ext/datagram/not_advertised.ndjson",
-      "title": "A DATAGRAM without local support is fatal",
+      "title": "A DATAGRAM without local support closes the session",
       "refs": [
         "EXTENSIONS.md#6.1"
       ],
@@ -2285,9 +2308,10 @@
     {
       "id": "ext.datagram.too_large",
       "file": "fixtures/traces/ext/datagram/too_large.ndjson",
-      "title": "A DATAGRAM larger than advertised is fatal",
+      "title": "The DATAGRAM size check includes Sequence and Flow",
       "refs": [
-        "EXTENSIONS.md#6.1"
+        "EXTENSIONS.md#6.1",
+        "EXTENSIONS.md#6.6"
       ],
       "findings": [],
       "profile": "zmux-small-dgram",
@@ -2296,13 +2320,14 @@
     {
       "id": "ext.datagram.flow_associated",
       "file": "fixtures/traces/ext/datagram/flow_associated.ndjson",
-      "title": "A flow prefix associates a datagram with a stream",
+      "title": "Datagrams enter their session or stream queue across varint boundaries",
       "refs": [
-        "EXTENSIONS.md#6.3"
+        "EXTENSIONS.md#6.3",
+        "EXTENSIONS.md#6.9"
       ],
       "findings": [],
       "profile": "zmux-small-dgram",
-      "steps": 12
+      "steps": 14
     },
     {
       "id": "ext.datagram.flow_unidirectional",
@@ -2319,7 +2344,7 @@
     {
       "id": "ext.datagram.flow_unopened_local",
       "file": "fixtures/traces/ext/datagram/flow_unopened_local.ndjson",
-      "title": "A flow naming an unopened local stream is fatal",
+      "title": "An unopened local stream is an invalid flow",
       "refs": [
         "EXTENSIONS.md#6.3",
         "EXTENSIONS.md#6.4"
@@ -2331,7 +2356,19 @@
     {
       "id": "ext.datagram.flow_beyond_limit",
       "file": "fixtures/traces/ext/datagram/flow_beyond_limit.ndjson",
-      "title": "A flow naming a stream beyond the limit is fatal",
+      "title": "A stream beyond the limit is an invalid flow",
+      "refs": [
+        "EXTENSIONS.md#6.3",
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.sequence_truncated",
+      "file": "fixtures/traces/ext/datagram/sequence_truncated.ndjson",
+      "title": "Sequence must be a complete varint",
       "refs": [
         "EXTENSIONS.md#6.3",
         "EXTENSIONS.md#6.4"
@@ -2343,7 +2380,19 @@
     {
       "id": "ext.datagram.flow_prefix_truncated",
       "file": "fixtures/traces/ext/datagram/flow_prefix_truncated.ndjson",
-      "title": "A datagram without a complete flow prefix is fatal",
+      "title": "Flow must be a complete varint",
+      "refs": [
+        "EXTENSIONS.md#6.3",
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
+    },
+    {
+      "id": "ext.datagram.context_truncated",
+      "file": "fixtures/traces/ext/datagram/context_truncated.ndjson",
+      "title": "A positive Flow requires a complete Context ID",
       "refs": [
         "EXTENSIONS.md#6.3",
         "EXTENSIONS.md#6.4"
@@ -2355,7 +2404,7 @@
     {
       "id": "ext.datagram.flow_closed_stream_dropped",
       "file": "fixtures/traces/ext/datagram/flow_closed_stream_dropped.ndjson",
-      "title": "Datagrams for a finished stream are dropped silently",
+      "title": "A datagram for a finished stream is discarded",
       "refs": [
         "EXTENSIONS.md#6.4"
       ],
@@ -2364,59 +2413,283 @@
       "steps": 13
     },
     {
-      "id": "ext.datagram.send_too_large",
-      "file": "fixtures/traces/ext/datagram/send_too_large.ndjson",
-      "title": "A datagram that does not fit is refused locally",
+      "id": "ext.datagram.send_with_flow",
+      "file": "fixtures/traces/ext/datagram/send_with_flow.ndjson",
+      "title": "The sender shares one sequence across session and stream datagrams",
       "refs": [
-        "EXTENSIONS.md#6.1"
+        "EXTENSIONS.md#6.3",
+        "EXTENSIONS.md#6.9"
       ],
       "findings": [],
       "profile": "zmux-small-dgram",
-      "steps": 6
+      "steps": 10
     },
     {
-      "id": "ext.datagram.send_with_flow",
-      "file": "fixtures/traces/ext/datagram/send_with_flow.ndjson",
-      "title": "Sent datagrams carry the flow prefix",
+      "id": "ext.datagram.sequence_exhaustion",
+      "file": "fixtures/traces/ext/datagram/sequence_exhaustion.ndjson",
+      "title": "The maximum sequence can be dispatched once",
       "refs": [
-        "EXTENSIONS.md#6.3"
+        "EXTENSIONS.md#6.9"
       ],
       "findings": [],
       "profile": "zmux-small-dgram",
       "steps": 8
     },
     {
-      "id": "ext.datagram.send_queue_drops_oldest",
-      "file": "fixtures/traces/ext/datagram/send_queue_drops_oldest.ndjson",
-      "title": "Datagrams wait in a 64-entry send queue while the pipe is not writable; the oldest is dropped, and sending never blocks",
+      "id": "ext.datagram.dedup_window",
+      "file": "fixtures/traces/ext/datagram/dedup_window.ndjson",
+      "title": "In-window reordering is allowed and H minus W is outside the window",
       "refs": [
-        "EXTENSIONS.md#6.5"
+        "EXTENSIONS.md#6.9"
       ],
       "findings": [],
       "profile": "zmux-small-dgram",
-      "steps": 72
+      "steps": 10
     },
     {
-      "id": "ext.datagram.receive_queue_overflow",
-      "file": "fixtures/traces/ext/datagram/receive_queue_overflow.ndjson",
-      "title": "A full 128-entry session receive queue drops its oldest datagram and counts it, never an error",
+      "id": "ext.datagram.dedup_across_paths",
+      "file": "fixtures/traces/ext/datagram/dedup_across_paths.ndjson",
+      "title": "A native copy and a record copy share the delivery window",
       "refs": [
-        "EXTENSIONS.md#6.5"
+        "EXTENSIONS.md#6.9",
+        "EXTENSIONS.md#6.8"
       ],
       "findings": [],
-      "profile": "zmux-small-dgram",
-      "steps": 136
+      "profile": "zmux-mp",
+      "steps": 12
     },
     {
-      "id": "ext.datagram.stream_queue_overflow",
-      "file": "fixtures/traces/ext/datagram/stream_queue_overflow.ndjson",
-      "title": "A stream's 32-entry datagram queue drops its oldest datagram; stream datagrams never spill into the session queue",
+      "id": "ext.datagram.channel_padding_both",
+      "file": "fixtures/traces/ext/datagram/channel_padding_both.ndjson",
+      "title": "Channel padding requires both declarations",
+      "refs": [
+        "EXTENSIONS.md#6.8",
+        "EXTENSIONS.md#6.9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 11
+    },
+    {
+      "id": "ext.datagram.channel_padding_local_only",
+      "file": "fixtures/traces/ext/datagram/channel_padding_local_only.ndjson",
+      "title": "Channel padding requires both declarations",
+      "refs": [
+        "EXTENSIONS.md#6.8",
+        "EXTENSIONS.md#6.9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "ext.datagram.channel_padding_peer_only",
+      "file": "fixtures/traces/ext/datagram/channel_padding_peer_only.ndjson",
+      "title": "Channel padding requires both declarations",
+      "refs": [
+        "EXTENSIONS.md#6.8",
+        "EXTENSIONS.md#6.9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 8
+    },
+    {
+      "id": "ext.datagram.dedup_two_records",
+      "file": "fixtures/traces/ext/datagram/dedup_two_records.ndjson",
+      "title": "The same sequence on two pipes is delivered once",
+      "refs": [
+        "EXTENSIONS.md#6.9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 11
+    },
+    {
+      "id": "ext.datagram.hold_failure",
+      "file": "fixtures/traces/ext/datagram/hold_failure.ndjson",
+      "title": "A rejected hold advances H and leaves its sequence free",
+      "refs": [
+        "EXTENSIONS.md#6.9",
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 10
+    },
+    {
+      "id": "ext.datagram.hold_expiry",
+      "file": "fixtures/traces/ext/datagram/hold_expiry.ndjson",
+      "title": "An expired hold releases its slot and duplicates do not extend it",
+      "refs": [
+        "EXTENSIONS.md#6.9",
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "ext.datagram.hold_delivery",
+      "file": "fixtures/traces/ext/datagram/hold_delivery.ndjson",
+      "title": "A datagram held before its opener is delivered once",
+      "refs": [
+        "EXTENSIONS.md#6.9",
+        "EXTENSIONS.md#6.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "ext.datagram.active_writable_only",
+      "file": "fixtures/traces/ext/datagram/active_writable_only.ndjson",
+      "title": "A datagram waits when no outbound path qualifies",
+      "refs": [
+        "MULTIPATH.md#11"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 13
+    },
+    {
+      "id": "ext.datagram.copies_wait_for_open_ack",
+      "file": "fixtures/traces/ext/datagram/copies_wait_for_open_ack.ndjson",
+      "title": "The first copy follows the opener before confirmation",
+      "refs": [
+        "MULTIPATH.md#11",
+        "MULTIPATH.md#7.5.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 23
+    },
+    {
+      "id": "ext.datagram.copies_next_tier",
+      "file": "fixtures/traces/ext/datagram/copies_next_tier.ndjson",
+      "title": "An extra copy can use the next tier without overflow",
+      "refs": [
+        "MULTIPATH.md#11",
+        "MULTIPATH.md#7.5.2"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 13
+    },
+    {
+      "id": "ext.datagram.no_reinjection",
+      "file": "fixtures/traces/ext/datagram/no_reinjection.ndjson",
+      "title": "A failed pipe does not reinject its datagrams",
       "refs": [
         "EXTENSIONS.md#6.5"
       ],
       "findings": [],
+      "profile": "zmux-mp",
+      "steps": 17
+    },
+    {
+      "id": "ext.datagram.expiry_is_local",
+      "file": "fixtures/traces/ext/datagram/expiry_is_local.ndjson",
+      "title": "Expiry leaves no frame and does not consume a sequence",
+      "refs": [
+        "EXTENSIONS.md#6.9",
+        "MULTIPATH.md#11"
+      ],
+      "findings": [],
       "profile": "zmux-small-dgram",
-      "steps": 42
+      "steps": 11
+    },
+    {
+      "id": "ext.datagram.state_survives_resume",
+      "file": "fixtures/traces/ext/datagram/state_survives_resume.ndjson",
+      "title": "Resume preserves datagram sequences and channel padding",
+      "refs": [
+        "EXTENSIONS.md#6.9",
+        "EXTENSIONS.md#6.8",
+        "RESUME.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 23
+    },
+    {
+      "id": "ext.datagram.foreign_resume_locator",
+      "file": "fixtures/traces/ext/datagram/foreign_resume_locator.ndjson",
+      "title": "A foreign locator cannot restore state or apply a first batch",
+      "refs": [
+        "MULTIPATH.md#5.4",
+        "RESUME.md#4.3"
+      ],
+      "findings": [],
+      "profile": "zmux-mp-resume",
+      "steps": 11
+    },
+    {
+      "id": "ext.datagram.ack_no_return_pipe",
+      "file": "fixtures/traces/ext/datagram/ack_no_return_pipe.ndjson",
+      "title": "Received datagrams cannot solicit a report without a return pipe",
+      "refs": [
+        "EXTENSIONS.md#6.10"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 12
+    },
+    {
+      "id": "ext.datagram.ack_cross_path",
+      "file": "fixtures/traces/ext/datagram/ack_cross_path.ndjson",
+      "title": "Both copies are reported by their pipe and channel",
+      "refs": [
+        "EXTENSIONS.md#6.10",
+        "EXTENSIONS.md#6.9"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 15
+    },
+    {
+      "id": "ext.datagram.ack_limits",
+      "file": "fixtures/traces/ext/datagram/ack_limits.ndjson",
+      "title": "Feedback obeys both spacing and the one-second count",
+      "refs": [
+        "EXTENSIONS.md#6.10"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 14
+    },
+    {
+      "id": "ext.datagram.ack_direction_and_late",
+      "file": "fixtures/traces/ext/datagram/ack_direction_and_late.ndjson",
+      "title": "Sending datagrams alone produces no feedback",
+      "refs": [
+        "EXTENSIONS.md#6.10"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 10
+    },
+    {
+      "id": "ext.datagram.ack_one_way_datagram_capability",
+      "file": "fixtures/traces/ext/datagram/ack_one_way_datagram_capability.ndjson",
+      "title": "Feedback uses the report sender's datagram limit",
+      "refs": [
+        "EXTENSIONS.md#6.10"
+      ],
+      "findings": [],
+      "profile": "zmux-small",
+      "steps": 8
+    },
+    {
+      "id": "ext.datagram.ack_without_capability",
+      "file": "fixtures/traces/ext/datagram/ack_without_capability.ndjson",
+      "title": "An ACK sender needs its own datagram capability",
+      "refs": [
+        "EXTENSIONS.md#6.10"
+      ],
+      "findings": [],
+      "profile": "zmux-small-dgram",
+      "steps": 6
     },
     {
       "id": "compat.qmux.plain_peer_basic",
@@ -3324,13 +3597,13 @@
     {
       "id": "multipath.idle.received_records_only",
       "file": "fixtures/traces/multipath/idle/received_records_only.ndjson",
-      "title": "In multipath sessions only received records restart the idle timer",
+      "title": "In multipath sessions only received or newly acknowledged activity frames restart the idle timer",
       "refs": [
         "SPEC.md#6.4"
       ],
       "findings": [],
       "profile": "zmux-mp",
-      "steps": 17
+      "steps": 34
     },
     {
       "id": "multipath.idle.keep_alive_counts_activity",
@@ -4028,7 +4301,7 @@
     {
       "id": "multipath.epoch.answerer_switches_on_peer_join",
       "file": "fixtures/traces/multipath/epoch/answerer_switches_on_peer_join.ndjson",
-      "title": "A verified join of the peer with epoch 1 switches the answering end to epoch 1 before any acknowledgement of its answer",
+      "title": "An authorized epoch 1 Join switches the answering end after key exchange without an acknowledgement of the answer",
       "refs": [
         "MULTIPATH.md#10.7",
         "secure-carrier/SPEC.md#11.2"
@@ -4036,6 +4309,42 @@
       "findings": [],
       "profile": "zmux-mp",
       "steps": 19
+    },
+    {
+      "id": "multipath.epoch.authorization_denied",
+      "file": "fixtures/traces/multipath/epoch/authorization_denied.ndjson",
+      "title": "A denied epoch 1 Join leaves its Pipe ID available and preserves epoch 0",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 30
+    },
+    {
+      "id": "multipath.epoch.authorization_invalidated",
+      "file": "fixtures/traces/multipath/epoch/authorization_invalidated.ndjson",
+      "title": "An approved Join whose Pipe ID was taken while waiting has no effect",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 30
+    },
+    {
+      "id": "multipath.epoch.join_kex_failure",
+      "file": "fixtures/traces/multipath/epoch/join_kex_failure.ndjson",
+      "title": "An authorized epoch 1 Join with a rejected key exchange preserves epoch 0",
+      "refs": [
+        "MULTIPATH.md#10.7",
+        "MULTIPATH.md#5.4"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 20
     },
     {
       "id": "multipath.epoch.previous_deleted_after_retention",
@@ -4455,5 +4764,125 @@
       "profile": "zmux-small",
       "steps": 9
     }
-  ]
+  ],
+  "datagram_checkpoints": {
+    "E1": {
+      "traces": [
+        "core.handshake.application_waits_for_family",
+        "core.handshake.missing_datagram_family_initiator",
+        "core.handshake.missing_datagram_family_responder",
+        "core.handshake.retired_datagram_parameter_initiator",
+        "core.handshake.retired_datagram_parameter_responder",
+        "core.handshake.family_carrier_early_application",
+        "compat.qmux.remembered_early_data",
+        "compat.qmux.receive_early_data",
+        "compat.qmux.datagram_opaque_initiator",
+        "compat.qmux.datagram_opaque_responder",
+        "ext.datagram.not_advertised",
+        "ext.datagram.too_large",
+        "ext.datagram.flow_associated",
+        "ext.datagram.flow_unidirectional",
+        "ext.datagram.flow_unopened_local",
+        "ext.datagram.flow_beyond_limit",
+        "ext.datagram.sequence_truncated",
+        "ext.datagram.flow_prefix_truncated",
+        "ext.datagram.context_truncated",
+        "ext.datagram.flow_closed_stream_dropped",
+        "ext.datagram.send_with_flow",
+        "ext.datagram.sequence_exhaustion",
+        "ext.datagram.dedup_window",
+        "ext.datagram.dedup_across_paths",
+        "ext.datagram.dedup_two_records",
+        "ext.datagram.hold_failure",
+        "ext.datagram.hold_expiry",
+        "ext.datagram.hold_delivery",
+        "ext.datagram.state_survives_resume",
+        "ext.datagram.foreign_resume_locator"
+      ],
+      "wire": [
+        "datagram-sequence-0",
+        "datagram-sequence-63",
+        "datagram-sequence-64",
+        "datagram-sequence-16383",
+        "datagram-sequence-16384",
+        "datagram-sequence-1073741823",
+        "datagram-sequence-1073741824",
+        "datagram-sequence-4611686018427387903",
+        "tp-zmux-without-family",
+        "tp-zmux-family-malformed",
+        "tp-datagram-flows-retired-empty",
+        "tp-datagram-flows-retired-nonempty"
+      ]
+    },
+    "E2": {
+      "traces": [
+        "ext.datagram.channel_padding_both",
+        "ext.datagram.channel_padding_local_only",
+        "ext.datagram.channel_padding_peer_only",
+        "ext.datagram.active_writable_only"
+      ],
+      "wire": [
+        "record-padding-before-lengthless-stream",
+        "record-padding-before-lengthless-datagram",
+        "channel-datagram-unpadded",
+        "channel-datagram-padded-quic",
+        "channel-datagram-padded-h3",
+        "channel-datagram-padded-at-limit",
+        "datagram-at-limit",
+        "tp-carrier-datagram-padding",
+        "datagram-above-limit",
+        "channel-datagram-padding-without-negotiation",
+        "channel-datagram-padding-only",
+        "channel-datagram-wrong-type",
+        "channel-datagram-non-minimal-type",
+        "channel-datagram-truncated-sequence",
+        "channel-datagram-truncated-flow",
+        "channel-datagram-truncated-context",
+        "channel-datagram-above-frame-limit",
+        "channel-datagram-padded-over-limit",
+        "tp-carrier-datagram-padding-nonempty",
+        "tp-carrier-datagram-padding-without-channel",
+        "tp-carrier-datagram-padding-without-datagrams",
+        "tp-carrier-datagram-padding-with-zero-size"
+      ]
+    },
+    "E3": {
+      "traces": [
+        "ext.datagram.copies_wait_for_open_ack",
+        "ext.datagram.copies_next_tier"
+      ],
+      "wire": []
+    },
+    "E4": {
+      "traces": [
+        "ext.datagram.expiry_is_local",
+        "ext.datagram.no_reinjection"
+      ],
+      "wire": []
+    },
+    "E5": {
+      "traces": [
+        "ext.datagram.ack_no_return_pipe",
+        "ext.datagram.ack_cross_path",
+        "ext.datagram.ack_limits",
+        "ext.datagram.ack_direction_and_late",
+        "ext.datagram.ack_one_way_datagram_capability",
+        "ext.datagram.ack_without_capability"
+      ],
+      "wire": [
+        "datagram-ack-ranges",
+        "datagram-ack-wide-range",
+        "datagram-ack-at-limit",
+        "datagram-ack-channel",
+        "datagram-ack-first-range-underflow",
+        "datagram-ack-gap-underflow",
+        "datagram-ack-range-underflow",
+        "datagram-ack-range-truncated",
+        "datagram-ack-range-count",
+        "datagram-ack-size",
+        "datagram-ack-no-family",
+        "datagram-ack-no-capability"
+      ]
+    }
+  }
 }

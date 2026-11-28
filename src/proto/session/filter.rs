@@ -70,6 +70,10 @@ impl<T: Copy + Ord, const MAX: bool> WinFilter<T, MAX> {
 }
 
 impl MinFilter {
+    pub(super) fn observation(&self) -> Option<(Instant, Duration)> {
+        self.s.map(|s| s[0])
+    }
+
     /// Adds an RTT sample (at least 1 ns) taken at `now`, for a minimum
     /// over `span`.
     pub(crate) fn sample(&mut self, now: Instant, rtt: Duration, span: Duration) {

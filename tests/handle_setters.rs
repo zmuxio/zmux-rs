@@ -154,63 +154,67 @@ async fn handle_setters_fail_like_the_parts() {
 }
 
 /// A datagram sent through the handle while a write of the part is blocked
-/// (in a task of its own) is queued and reaches the peer's stream; the
-/// handle reports the same largest size as the part. Once the part was
+/// is queued and reaches the peer's stream; the
+/// handle reports the same path capacities as the part. Once the part was
 /// released the handle's send fails as the part's would have: the stream is
 /// closed.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn handle_sends_a_stream_datagram_while_a_write_is_in_flight() {
-    watchdog(20, "handle stream datagram", async {
+    watchdog(60, "handle stream datagram", async {
         let config = || {
             let mut c = Config::default();
             c.enable_datagrams = true;
             c
         };
-        let (a, b) = tcp().await;
+        let (a, b) = tokio::io::duplex(64 << 10);
         let (client, server) = connect(
-            PipeIo::from_tcp(a),
-            PipeIo::from_tcp(b),
+            PipeIo::new(a),
+            PipeIo::new(b),
             small_windows(config()),
             small_windows(config()),
         )
         .await;
         let (mut send, _recv) = client.open_bi().await.unwrap();
+        send.pin_id().unwrap();
+        let (_ssend, srecv) = server.accept_bi().await.unwrap();
         let handle = send.handle();
         send.set_send_buffer(1).unwrap();
         let window = send.send_capacity();
         let bound = send.send_buffer() as u64;
         let size = send.max_datagram_size(7);
+        let path = send.datagram_path(7);
         assert!(size.is_some_and(|n| n > 0));
-        assert_eq!(handle.max_datagram_size(7), size, "one implementation");
+        assert!(path.payload.is_some_and(|n| n > 0));
         let big = vec![7u8; usize::try_from(window + bound * 4).unwrap()];
-        let writer = tokio::spawn(async move {
-            send.write_all(&big).await.unwrap();
-            send
-        });
-        while {
-            let stats = handle.stats();
-            stats.bytes_sent < window || stats.bytes_written < window + bound
-        } {
-            tokio::task::yield_now().await;
+        {
+            let mut write = pin!(send.write_all(&big));
+            assert!(
+                poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            assert_eq!(handle.max_datagram_size(7), size);
+            assert_eq!(handle.datagram_path(7), path);
+            assert_eq!(handle.path_datagram_size(7), path.payload);
+            assert_eq!(handle.datagram_path(1 << 62), zmux::DatagramPath::default());
+            handle
+                .send_datagram(7, bytes::Bytes::from_static(b"while writing"))
+                .unwrap();
+            let got = srecv.read_datagram().await.unwrap();
+            assert_eq!((got.context, &got.payload[..]), (7, &b"while writing"[..]));
+            handle.set_send_buffer(bound * 8).unwrap();
+            write.await.unwrap();
         }
-        assert!(!writer.is_finished(), "the write is in flight");
-        handle
-            .send_datagram(7, bytes::Bytes::from_static(b"while writing"))
-            .unwrap();
-        let (_ssend, srecv) = server.accept_bi().await.unwrap();
-        let got = srecv.read_datagram().await.unwrap();
-        assert_eq!((got.context, &got.payload[..]), (7, &b"while writing"[..]));
-        // The same errors as the part's: a context beyond the varint range.
-        assert_eq!(
+        // A live stream refuses a context beyond the wire varint range.
+        assert!(matches!(
             handle.send_datagram(1 << 62, bytes::Bytes::new()),
-            Err(zmux::DatagramError::ClosedStream)
-        );
-        handle.set_send_buffer(bound * 8).unwrap();
-        let send = writer.await.unwrap();
+            Err(zmux::DatagramError::InvalidOptions(error)) if error.field() == "datagram_context"
+        ));
         send.send_datagram(7, bytes::Bytes::from_static(b"part"))
             .unwrap();
         assert_eq!(&srecv.read_datagram().await.unwrap().payload[..], b"part");
         drop(send);
+        assert_eq!(handle.datagram_path(7), zmux::DatagramPath::default());
         assert_eq!(
             handle.send_datagram(7, bytes::Bytes::from_static(b"late")),
             Err(zmux::DatagramError::ClosedStream),

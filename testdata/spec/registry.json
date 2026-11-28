@@ -457,6 +457,26 @@
       }
     },
     {
+      "name": "DATAGRAM_ACK",
+      "kind": "zmux",
+      "gate": [
+        "zmux_datagram_family",
+        "max_datagram_frame_size"
+      ],
+      "gate_all": true,
+      "spec": "EXTENSIONS.md#6.10",
+      "ack_eliciting": false,
+      "retransmit": "never",
+      "first": {
+        "value": 683399583,
+        "hex": "0x28bbd99f"
+      },
+      "last": {
+        "value": 683399583,
+        "hex": "0x28bbd99f"
+      }
+    },
+    {
       "name": "PIPE_ACK",
       "kind": "zmux",
       "gate": [
@@ -546,6 +566,11 @@
       "spec": "MULTIPATH.md#10.7",
       "ack_eliciting": true,
       "retransmit": "offer-until-answered-answer-until-acked",
+      "join_switch_requires": [
+        "authorization",
+        "revalidation",
+        "key_exchange"
+      ],
       "first": {
         "value": 38704107,
         "hex": "0x024e93eb"
@@ -570,7 +595,7 @@
       "scope": "qmux",
       "format": "varint",
       "absent_default": 0,
-      "zmux_sends": "30000",
+      "zmux_sends": "30000 (ms)",
       "spec": "SPEC.md#5.3",
       "id": {
         "value": 1,
@@ -807,14 +832,24 @@
     },
     {
       "name": "zmux_datagram_flows",
-      "scope": "zmux",
-      "format": "empty",
-      "absent_default": "not supported",
-      "zmux_sends": "when datagrams are enabled",
-      "spec": "EXTENSIONS.md#6",
+      "scope": "zmux-retired",
+      "zmux_sends": "never",
+      "spec": "EXTENSIONS.md#6.2",
       "id": {
         "value": 183734765,
         "hex": "0x0af391ed"
+      }
+    },
+    {
+      "name": "zmux_datagram_family",
+      "scope": "zmux",
+      "format": "empty",
+      "absent_default": "plain QMux if there is no other zmux evidence",
+      "zmux_sends": "always",
+      "spec": "SPEC.md#5.5",
+      "id": {
+        "value": 669491266,
+        "hex": "0x27e7a042"
       }
     },
     {
@@ -827,6 +862,18 @@
       "id": {
         "value": 1025985631,
         "hex": "0x3d274c5f"
+      }
+    },
+    {
+      "name": "zmux_carrier_datagram_padding",
+      "scope": "zmux",
+      "format": "empty",
+      "absent_default": "not supported",
+      "zmux_sends": "with zmux_carrier_datagrams when channel padding is supported",
+      "spec": "EXTENSIONS.md#6.8",
+      "id": {
+        "value": 544330990,
+        "hex": "0x2071d4ee"
       }
     },
     {
@@ -906,7 +953,7 @@
       "scope": "zmux",
       "format": "varint",
       "absent_default": "not supported",
-      "zmux_sends": "resume_timeout in ms when enabled",
+      "zmux_sends": "Resume Grace in ms when enabled",
       "spec": "RESUME.md#3",
       "id": {
         "value": 223836366,
@@ -935,7 +982,7 @@
     },
     {
       "name": "CONNECTION_REFUSED",
-      "source": "RFC 9000",
+      "source": "RFC 9000, SPEC.md#10.2",
       "wire": true,
       "code": {
         "value": 2,
@@ -1390,6 +1437,7 @@
     "lane_key_bytes": 16,
     "default_max_record_size": 16382,
     "zmux_max_record_size": 65535,
+    "max_padded_channel_datagram_size": 65535,
     "max_preamble_tp_overhead": 32,
     "pairing_token_bytes": 16,
     "max_unpaired_carriers": 64,
@@ -1401,8 +1449,6 @@
     "fail_floor_ms": 2000,
     "first_record_timeout_ms": 2000,
     "unauthenticated_carriers_per_source": 8,
-    "stream_datagram_queue": 32,
-    "datagram_receive_bytes": 1048576,
     "suspect_floor_min_ms": 50,
     "probe_interval_ms": 15000,
     "max_join_deadline_ms": 60000,
@@ -1416,11 +1462,7 @@
     "inbound_silence_margin_floor_ms": 2000,
     "dead_timeout_min_ms": 1000,
     "write_call_min_bytes": 4096,
-    "write_call_rate_ms": 50,
-    "early_data_max_data": 16384,
-    "early_data_max_streams_bidi": 4,
-    "early_data_max_stream_data": 4096,
-    "early_data_max_preamble": 1024
+    "write_call_rate_ms": 50
   },
   "allocation": {
     "method": "v = 2^14 + (SHA-256('zmux <kind> <name>[#i]')[0:8] as big-endian) mod (2^30 - 2^14)",

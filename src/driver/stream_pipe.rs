@@ -31,11 +31,10 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll};
 
 use ::tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use bytes::Bytes;
 
 use super::handle::Shared;
 use super::tokio::{RecvStream, SendStream, Tokio};
-use crate::proto::session::{PieceCursor, PipeError, StreamError, TransmitBuf};
+use crate::proto::session::{PieceCursor, PipeError, Segment, StreamError, TransmitBuf};
 use crate::proto::{ApplicationErrorCode, VarInt};
 
 /// `ZMUX_CARRIER_FAILED` as a code.
@@ -61,8 +60,8 @@ impl StreamReader {
         &mut self,
         cx: &mut Context<'_>,
         max: usize,
-    ) -> Poll<io::Result<Option<Bytes>>> {
-        let r = std::task::ready!(self.recv.with_slot(|r, t| r.poll_read_chunk(
+    ) -> Poll<io::Result<Option<Segment>>> {
+        let r = std::task::ready!(self.recv.with_slot(|r, t| r.poll_read_segment(
             cx.waker(),
             t,
             max.max(1)

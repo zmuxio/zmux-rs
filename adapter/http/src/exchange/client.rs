@@ -2,6 +2,8 @@
 //! state and its requests; the two halves zmux holds share only their
 //! buffers with it.
 
+use crate::client::{BoxIo, request_head};
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io;
@@ -13,7 +15,7 @@ use std::time::Duration;
 
 use crate::util::{hex, random_u64};
 use bytes::{Buf, Bytes, BytesMut};
-use http::{Method, Request, StatusCode, header};
+use http::{Method, StatusCode, header};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -168,6 +170,16 @@ pub fn dial_exchange_split(
     down: ExchangeEndpoint,
     options: &ExchangeOptions,
 ) -> io::Result<PipeIo> {
+    if options
+        .carrier_credential
+        .as_ref()
+        .is_some_and(|c| c.prefix_ticket_header().is_some())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HTTP exchange uses its request envelope and does not accept PrefixAuth credentials",
+        ));
+    }
     let psk = options.mac_psk()?;
     let mut cid: CarrierId = [0; 16];
     zmux::proto::seal::fill_random(&mut cid).map_err(io::Error::other)?;
@@ -409,10 +421,6 @@ impl Drop for Writer {
 
 // ---- HTTP ------------------------------------------------------------------------------
 
-type BoxIo = Box<dyn IoStream>;
-trait IoStream: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> IoStream for T {}
-
 type Connect =
     Box<dyn Fn() -> Pin<Box<dyn Future<Output = io::Result<BoxIo>> + Send>> + Send + Sync>;
 
@@ -448,12 +456,15 @@ impl Http {
         let mut hops = 0;
         loop {
             let mut sender = self.sender().await?;
-            let mut req = Request::builder()
-                .method(Method::POST)
-                .uri(path.as_str())
-                .header(header::HOST, self.authority.as_str())
-                .header(header::CACHE_CONTROL, "no-store")
-                .header(header::CONTENT_TYPE, "application/octet-stream");
+            let mut req = request_head(
+                Method::POST,
+                http::Version::HTTP_11,
+                &self.authority,
+                &path,
+                https,
+            )
+            .header(header::CACHE_CONTROL, "no-store")
+            .header(header::CONTENT_TYPE, "application/octet-stream");
             if let Some(h) = credential.filter(|h| !h.created.load(Ordering::Relaxed)) {
                 req = req.header(&h.name, &h.value);
             }

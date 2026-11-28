@@ -28,6 +28,7 @@ use super::streams::SendBuffer;
 use super::tier::Gate;
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::proto::frame::DatagramPrefix;
 use crate::proto::payload::Flow;
 use crate::proto::varint;
 use crate::util::{f64_of, u64_sat};
@@ -37,12 +38,6 @@ impl SessionCore {
     /// in use, as between zmux endpoints always.
     pub(super) fn acknowledged(&self) -> bool {
         self.mp.is_some() || self.pipe_ack.is_some()
-    }
-
-    /// The bytes sent and kept until a `PIPE_ACK` covers them (multipath
-    /// only: a single pipe drops what it sent).
-    pub(super) fn retained(&self) -> u64 {
-        self.mp.as_deref().map_or(0, mpath::Mp::retained)
     }
 
     /// The log of the batch being built, which multipath keeps for its
@@ -204,23 +199,8 @@ impl SessionCore {
         mp.acks_mut().copy_by(now + mpath::ACK_COPY_INTERVAL);
     }
 
-    /// The pipe a stream datagram must follow (multipath): the pipe of the
-    /// stream's opening frame while that is unacknowledged and the pipe is
-    /// live.
-    pub(super) fn datagram_pipe(&self, flow: Option<(u64, u64)>) -> Option<u64> {
-        self.mp.as_ref()?;
-        let (stream_id, _) = flow?;
-        let send = self.streams.send(self.streams.key_of(stream_id)?)?;
-        let opened = send.mp().acked.contains(0, 1)
-            || send.mp().buf_floor > 0
-            || (send.base > 0 && send.mp().preamble_acked);
-        let pipe = send.mp().open_pipe.filter(|_| !opened)?;
-        self.out_ref(pipe).filter(|o| o.is_live()).map(|_| pipe)
-    }
-
     pub(super) fn count_sent(&mut self, bytes: usize, records: u64) {
         self.stats.bytes_sent += bytes as u64;
-        self.count_earned(bytes as u64);
         self.stats.records_sent += records;
         if self.mp.is_none() {
             let rtt = self.session_rtt_min();
@@ -261,7 +241,9 @@ impl SessionCore {
         {
             return r;
         }
-        self.srtt.unwrap_or(Duration::from_millis(333))
+        self.srtt
+            .filter(|rtt| !rtt.is_zero())
+            .unwrap_or(Duration::from_millis(333))
     }
 }
 
@@ -391,15 +373,19 @@ impl SessionCore {
             return true;
         }
         if self.state == State::Establishing {
-            // Early data under the floor.
+            // Carrier early data under remembered QMux parameters.
             return self.early_open() && id == 0 && (self.opening_ready() || self.data_pending());
         }
         if self.shape.is_some() && self.shape_wants(id) {
             return true;
         }
+        if self.wants_datagram_ack(id) {
+            return true;
+        }
         let held = self.shape.is_some() && self.shape_held(id);
         if self.mp.is_none() {
             return self.control_pending()
+                || self.datagram_record_due(id)
                 || !held && (self.opening_ready() || self.data_pending())
                 || self.single_pipe_ack_due(self.now);
         }
@@ -421,22 +407,13 @@ impl SessionCore {
         if control && o.takes_new_data() && self.opening_ready() {
             return true;
         }
-        if o.state() == OutState::Active
-            && self
-                .dgram()
-                .send
-                .iter()
-                .any(|o| self.datagram_pipe(o.flow) == Some(id))
-        {
+        if self.datagram_record_due(id) {
             return true;
         }
-        // Stream data before the opportunistic copies, which cost more to
-        // look for and matter only while flow control holds data back.
-        // Both are paced: a held pipe waits for
-        // its release.
+        // Look for ready stream data before checking for copies and
+        // blocked-prefix repairs. Both wait for the pacing and shape gates.
         !held && self.data_for_pipe(id)
-            || (!o.limiter_held()
-                && (self.copies_queued(id, 0) || self.opp_due(id, now, None).is_some()))
+            || (!o.limiter_held() && (self.copies_queued(id, 0) || self.opp_due(id, now)))
     }
 
     /// Whether a scheduled stream has data for lane `lane` of pipe `id`,
@@ -488,20 +465,41 @@ impl SessionCore {
             .mp
             .as_deref()
             .map_or(Duration::ZERO, mpath::Mp::peer_mad);
+        let confirmation = (total > 0)
+            .then(|| self.mp.as_deref().filter(|m| m.batch().has_streams()))
+            .flatten()
+            .and_then(|_| {
+                let a = self.att(id)?;
+                let o = a.out()?;
+                Some(super::estimator::Confirmation {
+                    eta: self.eta_inputs(a, o),
+                    return_flight: o.est().confirmation_return(peer_mad),
+                })
+            });
+        let restricted = self.mp.as_deref().is_some_and(|mp| {
+            mp.batch().txlog.iter().any(|(_, frame)| {
+                matches!(frame, pipes::SentFrame::Stream { key, .. } if !self.unrestricted_delivery_stream(id, *key))
+            })
+        }) || self.shape_instance(id).is_some()
+            || self.out_ref(id).is_some_and(|out| self.paced(out) || out.est().rate_lo.is_some());
         let Some(o) = self.atts.get_mut(id).and_then(Attachment::out_mut) else {
             return;
         };
         let base = o.sent();
-        if let Some(m) = self.mp.as_deref_mut().map(mpath::Mp::batch_mut) {
+        if let Some(mp) = self.mp.as_deref_mut() {
+            let (m, repair) = mp.batch_and_repairs();
             m.new_data = false;
             m.txlog_new = false;
-            let ends = out.record_ends();
+            let ends = out.records();
             for (idx, f) in m.txlog.drain(..) {
-                let end = ends.get(idx as usize).copied().unwrap_or(total);
+                let end = ends.get(idx as usize).map_or(total, |record| record.end);
                 o.retain_frame(lane, base + end, f);
                 if let pipes::SentFrame::Stream { key, off, len, .. } = f
                     && let Some(send) = self.streams.send_mut(key)
                 {
+                    if off == 0 && len > 0 && send.mp().logged_to == 0 {
+                        repair.note_opening(key);
+                    }
                     send.mp_mut().carry(stream::Carry {
                         off,
                         end: off + len,
@@ -511,14 +509,17 @@ impl SessionCore {
                 }
             }
             for idx in m.txactivity.drain(..) {
-                let end = ends.get(idx as usize).copied().unwrap_or(total);
+                let end = ends.get(idx as usize).map_or(total, |record| record.end);
                 o.activity_at(base + end);
             }
         }
         if total == 0 {
             return;
         }
-        o.batch_sent(lane, total, out.record_ends().len() as u64, eliciting);
+        o.batch_sent(lane, total, out.records().len() as u64, eliciting);
+        if restricted {
+            o.note_delivery_restriction();
+        }
         if let Some(l) = o.lanes_mut() {
             if tx_lanes {
                 l.bind_batch(lane, base + total);
@@ -539,111 +540,141 @@ impl SessionCore {
             return;
         }
         if let Some(o) = self.out_mut(id) {
-            o.mp_batch_sent(lane, eliciting, peer_mad, now);
+            o.mp_batch_sent(lane, eliciting, confirmation, now);
         }
         self.batch_stream_bytes = 0;
     }
 
-    /// Writes queued datagrams that may go on pipe `pipe`: on the control
-    /// pipe every datagram except the stream datagrams that follow their
-    /// opening frame on another pipe; on another pipe only those that
-    /// follow it there, and only while it may carry DATAGRAM (ACTIVE).
-    /// Those that the pipe's datagram channel takes are left to
-    /// [`SessionCore::poll_channel`].
-    pub(super) fn write_datagrams(&mut self, pipe: u64, control: bool, w: &mut Records<'_>) {
-        let bound = self.max_datagram_frame();
-        let max_frame = bound.unwrap_or(0);
-        let ch = control
-            .then(|| self.channel_for(pipe, w.shape.is_some()))
-            .flatten();
-        let carries = self.mp.is_none()
-            || self
-                .out_ref(pipe)
-                .is_some_and(|o| o.state() == OutState::Active);
-        let mut i = 0;
-        loop {
-            let Some(o) = self.dgram().send.get(i) else {
-                return;
+    fn datagram_record_due(&self, pipe: u64) -> bool {
+        let route = super::datagram::DatagramRoute::Record(pipe);
+        (!self.shape_held(pipe) || self.record_flow_budget(pipe).is_zero())
+            && (self.next_datagram_flow(route).is_some() || self.datagram_replica_due(route))
+    }
+
+    /// Writes the datagram chosen for this pipe's next record turn. A
+    /// CoDel drop also consumes the flow's turn.
+    pub(super) fn write_record_datagram(
+        &mut self,
+        pipe: u64,
+        w: &mut Records<'_>,
+        max_frame: usize,
+        datagram: super::datagram::ReadyDatagram,
+    ) -> bool {
+        if let Some(shape) = &mut w.shape {
+            shape.datagram_delay_left = self.record_flow_budget(pipe);
+        }
+        let route = super::datagram::DatagramRoute::Record(pipe);
+        let i = datagram.index;
+        if datagram.replica {
+            if !self.record_replica_has_budget(i) {
+                return true;
+            }
+            let copy = self
+                .dgram()
+                .copies
+                .as_ref()
+                .expect("selected replica")
+                .get(i);
+            let total = copy.prefix.encoded_len() + copy.data.len();
+            let Some(last) = Self::reserve_datagram_record(w, total, max_frame) else {
+                return false;
             };
-            let (flow, data) = (&o.flow, &o.data);
-            let follow = self.datagram_pipe(*flow);
-            let here = match follow {
-                Some(p) => p == pipe && carries,
-                None => control,
+            let (prefix, data) = (copy.prefix, copy.data.clone());
+            #[cfg(all(feature = "tokio", not(loom)))]
+            if let Some(handoff) = copy.handoff.clone() {
+                w.out
+                    .track_handoff(handoff, super::splice_handoff::Medium::Record);
+            }
+            self.dispatch_datagram_replica(route, i);
+            self.emit_datagram_record(w, last, prefix, &data, false);
+        } else {
+            let packet = self.dgram().send.get(i).expect("selected flow head");
+            let prefix = self
+                .next_datagram_prefix(packet.flow)
+                .expect("selected datagram prefix");
+            let flow = self.flow_of(packet.flow);
+            let total = prefix.encoded_len() + packet.data.len();
+            let Some(last) = Self::reserve_datagram_record(w, total, max_frame) else {
+                return false;
             };
-            if !here {
-                i += 1;
-                continue;
-            }
-            let flow = self.flow_of(*flow);
-            let prefix = flow.map_or(0, |f| f.encoded_len());
-            let total = prefix + data.len();
-            if follow.is_none()
-                && ch.is_some_and(|c| {
-                    crate::proto::frame::channel::datagram_len(c.id, total) <= c.max
-                })
-            {
-                // The channel's task sends it.
-                i += 1;
-                continue;
-            }
-            if bound.is_some_and(|m| 1 + total > m) {
-                // Larger than any frame the carriers take now (a pipe with
-                // smaller records joined since it was queued): dropped and
-                // counted, so that it does not hold the datagrams after it.
-                let _ = self.take_send_datagram(i);
-                self.stats.datagrams_dropped_send += 1;
-                continue;
-            }
-            // With a Length field when it fits the peer's frame limit and
-            // our records; otherwise last in its record, in one of its own
-            // when it exceeds our record size.
-            let with_len = 1 + varint::len(total as u64) + total;
-            let last = with_len > max_frame.min(w.max_record());
-            let frame_len = if last { 1 + total } else { with_len };
-            let room = if frame_len <= w.max_record() {
-                w.ensure(frame_len)
-            } else {
-                w.own_record(frame_len)
-            };
-            if !room {
-                return;
-            }
             if self.send_delay_drop(i) {
-                continue;
+                return true;
             }
-            let Some(data) = self.take_send_datagram(i) else {
-                return;
-            };
-            let mut header = [0u8; 9 + 16];
-            let mut n = 1;
-            if last {
-                header[0] = 0x30;
-            } else {
-                header[0] = 0x31;
-                n += varint::encode(total as u64, &mut header[1..]).unwrap_or(0);
+            let packet = self.take_send_datagram(i).expect("selected flow head");
+            let len = packet.data.len() as u64;
+            #[cfg(all(feature = "tokio", not(loom)))]
+            if let Some(handoff) = packet.handoff.clone() {
+                w.out
+                    .track_handoff(handoff, super::splice_handoff::Medium::Record);
             }
-            if let Some(f) = flow {
-                n += f.encode(&mut header[n..]).unwrap_or(0);
-            }
-            w.out.push_bytes(&header[..n]);
-            let len = data.len() as u64;
-            w.payload(data);
-            w.activity = true;
-            w.traffic = true;
-            w.elicit();
-            self.note_activity(w);
-            if last {
-                w.end_record();
-            }
+            self.datagram_dispatched(route, &packet);
+            Self::spend_data_room(&mut self.pace_left, w, len);
+            self.emit_datagram_record(w, last, prefix, &packet.data, true);
             self.datagram_sent(flow, len);
+            if !self.dgram().send.is_empty() && self.features.carrier_datagrams {
+                self.channel_kick();
+            }
+        }
+        true
+    }
+
+    fn reserve_datagram_record(
+        w: &mut Records<'_>,
+        total: usize,
+        max_frame: usize,
+    ) -> Option<bool> {
+        let with_len = 1 + varint::len(total as u64) + total;
+        let last = with_len > max_frame.min(w.max_record());
+        let frame_len = if last { 1 + total } else { with_len };
+        let room = if frame_len <= w.max_record() {
+            w.ensure(frame_len)
+        } else {
+            w.own_record(frame_len)
+        };
+        room.then_some(last)
+    }
+
+    fn emit_datagram_record(
+        &mut self,
+        w: &mut Records<'_>,
+        last: bool,
+        prefix: DatagramPrefix,
+        data: &[u8],
+        original: bool,
+    ) {
+        let mut header = [0u8; 9 + 24];
+        let mut n = 1;
+        if last {
+            header[0] = 0x30;
+        } else {
+            header[0] = 0x31;
+            let total = prefix.encoded_len() + data.len();
+            n += varint::encode(total as u64, &mut header[1..]).expect("sized datagram length");
+        }
+        n += prefix
+            .encode(&mut header[n..])
+            .expect("sized datagram prefix");
+        if original {
+            w.note_own(data.len(), true, false);
+        }
+        if last {
+            self.shape_tail(w, n + data.len());
+        }
+        w.out.push_bytes(&header[..n]);
+        w.payload(data);
+        w.activity = true;
+        w.traffic = true;
+        w.elicit();
+        self.note_activity(w);
+        if last {
+            w.end_record();
         }
     }
 
     /// Counts a datagram handed to a carrier, in a record or on a datagram
     /// channel: application bytes, and its stream's.
     pub(super) fn datagram_sent(&mut self, flow: Option<Flow>, len: u64) {
-        self.stats.datagrams_sent += 1;
+        self.dgram_mut().counters.sent += 1;
         self.meter.add(Count::DatagramSent, len);
         if let Some(Flow::Stream { stream_id, .. }) = flow
             && let Some(s) = self
@@ -701,9 +732,15 @@ impl SessionCore {
         self.streams.enqueue(key, u);
     }
 
-    pub(super) fn write_stream_data(&mut self, pipe: u64, w: &mut Records<'_>) {
+    pub(super) fn write_data(&mut self, pipe: u64, w: &mut Records<'_>, record_datagrams: bool) {
+        let datagram_limit = if record_datagrams && self.datagrams_pending() {
+            self.prepare_datagram_dispatch();
+            self.datagram_record_limit(pipe)
+        } else {
+            None
+        };
         if self.mp.is_some() {
-            self.write_stream_data_mp(pipe, w);
+            self.write_data_mp(pipe, w, datagram_limit);
             return;
         }
         if self.out_ref(pipe).is_some_and(|o| o.lanes().is_some()) {
@@ -715,16 +752,22 @@ impl SessionCore {
                     skipped: Vec::new(),
                 },
                 w,
+                datagram_limit,
             );
             return;
         }
         let offered = self.out_ref(pipe).is_some_and(OutPipe::lanes_offered);
-        self.write_streams(pipe, &mut SinglePick { offered, passed: 0 }, w);
+        self.write_streams(
+            pipe,
+            &mut SinglePick { offered, passed: 0 },
+            w,
+            datagram_limit,
+        );
     }
 
-    /// Discards a stream once both parts are terminal, its control frames
-    /// are out, and the application released it or the stack rejected it
-    /// A peer stream returns its stream-count credit.
+    /// Settles the finished stream's part of a shutdown drain. Discards the
+    /// stream once the application released it or the stack rejected it.
+    /// A discarded peer stream returns its stream-count credit.
     pub(super) fn try_discard(&mut self, key: StreamKey) {
         if self.early_retains() {
             // Carrier early data may still be rejected and sent again.
@@ -734,10 +777,18 @@ impl SessionCore {
         let Some(s) = self.streams.get(key) else {
             return;
         };
-        if !s.parts_terminal() || !(s.released || s.offer == Offer::Rejected) || s.ctrl_queued {
+        if s.shutdown_pending() {
             return;
         }
-        if s.send.as_ref().is_some_and(|x| x.queued.is_some()) {
+        let discard = s.released || s.offer == Offer::Rejected;
+        let settled = self
+            .goaway
+            .as_mut()
+            .is_some_and(|g| g.draining.remove(&key));
+        if !discard {
+            if settled {
+                self.check_shutdown_done(None);
+            }
             return;
         }
         // A handle that outlives the stream keeps its final statistics and
@@ -749,7 +800,7 @@ impl SessionCore {
         {
             let _ = slot.set(StreamFinal { stats, settings });
         }
-        let Some(s) = self.streams.remove(key) else {
+        let Some(mut s) = self.streams.remove(key) else {
             return;
         };
         if let Some(id) = s.id
@@ -759,11 +810,15 @@ impl SessionCore {
         }
         if let Some(mp) = self.mp.as_deref_mut() {
             mp.picks_mut().forget(key);
+            mp.blocked_mut().forget(key);
         }
-        if let Some(r) = &s.recv
-            && r.held() > 0
-        {
-            self.credit_consumed(r.held());
+        if let Some(recv) = &mut s.recv {
+            self.streams
+                .replace_protected_history(recv.protected_history(), 0);
+            let held = recv.drop_all(&mut self.receive);
+            if held > 0 {
+                self.credit_consumed(held);
+            }
         }
         if let Some(owed) = s.recv.as_ref().map(stream::RecvPart::credit_owed)
             && owed > 0
@@ -780,10 +835,18 @@ impl SessionCore {
         {
             self.dgram_mut().stream_bytes -= d.bytes;
         }
-        if !s.local {
-            self.stream_count_credit(di(s.dir));
-        }
+        let local_receive = s.local && s.recv.is_some();
+        let peer_direction = (!s.local).then(|| di(s.dir));
         self.streams.recycle(s);
+        if local_receive {
+            self.release_local_receive();
+        }
+        if let Some(d) = peer_direction {
+            self.stream_count_credit(d);
+        }
+        if self.streams.memory_pressure() {
+            self.reclaim_receive_space(false);
+        }
         self.check_shutdown_done(None);
     }
 }
@@ -791,17 +854,52 @@ impl SessionCore {
 impl SessionCore {
     /// A snapshot of the statistics.
     pub fn stats(&self) -> SessionStats {
-        let mut s = self.stats.clone();
+        let mut s = SessionStats {
+            bytes_sent: self.stats.bytes_sent,
+            bytes_received: self.stats.bytes_received,
+            records_sent: self.stats.records_sent,
+            records_received: self.stats.records_received,
+            streams_opened_local: self.stats.streams_opened_local,
+            streams_opened_remote: self.stats.streams_opened_remote,
+            datagrams_sent: self.dgram().counters.sent,
+            datagrams_received: self.dgram().counters.received,
+            datagrams_dropped_recv: self.dgram().counters.dropped_recv,
+            datagrams_dropped_limit: self.dgram().counters.dropped_limit,
+            datagrams_sent_channel: self.dgram().counters.sent_channel,
+            datagrams_received_channel: self.dgram().counters.received_channel,
+            bytes_duplicate_received: self.stats.bytes_duplicate_received,
+            stream_credit_waits: self.stats.stream_credit_waits,
+            pipes_added: self.stats.pipes_added,
+            join_auth_failures: self.stats.join_auth_failures,
+            first_flight_timeouts: self.stats.first_flight_timeouts,
+            ..SessionStats::default()
+        };
         let app = self.meter.get();
         s.bytes_written = app.bytes_written;
         s.bytes_read = app.bytes_read;
         s.datagram_bytes_sent = app.datagram_bytes_sent;
         s.datagram_bytes_received = app.datagram_bytes_received;
+        let drops = self.dgram().stats.drops;
+        s.datagrams_dropped_send = drops.without_limiter();
+        s.datagrams_dropped_limit += drops.limiter;
         s.no_effect_budget = self.budget.tokens();
         if let Some(mp) = self.mp.as_deref() {
+            s.bytes_reinjected = mp.counters.bytes_reinjected;
+            s.bytes_opportunistic = mp.counters.bytes_opportunistic;
+            s.bytes_redundant = mp.counters.bytes_redundant;
+            s.penalties = mp.counters.penalties;
+            s.reinjections = mp.counters.reinjections;
+            s.pipe_failures = mp.counters.pipe_failures;
+            s.join_pending = mp.counters.join_pending;
+            s.join_batch_dropped = mp.counters.join_batch_dropped;
+            s.join_failures = mp.counters.join_failures;
+            s.join_replays = mp.counters.join_replays;
+            s.join_refusals = mp.counters.join_refusals;
+            s.suspensions = mp.counters.suspensions;
+            s.suspended_time = mp.counters.suspended_time;
             let (fallbacks, applied) = mp.picks().counts();
-            s.scheduler_fallbacks += fallbacks;
-            s.scheduler_answers += applied;
+            s.scheduler_fallbacks = fallbacks;
+            s.scheduler_answers = applied;
         }
         s.streams_active = self.streams.len() as u64;
         s.smoothed_rtt = self.srtt;
@@ -868,7 +966,17 @@ impl SessionCore {
         // share it.
         let config =
             (size_of::<Config>() + 2 * size_of::<usize>()) / Arc::strong_count(&self.config);
-        let mut n = size_of::<Self>() + config + self.streams.heap_bytes();
+        let mut n =
+            size_of::<Self>() + config + self.streams.heap_bytes() + self.received_data_memory();
+        n += self.recv_refs.heap_bytes();
+        n += self
+            .write_domain()
+            .map_or(0, |ledger| ledger.state_heap_bytes());
+        n += self.memory_writers.capacity() * size_of::<StreamKey>();
+        n += self
+            .lane_open_timers
+            .as_ref()
+            .map_or(0, |timers| size_of_val(&**timers) + timers.heap_bytes());
         n += self.events.capacity() * size_of::<CoreEvent>();
         // Attachments (with their pipe halves) live inline in `atts`.
         n += self.atts.heap_bytes();
@@ -898,6 +1006,8 @@ impl SessionCore {
             }
             return;
         }
+        self.set_pacing_deadline(pipe, None);
+        self.cancel_pipe_lane_open(pipe);
         self.views_changed();
         if self.mp.is_some() && (self.state < State::Closing || self.close_waiting()) {
             // During the close wait a failed pipe's records are reinjected.
@@ -953,6 +1063,7 @@ impl SessionCore {
     pub(super) fn send_buffer(&self) -> SendBuffer {
         SendBuffer {
             total: self.session_send_buffer(),
+            hard: self.send_buffer_limit(),
             retained: self.mp.as_deref().map(mpath::Mp::retained),
         }
     }
@@ -1061,6 +1172,8 @@ impl SessionCore {
             return Ok(());
         }
         if self.mp.is_some() {
+            #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+            self.member_bytes(super::PipeId(id), false, len);
             self.mp_record_end(len, now);
         } else {
             let mut activity = false;

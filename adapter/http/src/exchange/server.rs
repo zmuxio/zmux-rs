@@ -21,16 +21,11 @@ use zmux::adapter::{Admit, Entry};
 use zmux::{Listener, PipeHint, PipeIo};
 
 use super::ExchangeOptions;
-use super::record::Record;
 use super::wire::{
     self, BUSY, CarrierId, FIN, GONE, HEADER_LEN, Header, Key, Kind, MAC_LEN, MAX_REASON, REQ_FIN,
     REQUEST_OVERHEAD, unix_seconds,
 };
 use crate::body::{Gathered, PipeBody, ReplayBody, read_to};
-
-/// The granularity of the memory charged to the listener, so that small
-/// changes do not touch its account.
-const CHARGE_UNIT: u64 = 64 << 10;
 
 /// The server of the exchange carrier: it turns the requests of each
 /// carrier into one pipe handed to its [`Listener`]. Cheap to clone; all
@@ -45,7 +40,7 @@ const CHARGE_UNIT: u64 = 64 << 10;
 ///
 /// The bytes a carrier holds (uplink pieces for zmux, downlink bytes not
 /// yet acknowledged) are charged to the listener's memory budget
-/// ([`ListenerAdapter::charge_memory`](zmux::adapter::ListenerAdapter::charge_memory)).
+/// ([`ListenerAdapter::reserve_memory`](zmux::adapter::ListenerAdapter::reserve_memory)).
 #[derive(Clone)]
 pub struct ExchangeServer {
     inner: Arc<Shared>,
@@ -72,7 +67,7 @@ struct Shared {
     bodies: std::ops::RangeInclusive<usize>,
     /// The length of the authentication header in the body encoding.
     header_len: usize,
-    record: Record,
+    record: Option<zmux::ReplayFilter>,
     table: Mutex<Table>,
 }
 
@@ -148,7 +143,21 @@ impl ExchangeServer {
     ///
     /// `InvalidInput` on options without a PSK that do not choose to run
     /// unauthenticated, or that set both, and on an `idle_timeout` of zero.
+    /// Use a listener for the exchange envelope when other carrier types
+    /// at this HTTP endpoint require prefix tickets.
     pub fn new(listener: &Listener, options: ExchangeOptions) -> io::Result<Self> {
+        // This endpoint owns request authentication through the exchange
+        // envelope. A prefix-protected listener is a separate entry.
+        if listener
+            .adapter()
+            .admission()
+            .is_some_and(zmux::Admission::requires_prefix_ticket)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "configure exchange with an envelope-only listener",
+            ));
+        }
         options.mac_psk()?;
         if options.idle_timeout.is_zero() {
             return Err(io::Error::new(
@@ -161,12 +170,17 @@ impl ExchangeServer {
         let window = i64::try_from(options.time_window.as_secs())
             .unwrap_or(i64::MAX)
             .min(i64::from(i32::MAX) + 1);
+        // Time is integral seconds. The filter's minimum (one millisecond)
+        // still accepts only the current second when the window is zero.
+        let replay_window =
+            Duration::from_millis(window.unsigned_abs().saturating_mul(1000).max(1));
+        let record = zmux::ReplayFilter::new(replay_window, options.max_recorded).ok();
         let enc = options.encoding;
         Ok(Self {
             inner: Arc::new(Shared {
                 listener: listener.clone(),
                 window,
-                record: Record::new(window, options.max_recorded),
+                record,
                 handshake: listener.adapter().handshake_timeout(),
                 bodies: wire::encoded_len(enc, REQUEST_OVERHEAD)
                     ..=wire::encoded_len(
@@ -261,7 +275,9 @@ impl ExchangeServer {
         B: http_body::Body + Unpin,
         B::Data: Buf,
     {
-        let arrival = Instant::now();
+        let adapter = self.inner.listener.adapter();
+        let clock = adapter.clock_domain();
+        let arrival = clock.now();
         let (mut parts, mut body) = req.into_parts();
         let back = |parts, read: Bytes, trailers, body| {
             let mut replay =
@@ -278,13 +294,10 @@ impl ExchangeServer {
         }
         let s = &self.inner;
         let first_record = s.listener.limits().first_record_timeout;
-        if crate::forwarded_early_data(&parts.headers) {
-            // Forwarded from TLS early data: no carrier is taken from it.
-            s.listener.adapter().count_setup_failure();
-            return Ok(crate::too_early());
-        }
         let peer = peer.unwrap_or(NO_ADDR);
-        let source = crate::request_source(&s.listener, &parts.headers, Some(peer)).unwrap_or(peer);
+        let Ok(source) = zmux_http_head::preprocess(&s.listener, &parts.headers, peer) else {
+            return Ok(crate::too_early());
+        };
         // The request's slots from its arrival; none for a closed listener,
         // which still authenticates the request to answer GONE.
         let entry = match s.listener.adapter().enter(peer, Some(source)) {
@@ -293,6 +306,12 @@ impl ExchangeServer {
             None => {
                 return Ok(crate::server::status(http::StatusCode::SERVICE_UNAVAILABLE));
             }
+        };
+        let reject = |entry: Option<Entry>, status| {
+            if let Some(e) = entry {
+                e.release();
+            }
+            Ok(crate::server::status(status))
         };
         let Some(len) = content_length(&parts.headers).filter(|n| s.bodies.contains(n)) else {
             if let Some(e) = entry {
@@ -303,20 +322,26 @@ impl ExchangeServer {
 
         // The authentication header, and nothing more, within the
         // listener's first-record timeout as the request arrived.
-        let mut read = Gathered::default();
+        let Ok(raw_charge) = adapter.reserve_memory(len as u64 + PIECE_COST as u64) else {
+            return reject(entry, http::StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let mut read = Gathered::new(len);
         let arrived = read_to(
             &mut body,
             &mut read,
             s.header_len,
-            zmux::adapter::handshake_deadline(arrival.into_std(), first_record)
-                .map(Instant::from_std),
+            clock.sleep_until(arrival.checked_add(first_record)),
         )
         .await;
+        if read.overflowed {
+            return reject(entry, http::StatusCode::BAD_REQUEST);
+        }
         let authenticated = arrived
             .then(|| s.header(&read.as_slice()[..s.header_len]))
             .flatten()
             .and_then(|h| {
-                let (lookup, key) = s.authenticate(&h, len)?;
+                let now = i64::try_from(unix_seconds()).ok()?;
+                let (lookup, key) = s.authenticate(&h, len, now)?;
                 Some((h, lookup, key))
             });
         let Some((header, mut lookup, key)) = authenticated else {
@@ -324,7 +349,7 @@ impl ExchangeServer {
                 e.release();
             }
             let trailers = read.trailers.take();
-            return back(parts, read.freeze(), trailers, body);
+            return back(parts, held_bytes(read.freeze(), raw_charge), trailers, body);
         };
         // A request of a known carrier gives its place back now; one that
         // may create a carrier keeps it.
@@ -342,28 +367,51 @@ impl ExchangeServer {
             &mut body,
             &mut read,
             len,
-            zmux::adapter::handshake_deadline(Instant::now().into_std(), s.handshake)
-                .map(Instant::from_std),
+            clock.sleep_until(clock.now().checked_add(s.handshake)),
         )
         .await
             && read.len() == len;
         let data_len = header.data_len as usize;
-        let raw = read.freeze();
-        let rest = raw.slice(s.header_len..);
-        let bin = complete
-            .then(|| wire::decode_body(s.options.encoding, rest))
-            .flatten()
-            .filter(|b| b.len() == data_len + MAC_LEN);
+        let raw = held_bytes(read.freeze(), raw_charge);
+        let bin = if complete {
+            let rest = raw.slice(s.header_len..);
+            match s.options.encoding {
+                super::BodyEncoding::Binary => Some(rest),
+                super::BodyEncoding::Base64 => {
+                    // The decoder's output fits inside the encoded length.
+                    let Ok(grant) = adapter.reserve_memory(rest.len() as u64 + PIECE_COST as u64)
+                    else {
+                        return reject(entry, http::StatusCode::SERVICE_UNAVAILABLE);
+                    };
+                    wire::decode_body(s.options.encoding, rest).map(|b| held_bytes(b, grant))
+                }
+            }
+        } else {
+            None
+        }
+        .filter(|b| b.len() == data_len + MAC_LEN);
         let Some(bin) = bin.filter(|b| header.data_authentic(&key, &b[..data_len], &b[data_len..]))
         else {
             // Changes nothing; the client sees no result.
-            if let Some(e) = entry {
-                e.release();
-            }
-            return Ok(crate::server::status(http::StatusCode::BAD_REQUEST));
+            return reject(entry, http::StatusCode::BAD_REQUEST);
         };
         let data = bin.slice(..data_len);
         let kind = header.valid_kind(&data);
+        let payload_space = if matches!(kind, Some(Kind::Down)) {
+            s.options.down_piece_size() as u64
+        } else {
+            0
+        };
+        // The downlink root may be retained by the HTTP server beyond its ACK.
+        // Also cover the intermediate and encoded buffers in base64 mode.
+        let binary_space = payload_space + wire::RESPONSE_HEAD as u64;
+        let response_space = match s.options.encoding {
+            super::BodyEncoding::Binary => 2 * payload_space + wire::RESPONSE_HEAD as u64,
+            super::BodyEncoding::Base64 => 2 * payload_space + 3 * binary_space,
+        } + 2 * PIECE_COST as u64;
+        let Ok(response_charge) = adapter.reserve_memory(response_space) else {
+            return reject(entry, http::StatusCode::SERVICE_UNAVAILABLE);
+        };
         let mut creation = None;
         let mut head = None;
         if let Some(arrival) = &mut entry
@@ -388,17 +436,7 @@ impl ExchangeServer {
                         Admit::Accept(_) => {}
                         Admit::TakeOver(_) => head = Some(arrival.response_head()),
                         Admit::Fallback(_) => {
-                            if parts
-                                .extensions
-                                .get::<zmux::adapter::TrackRequestFallback>()
-                                .is_some()
-                            {
-                                if let Some(outcome) = arrival.request_fallback() {
-                                    parts.extensions.insert(outcome);
-                                }
-                            } else {
-                                arrival.complete_request_fallback(true);
-                            }
+                            zmux_http_head::return_fallback(arrival, &mut parts.extensions);
                             return back(parts, raw, None, body);
                         }
                         Admit::Stall => {
@@ -417,20 +455,37 @@ impl ExchangeServer {
             Ok((kind, carrier)) => carrier.request(kind, &header, &data).await,
             Err(answer) => answer,
         };
-        let response = self.respond(&key, &header.answering(), answer);
+        let response = self.respond(&key, &header.answering(), answer, response_charge);
         Ok(match receipt {
             Some(sent) => response.map(|body| body.with_head(sent)),
             None => response,
         })
     }
 
-    fn respond(&self, key: &Key, to: &wire::Answering<'_>, answer: Answer) -> Response<PipeBody> {
+    fn respond(
+        &self,
+        key: &Key,
+        to: &wire::Answering<'_>,
+        answer: Answer,
+        mut charge: MemoryCharge,
+    ) -> Response<PipeBody> {
         let o = &self.inner.options;
         let head = wire::response_head(key, to, answer.flags, &answer.data);
-        let mut r = Response::new(PipeBody::fixed(wire::encode_body(
-            o.encoding,
-            [head, answer.data],
-        )));
+        let [head, data] = wire::encode_body(o.encoding, [head, answer.data]);
+        let mut charged = head.len() as u64 + PIECE_COST as u64;
+        if !data.is_empty() {
+            charged += 2 * o.down_piece_size() as u64 + PIECE_COST as u64;
+        }
+        charge
+            .resize(charged)
+            .expect("encoded response fits its grant");
+        let body = if data.is_empty() {
+            [held_bytes(head, charge), data]
+        } else {
+            let charge = Arc::new(charge);
+            [held_bytes(head, charge.clone()), held_bytes(data, charge)]
+        };
+        let mut r = Response::new(PipeBody::fixed(body));
         let h = r.headers_mut();
         h.insert(
             header::CACHE_CONTROL,
@@ -444,6 +499,29 @@ impl ExchangeServer {
             }),
         );
         r
+    }
+}
+
+/// An allocation sent to an HTTP host or retained in the carrier queue.
+struct HeldBytes<C> {
+    bytes: Bytes,
+    _charge: C,
+}
+
+fn held_bytes(bytes: Bytes, charge: impl Send + 'static) -> Bytes {
+    if bytes.is_empty() {
+        Bytes::new()
+    } else {
+        Bytes::from_owner(HeldBytes {
+            bytes,
+            _charge: charge,
+        })
+    }
+}
+
+impl<C> AsRef<[u8]> for HeldBytes<C> {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -507,7 +585,7 @@ impl Shared {
     /// MAC, its Time within the window, its Data Length, and its (Carrier
     /// ID, Nonce) pair, which it records. `None` when it is not
     /// authenticated.
-    fn authenticate(&self, h: &Header, len: usize) -> Option<(Lookup, Key)> {
+    fn authenticate(&self, h: &Header, len: usize, now: i64) -> Option<(Lookup, Key)> {
         let o = &self.options;
         let lookup = {
             let mut t = lock(&self.table);
@@ -525,7 +603,6 @@ impl Shared {
         if !h.authentic(&key) {
             return None;
         }
-        let now = i64::try_from(unix_seconds()).ok()?;
         let time = within_window(h.time, now, self.window)?;
         // The Data Length against the body and the limit of the Kind,
         // before the pair is recorded: a request refused here is refused
@@ -540,7 +617,11 @@ impl Shared {
         pair[..16].copy_from_slice(&h.cid);
         pair[16..].copy_from_slice(&h.nonce);
         self.record
-            .insert(pair, time, now - self.window)
+            .as_ref()
+            .is_some_and(|record| {
+                record.check_at(&pair, time.saturating_mul(1000), now.saturating_mul(1000))
+                    == zmux::ReplayVerdict::Fresh
+            })
             .then_some((lookup, key))
     }
 
@@ -644,13 +725,12 @@ impl Shared {
                 entry.release();
                 return Err(BUSY);
             }
-            let c = Arc::new(Carrier::new(
-                cid,
-                key,
-                Arc::downgrade(self),
-                o,
-                &self.listener,
-            ));
+            let Ok(carrier) = Carrier::new(cid, key, Arc::downgrade(self), o, &self.listener)
+            else {
+                entry.release();
+                return Err(BUSY);
+            };
+            let c = Arc::new(carrier);
             t.live.insert(cid, c.clone());
             c
         };
@@ -721,8 +801,8 @@ struct Carrier {
     key: Key,
     server: Weak<Shared>,
     limits: Limits,
-    listener: Listener,
     state: Mutex<State>,
+    _memory: MemoryCharge,
     /// Held DOWN requests wait on it: an assignment, new bytes, the end.
     changed: Notify,
     /// The idle watch waits on it: the carrier left the table.
@@ -774,7 +854,6 @@ struct State {
     writer: Option<Waker>,
     /// Assigned pieces from `ack` on.
     pieces: BTreeMap<u64, Piece>,
-    pieces_bytes: usize,
     /// The lowest unassigned number.
     contig: u64,
     /// The highest assigned number plus one.
@@ -785,9 +864,6 @@ struct State {
     /// The DOWN requests held, by number: the ticket of the latest.
     held: HashMap<u64, u64>,
     tickets: u64,
-
-    charge: Option<MemoryCharge>,
-    charged: u64,
 }
 
 /// What to do after the state's lock is released.
@@ -818,9 +894,6 @@ impl State {
         self.pieces.clear();
         self.up_ooo_bytes = 0;
         self.queue_bytes = 0;
-        self.pieces_bytes = 0;
-        self.charge = None;
-        self.charged = 0;
         Effects {
             reader: self.reader.take(),
             writer: self.writer.take(),
@@ -848,10 +921,7 @@ impl State {
             return Err(());
         }
         self.ack = ack;
-        let kept = self.pieces.split_off(&ack);
-        for p in std::mem::replace(&mut self.pieces, kept).into_values() {
-            self.pieces_bytes -= p.data.len();
-        }
+        self.pieces = self.pieces.split_off(&ack);
         Ok(())
     }
 
@@ -899,7 +969,7 @@ impl State {
 
     fn deliver(&mut self, d: Bytes) {
         if !self.reader_gone && !d.is_empty() {
-            self.queue_bytes += d.len();
+            self.queue_bytes += d.len() + PIECE_COST;
             self.queue.push_back(d);
         }
     }
@@ -979,18 +1049,12 @@ impl State {
         if piece.fin && self.down_fin.is_none() {
             self.down_fin = Some(n);
         }
-        self.pieces_bytes += piece.data.len();
         self.pieces.insert(n, piece.clone());
         self.assigned_end = self.assigned_end.max(n + 1);
         while self.pieces.contains_key(&self.contig) {
             self.contig += 1;
         }
         (piece, fx)
-    }
-
-    /// The bytes held for the carrier.
-    fn held_bytes(&self) -> u64 {
-        (self.queue_bytes + self.up_ooo_bytes + self.pending.len() + self.pieces_bytes) as u64
     }
 }
 
@@ -1024,8 +1088,18 @@ impl Carrier {
         server: Weak<Shared>,
         o: &ExchangeOptions,
         listener: &Listener,
-    ) -> Self {
-        Self {
+    ) -> io::Result<Self> {
+        // UP payload roots own their grants. Keep room for the queue and
+        // tree entries, including an out-of-order run moved into the queue.
+        let up = (o.up_store as u64)
+            .saturating_mul(4)
+            .saturating_add(4 * PIECE_COST as u64);
+        let down = (o.down_piece_size() as u64)
+            .saturating_mul(2)
+            .saturating_add(2 * PIECE_COST as u64)
+            .saturating_mul(o.down_window.max(1).saturating_add(2));
+        let memory = listener.adapter().reserve_memory(up.saturating_add(down))?;
+        Ok(Self {
             worker: std::sync::OnceLock::new(),
             cid,
             key,
@@ -1040,21 +1114,21 @@ impl Carrier {
                 gone_memory: o.gone_memory,
                 max_carriers: o.max_carriers,
             },
-            listener: listener.clone(),
+            _memory: memory,
             state: Mutex::new(State {
                 last_request: Some(Instant::now()),
                 ..State::default()
             }),
             changed: Notify::new(),
             ended: Notify::new(),
-        }
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
         lock(&self.state)
     }
 
-    /// Releases the lock, then wakes, recharges and retires as `fx` says.
+    /// Releases the lock, then wakes and retires as `fx` says.
     fn apply(&self, mut st: MutexGuard<'_, State>, mut fx: Effects) {
         if !st.retired && !st.failed && st.complete() {
             fx.retire = true;
@@ -1064,13 +1138,6 @@ impl Carrier {
                 fx.retire = false;
             }
             st.retired = true;
-        }
-        if !st.failed {
-            let want = st.held_bytes().div_ceil(CHARGE_UNIT) * CHARGE_UNIT;
-            if want != st.charged {
-                st.charged = want;
-                st.charge = (want > 0).then(|| self.listener.adapter().charge_memory(want));
-            }
         }
         drop(st);
         for w in [fx.reader, fx.writer].into_iter().flatten() {
@@ -1282,10 +1349,12 @@ impl AsyncRead for UpReader {
             let n = front.len().min(buf.remaining());
             buf.put_slice(&front[..n]);
             front.advance(n);
-            if front.is_empty() {
-                st.queue.pop_front();
-            }
+            let empty = front.is_empty();
             st.queue_bytes -= n;
+            if empty {
+                st.queue.pop_front();
+                st.queue_bytes -= PIECE_COST;
+            }
         }
         c.apply(st, Effects::default());
         Poll::Ready(Ok(()))
@@ -1371,6 +1440,13 @@ impl Drop for DownWriter {
         self.0.apply(st, fx);
     }
 }
+
+#[cfg(test)]
+use zmux::{ClockDomain, MonotonicClock};
+
+#[cfg(test)]
+#[path = "../../../../tests/common/clock.rs"]
+mod test_clock;
 
 #[cfg(test)]
 mod tests {
@@ -1661,6 +1737,39 @@ mod tests {
         assert!(!read.load(Ordering::Relaxed), "the body was read");
     }
 
+    #[tokio::test]
+    async fn the_body_is_unread_when_its_workspace_cannot_be_reserved() {
+        let mut limits = zmux::ListenerConfig::default();
+        limits.limits.memory_budget = Some(1);
+        let listener = Listener::new(zmux::Config::default(), limits).unwrap();
+        let server =
+            ExchangeServer::new(&listener, ExchangeOptions::default().with_unauthenticated())
+                .unwrap();
+        let nonce = NONCES.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+        let (_, req) = request(&[2; 16], Kind::Up, 0, 0, wire::unix_time(), nonce, b"x");
+        assert_unread_503(&server, req, None).await;
+        assert_eq!(server.carriers(), 0);
+        assert!(listener.adapter().reserve_memory(1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_slice_keeps_its_full_workspace_reserved() {
+        let mut limits = zmux::ListenerConfig::default();
+        limits.limits.memory_budget = Some(128);
+        let listener = Listener::new(zmux::Config::default(), limits).unwrap();
+        let adapter = listener.adapter();
+        let bytes = held_bytes(
+            Bytes::from_static(b"abc"),
+            adapter.reserve_memory(128).unwrap(),
+        );
+        let slice = bytes.slice(..1);
+        drop(bytes);
+        assert_eq!(slice.as_ref(), b"a");
+        assert!(adapter.reserve_memory(1).is_err());
+        drop(slice);
+        assert!(adapter.reserve_memory(128).is_ok());
+    }
+
     /// A request that finds no free slot of the listener (the global
     /// bound) is answered 503 as one without a slot of its source.
     #[tokio::test]
@@ -1857,10 +1966,14 @@ mod tests {
     /// changes nothing: the carrier still waits for that piece.
     #[tokio::test]
     async fn failures_after_authentication_are_400() {
+        let wait = Duration::from_secs(65);
+        let (clock, domain) = super::test_clock::ManualClock::domain(Duration::from_secs(120));
+        let mut timers = clock.registrations();
         let mut limits = zmux::ListenerConfig::default();
-        limits.handshake_timeout = Duration::from_millis(50);
-        let listener =
-            Listener::new(zmux::Config::default(), limits).expect("valid listener configuration");
+        limits.handshake_timeout = wait;
+        let mut config = zmux::Config::default();
+        config.clock_domain = domain.clone();
+        let listener = Listener::new(config, limits).expect("valid listener configuration");
         let server =
             ExchangeServer::new(&listener, ExchangeOptions::default().with_unauthenticated())
                 .unwrap();
@@ -1878,10 +1991,24 @@ mod tests {
                 .header(header::CONTENT_LENGTH, full.len())
                 .body(Chan(rx))
                 .unwrap();
-            let resp = server
-                .handle(req, None, &PairField::default())
+            let pair = PairField::default();
+            let mut handle = std::pin::pin!(server.handle(req, None, &pair));
+            if late {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let deadline = domain.now() + wait;
+                    assert!(
+                        std::future::poll_fn(|cx| Poll::Ready(
+                            handle.as_mut().poll(cx).is_pending()
+                        ))
+                        .await
+                    );
+                    while timers.recv().await.unwrap() != deadline {}
+                    clock.advance(wait);
+                })
                 .await
-                .unwrap_or_else(|_| panic!("handed back"));
+                .unwrap();
+            }
+            let resp = handle.await.unwrap_or_else(|_| panic!("handed back"));
             drop(keep);
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "late {late}");
             assert!(
@@ -1985,10 +2112,15 @@ mod tests {
     /// first-record timeout is handed back with what arrived.
     #[tokio::test]
     async fn a_late_header_is_handed_back() {
+        let wait = Duration::from_secs(60);
+        let (clock, domain) = super::test_clock::ManualClock::domain(Duration::from_secs(120));
+        let mut timers = clock.registrations();
+        let deadline = domain.now() + wait;
         let mut limits = zmux::ListenerConfig::default();
-        limits.limits.first_record_timeout = Duration::from_millis(50);
-        let listener =
-            Listener::new(zmux::Config::default(), limits).expect("valid listener configuration");
+        limits.limits.first_record_timeout = wait;
+        let mut config = zmux::Config::default();
+        config.clock_domain = domain;
+        let listener = Listener::new(config, limits).expect("valid listener configuration");
         let server =
             ExchangeServer::new(&listener, ExchangeOptions::default().with_unauthenticated())
                 .unwrap();
@@ -1998,10 +2130,18 @@ mod tests {
             .body(Chan(body))
             .unwrap();
         tx.send(Bytes::from_static(&[0; 10])).await.unwrap();
-        let back = server
-            .handle(req, None, &PairField::default())
-            .await
-            .unwrap_err();
+        let back = tokio::time::timeout(Duration::from_secs(30), async {
+            let pair = PairField::default();
+            let mut handle = std::pin::pin!(server.handle(req, None, &pair));
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(handle.as_mut().poll(cx).is_pending())).await
+            );
+            assert_eq!(timers.recv().await.unwrap(), deadline);
+            clock.advance(wait);
+            handle.await.unwrap_err()
+        })
+        .await
+        .unwrap();
         let (front, rest) = fallback(back).into_body().into_parts();
         assert_eq!(front.len(), 10);
         assert!(rest.is_some());
@@ -2130,6 +2270,52 @@ mod tests {
         .unwrap();
         listener.close();
         serving.await.unwrap();
+    }
+
+    #[test]
+    fn replay_identity_spans_timestamps_and_expiry_buckets() {
+        let (_, server) = server(
+            ExchangeOptions::default()
+                .with_time_window(Duration::from_secs(60))
+                .with_max_recorded(1),
+        );
+        let authenticate = |time, now, nonce| {
+            let (out, _) = request(&[2; 16], Kind::Up, 0, 0, time, [nonce; 8], b"a");
+            server
+                .inner
+                .authenticate(
+                    &server.inner.header(&out.header).unwrap(),
+                    REQUEST_OVERHEAD + 1,
+                    now,
+                )
+                .is_some()
+        };
+        assert!(authenticate(1_000, 1_000, 9));
+        assert!(!authenticate(1_030, 1_030, 9));
+        assert!(!authenticate(985, 990, 9));
+        assert!(!authenticate(1_030, 1_030, 8));
+        assert!(authenticate(1_090, 1_090, 9));
+    }
+
+    #[test]
+    fn zero_replay_window_records_only_the_current_wire_second() {
+        let (_, server) = server(ExchangeOptions::default().with_time_window(Duration::ZERO));
+        let authenticate = |time, now| {
+            let (out, _) = request(&[2; 16], Kind::Up, 0, 0, time, [9; 8], b"a");
+            server
+                .inner
+                .authenticate(
+                    &server.inner.header(&out.header).unwrap(),
+                    REQUEST_OVERHEAD + 1,
+                    now,
+                )
+                .is_some()
+        };
+        let wrap = i64::from(u32::MAX) + 1;
+        assert!(!authenticate(u32::MAX, wrap));
+        assert!(authenticate(0, wrap));
+        assert!(!authenticate(0, wrap));
+        assert!(authenticate(1, wrap + 1));
     }
 
     /// A request repeated with the same (Carrier ID, Nonce) is handed back.

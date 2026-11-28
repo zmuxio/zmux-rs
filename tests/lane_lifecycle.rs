@@ -25,7 +25,7 @@ const KEY: [u8; 16] = [0x5a; 16];
 
 fn config(key: Option<[u8; 16]>) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"lane-lifecycle--0123456789abcdef").with_end_to_end();
     c.test_hooks().lane_key = key;
     c
@@ -245,7 +245,7 @@ fn prefetched_lane_records_attach_and_replay_their_suffix() {
 async fn attach_fails(s: &Session) {
     let (a, mut b) = tokio::io::duplex(4096);
     assert!(
-        s.begin_add_pipe(PipeIo::new(a), PipeOptions::default())
+        s.test_begin_join(PipeIo::new(a), PipeOptions::default())
             .is_err(),
         "a closing or closed session takes no pipe"
     );
@@ -387,7 +387,7 @@ fn pipe_closed_waits_for_lane_worker_exit() {
 /// The unsent count a lane opener gives its lane reaches the pipe.
 #[test]
 fn a_lane_openers_unsent_count_is_read() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
     multi_thread(async {
         let (ca, sa) = (Arc::new(()), Arc::new(()));
         let (cid, sid) = (CarrierConnId::new(&ca), CarrierConnId::new(&sa));
@@ -398,7 +398,7 @@ fn a_lane_openers_unsent_count_is_read() {
             lane_carrier(y, &sid, cid.clone()),
             config(Some(KEY)),
         ));
-        let read = Arc::new(AtomicBool::new(false));
+        let read = Arc::new(Notify::new());
         let (peer, was_read) = (sid.clone(), read.clone());
         let io = PipeIo::new(x)
             .with_carrier_conn(cid.clone())
@@ -410,7 +410,7 @@ fn a_lane_openers_unsent_count_is_read() {
                         PipeIo::reader(r).with_carrier_conn(peer),
                     ));
                     Ok(zmux::adapter::Lane::new(w).with_unsent(move || {
-                        was_read.store(true, Ordering::SeqCst);
+                        was_read.notify_one();
                         Some(1234)
                     }))
                 }
@@ -422,12 +422,7 @@ fn a_lane_openers_unsent_count_is_read() {
             let _ = send.write_all(&vec![7; 4 << 20]).await;
             send
         });
-        watchdog(10, "the lane's count is read", async {
-            while !read.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
+        watchdog(30, "the lane's count is read", read.notified()).await;
         drop(client.close());
         drop(server.close());
         drop(writer);

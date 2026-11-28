@@ -53,7 +53,7 @@ async fn expect_lowat(socket: &impl AsRawFd, want: u32) {
 
 fn mp_config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"lowat-test-psk-0123456789abcdef!").with_end_to_end();
     c
 }
@@ -92,7 +92,7 @@ async fn multipath_pipes_get_32_kib() {
     expect_lowat(&bootstrap, 32 * 1024).await;
     let (stream, added) = connect(addr).await;
     session
-        .begin_add_pipe(PipeIo::from_tcp(stream), PipeOptions::default())
+        .test_begin_join(PipeIo::from_tcp(stream), PipeOptions::default())
         .unwrap();
     expect_lowat(&added, 32 * 1024).await;
     session.close().await;
@@ -164,7 +164,7 @@ fn blocking_multipath_pipes_get_32_kib() {
     let stream = std::net::TcpStream::connect(addr).unwrap();
     let added = stream.try_clone().unwrap();
     session
-        .begin_add_pipe(
+        .test_begin_join(
             zmux::blocking::PipeIo::from_tcp(stream),
             PipeOptions::default(),
         )

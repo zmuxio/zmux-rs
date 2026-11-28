@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::{InPipe, InState, OutPipe, OutState, TierState};
 use crate::proto::TransportErrorCode as T;
+use crate::proto::session::health::HealthTracker;
 
 /// What a pipe held when the session retired it, for the handles that
 /// outlive it: its options and how it ended.
@@ -53,7 +54,11 @@ enum PeerAttachment {
     reason = "independent state flags, not a mode that an enum would encode"
 )]
 struct AttMp {
+    accounting: Option<std::sync::Arc<crate::proto::session::accounting::Ledger>>,
+    health: HealthTracker,
     fate_group: u64,
+    replica_domain: Option<std::num::NonZeroU64>,
+    physical_connection: Option<Box<super::super::CarrierConnId>>,
     /// A peer ID used without attachment state (refused join, or abandoned
     /// before it was seen): only its `PIPE_ABANDON` is kept, while the ID is
     /// in the replay window.
@@ -111,7 +116,11 @@ struct AttMp {
 impl AttMp {
     const fn new(fate_group: u64, seq: u64) -> Self {
         Self {
+            accounting: None,
+            health: HealthTracker::new(),
             fate_group,
+            replica_domain: None,
+            physical_connection: None,
             unattached: false,
             joined: false,
             peer: PeerAttachment::Attached,
@@ -141,6 +150,28 @@ impl AttMp {
 static NO_ATT_MP: AttMp = AttMp::new(0, 0);
 
 impl Attachment {
+    pub(in crate::proto::session) fn accounting(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::proto::session::accounting::Ledger>> {
+        self.mp().accounting.as_ref()
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(in crate::proto::session) fn set_accounting(
+        &mut self,
+        ledger: std::sync::Arc<crate::proto::session::accounting::Ledger>,
+    ) {
+        self.mp_mut().accounting = Some(ledger);
+    }
+
+    pub(in crate::proto::session) fn health(&self) -> Option<&HealthTracker> {
+        self.mp.as_deref().map(|mp| &mp.health)
+    }
+
+    pub(in crate::proto::session) fn health_mut(&mut self) -> Option<&mut HealthTracker> {
+        self.mp.as_deref_mut().map(|mp| &mut mp.health)
+    }
+
     /// An attachment of a multipath session.
     pub(crate) fn new(id: u64, joiner_local: bool, fate_group: u64, seq: u64) -> Self {
         Self {
@@ -364,6 +395,28 @@ impl Attachment {
     #[inline]
     pub(crate) fn fate(&self) -> (bool, u64) {
         (self.joiner_local, self.mp().fate_group)
+    }
+
+    pub(crate) fn physical_connection(&self) -> Option<&super::super::CarrierConnId> {
+        self.mp().physical_connection.as_deref()
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn set_physical_connection(&mut self, connection: super::super::CarrierConnId) {
+        let physical = &mut self.mp_mut().physical_connection;
+        if let Some(current) = physical {
+            **current = connection;
+        } else {
+            *physical = Some(Box::new(connection));
+        }
+    }
+
+    pub(crate) fn replica_domain(&self) -> Option<std::num::NonZeroU64> {
+        self.mp().replica_domain
+    }
+
+    pub(crate) fn set_replica_domain(&mut self, domain: Option<std::num::NonZeroU64>) {
+        self.mp_mut().replica_domain = domain;
     }
 
     /// A peer ID used without attachment state.
@@ -797,5 +850,19 @@ impl Attachment {
             .as_ref()
             .is_none_or(|p| p.state() == InState::Ended)
             && self.out.as_ref().is_none_or(|o| !o.state().is_live())
+            && !self.graceful_shutdown_pending()
+    }
+
+    pub(crate) fn graceful_shutdown_pending(&self) -> bool {
+        self.out
+            .as_ref()
+            .is_some_and(OutPipe::graceful_shutdown_pending)
+    }
+
+    pub(crate) fn displaceable(&self, local: bool) -> bool {
+        self.joiner_local() == local
+            && !self.unattached()
+            && !self.deferred()
+            && !self.graceful_shutdown_pending()
     }
 }

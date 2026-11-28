@@ -6,9 +6,8 @@ mod common;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use common::watchdog;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -17,7 +16,7 @@ use zmux::{Config, EarlyData, EarlyDataState, PipeIo, Session};
 /// A read half that counts what it delivered.
 struct Counted<R> {
     inner: R,
-    seen: Arc<AtomicUsize>,
+    seen: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for Counted<R> {
@@ -28,8 +27,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for Counted<R> {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
-        self.seen
-            .fetch_add(buf.filled().len() - before, Ordering::SeqCst);
+        if buf.filled().len() > before
+            && let Some(seen) = self.seen.take()
+        {
+            let _ = seen.send(());
+        }
         polled
     }
 }
@@ -66,20 +68,6 @@ fn carrier_early() -> Config {
     c
 }
 
-/// The server's parameters of an earlier session.
-async fn remembered() -> zmux::proto::params::TransportParameters {
-    let (a, b) = tokio::io::duplex(1 << 16);
-    let (client, server) = tokio::join!(
-        Session::connect(PipeIo::new(a), carrier_early()),
-        Session::accept(PipeIo::new(b), carrier_early()),
-    );
-    let (client, server) = (client.unwrap(), server.unwrap());
-    let tp = client.adapter().parameters_to_remember().unwrap();
-    client.close().await;
-    server.close().await;
-    tp
-}
-
 /// Small reads of another session while a first read waits.
 async fn other_traffic() {
     let (a, b) = tokio::io::duplex(1 << 16);
@@ -100,6 +88,7 @@ async fn other_traffic() {
 /// The server speaks before the carrier decided, with less than the client
 /// remembers. Rejected early data assumed nothing: the session restarts, and
 /// the server gets the client's parameters and the data.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn a_peer_speaking_before_a_rejection_leaves_the_restart() {
     // One thread: the other pipes' small reads share its scratch buffer.
@@ -108,18 +97,22 @@ fn a_peer_speaking_before_a_rejection_leaves_the_restart() {
         .build()
         .unwrap();
     rt.block_on(watchdog(20, "restart", async {
-        let mut remembered = remembered().await;
-        remembered.initial_max_data = remembered.initial_max_data.map(|m| m * 2);
+        let remembered = zmux::proto::params::TransportParameters {
+            initial_max_data: Some(2 << 20),
+            initial_max_streams_bidi: Some(8),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            ..Default::default()
+        };
         let (a, b) = tokio::io::duplex(1 << 16);
         let (r, w) = tokio::io::split(a);
-        let seen = Arc::new(AtomicUsize::new(0));
+        let (seen, read) = tokio::sync::oneshot::channel();
         let restarted = Arc::new(AtomicBool::new(false));
         let (decide, decided) = tokio::sync::oneshot::channel::<bool>();
         let hook = restarted.clone();
         let pipe = PipeIo::from_halves(
             Counted {
                 inner: r,
-                seen: seen.clone(),
+                seen: Some(seen),
             },
             Discarding {
                 inner: w,
@@ -129,16 +122,21 @@ fn a_peer_speaking_before_a_rejection_leaves_the_restart() {
         .with_early_data(remembered, async move { decided.await.unwrap_or(false) })
         .with_early_restart(move || {
             hook.store(true, Ordering::SeqCst);
-            Ok(())
+            Ok(None)
         });
         let client = Session::connect(pipe, carrier_early()).await.unwrap();
         let (mut send, _recv) = client.open_bi().await.unwrap();
         send.write_all(b"early request").await.unwrap();
         send.finish().unwrap();
-        let accepting = tokio::spawn(Session::accept(PipeIo::new(b), Config::default()));
-        while seen.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        let mut server = Config::default();
+        server.test_hooks().transport_parameters = Some(zmux::proto::params::TransportParameters {
+            initial_max_data: Some(1 << 20),
+            initial_max_streams_bidi: Some(8),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            ..Default::default()
+        });
+        let accepting = tokio::spawn(Session::accept(PipeIo::new(b), server));
+        read.await.unwrap();
         assert_eq!(client.early_data(), EarlyDataState::Pending);
         other_traffic().await;
         decide.send(false).unwrap();

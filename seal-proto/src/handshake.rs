@@ -607,6 +607,16 @@ pub struct ResponderReply {
 }
 
 impl ResponderReply {
+    /// Checks the public encapsulation key, if present, before beginning
+    /// the work to construct message 2.
+    ///
+    /// # Errors
+    ///
+    /// Returns `kex` for an invalid encapsulation key.
+    pub fn check_reply_key(&self) -> Result<(), Error> {
+        self.engine.check_reply_key()
+    }
+
     /// Starts a Reply with a proof: `payload` ends with a proof item whose signature is
     /// a placeholder of the `KeyAlg`'s length, replaced by [`SignReply::finish`].
     ///

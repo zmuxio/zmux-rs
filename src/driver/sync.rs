@@ -28,6 +28,56 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock()
 }
 
+#[cfg(any(feature = "tokio", feature = "blocking", all(test, loom)))]
+pub(super) use slots::Slots;
+
+#[cfg(any(feature = "tokio", feature = "blocking", all(test, loom)))]
+mod slots {
+    #[cfg(all(test, loom))]
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(not(all(test, loom)))]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Work acquired at admission and released by its actual owner.
+    #[derive(Default)]
+    pub(in crate::driver) struct Slots(AtomicUsize);
+
+    impl Slots {
+        pub(in crate::driver) fn used(&self) -> usize {
+            self.0.load(Ordering::Acquire)
+        }
+
+        pub(in crate::driver) fn try_acquire(&self, limit: usize) -> bool {
+            self.try_acquire_count(1, limit)
+        }
+
+        pub(in crate::driver) fn try_acquire_count(&self, count: usize, limit: usize) -> bool {
+            let mut current = self.used();
+            while count <= limit.saturating_sub(current) {
+                match self.0.compare_exchange(
+                    current,
+                    current + count,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(observed) => current = observed,
+                }
+            }
+            false
+        }
+
+        pub(in crate::driver) fn release(&self) {
+            self.release_count(1);
+        }
+
+        pub(in crate::driver) fn release_count(&self, count: usize) {
+            let previous = self.0.fetch_sub(count, Ordering::Release);
+            debug_assert!(previous >= count, "release requires occupied slots");
+        }
+    }
+}
+
 #[cfg(any(feature = "tokio", all(test, loom)))]
 pub(crate) use side::{
     AtomicBool, AtomicU8, AtomicWaker, Ordering, TryMutex, TryMutexGuard, try_lock_side,

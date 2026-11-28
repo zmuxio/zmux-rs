@@ -55,6 +55,7 @@ fn gates_from(bits: u8) -> Gates {
             2 => 1200,
             _ => u64::MAX,
         },
+        datagram_ack: bits & 32 != 0,
         goaway: bits & 2 != 0,
         priority: bits & 4 != 0,
         multipath: bits & 8 != 0,

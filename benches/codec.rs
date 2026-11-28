@@ -149,7 +149,7 @@ fn batch(chunk: usize) -> Vec<u8> {
     out
 }
 
-fn take(event: Event<'_>, dst: &mut Option<&mut [u8]>, data: &mut u64) {
+fn take(event: &Event<'_>, dst: &mut Option<&mut [u8]>, data: &mut u64) {
     if let Event::Frame(Frame::Stream(s)) = event {
         if let Some(d) = dst.as_deref_mut() {
             let at = (s.offset as usize) % (d.len() - s.data.len());
@@ -166,7 +166,7 @@ fn parse(reader: &mut RecordReader, bytes: &[u8], read: usize, dst: Option<&mut 
     for chunk in bytes.chunks(read) {
         let mut input = chunk;
         while let Some(event) = reader.read(&mut input, &Gates::ALL).unwrap() {
-            take(event, &mut dst, &mut data);
+            take(&event, &mut dst, &mut data);
         }
     }
     data
@@ -191,7 +191,7 @@ fn parse_in_place(
         filled += n;
         let mut input = &buf[..filled];
         while let Some(event) = reader.read_complete(&mut input, &Gates::ALL).unwrap() {
-            take(event, &mut dst, &mut data);
+            take(&event, &mut dst, &mut data);
         }
         let left = input.len();
         buf.copy_within(filled - left..filled, 0);

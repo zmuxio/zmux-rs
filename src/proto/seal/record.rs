@@ -176,6 +176,10 @@ impl Opener {
         }
     }
 
+    pub(crate) fn has_expanded_key(&self) -> bool {
+        self.0.keyed.is_some()
+    }
+
     /// Drops the expanded key of an idle carrier; the next record expands it
     /// again.
     pub(crate) fn release_idle(&mut self) {

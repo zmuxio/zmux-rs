@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use bytes::Bytes;
+use zmux::Chunk;
 use zmux::{Config, Listener, ListenerConfig, Session};
 use zmux_http::Options;
 
@@ -28,7 +28,7 @@ async fn bulk(name: &str, client: Session, server: Session) {
         (n, server)
     });
     let mut s = client.open_uni().await.unwrap();
-    let chunk = Bytes::from(vec![1u8; 64 * 1024]);
+    let chunk = Chunk::from(vec![1u8; 64 * 1024]);
     let (mut sent, mut t) = (0u64, Instant::now());
     while sent < total + warm {
         if sent == warm {

@@ -10,12 +10,14 @@
 //!   once-only event stays) and moves it to the tail, so events are read in
 //!   the order of their keys' latest occurrences. A `SessionResumed` removes
 //!   an unread `ResumeUnattended`.
-//! - Nothing is ever dropped. The keys are those of the pipes the session
+//! - The keys are those of the pipes the session
 //!   holds (a constant number each), its tiers, its carrier candidates and
 //!   a fixed set of session keys, so the queue is bounded by what bounds
-//!   those (`max_pipes`, the join admission caps, the memory budget), with
+//!   those (attachment capacity, Join admission caps, memory budget), with
 //!   no limit or overflow count of its own.
-//! - When a pipe is retired its keys leave the queue. The one
+//! - When a pipe is retired its keys leave the queue. Health subscribers keep
+//!   the direction changes for a bounded number of recently retired pipes.
+//!   The one
 //!   session-level summary [`SessionEvent::PipesRetired`] (pipes retired,
 //!   failures and ends the application did not read, the last few IDs),
 //!   itself a key that moves to the tail at each retirement, counts the
@@ -41,6 +43,7 @@ pub(crate) const SUMMARY_IDS: usize = 4;
 /// What a queued event is keyed by.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Key {
+    Controller(u8),
     Added(u64),
     Joined(u64),
     Suspect(u64),
@@ -49,6 +52,7 @@ enum Key {
     Closed(u64, PipeHalf),
     Priority(u64),
     Quality(u64),
+    Health(u64, PipeHalf),
     Tier(u64),
     JoinAuth(&'static str),
     CapacityBelow,
@@ -56,6 +60,7 @@ enum Key {
     EpochCommitted,
     EpochDeleted,
     DatagramPath,
+    Shaping(crate::shaping::EventKind),
     Retired,
     Candidate(CarrierKind, Option<Arc<str>>),
     Chosen,
@@ -85,6 +90,13 @@ impl Key {
     /// makes.
     fn of(event: &SessionEvent) -> Option<Self> {
         Some(match event {
+            SessionEvent::TargetChanged { .. }
+            | SessionEvent::BatchReserved { .. }
+            | SessionEvent::BatchRolledBack { .. }
+            | SessionEvent::DrainCommitted { .. }
+            | SessionEvent::AttemptStarted { .. }
+            | SessionEvent::AttemptFinished { .. } => Self::Controller(0),
+            SessionEvent::PipeHealthChanged(change) => Self::Health(change.pipe.0, change.half),
             SessionEvent::PipeAdded { pipe, .. } => Self::Added(pipe.0),
             SessionEvent::PipeJoined { pipe, .. } => Self::Joined(pipe.0),
             SessionEvent::PipeSuspect { pipe, .. } => Self::Suspect(pipe.0),
@@ -101,6 +113,7 @@ impl Key {
             SessionEvent::EpochCommitted { .. } => Self::EpochCommitted,
             SessionEvent::EpochDeleted { .. } => Self::EpochDeleted,
             SessionEvent::DatagramPathChanged { .. } => Self::DatagramPath,
+            SessionEvent::Shaping(event) => Self::Shaping(event.kind),
             SessionEvent::CarrierCandidate { kind, variant, .. } => {
                 Self::Candidate(*kind, variant.clone())
             }
@@ -136,9 +149,17 @@ fn merge(old: &mut SessionEvent, new: SessionEvent) {
 }
 
 #[derive(Default, Debug)]
-struct HeldKey {
-    observers: usize,
-    retired: Option<bool>,
+struct RecentHealth {
+    pipes: [Option<u64>; SUMMARY_IDS],
+    next: usize,
+}
+
+impl RecentHealth {
+    fn retired(&mut self, pipe: u64) -> Option<u64> {
+        let expired = self.pipes[self.next].replace(pipe);
+        self.next = (self.next + 1) % SUMMARY_IDS;
+        expired
+    }
 }
 
 const NIL: usize = usize::MAX;
@@ -163,13 +184,8 @@ pub(crate) struct EventQueue {
     tail: usize,
     /// The session is closed: nothing more is queued.
     frozen: bool,
-    // Allocated only while callbacks hold pipe keys. Retirement of a held
-    // pipe is folded into the summary once its last callback returns.
-    #[allow(
-        clippy::box_collection,
-        reason = "sessions without a join observer need only a pointer"
-    )]
-    held: Option<Box<HashMap<u64, HeldKey>>>,
+    controller_next: u8,
+    health_observed: Option<Box<RecentHealth>>,
     /// The pipes of which the application read a terminal event
     /// (`PipeFailed` or `PipeClosed`), until they are retired.
     read_terminal: std::collections::HashSet<u64>,
@@ -184,36 +200,10 @@ impl EventQueue {
             head: NIL,
             tail: NIL,
             frozen: false,
-            held: None,
+            controller_next: 0,
+            health_observed: None,
             read_terminal: std::collections::HashSet::new(),
         }
-    }
-
-    pub(super) fn hold(&mut self, pipe: u64) {
-        self.held
-            .get_or_insert_default()
-            .entry(pipe)
-            .or_default()
-            .observers += 1;
-    }
-
-    pub(super) fn release_hold(&mut self, pipe: u64) {
-        let held = self.held.as_mut().expect("held pipe keys");
-        let entry = held.get_mut(&pipe).expect("held pipe");
-        entry.observers -= 1;
-        if entry.observers == 0 {
-            let retirement = held.remove(&pipe).and_then(|key| key.retired);
-            if held.is_empty() {
-                self.held = None;
-            }
-            if let Some(failed) = retirement {
-                self.fold_retired(pipe, failed);
-            }
-        }
-    }
-
-    pub(super) fn holding(&self) -> bool {
-        self.held.is_some()
     }
 
     /// Unread events.
@@ -227,16 +217,27 @@ impl EventQueue {
         self.frozen = true;
     }
 
+    pub(super) fn observe_health(&mut self) {
+        self.health_observed.get_or_insert_default();
+    }
+
     /// Queues an event: updates the unread one of its key and moves it to
     /// the tail, or appends it.
     pub(crate) fn push(&mut self, event: SessionEvent) {
-        if self.frozen {
+        if self.frozen
+            || (self.health_observed.is_none()
+                && matches!(event, SessionEvent::PipeHealthChanged(_)))
+        {
             return;
         }
-        let Some(key) = Key::of(&event) else {
+        let Some(mut key) = Key::of(&event) else {
             debug_assert!(false, "the summary is made by the queue");
             return;
         };
+        if let Key::Controller(slot) = &mut key {
+            *slot = self.controller_next;
+            self.controller_next = self.controller_next.wrapping_add(1);
+        }
         if matches!(event, SessionEvent::SessionResumed) {
             // Stale once the session resumed.
             self.remove(&Key::Unattended);
@@ -259,16 +260,21 @@ impl EventQueue {
         if self.frozen {
             return;
         }
-        if let Some(entry) = self.held.as_mut().and_then(|h| h.get_mut(&pipe)) {
-            entry.retired = Some(failed);
-            return;
-        }
         self.fold_retired(pipe, failed);
     }
 
     fn fold_retired(&mut self, pipe: u64, failed: bool) {
         for key in Key::of_pipe(pipe) {
             self.remove(&key);
+        }
+        if let Some(expired) = self
+            .health_observed
+            .as_mut()
+            .and_then(|health| health.retired(pipe))
+        {
+            for half in [PipeHalf::Inbound, PipeHalf::Outbound] {
+                self.remove(&Key::Health(expired, half));
+            }
         }
         let read = self.read_terminal.remove(&pipe);
         let (f, c) = (u64::from(failed && !read), u64::from(!failed && !read));
@@ -308,19 +314,7 @@ impl EventQueue {
 
     /// The next event, the one whose key occurred longest ago.
     pub(crate) fn pop(&mut self) -> Option<SessionEvent> {
-        let mut i = self.head;
-        if let Some(held) = &self.held {
-            while i != NIL
-                && self.nodes[i]
-                    .entry
-                    .as_ref()?
-                    .1
-                    .pipe()
-                    .is_some_and(|id| held.contains_key(&id.0))
-            {
-                i = self.nodes[i].next;
-            }
-        }
+        let i = self.head;
         if i == NIL {
             return None;
         }
@@ -647,21 +641,6 @@ mod tests {
         assert_eq!(q.pop(), None);
         q.push(SessionEvent::ResumeUnattended);
         assert_eq!(q.pop(), Some(SessionEvent::ResumeUnattended));
-    }
-
-    #[test]
-    fn held_keys_do_not_hide_other_pipes_or_leak_a_retirement() {
-        let mut queue = EventQueue::new();
-        queue.hold(7);
-        queue.push(quality(7, 10));
-        queue.push(quality(8, 11));
-        assert_eq!(queue.pop(), Some(quality(8, 11)));
-        queue.retire(7, true);
-        queue.freeze();
-        assert_eq!(queue.pop(), None);
-        queue.release_hold(7);
-        assert_eq!(queue.pop(), Some(retired(1, 1, 0, &[7])));
-        assert_eq!(queue.pop(), None);
     }
 
     #[test]

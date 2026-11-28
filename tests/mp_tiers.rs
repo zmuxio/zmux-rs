@@ -97,7 +97,7 @@ type Net = MpNet<Seen, Vec<StreamKey>>;
 
 fn config(edit: impl Fn(&mut Config)) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 16;
+    c.session_policy.limits.steady_attachments = 16;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.scheduler = Scheduler::SpreadEta;
     c.max_idle_timeout = Some(Duration::from_secs(120));
@@ -362,7 +362,7 @@ fn a_bidi_attachment_states_its_request_on_itself() {
         .unwrap();
     n.run_for(100);
     assert_eq!(n.links[&id].statuses, [(id, 1, false, 3)]);
-    assert_eq!(n.links[&0].statuses, Vec::new());
+    assert_eq!(n.links[&0].statuses, [] as [(u64, u64, bool, u64); 0]);
 }
 
 #[test]
@@ -656,16 +656,14 @@ fn pipe_options_read_back_every_held_setting() {
 
 /// A pipe's options read back the values the join fixed as they are, whoever
 /// chose them: the adding side reads what it asked for resolved (the record
-/// mode, the key group) and `return_on_reply` as given; the side the peer
+/// mode and the key group); the side the peer
 /// joined reads the direction from its own view, the mode and group of the
 /// join, and the defaults elsewhere.
 #[test]
 fn a_joined_pipe_reads_the_values_the_join_fixed() {
     use zmux::{Change, Inherit, PipeDirection};
     let mut n = net(|_| {});
-    let opts = PipeOptions::new()
-        .with_label("mine")
-        .with_return_on_reply(true);
+    let opts = PipeOptions::new().with_label("mine");
     let id = n.add_pipe_directed(false, true, &opts).unwrap();
     n.run_for(1000);
     let id = PipeId::new(id);
@@ -674,13 +672,11 @@ fn a_joined_pipe_reads_the_values_the_join_fixed() {
     assert_eq!(a.record_mode, Inherit::Set(zmux::RecordMode::Trusted));
     assert_eq!(a.key_group, Inherit::Set(1));
     assert_eq!(a.label.as_deref(), Some("mine"));
-    assert!(a.return_on_reply);
     let b = n.ends[B].pipe_options(id).unwrap();
     assert_eq!(b.direction, PipeDirection::In);
     assert_eq!(b.record_mode, Inherit::Set(zmux::RecordMode::Trusted));
     assert_eq!(b.key_group, Inherit::Set(1));
     assert_eq!(b.label, None);
-    assert!(!b.return_on_reply);
     assert_eq!(b.weight, Change::Keep);
     assert_eq!(b.send_priority, Change::Keep);
     assert_eq!(b.liveness, Change::Keep);

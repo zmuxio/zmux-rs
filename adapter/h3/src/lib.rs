@@ -88,12 +88,13 @@
 //! ```
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll, ready};
 
 use bytes::{Buf, Bytes};
@@ -104,7 +105,7 @@ use quinn::rustls;
 use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, ReadBuf};
 use zmux::adapter::{Admit, Entry};
-use zmux::adapter::{CarrierConnId, ChunkBuf, ChunkWrite};
+use zmux::adapter::{CarrierConnId, ChunkBuf, ChunkWrite, MemoryCharge};
 use zmux::proto::ApplicationErrorCode;
 use zmux::{CarrierCredential, ConnectError, Listener, PipeHint, PipeIo, Session};
 pub use zmux_quinn::LaneWindows;
@@ -123,6 +124,20 @@ type ClientRecv = h3::client::RequestStream<RecvStream, ChunkBuf>;
 pub type ServerSend = h3::server::RequestStream<SendStream<ChunkBuf>, ChunkBuf>;
 /// The receiving half of a server's request stream: the request body.
 pub type ServerRecv = h3::server::RequestStream<RecvStream, ChunkBuf>;
+
+#[cfg(feature = "test-hooks")]
+type PipeTapFuture = std::pin::Pin<Box<dyn Future<Output = io::Result<PipeIo>> + Send>>;
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone)]
+struct PipeTap(Arc<dyn Fn(PipeIo) -> PipeTapFuture + Send + Sync>);
+
+#[cfg(feature = "test-hooks")]
+impl std::fmt::Debug for PipeTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PipeTap")
+    }
+}
 
 /// The adapter's options: how the carriers size the connection's flow
 /// control for lanes, and the fallback of requests.
@@ -148,6 +163,8 @@ pub struct Options {
     /// request's response head (default [`zmux::adapter::DIAL_TIMEOUT`],
     /// 10 s); one not done within it fails with `TimedOut`.
     pub timeout: std::time::Duration,
+    #[cfg(feature = "test-hooks")]
+    pipe_tap: Option<PipeTap>,
 }
 
 impl Default for Options {
@@ -157,11 +174,26 @@ impl Default for Options {
             fallback: None,
             carrier_credential: None,
             timeout: zmux::adapter::DIAL_TIMEOUT,
+            #[cfg(feature = "test-hooks")]
+            pipe_tap: None,
         }
     }
 }
 
 impl Options {
+    /// Installs a test observer on each admitted request's PipeIo.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_pipe_tap<F, Fut>(mut self, tap: F) -> Self
+    where
+        F: Fn(PipeIo) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = io::Result<PipeIo>> + Send + 'static,
+    {
+        self.pipe_tap = Some(PipeTap(Arc::new(move |pipe| Box::pin(tap(pipe)))));
+        self
+    }
+
     /// The defaults.
     #[must_use]
     pub fn new() -> Self {
@@ -243,6 +275,7 @@ pub fn server_config(
     tls.max_early_data_size = 0;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut c = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    zmux_quinn::track_server_early_data(&mut c);
     c.transport_config(Arc::new(options.transport_config()));
     Ok(c)
 }
@@ -255,7 +288,7 @@ fn h3_channel(
     stream_id: u64,
     peer_enabled: Box<dyn Fn() -> bool + Send + Sync>,
 ) -> Arc<QuicChannel> {
-    datagrams.channel_when(stream_id / 4, Some(peer_enabled))
+    datagrams.http_datagram_channel(stream_id / 4, peer_enabled)
 }
 
 /// `ZMUX_CARRIER_FAILED` as an HTTP/3 stream error code.
@@ -275,7 +308,7 @@ fn with_connection<T: Send + Sync + 'static>(
 ) -> PipeIo {
     let exporter = Arc::downgrade(owner);
     zmux_quinn::with_packet_counters(io, owner, conn)
-        .with_carrier_conn(id)
+        .with_carrier_transport(zmux::CarrierKind::Http3, id)
         // HTTP/3 runs over ALPN `h3`, as the other QUIC carriers report theirs.
         .with_terminated_tls(|| Some(zmux::TlsState::new(Some(b"h3".to_vec()), None)))
         .with_carrier_secure()
@@ -302,85 +335,116 @@ fn h3_error(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
 #[must_use = "the connection is driven while the client and its pipes are alive"]
 pub struct Carrier {
     inner: Arc<ClientInner>,
+    request: Arc<ClientRequest>,
 }
 
 impl std::fmt::Debug for Carrier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Carrier")
             .field("connection", &self.inner.conn.stable_id())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
+struct ClientRequest {
+    uri: http::Uri,
+    timeout: std::time::Duration,
+    carrier_credential: Option<Arc<dyn CarrierCredential>>,
+}
+
+static CLIENTS: LazyLock<Mutex<HashMap<usize, Weak<ClientInner>>>> = LazyLock::new(Mutex::default);
+
 struct ClientInner {
     conn: Connection,
-    send: SendRequest<bounded::OpenStreams, ChunkBuf>,
-    uri: http::Uri,
-    /// The connection's identity for zmux: this state's allocation.
-    id: OnceLock<CarrierConnId>,
+    authority: http::Uri,
+    handshake: zmux_quinn::Handshake,
     window: u64,
-    /// The limit on a response head ([`Options::timeout`]).
-    timeout: std::time::Duration,
-    /// The credential of each request, and the connection's handshake it
-    /// is given.
-    carrier_credential: Option<(Arc<dyn CarrierCredential>, zmux_quinn::Handshake)>,
-    driver: tokio::task::AbortHandle,
-    /// The connection's HTTP Datagrams, the channels of its pipes.
+    id: OnceLock<CarrierConnId>,
+    ready: tokio::sync::watch::Receiver<()>,
+    driver: OnceLock<Result<ClientDriver, Arc<io::Error>>>,
     datagrams: Arc<ConnectionDatagrams>,
+}
+
+struct ClientDriver {
+    send: SendRequest<bounded::OpenStreams, ChunkBuf>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for ClientDriver {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl Drop for ClientInner {
     fn drop(&mut self) {
-        self.driver.abort();
+        let mut clients = CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = self.conn.stable_id();
+        if clients
+            .get(&key)
+            .is_some_and(|owner| std::ptr::eq(owner.as_ptr(), self))
+        {
+            clients.remove(&key);
+        }
     }
 }
 
 impl Carrier {
-    /// The HTTP/3 client of `conn`, an established QUIC connection with
-    /// the ALPN identifier `h3`, whose pipes and lanes are requests to
-    /// `uri` (inside a tokio runtime): it exchanges the HTTP/3 settings and
-    /// starts driving the connection. The connection's receive window is
-    /// set for the lanes and charged to the zmux session the pipes carry.
-    /// With [`Options::carrier_credential`], each request body starts with its
-    /// prefix.
+    /// Binds a request URI to an established, host-owned QUIC connection.
+    /// All live bindings of this connection share one HTTP/3 driver and
+    /// one HTTP Datagram receiver. Keep a binding while opening requests.
+    /// The application authorizes the initial authority and owns QUIC close.
     ///
     /// # Errors
-    ///
-    /// `ConnectionReset` when the HTTP/3 settings exchange fails, `TimedOut`
-    /// when it is not done within [`Options::timeout`].
+    /// `InvalidInput` for a URI outside the connection's HTTPS authority,
+    /// a missing or invalid actual receive window, or different settings
+    /// from an existing binding.
+    /// `ConnectionReset` or `TimedOut` if HTTP/3 initialization fails.
     pub async fn new(conn: Connection, uri: http::Uri, options: &Options) -> io::Result<Self> {
-        let carrier_credential = options
-            .carrier_credential
-            .clone()
-            .map(|c| (c, zmux_quinn::Handshake::of(&conn)));
-        let window = options.windows.receive_window();
-        conn.set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
-        let (mut driver, send) = zmux::adapter::within(options.timeout, async {
-            h3::client::builder()
-                .enable_datagram(true)
-                .max_field_section_size(bounded::MAX_FIELD_SECTION)
-                .build::<_, _, ChunkBuf>(bounded::Connection::new(conn.clone()))
-                .await
-                .map_err(h3_error)
+        let window = options.windows.established_receive_window()?;
+        Self::bind(conn, uri, options, window, false).await
+    }
+
+    async fn bind(
+        conn: Connection,
+        uri: http::Uri,
+        options: &Options,
+        window: u64,
+        owns_close: bool,
+    ) -> io::Result<Self> {
+        if uri.scheme_str() != Some("https")
+            || uri.host().is_none()
+            || uri.port_u16() == Some(0)
+            || uri
+                .authority()
+                .is_some_and(|authority| authority.as_str().contains('@'))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HTTP/3 requires an HTTPS authority",
+            ));
+        }
+        let inner = ClientInner::bind(conn, &uri, options.timeout, window, owns_close);
+        if !zmux::adapter::redirect::same_origin(&inner.authority.to_string(), &uri.to_string())
+            || inner.window != window
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HTTP/3 connection binding differs",
+            ));
+        }
+        let mut ready = inner.ready.clone();
+        zmux::adapter::within(options.timeout, async {
+            let _ = ready.changed().await;
+            inner.driver().map(|_| ())
         })
         .await?;
-        let driver = tokio::spawn(async move {
-            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
-        })
-        .abort_handle();
-        let inner = Arc::new(ClientInner {
-            datagrams: ConnectionDatagrams::new(conn.clone()),
-            conn,
-            send,
+        let request = Arc::new(ClientRequest {
             uri,
-            id: OnceLock::new(),
-            window,
             timeout: options.timeout,
-            carrier_credential,
-            driver,
+            carrier_credential: options.carrier_credential.clone(),
         });
-        let _ = inner.id.set(CarrierConnId::new(&inner));
-        Ok(Self { inner })
+        Ok(Self { inner, request })
     }
 
     /// The QUIC connection, for its own features (statistics, path,
@@ -398,6 +462,16 @@ impl Carrier {
         &self.inner.datagrams
     }
 
+    /// Whether the peer's HTTP/3 SETTINGS and QUIC transport both allow
+    /// sending HTTP Datagrams.
+    #[must_use]
+    pub fn http_datagrams(&self) -> bool {
+        self.inner
+            .driver()
+            .is_ok_and(|driver| driver.send.settings().enable_datagram())
+            && self.inner.conn.max_datagram_size().is_some()
+    }
+
     /// A new pipe on a request of the connection: the bootstrap carrier of
     /// a session this endpoint starts, or a pipe it joins. Returns once the
     /// request was sent (its response is awaited by the pipe's reads).
@@ -409,16 +483,16 @@ impl Carrier {
     /// `ConnectionReset` when the request cannot be sent.
     pub async fn open_pipe(&self) -> io::Result<PipeIo> {
         let inner = &self.inner;
-        let (send, recv) = inner.request().await?;
-        let settings = inner.send.clone();
+        let (send, recv) = self.request().await?;
+        let settings = inner.driver()?.send.clone();
         let channel = h3_channel(
             &inner.datagrams,
             recv.id().into_inner(),
             Box::new(move || settings.settings().enable_datagram()),
         );
-        let opener = inner.clone();
+        let opener = self.clone();
         let (left, response) = tokio::sync::oneshot::channel();
-        let mut reader = BodyReader::client(recv, inner.clone());
+        let mut reader = BodyReader::client(recv, inner.clone(), self.request.timeout);
         reader.left = Some(left);
         let (r, w) = paired(
             reader,
@@ -426,16 +500,16 @@ impl Carrier {
         );
         let io = PipeIo::from_chunk_halves(r, w)
             .with_drain(drain(response, inner.clone()), zmux::adapter::DRAIN_LIMIT)
-            .with_carrier(zmux::CarrierKind::Http3)
             .with_connection_memory(inner.window)
             .with_datagram_channel(channel)
             .with_lane_opener(move || {
-                let inner = opener.clone();
+                let carrier = opener.clone();
                 async move {
-                    let (send, recv) = inner.request().await?;
+                    let (send, recv) = carrier.request().await?;
                     // The response stays open, unread: stopping it would make
                     // the server drop the request before the lane is routed.
-                    let mut lane = BodyWriter::new(SendHalf::Client(send), Some(inner as Keep));
+                    let mut lane =
+                        BodyWriter::new(SendHalf::Client(send), Some(carrier.inner as Keep));
                     lane.response = Some(recv);
                     Ok(zmux::adapter::Lane::from_chunks(lane))
                 }
@@ -445,27 +519,115 @@ impl Carrier {
 }
 
 impl ClientInner {
+    fn bind(
+        conn: Connection,
+        uri: &http::Uri,
+        timeout: std::time::Duration,
+        window: u64,
+        owns_close: bool,
+    ) -> Arc<Self> {
+        let key = conn.stable_id();
+        let mut clients = CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(inner) = clients.get(&key).and_then(Weak::upgrade) {
+            return inner;
+        }
+        let handshake = zmux_quinn::Handshake::of(&conn);
+        let (ready, wait) = tokio::sync::watch::channel(());
+        let datagrams = ConnectionDatagrams::new(conn.clone());
+        let inner = Arc::new(Self {
+            conn,
+            authority: uri.clone(),
+            handshake,
+            window,
+            id: OnceLock::new(),
+            ready: wait,
+            driver: OnceLock::new(),
+            datagrams,
+        });
+        let _ = inner.id.set(CarrierConnId::new(&inner));
+        clients.insert(key, Arc::downgrade(&inner));
+        drop(clients);
+
+        let starting = inner.clone();
+        // Initialization may open HTTP/3 control streams. A cancelled request
+        // waiting here releases its reference without interrupting initialization.
+        tokio::spawn(async move {
+            let driver = starting
+                .start_driver(timeout, owns_close)
+                .await
+                .map_err(Arc::new);
+            let _ = starting.driver.set(driver);
+            drop(ready);
+        });
+        inner
+    }
+
+    async fn start_driver(
+        &self,
+        timeout: std::time::Duration,
+        owns_close: bool,
+    ) -> io::Result<ClientDriver> {
+        if self
+            .handshake
+            .alpn
+            .as_deref()
+            .is_some_and(|alpn| alpn != ALPN)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "connection did not negotiate HTTP/3",
+            ));
+        }
+        let (mut driver, send) = zmux::adapter::within(timeout, async {
+            h3::client::builder()
+                .enable_datagram(true)
+                .max_field_section_size(bounded::MAX_FIELD_SECTION)
+                .build::<_, _, ChunkBuf>(bounded::Connection::new(self.conn.clone(), owns_close))
+                .await
+                .map_err(h3_error)
+        })
+        .await?;
+        let task = tokio::spawn(async move {
+            let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+        })
+        .abort_handle();
+        Ok(ClientDriver { send, task })
+    }
+
+    fn driver(&self) -> io::Result<&ClientDriver> {
+        self.driver
+            .get()
+            .ok_or(io::ErrorKind::BrokenPipe)?
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.clone()))
+    }
+
     fn id(&self) -> CarrierConnId {
         self.id.get().expect("set at creation").clone()
     }
+}
 
-    /// A new request: its body, the credential's prefix first, and its
-    /// response's.
+impl Carrier {
+    /// Opens the request body, writes its credential prefix, and returns its
+    /// two halves. The HTTP/3 driver belongs to the connection.
     async fn request(&self) -> io::Result<(ClientSend, ClientRecv)> {
-        let request = http::Request::post(self.uri.clone())
+        let request = http::Request::post(self.request.uri.clone())
             .body(())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let stream = self
+            .inner
+            .driver()?
             .send
             .clone()
             .send_request(request)
             .await
             .map_err(h3_error)?;
         let (mut send, recv) = stream.split();
-        if let Some((credential, handshake)) = &self.carrier_credential {
-            let prefix = credential.prefix(&handshake.carrier_info(&self.conn))?;
+        if let Some(credential) = &self.request.carrier_credential {
+            let conn = &self.inner.conn;
+            let prefix = credential.prefix(&self.inner.handshake.carrier_info(conn))?;
             let mut data = ChunkBuf::new();
-            data.take_from(&mut [Bytes::from(prefix)]);
+            data.push(Bytes::from(prefix));
             send.send_data(data).await.map_err(h3_error)?;
         }
         Ok((send, recv))
@@ -482,7 +644,7 @@ impl ClientInner {
     doc = " client configuration, with the ALPN identifier `h3`: `client_config`)"
 )]
 /// to `addr`, verified for the host of `uri`: a request to `uri`. For
-/// [`zmux::helpers::PipePool`] and [`Session::add_pipe`]; to open more pipes
+/// [`zmux::SessionController`] and [`Session::begin_change`]; to open more pipes
 /// on one connection, make a [`Carrier`] instead.
 ///
 /// # Errors
@@ -506,7 +668,10 @@ pub async fn dial(
         options.timeout,
         Box::pin(async {
             let conn = connecting.await.map_err(io::Error::other)?;
-            Carrier::new(conn, uri, options).await?.open_pipe().await
+            Carrier::bind(conn, uri, options, options.windows.receive_window(), true)
+                .await?
+                .open_pipe()
+                .await
         }),
     )
     .await
@@ -542,20 +707,25 @@ pub async fn connect(
 pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
     let l = listener.clone();
     let endpoint = &endpoint;
+    let window = options.windows.receive_window();
     l.serve_connections(
         move || async move { endpoint.accept().await.map(Ok) },
         |incoming: quinn::Incoming| {
-            let guard = listener.adapter().setup_guard();
+            let adapter = listener.adapter();
+            let workspace = adapter
+                .reserve_memory(window)
+                .map(|charge| (charge, adapter.setup_guard()));
             async move {
+                let (charge, guard) = workspace?;
                 let conn = incoming.await?;
                 guard.done();
-                Ok::<_, io::Error>(conn)
+                Ok::<_, io::Error>((conn, charge))
             }
         },
-        move |listener, conn: Connection| {
+        move |listener, (conn, charge): (Connection, _)| {
             let options = options.clone();
             async move {
-                let _ = serve_connection(&listener, conn, &options).await;
+                let _ = serve_reserved(&listener, conn, &options, charge).await;
             }
         },
     )
@@ -611,26 +781,43 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
 /// `ConnectionReset` when the HTTP/3 connection fails or ends with an
 /// error; a request's failure ends only that request. A connection closed
 /// normally (`H3_NO_ERROR`, or after a GOAWAY once its requests are done)
-/// is `Ok`.
+/// is `Ok`. An exhausted listener memory budget refuses the connection.
+/// A missing or invalid actual receive window or missing QUIC early-data
+/// provenance tracking with ticket admission returns `InvalidInput`.
 pub async fn serve_connection(
     listener: &Listener,
     conn: Connection,
     options: &Options,
 ) -> io::Result<()> {
-    let window = options.windows.receive_window();
-    conn.set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
-    let charge = listener.adapter().charge_memory(window);
-    let identity = Arc::new(conn.stable_id());
+    let window = options.windows.established_receive_window()?;
+    let charge = listener.adapter().reserve_memory(window)?;
+    serve_reserved(listener, conn, options, charge).await
+}
+
+async fn serve_reserved(
+    listener: &Listener,
+    conn: Connection,
+    options: &Options,
+    charge: MemoryCharge,
+) -> io::Result<()> {
+    let handshake = zmux_quinn::Handshake::of(&conn);
+    if let Err(error) = handshake.require_ticket_provenance(listener) {
+        conn.close(VarInt::from_u32(0), b"");
+        return Err(error);
+    }
     let shared = Arc::new(Served {
         datagrams: ConnectionDatagrams::new(conn.clone()),
         listener: listener.clone(),
-        id: CarrierConnId::new(&identity),
-        handshake: zmux_quinn::Handshake::of(&conn),
+        id: OnceLock::new(),
+        handshake,
         conn: conn.clone(),
         fallback: options.fallback.clone(),
+        #[cfg(feature = "test-hooks")]
+        pipe_tap: options.pipe_tap.clone(),
         _charge: charge,
         connection: Mutex::new(None),
     });
+    let _ = shared.id.set(CarrierConnId::new(&shared));
     let request_stop = bounded::RequestStop::default();
     let mut h3 = h3::server::builder()
         .enable_datagram(true)
@@ -737,20 +924,26 @@ pub async fn serve_connection(
 /// What the requests of one served connection share.
 struct Served {
     listener: Listener,
-    id: CarrierConnId,
+    id: OnceLock<CarrierConnId>,
     handshake: zmux_quinn::Handshake,
     conn: Connection,
     fallback: Option<Fallback>,
+    #[cfg(feature = "test-hooks")]
+    pipe_tap: Option<PipeTap>,
     /// The connection's HTTP Datagrams, the channels of its pipes.
     datagrams: Arc<ConnectionDatagrams>,
     /// The connection's receive window in the listener's budget, until the
     /// last of its requests ends (not only its accept loop).
-    _charge: zmux::adapter::MemoryCharge,
+    _charge: MemoryCharge,
     /// The HTTP/3 connection once it accepts no more requests.
     connection: Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 impl Served {
+    fn id(&self) -> CarrierConnId {
+        self.id.get().expect("set at creation").clone()
+    }
+
     /// The datagram channel of the pipe on request `send`: usable when the
     /// client's SETTINGS, which precede its requests, enabled HTTP
     /// Datagrams.
@@ -774,13 +967,19 @@ impl Served {
     }
 
     async fn handle(self: &Arc<Self>, io: PipeIo, entry: Entry, stopped: bounded::Stopped) -> bool {
+        let io = with_connection(io, self.id(), self, |s| &s.conn);
+        #[cfg(feature = "test-hooks")]
+        let io = if let Some(tap) = &self.pipe_tap {
+            let Ok(io) = tap.0(io).await else {
+                return false;
+            };
+            io
+        } else {
+            io
+        };
         self.listener
             .adapter()
-            .setup_until(
-                with_connection(io, self.id.clone(), self, |s| &s.conn),
-                PipeHint::from_entry(entry),
-                stopped,
-            )
+            .setup_until(io, PipeHint::from_entry(entry), stopped)
             .await
             .is_some()
     }
@@ -825,15 +1024,15 @@ impl Served {
         mut stopped: bounded::Stopped,
         fallback_stop: bounded::FallbackStop,
     ) {
-        let mut reader = BodyReader::server(recv);
+        let mut reader = BodyReader::server(recv, Some(self.clone()));
         let (parts, ()) = head.into_parts();
         let admit = {
-            let info = self.handshake.carrier_info(&self.conn).with_request_head(
-                Arc::new(parts.clone()),
-                |p, each| {
+            let info = self
+                .handshake
+                .server_carrier_info(&self.conn, Some(send.send_id().into_inner()))
+                .with_request_head(Arc::new(parts.clone()), |p, each| {
                     zmux::adapter::visit_fields(&p.headers, each);
-                },
-            );
+                });
             let Some(verdict) = zmux::adapter::while_open(
                 &mut stopped,
                 entry.decide_request(info, Some(&mut reader)),
@@ -864,10 +1063,12 @@ impl Served {
         match admit {
             Admit::Accept(rest) => {
                 let channel = self.channel(&send);
-                let (r, w) = paired(reader, BodyWriter::new(SendHalf::Server(send), None));
+                let (r, w) = paired(
+                    reader,
+                    BodyWriter::new(SendHalf::Server(send), Some(self.clone())),
+                );
                 self.handle(
                     PipeIo::from_chunk_halves(r, w)
-                        .with_carrier(zmux::CarrierKind::Http3)
                         .with_prefix(rest)
                         .with_datagram_channel(channel),
                     entry,
@@ -881,24 +1082,17 @@ impl Served {
                 // the connection's state: a detached carrier outlives this
                 // request's task.
                 let channel = self.channel(&send);
-                let keep: Keep = self.clone();
-                #[expect(
-                    clippy::used_underscore_binding,
-                    reason = "a field held only for its drop, set late"
-                )]
-                {
-                    reader._keep = Some(keep.clone());
-                }
-                let (r, w) = paired(reader, BodyWriter::new(SendHalf::Server(send), Some(keep)));
+                let (r, w) = paired(
+                    reader,
+                    BodyWriter::new(SendHalf::Server(send), Some(self.clone())),
+                );
                 // Cut when the fallback's future returns the carrier
                 // without a detach, wherever the host keeps the halves: a
                 // response not ended is reset, the request body stopped.
                 let (r, w, cut) = (Cut::new(r), Cut::new(w), Cutter::default());
                 let cut = cut.with(&r).with(&w);
-                let io = PipeIo::from_chunk_halves(r, w)
-                    .with_carrier(zmux::CarrierKind::Http3)
-                    .with_datagram_channel(channel);
-                let io = with_connection(io, self.id.clone(), self, |s| &s.conn);
+                let io = PipeIo::from_chunk_halves(r, w).with_datagram_channel(channel);
+                let io = with_connection(io, self.id(), self, |s| &s.conn);
                 let io = zmux::adapter::AdmitIo::pipe(io).with_on_return(move || cut.run());
                 entry.take_over(io, prefix).await;
             }
@@ -943,15 +1137,14 @@ impl Served {
             .await;
         let channel = self.channel(&send);
         let answer = Arc::new(Answer::new(send));
-        let mut reader = BodyReader::server(recv);
+        let mut reader = BodyReader::server(recv, Some(self.clone()));
         reader.answer = Some(answer.clone());
         let (gone, released) = tokio::sync::oneshot::channel();
-        let mut writer = BodyWriter::unanswered(answer.clone());
+        let mut writer = BodyWriter::unanswered(answer.clone(), Some(self.clone()));
         writer.answer_owner = Some(gone);
         let (r, w) = paired(reader, writer);
         let io = answer
             .on_taken(PipeIo::from_chunk_halves(r, w), released)
-            .with_carrier(zmux::CarrierKind::Http3)
             .with_datagram_channel(channel);
         if !self.handle(io, entry, stopped).await {
             return;
@@ -1029,21 +1222,21 @@ impl Fallback {
 /// half returns here when its reader is dropped, so that a carrier nobody
 /// committed to can go to the fallback ([`Answer::reclaim`]).
 struct Answer {
-    send: tokio::sync::Mutex<Option<Box<SendHalf>>>,
+    send: tokio::sync::Mutex<Option<ResponseHalf>>,
     recv: Mutex<Option<ServerRecv>>,
     /// The writer started, the listener took the carrier, or it was
     /// reclaimed.
     committed: AtomicBool,
-    responded: AtomicBool,
 }
 
 impl Answer {
     fn new(send: ServerSend) -> Self {
         Self {
-            send: tokio::sync::Mutex::new(Some(Box::new(SendHalf::Server(send)))),
+            send: tokio::sync::Mutex::new(Some(ResponseHalf::Pending(Box::new(SendHalf::Server(
+                send,
+            ))))),
             recv: Mutex::new(None),
             committed: AtomicBool::new(false),
-            responded: AtomicBool::new(false),
         }
     }
 
@@ -1065,31 +1258,24 @@ impl Answer {
         })
     }
 
-    /// Sends the response on `half`, once per request.
-    async fn respond(&self, half: &mut SendHalf) -> io::Result<()> {
-        if self.responded.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        half.respond().await.map_err(h3_error)
-    }
-
-    /// The listener took the carrier: the response is sent now.
+    /// The listener took the carrier: write the head while holding the response
+    /// slot. A failed or cancelled write consumes and resets the stream.
     async fn taken(&self) {
         let mut slot = self.send.lock().await;
-        if let Some(half) = slot.as_mut() {
-            let _ = self.respond(half).await;
+        if let Some(half) = slot.take() {
+            *slot = half.respond().await.ok().map(ResponseHalf::Sent);
         }
     }
 
-    /// The sending half for the writer, the response sent.
+    /// Gives the body writer the stream only after the head was written.
     async fn take(this: Arc<Self>) -> io::Result<Box<SendHalf>> {
-        let half = this.send.lock().await.take();
-        let Some(half) = half else {
-            return Err(io::ErrorKind::BrokenPipe.into());
-        };
-        let mut guard = ResetOnDrop(Some(half));
-        this.respond(guard.half()).await?;
-        Ok(guard.release())
+        let half = this
+            .send
+            .lock()
+            .await
+            .take()
+            .ok_or(io::ErrorKind::BrokenPipe)?;
+        half.respond().await
     }
 
     /// Both halves, when nothing committed to the carrier.
@@ -1103,18 +1289,33 @@ impl Answer {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
-        match *send {
+        match *send.release() {
             SendHalf::Server(s) => Some((s, recv)),
             SendHalf::Client(_) => None,
         }
     }
 }
 
-impl Drop for Answer {
-    fn drop(&mut self) {
-        // A half nobody took fails, as a dropped body does.
-        if let Some(h) = self.send.get_mut().as_mut() {
-            h.reset();
+/// The response stream's state travels with the unique sending half.
+enum ResponseHalf {
+    Pending(Box<SendHalf>),
+    Sent(Box<SendHalf>),
+}
+
+impl ResponseHalf {
+    async fn respond(self) -> io::Result<Box<SendHalf>> {
+        match self {
+            Self::Pending(mut half) => {
+                half.respond().await.map_err(h3_error)?;
+                Ok(half)
+            }
+            Self::Sent(half) => Ok(half),
+        }
+    }
+
+    fn release(self) -> Box<SendHalf> {
+        match self {
+            Self::Pending(half) | Self::Sent(half) => half,
         }
     }
 }
@@ -1198,7 +1399,7 @@ impl<T: ChunkWrite + Unpin> ChunkWrite for Cut<T> {
     fn poll_write_chunks(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        chunks: &mut [Bytes],
+        chunks: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
         self.poll_with(cx, |h, cx| h.poll_write_chunks(cx, chunks))
     }
@@ -1261,40 +1462,10 @@ impl SendHalf {
             Self::Server(s) => s.send_response(http::Response::new(())).await,
         }
     }
-
-    fn reset(&mut self) {
-        match self {
-            Self::Client(s) => s.stop_stream(carrier_failed()),
-            Self::Server(s) => s.stop_stream(carrier_failed()),
-        }
-    }
-}
-
-/// Resets the half it holds when dropped unreleased: a write or end
-/// cancelled with its body (a QUIC stream dropped otherwise would end
-/// gracefully).
-struct ResetOnDrop(Option<Box<SendHalf>>);
-
-impl ResetOnDrop {
-    fn half(&mut self) -> &mut SendHalf {
-        self.0.as_mut().expect("held until released")
-    }
-
-    fn release(mut self) -> Box<SendHalf> {
-        self.0.take().expect("held until released")
-    }
-}
-
-impl Drop for ResetOnDrop {
-    fn drop(&mut self) {
-        if let Some(h) = self.0.as_mut() {
-            h.reset();
-        }
-    }
 }
 
 /// What a write or the end of a body gives back: the half and the outcome.
-type OpDone = (Box<SendHalf>, Result<(), h3::error::StreamError>);
+type OpDone = io::Result<Box<SendHalf>>;
 
 /// A write or the end of a body in progress, owning the half until done.
 type Op = Pin<Box<dyn Future<Output = OpDone> + Send>>;
@@ -1348,14 +1519,14 @@ impl BodyWriter {
     }
 
     /// A server's half that sends its response before its first write.
-    fn unanswered(answer: Arc<Answer>) -> Self {
+    fn unanswered(answer: Arc<Answer>, keep: Option<Keep>) -> Self {
         Self {
             answer_owner: None,
             sending: Sending::Unanswered(answer),
             finishing: false,
             finished: false,
             ended_gracefully: Arc::default(),
-            _keep: None,
+            _keep: keep,
             response: None,
         }
     }
@@ -1379,6 +1550,7 @@ impl BodyWriter {
                         }
                     };
                 }
+                Sending::Gone => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
                 _ => return Poll::Ready(Ok(())),
             }
         }
@@ -1386,18 +1558,30 @@ impl BodyWriter {
 
     /// Drives the write in flight to its end.
     fn poll_op(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let Sending::Busy(op) = &mut self.sending else {
-            return Poll::Ready(Ok(()));
+        let op = match &mut self.sending {
+            Sending::Busy(op) => op,
+            Sending::Gone => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            _ => return Poll::Ready(Ok(())),
         };
-        let (half, r) = ready!(op.as_mut().poll(cx));
-        self.sending = Sending::Idle(half);
-        Poll::Ready(r.map_err(h3_error))
+        let result = ready!(op.as_mut().poll(cx));
+        self.sending = Sending::Gone;
+        match result {
+            Ok(half) => {
+                self.sending = Sending::Idle(half);
+                Poll::Ready(Ok(()))
+            }
+            Err(error) => Poll::Ready(Err(error)),
+        }
     }
 
     /// Takes the buffers of `chunks` once the previous write is done, and
     /// sends each as one DATA frame.
-    fn poll_send(&mut self, cx: &mut Context<'_>, chunks: &mut [Bytes]) -> Poll<io::Result<usize>> {
-        if chunks.iter().all(Bytes::is_empty) {
+    fn poll_send(
+        &mut self,
+        cx: &mut Context<'_>,
+        chunks: &mut [zmux::Chunk],
+    ) -> Poll<io::Result<usize>> {
+        if chunks.iter().all(zmux::Chunk::is_empty) {
             return Poll::Ready(Ok(0));
         }
         ready!(self.poll_answer(cx))?;
@@ -1408,9 +1592,9 @@ impl BodyWriter {
             return Poll::Ready(Ok(0));
         }
         // Taken now; the next call drives it, and reports its error.
-        self.start(cx, |mut g| async move {
-            let r = g.half().send(data).await;
-            (g.release(), r)
+        self.start(cx, |mut half| async move {
+            half.send(data).await.map_err(h3_error)?;
+            Ok(half)
         })?;
         Poll::Ready(Ok(n))
     }
@@ -1418,28 +1602,16 @@ impl BodyWriter {
     /// Starts `op` on the idle half, and polls it once.
     fn start<F, Fut>(&mut self, cx: &mut Context<'_>, op: F) -> io::Result<()>
     where
-        F: FnOnce(ResetOnDrop) -> Fut,
+        F: FnOnce(Box<SendHalf>) -> Fut,
         Fut: Future<Output = OpDone> + Send + 'static,
     {
         let Sending::Idle(half) = std::mem::replace(&mut self.sending, Sending::Gone) else {
             return Err(io::Error::other("body writer lost its stream"));
         };
-        self.sending = Sending::Busy(Box::pin(op(ResetOnDrop(Some(half)))));
+        self.sending = Sending::Busy(Box::pin(op(half)));
         match self.poll_op(cx) {
             Poll::Ready(r) => r,
             Poll::Pending => Ok(()),
-        }
-    }
-}
-
-impl Drop for BodyWriter {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        // A write in flight resets its half as it is dropped.
-        if let Sending::Idle(h) = &mut self.sending {
-            h.reset();
         }
     }
 }
@@ -1448,7 +1620,7 @@ impl ChunkWrite for BodyWriter {
     fn poll_write_chunks(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        chunks: &mut [Bytes],
+        chunks: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
         self.get_mut().poll_send(cx, chunks)
     }
@@ -1471,9 +1643,9 @@ impl ChunkWrite for BodyWriter {
             ready!(self.poll_answer(cx))?;
             ready!(self.poll_op(cx))?;
             self.finishing = true;
-            self.start(cx, |mut g| async move {
-                let r = g.half().finish().await;
-                (g.release(), r)
+            self.start(cx, |mut half| async move {
+                half.finish().await.map_err(h3_error)?;
+                Ok(half)
             })?;
         }
         ready!(self.poll_op(cx))?;
@@ -1524,8 +1696,7 @@ struct BodyReader {
 }
 
 impl BodyReader {
-    fn client(mut recv: ClientRecv, keep: Arc<ClientInner>) -> Self {
-        let limit = keep.timeout;
+    fn client(mut recv: ClientRecv, keep: Arc<ClientInner>, limit: std::time::Duration) -> Self {
         let response: Response = Box::pin(async move {
             let r = match tokio::time::timeout(limit, recv.recv_response()).await {
                 Ok(Ok(resp)) if resp.status().is_success() => Ok(()),
@@ -1553,14 +1724,14 @@ impl BodyReader {
         }
     }
 
-    fn server(recv: ServerRecv) -> Self {
+    fn server(recv: ServerRecv, keep: Option<Keep>) -> Self {
         Self {
             half: Some(RecvHalf::Server(recv)),
             response: None,
             held: Bytes::new(),
             ended: false,
             peer_may_finish: Arc::default(),
-            _keep: None,
+            _keep: keep,
             left: None,
             answer: None,
         }
@@ -1686,6 +1857,12 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
+    fn adopted_options() -> Options {
+        let windows = LaneWindows::default();
+        Options::new()
+            .with_windows(windows.with_established_receive_window(windows.receive_window()))
+    }
+
     #[tokio::test]
     async fn drop_reader_after_buffered_data_with_a_pending_transport_read() {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1723,14 +1900,16 @@ mod tests {
             let client = Carrier::new(
                 c.clone(),
                 "https://localhost/".parse().unwrap(),
-                &Options::default(),
+                &adopted_options(),
             )
             .await
             .unwrap();
-            let mut server =
-                h3::server::Connection::<_, ChunkBuf>::new(bounded::Connection::new(s.clone()))
-                    .await
-                    .unwrap();
+            let mut server = h3::server::Connection::<_, ChunkBuf>::new(bounded::Connection::new(
+                s.clone(),
+                true,
+            ))
+            .await
+            .unwrap();
             // Put an entire request header and DATA frame in one QUIC write.
             // Resolving the header buffers the DATA before the body's first poll.
             let (mut send, _recv) = c.open_bi().await.unwrap();
@@ -1751,7 +1930,7 @@ mod tests {
                 .await
                 .unwrap();
             let (response, recv) = request.split();
-            let mut reader = BodyReader::server(recv);
+            let mut reader = BodyReader::server(recv, None);
             let mut byte = [0];
             reader.read_exact(&mut byte).await.unwrap();
             assert_eq!(byte, [b'a']);
@@ -1760,6 +1939,25 @@ mod tests {
             drop(reader);
             assert_eq!(send.stopped().await.unwrap(), Some(0u32.into()));
             blocked_response_belongs_to_its_carrier(response).await;
+
+            let mut request = client.inner.driver().unwrap().send.clone();
+            let _request = request
+                .send_request(http::Request::post("https://localhost/").body(()).unwrap())
+                .await
+                .unwrap();
+            let (_, request) = server
+                .accept()
+                .await
+                .unwrap()
+                .unwrap()
+                .resolve_request()
+                .await
+                .unwrap();
+            let (mut response, _recv) = request.split();
+            response.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+            let failed = Arc::new(Answer::new(response));
+            failed.taken().await;
+            assert!(Answer::take(failed).await.is_err());
             drop(client);
             c.close(0u32.into(), b"");
             s.close(0u32.into(), b"");
@@ -1774,7 +1972,7 @@ mod tests {
         let answer = Arc::new(Answer::new(response));
         let send_gate = answer.send.lock().await;
         let (gone, released) = tokio::sync::oneshot::channel();
-        let mut writer = BodyWriter::unanswered(answer.clone());
+        let mut writer = BodyWriter::unanswered(answer.clone(), None);
         writer.answer_owner = Some(gone);
         let (near, far) = tokio::io::duplex(8192);
         let io = answer.on_taken(PipeIo::new(near), released);
@@ -1839,18 +2037,14 @@ mod tests {
             async { server.accept().await.unwrap().await },
         );
         let (c, s) = (c.unwrap(), s.unwrap());
-        let client = Carrier::new(
-            c,
-            "https://localhost/".parse().unwrap(),
-            &Options::default(),
-        )
-        .await
-        .unwrap();
+        let client = Carrier::new(c, "https://localhost/".parse().unwrap(), &adopted_options())
+            .await
+            .unwrap();
         let (requests, incoming) = tokio::sync::mpsc::unbounded_channel();
         let incoming = Arc::new(tokio::sync::Mutex::new(incoming));
         let serving = tokio::spawn(async move {
             let mut server =
-                h3::server::Connection::<_, ChunkBuf>::new(bounded::Connection::new(s))
+                h3::server::Connection::<_, ChunkBuf>::new(bounded::Connection::new(s, true))
                     .await
                     .unwrap();
             while let Ok(Some(resolver)) = server.accept().await {
@@ -1868,7 +2062,7 @@ mod tests {
                 let (mut send, recv) = request.split();
                 send.send_response(http::Response::new(())).await.unwrap();
                 let (reader, writer) = paired(
-                    BodyReader::server(recv),
+                    BodyReader::server(recv, None),
                     BodyWriter::new(SendHalf::Server(send), None),
                 );
                 (opened, PipeIo::from_chunk_halves(reader, writer), 0)

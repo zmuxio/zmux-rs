@@ -250,6 +250,31 @@ impl Options {
         self
     }
 
+    /// Validates the admission configuration for an HTTP server.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for unauthenticated exchange alongside a ticket-protected
+    /// entry or a conflict between the ticket and pairing fields.
+    pub fn validate_server(&self, listener: &zmux::Listener) -> std::io::Result<()> {
+        let adapter = listener.adapter();
+        let ticket = adapter
+            .admission()
+            .and_then(zmux::Admission::prefix_ticket_header);
+        if ticket.is_some()
+            && self
+                .exchange
+                .as_ref()
+                .is_some_and(|x| x.options().unauthenticated)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a ticket-protected HTTP endpoint requires PSK-authenticated exchange",
+            ));
+        }
+        self.pair_field.check_ticket_header(ticket)
+    }
+
     /// Serves the requests that carry no pipe with `fallback`.
     #[must_use]
     pub fn with_fallback(mut self, fallback: Fallback) -> Self {

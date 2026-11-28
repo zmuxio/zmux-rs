@@ -1,27 +1,27 @@
 {
   "protocol": "zmux",
   "counts": {
-    "traces": 381,
-    "trace_steps": 7211,
+    "traces": 406,
+    "trace_steps": 7357,
     "traces_by_group": {
-      "compat": 10,
-      "core": 157,
-      "ext": 51,
+      "compat": 14,
+      "core": 155,
+      "ext": 71,
       "findings": 3,
-      "multipath": 142,
+      "multipath": 145,
       "resume": 18
     },
-    "wire_valid": 57,
-    "wire_invalid": 100
+    "wire_valid": 81,
+    "wire_invalid": 126
   },
   "sha256": {
-    "assets/registry.json": "01919ad4d6b22da6c5d24637d60a51b8eeb22303f048e119ea6075efc5c207f1",
-    "fixtures/profiles.json": "8efe1ec711b76bf85c657c16eb9411682b7101aa0db1a5ed2a8c1698f38ac89c",
-    "fixtures/wire/valid.ndjson": "7cafc4488518721b044644fcf7979000f6fa4cb0d375d9853ed6367157352a69",
-    "fixtures/wire/invalid.ndjson": "027805f0ff24796d9d847473a4cab8cc08d1f1447ef818d22b0d44ccb6a2a106",
-    "fixtures/traces/index.json": "746adba45a499f4d7625e8ad103a0f22adf7af905a1e28408cf2eb18159652a1",
+    "assets/registry.json": "8faebeb9a117befa4f3c40621648a8a8f7f14fb299cff13b4c579567fbb5b7f0",
+    "fixtures/profiles.json": "60bbaa97701bf4ea713716df32357108669205850e2d96bd78dc6594c3d0069e",
+    "fixtures/wire/valid.ndjson": "0396e3e31a3f7104f78eb1aa20f1dd74a9789c4aefda319888a5c5589d031859",
+    "fixtures/wire/invalid.ndjson": "9b51d783a9b44a28283a7f785f493e069ac03c6dde5aac95e126e9926d7e261a",
+    "fixtures/traces/index.json": "6fcd0819b543a8acc398a2b36af3d20dbb60494711ba763974d8b2490661aaed",
     "fixtures/capsules.json": "eb1e8eae3c52ce610344cb440c4eaf6c6cda74671c72f1edcc682ea92d3a5fa6",
-    "WIRE_EXAMPLES.md": "0df557fa54d0abae95381e0fa303efc1e5d9684cd92d3cf17b4afd82301ca312"
+    "WIRE_EXAMPLES.md": "947af6421d423244964d1fc78aa683cd88c254dc87b94d58da305380d787410c"
   },
-  "traces_sha256": "7d27de4f7201e2f5654346cc8ab5e3d0fb960a578915ca15dcd83d6e5f3a6ceb"
+  "traces_sha256": "771e61dbc878f15e5d4ec7e6a27497dd3e0dd01130317780555bdef3431db32b"
 }

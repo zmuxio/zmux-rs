@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::exporter::CarrierExporter;
+#[cfg(all(feature = "tokio", not(loom)))]
 use super::prefix_auth::{PREFIX_TOKEN_LEN, PrefixAuthVerifier};
 use super::record::Framing;
 
@@ -100,7 +101,16 @@ pub struct Admission {
     stall: (Duration, Duration),
     discard_buffer: usize,
     fallback_on_peek_timeout: bool,
-    decide: Arc<dyn Decide>,
+    #[cfg(all(feature = "tokio", not(loom)))]
+    first_message_ticket: bool,
+    decide: AdmissionDecider,
+}
+
+#[derive(Clone)]
+enum AdmissionDecider {
+    Host(Arc<dyn Decide>),
+    #[cfg(all(feature = "tokio", not(loom)))]
+    Ticket(Arc<PrefixAuthVerifier>, PrefixRejection),
 }
 
 impl std::fmt::Debug for Admission {
@@ -152,6 +162,10 @@ impl Admission {
     /// [`Admission::with_peek_timeout`] and
     /// [`Admission::with_stall_interval`] set them instead.
     pub fn with_decider(peek: usize, decide: impl Decide) -> Self {
+        Self::configured(peek, AdmissionDecider::Host(Arc::new(decide)))
+    }
+
+    fn configured(peek: usize, decide: AdmissionDecider) -> Self {
         let peek_timeout = draw(PEEK_TIMEOUT_DRAWN.0, PEEK_TIMEOUT_DRAWN.1);
         let max = draw(STALL_MAX_DRAWN.0, STALL_MAX_DRAWN.1);
         let min = draw(max / 4, max * 3 / 4);
@@ -163,18 +177,55 @@ impl Admission {
             stall: (min, max),
             discard_buffer: 512,
             fallback_on_peek_timeout: false,
-            decide: Arc::new(decide),
+            #[cfg(all(feature = "tokio", not(loom)))]
+            first_message_ticket: false,
+            decide,
         }
     }
 
-    /// An admission by prefix authentication tokens:
-    /// [`PREFIX_TOKEN_LEN`] bytes read (none on a carrier decided on its
-    /// HTTP request head, whose token is in a request header field),
-    /// decided by [`PrefixAuthVerifier::decide`].
-    pub fn prefix_auth(verifier: Arc<PrefixAuthVerifier>) -> Self {
-        Self::new(PREFIX_TOKEN_LEN, move |info, prefix| {
-            verifier.decide(&info, prefix)
-        })
+    /// An admission by ticket presentation. Reads exactly 64 bytes of a
+    /// stream, one complete first message, or a single field on a request head.
+    /// All verification failures use the selected refusal policy.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    #[must_use]
+    pub fn prefix_auth(verifier: Arc<PrefixAuthVerifier>, reject: PrefixRejection) -> Self {
+        let admission =
+            Self::configured(PREFIX_TOKEN_LEN, AdmissionDecider::Ticket(verifier, reject));
+        if reject == PrefixRejection::Close {
+            admission.with_max_message(PREFIX_TOKEN_LEN)
+        } else {
+            admission
+        }
+    }
+
+    /// For ticket admission on an upgrade, defer the credential check to
+    /// the carrier's first message. Other entries use their normal ticket input.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    #[must_use]
+    pub fn with_first_message_ticket(mut self) -> Self {
+        self.first_message_ticket = true;
+        self
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn defers_ticket_upgrade(&self) -> bool {
+        self.first_message_ticket && self.ticket_verifier().is_some()
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn ticket_verifier(&self) -> Option<(&PrefixAuthVerifier, PrefixRejection)> {
+        match &self.decide {
+            AdmissionDecider::Ticket(verifier, reject) => Some((verifier, *reject)),
+            AdmissionDecider::Host(_) => None,
+        }
+    }
+
+    /// The agreed ticket request field, when this entry requires a prefix ticket.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    #[must_use]
+    pub fn prefix_ticket_header(&self) -> Option<&str> {
+        self.ticket_verifier()
+            .map(|(verifier, _)| verifier.header_name())
     }
 
     /// With this peek timeout: the limit on reading the prefix and
@@ -294,10 +345,21 @@ impl Admission {
         self.discard_buffer
     }
 
-    /// The decider, for a driver that applies the admission.
+    /// The host decider, when supplied by the application.
     #[must_use]
-    pub fn decider(&self) -> &dyn Decide {
-        &*self.decide
+    pub fn decider(&self) -> Option<&dyn Decide> {
+        match &self.decide {
+            AdmissionDecider::Host(decide) => Some(&**decide),
+            #[cfg(all(feature = "tokio", not(loom)))]
+            AdmissionDecider::Ticket(_, _) => None,
+        }
+    }
+
+    /// Whether this entry requires a prefix ticket.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    #[must_use]
+    pub fn requires_prefix_ticket(&self) -> bool {
+        self.ticket_verifier().is_some()
     }
 
     /// Checks the bounds: [`Admission::with_max_message`] at most
@@ -524,6 +586,31 @@ impl AdmissionVerdict {
     }
 }
 
+/// The refusal policy for a ticket-protected admission.
+#[cfg(all(feature = "tokio", not(loom)))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PrefixRejection {
+    /// Close the carrier or end the protected request.
+    #[default]
+    Close,
+    /// Hand back the original input. A byte carrier without a fallback
+    /// target stalls until its configured time limit.
+    Fallback,
+    /// Stall without sending, then close at the configured time limit.
+    Stall,
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+impl PrefixRejection {
+    pub(crate) fn verdict(self) -> AdmissionVerdict {
+        match self {
+            Self::Close => AdmissionVerdict::Close,
+            Self::Fallback => AdmissionVerdict::fallback(),
+            Self::Stall => AdmissionVerdict::Stall,
+        }
+    }
+}
+
 /// What of a carrier a decision is taken on ([`CarrierInfo::stage`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -615,6 +702,14 @@ pub type VisitFields<R> = fn(&R, &mut dyn FnMut(&str, &[u8]));
 
 type HeadersFn = dyn Fn(&mut dyn FnMut(&str, &[u8])) + Send + Sync;
 
+#[derive(Debug, Default, Clone, Copy)]
+enum CarrierProtection {
+    #[default]
+    Cleartext,
+    Encrypted,
+    Tls13OrQuic,
+}
+
 /// The metadata of a carrier, as far as its adapter has it: a server's
 /// admission decides with it, and a client's [`CarrierCredential`] is given
 /// it. Fields that do not apply are `None`. Owned and cheap to clone (its
@@ -673,6 +768,9 @@ pub struct CarrierInfo {
     pub upgrade: bool,
     headers: Option<Arc<HeadersFn>>,
     exporter: Option<CarrierExporter>,
+    protection: CarrierProtection,
+    early_data: bool,
+    early_data_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl std::fmt::Debug for CarrierInfo {
@@ -688,6 +786,9 @@ impl std::fmt::Debug for CarrierInfo {
             .field("upgrade", &self.upgrade)
             .field("headers", &self.headers.is_some())
             .field("exporter", &self.exporter.is_some())
+            .field("protection", &self.protection)
+            .field("early_data", &self.early_data)
+            .field("tracks_early_data", &self.early_data_check.is_some())
             .finish()
     }
 }
@@ -797,9 +898,67 @@ impl CarrierInfo {
         }
     }
 
+    /// Marks an outer carrier with encryption. TLS 1.2 can carry bearer
+    /// tickets, as can other encrypted outer protocols.
+    #[must_use]
+    pub fn with_encrypted(mut self) -> Self {
+        if matches!(self.protection, CarrierProtection::Cleartext) {
+            self.protection = CarrierProtection::Encrypted;
+        }
+        self
+    }
+
+    /// Adds the completed TLS 1.3 or QUIC exporter of the actual carrier.
+    /// Adapters must call this only for the connection carrying the bytes.
+    #[must_use]
+    pub fn with_prefix_binding(mut self, exporter: CarrierExporter) -> Self {
+        self.protection = CarrierProtection::Tls13OrQuic;
+        self.exporter = Some(exporter);
+        self
+    }
+
+    /// Marks bytes carried in, or exposed to, outer-protocol early data.
+    #[must_use]
+    pub fn with_early_data(mut self) -> Self {
+        self.early_data = true;
+        self
+    }
+
+    /// Checks early-data provenance when the presentation has been read.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_early_data_check(
+        mut self,
+        check: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.early_data_check = Some(Arc::new(check));
+        self
+    }
+
+    /// Whether the outer carrier encrypts this presentation.
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
+        !matches!(self.protection, CarrierProtection::Cleartext)
+    }
+
+    /// Whether this presentation may have been sent as early data.
+    #[must_use]
+    pub fn is_early_data(&self) -> bool {
+        self.early_data || self.early_data_check.as_ref().is_some_and(|check| check())
+    }
+
+    /// Whether the actual carrier is eligible for a bound presentation.
+    #[must_use]
+    pub const fn has_prefix_binding(&self) -> bool {
+        matches!(self.protection, CarrierProtection::Tls13OrQuic)
+    }
+
     /// With the exporter of the carrier's completed TLS or QUIC handshake.
     #[must_use]
     pub fn with_exporter(mut self, exporter: CarrierExporter) -> Self {
+        if self.has_prefix_binding() {
+            self.protection = CarrierProtection::Encrypted;
+        }
         self.exporter = Some(exporter);
         self
     }
@@ -847,6 +1006,11 @@ impl CarrierInfo {
 /// a credential bound to it). An error fails the dial.
 /// [`crate::PrefixAuth`] is one.
 pub trait CarrierCredential: Send + Sync + std::fmt::Debug {
+    /// The agreed request field if this credential presents a prefix ticket.
+    fn prefix_ticket_header(&self) -> Option<&str> {
+        None
+    }
+
     /// The bytes a byte-stream carrier, an HTTP request body carrier or a
     /// QUIC carrier's first stream starts with.
     fn prefix(&self, info: &CarrierInfo) -> io::Result<Vec<u8>>;

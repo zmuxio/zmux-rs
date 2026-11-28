@@ -9,7 +9,6 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::relay;
@@ -19,7 +18,7 @@ use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeIo, PipeOptions, Sess
 
 fn config(policy: Scheduler) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"driver-test-psk-0123456789abcdef").with_end_to_end();
     c.scheduler = policy;
     c
@@ -90,7 +89,7 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     assert_eq!(client.multipath(), zmux::Multipath::InUse);
     let second = TcpStream::connect(addr).await.unwrap();
     let pipe = client
-        .begin_add_pipe(
+        .test_begin_join(
             PipeIo::from_tcp(second),
             PipeOptions::new()
                 .with_send_priority(5)
@@ -129,7 +128,7 @@ async fn every_pipe_has_a_handle_and_joins_are_awaited() {
     let (dead, far) = tokio::io::duplex(1024);
     drop(far);
     let lost = client
-        .begin_add_pipe(PipeIo::new(dead), PipeOptions::new())
+        .test_begin_join(PipeIo::new(dead), PipeOptions::new())
         .unwrap();
     let e = tokio::time::timeout(Duration::from_secs(10), lost.joined())
         .await
@@ -189,7 +188,7 @@ async fn two_pipes_spread() {
     assert_eq!(s.multipath(), zmux::Multipath::InUse);
     let c2 = TcpStream::connect(addr).await.unwrap();
     let pipe = s
-        .begin_add_pipe(PipeIo::from_tcp(c2), PipeOptions::default())
+        .test_begin_join(PipeIo::from_tcp(c2), PipeOptions::default())
         .unwrap();
     echo(&s, 4 << 20).await;
     let info = s.pipes();
@@ -208,12 +207,12 @@ async fn severed_pipe_fails_over() {
     let s = Session::connect(PipeIo::from_tcp(c), cfg).await.unwrap();
     let (raddr, cut) = relay(addr).await;
     let c2 = TcpStream::connect(raddr).await.unwrap();
-    s.begin_add_pipe(PipeIo::from_tcp(c2), PipeOptions::default())
+    s.test_begin_join(PipeIo::from_tcp(c2), PipeOptions::default())
         .unwrap();
     let s2 = s.clone();
     let job = tokio::spawn(async move { echo(&s2, 8 << 20).await });
     tokio::time::sleep(Duration::from_millis(30)).await;
-    cut.store(true, Ordering::SeqCst);
+    cut.send(()).expect("the relay is forwarding traffic");
     if std::env::var("MP_DEBUG").is_ok() {
         let s3 = s.clone();
         tokio::spawn(async move {
@@ -246,7 +245,7 @@ async fn blocking_client_two_pipes() {
         .unwrap();
         assert_eq!(s.multipath(), zmux::Multipath::InUse);
         let c2 = std::net::TcpStream::connect(addr).unwrap();
-        s.begin_add_pipe(zmux::blocking::PipeIo::from_tcp(c2), PipeOptions::default())
+        s.test_begin_join(zmux::blocking::PipeIo::from_tcp(c2), PipeOptions::default())
             .unwrap();
         let (mut send, mut recv) = s.open_bi().unwrap();
         let len = 2 << 20;
@@ -278,7 +277,7 @@ async fn an_adapters_unsent_count_is_the_pipes_queued_bytes() {
         .unwrap();
     let c2 = TcpStream::connect(addr).await.unwrap();
     let io = PipeIo::from_tcp(c2).with_unsent(|| Some(4321));
-    let pipe = s.begin_add_pipe(io, PipeOptions::default()).unwrap();
+    let pipe = s.test_begin_join(io, PipeOptions::default()).unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
         .await
         .expect("joined in time")
@@ -321,7 +320,7 @@ async fn an_aborted_pipe_reports_the_same_end_to_every_wait() {
     for registered_first in [true, false] {
         let second = TcpStream::connect(addr).await.unwrap();
         let pipe = client
-            .begin_add_pipe(PipeIo::from_tcp(second), PipeOptions::new())
+            .test_begin_join(PipeIo::from_tcp(second), PipeOptions::new())
             .unwrap();
         common::watchdog(10, "joined", pipe.joined()).await.unwrap();
         let clone = pipe.clone();
@@ -376,7 +375,7 @@ async fn an_application_close_delivers_the_tail_on_every_pipe() {
             .unwrap();
         let c2 = TcpStream::connect(addr).await.unwrap();
         let pipe = s
-            .begin_add_pipe(PipeIo::from_tcp(c2), PipeOptions::default())
+            .test_begin_join(PipeIo::from_tcp(c2), PipeOptions::default())
             .unwrap();
         pipe.joined().await.unwrap();
         let mut send = s.open_uni().await.unwrap();

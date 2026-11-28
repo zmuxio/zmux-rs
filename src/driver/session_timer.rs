@@ -235,6 +235,8 @@ mod tests {
     fn a_wake_up_is_never_lost() {
         let (tx, rx) = mpsc::channel();
         let (wtx, wrx) = mpsc::channel::<Waker>();
+        let (ready, second_run_finished) = mpsc::channel();
+        let mut ready = Some(ready);
         let mut runs = 0u32;
         spawn(move |me| {
             runs += 1;
@@ -245,7 +247,16 @@ mod tests {
                     me.wake_by_ref();
                     Next::Idle
                 }
-                2 => Next::Idle,
+                2 => {
+                    let ready = ready.take().unwrap();
+                    // The timer thread processes this after it records this task as idle.
+                    spawn(move |_| {
+                        ready.send(()).unwrap();
+                        Next::Done
+                    })
+                    .unwrap();
+                    Next::Idle
+                }
                 _ => {
                     tx.send(runs).unwrap();
                     Next::Done
@@ -253,12 +264,13 @@ mod tests {
             }
         })
         .unwrap();
-        let waker = wrx.recv_timeout(Duration::from_secs(10)).unwrap();
-        // The second run happens by itself; the third by this wake-up.
-        std::thread::sleep(Duration::from_millis(50));
+        let waker = wrx.recv_timeout(Duration::from_secs(30)).unwrap();
+        second_run_finished
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
         assert!(rx.try_recv().is_err());
         waker.wake();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), 3);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(30)).unwrap(), 3);
     }
 
     /// A task that panics ends alone.

@@ -19,6 +19,20 @@ pub(crate) enum Json {
     Obj(Vec<(String, Json)>),
 }
 
+/// Validates an object containing only the fields declared by its caller.
+pub(crate) fn known(x: &Json, allowed: &[&str], what: &str) -> Result<(), Error> {
+    let Json::Obj(members) = x else {
+        return Err(err("type", what.to_owned()));
+    };
+    match members
+        .iter()
+        .find(|(key, _)| !allowed.contains(&key.as_str()))
+    {
+        Some((key, _)) => Err(err("unknown_member", format!("{what}.{key}"))),
+        None => Ok(()),
+    }
+}
+
 impl Json {
     pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         match self {

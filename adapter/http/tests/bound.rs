@@ -5,6 +5,9 @@
 
 mod support;
 
+#[path = "../../test-support/ticket.rs"]
+mod ticket;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +15,78 @@ use tokio::net::{TcpListener, TcpStream};
 use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeIo, PipeOptions, RecordMode, Session};
 use zmux_http::{Http2Connection, Options};
 use zmux_rustls::TlsConnection;
+
+#[tokio::test]
+async fn ticket_protected_endpoint_checks_exchange_and_pair_configuration() {
+    use zmux_http::{Endpoint, ExchangeOptions, ExchangeServer, PairField};
+    let (presenter, verifier) = ticket::fixture(zmux::PrefixBinding::Encrypted);
+    let exchange_listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(zmux::Admission::prefix_auth(
+        verifier,
+        zmux::PrefixRejection::Close,
+    ));
+    let protected = Listener::new(Config::default(), limits).unwrap();
+    let exchange = ExchangeServer::new(
+        &exchange_listener,
+        ExchangeOptions::default().with_unauthenticated(),
+    )
+    .unwrap();
+    assert!(
+        Endpoint::new(
+            exchange_listener.clone(),
+            Options::default().with_exchange(exchange.clone())
+        )
+        .is_ok()
+    );
+    let error = Endpoint::new(
+        protected.clone(),
+        Options::default().with_exchange(exchange),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("requires PSK-authenticated exchange")
+    );
+    let authenticated = ExchangeServer::new(
+        &exchange_listener,
+        ExchangeOptions::default().with_psk(b"test PSK"),
+    )
+    .unwrap();
+    assert!(Endpoint::new(protected, Options::default().with_exchange(authenticated)).is_ok());
+
+    let (_, verifier) = ticket::fixture(zmux::PrefixBinding::Encrypted);
+    let verifier = Arc::try_unwrap(verifier)
+        .unwrap()
+        .with_header("X-Ticket")
+        .unwrap();
+    let mut limits = ListenerConfig::default();
+    limits.admission = Some(zmux::Admission::prefix_auth(
+        Arc::new(verifier),
+        zmux::PrefixRejection::Close,
+    ));
+    let protected = Listener::new(Config::default(), limits).unwrap();
+    let error = Endpoint::new(
+        protected,
+        Options::default().with_pair_field(PairField::new("x-ticket").unwrap()),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with the HTTP pairing field")
+    );
+
+    let options = ExchangeOptions::default()
+        .with_psk(b"test PSK")
+        .with_carrier_credential(Arc::new(presenter));
+    let error = zmux_http::dial_exchange("localhost:1234", &options).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("does not accept PrefixAuth"));
+}
 
 /// TLS 1.3 configurations whose ALPN offers `h2` and `http/1.1`.
 fn tls() -> (tokio_rustls::TlsConnector, tokio_rustls::TlsAcceptor) {
@@ -85,7 +160,7 @@ async fn tls_conn(
 
 async fn joined_bound(session: &Session, io: PipeIo) -> Result<(), String> {
     let pipe = session
-        .begin_add_pipe(io, PipeOptions::new().with_record_mode(RecordMode::Bound))
+        .test_begin_join(io, PipeOptions::new().with_record_mode(RecordMode::Bound))
         .map_err(|e| e.to_string())?;
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
         .await
@@ -104,7 +179,7 @@ fn bound_over_tls() {
         let (connector, acceptor) = tls();
         let config = config(PipeAuth::exporter().with_end_to_end());
         let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
-        let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default());
+        let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default()).unwrap();
         let (addr, serving) = tls_server(endpoint, acceptor).await;
         let https = Options::default().with_https(true);
 
@@ -184,6 +259,11 @@ fn not_bound_over_h2c() {
         assert!(first.bound_exporter().is_none());
         let cs = Session::connect(first, config).await.unwrap();
         let ss = listener.accept().await.unwrap();
+        for session in [&cs, &ss] {
+            let sample = session.pipe_stats().remove(0).carrier_sample.unwrap();
+            assert_eq!(sample.source, zmux::CarrierSource::Unknown);
+            assert_eq!(sample.counts, None);
+        }
         // A client that claims the contract on its own.
         let claimed = h2
             .open_pipe()
@@ -217,6 +297,7 @@ fn bound_websocket_over_h2() {
         let config = config(PipeAuth::exporter().with_end_to_end());
         let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
         let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default())
+            .unwrap()
             .with_websocket(zmux_websocket::Options::default());
         let (addr, serving) = tls_server(endpoint, acceptor).await;
         let https = Options::default().with_https(true);
@@ -269,12 +350,14 @@ fn bound_websocket_over_h2() {
 fn a_bound_prefix_token_passes_over_tls() {
     support::run(2, 90, || async {
         let (connector, acceptor) = tls();
-        let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
-        let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 64).unwrap());
+        let (auth, verifier) = ticket::fixture(zmux::PrefixBinding::Bound);
         let mut limits = ListenerConfig::default();
-        limits.admission = Some(zmux::Admission::prefix_auth(verifier));
+        limits.admission = Some(zmux::Admission::prefix_auth(
+            verifier,
+            zmux::PrefixRejection::Fallback,
+        ));
         let listener = Listener::new(Config::default(), limits).unwrap();
-        let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default());
+        let endpoint = zmux_http::Endpoint::new(listener.clone(), Options::default()).unwrap();
         let (addr, serving) = tls_server(endpoint, acceptor).await;
         let https = Options::default()
             .with_https(true)

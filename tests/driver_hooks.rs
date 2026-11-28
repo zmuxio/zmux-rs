@@ -75,7 +75,7 @@ impl Pick for LeastUnsent {
 
 fn mp_config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"hooks-test-psk--0123456789abcdef").with_end_to_end();
     c
 }
@@ -157,7 +157,7 @@ async fn custom_transfer(mode: Mode, len: usize) -> (zmux::SessionStats, Arc<Lea
     .unwrap();
     // The view the policy answers for is complete before the first chunk.
     client
-        .add_pipe(
+        .test_join(
             PipeIo::from_tcp(TcpStream::connect(addr).await.unwrap()),
             PipeOptions::default(),
         )
@@ -382,7 +382,7 @@ async fn a_pending_window_answer_does_not_hold_the_tracer_back() {
     // A session event now, while the answer is pending: it reaches the tracer.
     let (carrier, _far) = tokio::io::duplex(1 << 16);
     let pipe = receiver
-        .begin_add_pipe(PipeIo::new(carrier), PipeOptions::default())
+        .test_begin_join(PipeIo::new(carrier), PipeOptions::default())
         .unwrap();
     let id = pipe.id();
     loop {
@@ -440,7 +440,7 @@ fn blocking_driver_runs_hooks_outside_the_lock() {
     )
     .unwrap();
     client
-        .begin_add_pipe(
+        .test_begin_join(
             zmux::blocking::PipeIo::from_tcp(std::net::TcpStream::connect(addr).unwrap()),
             PipeOptions::default(),
         )

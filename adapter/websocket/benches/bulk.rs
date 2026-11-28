@@ -9,7 +9,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
-use bytes::Bytes;
+use zmux::Chunk;
 use zmux::{Config, Listener, ListenerConfig, Session};
 
 struct Counting;
@@ -78,7 +78,7 @@ async fn bulk(client: Session, server: Session, zero_copy: bool) {
     });
     let mut s = client.open_uni().await.unwrap();
     let data = vec![1u8; 64 * 1024];
-    let chunk = Bytes::from(data.clone());
+    let chunk = Chunk::from(data.clone());
     let (mut sent, mut t, mut allocs, mut records) = (0u64, Instant::now(), 0, 0);
     while sent < total + warm {
         if sent == warm {

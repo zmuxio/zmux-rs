@@ -600,24 +600,76 @@ impl ResetStreamAt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Datagram<'a> {
     /// Datagram Data. With datagram flows in use it starts with the flow
-    /// prefix ([`crate::proto::payload::Flow`]).
+    /// prefix ([`DatagramPrefix`]).
     pub data: &'a [u8],
     /// Whether the Length field is present (type 0x31). Without it the data
     /// extends to the end of the record.
     pub explicit_len: bool,
 }
 
+/// The bytes preceding the application payload in a DATAGRAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramPrefix {
+    /// Plain QMux transports opaque Datagram Data.
+    Opaque,
+    /// The current zmux family uses a sequence and Flow on every datagram.
+    Sequenced {
+        sequence: u64,
+        flow: crate::proto::payload::Flow,
+    },
+}
+
+impl DatagramPrefix {
+    /// Size of the prefix on the wire.
+    #[must_use]
+    pub const fn encoded_len(self) -> usize {
+        match self {
+            Self::Opaque => 0,
+            Self::Sequenced { sequence, flow } => vlen(sequence) + flow.encoded_len(),
+        }
+    }
+
+    /// Writes the prefix before the application payload.
+    pub fn encode(self, out: &mut [u8]) -> Result<usize, EncodeError> {
+        match self {
+            Self::Opaque => Ok(0),
+            Self::Sequenced { sequence, flow } => {
+                let n = varint::encode(sequence, out)?;
+                Ok(n + flow.encode(&mut out[n..])?)
+            }
+        }
+    }
+}
+
 impl<'a> Datagram<'a> {
-    /// Splits the data into its flow and payload when datagram flows are in
-    /// use.
-    pub fn flow(&self) -> Result<(crate::proto::payload::Flow, &'a [u8]), Error> {
-        let ty = if self.explicit_len {
+    /// Splits same-family Datagram Data into its sequence, Flow, and payload.
+    pub fn sequenced(&self) -> Result<(u64, crate::proto::payload::Flow, &'a [u8]), Error> {
+        let (sequence, data) = self.sequence_data()?;
+        let (flow, payload) = self.flow_data(data)?;
+        Ok((sequence, flow, payload))
+    }
+
+    fn wire_type(&self) -> u64 {
+        if self.explicit_len {
             FrameType::DATAGRAM_LEN.0
         } else {
             FrameType::DATAGRAM.0
-        };
-        crate::proto::payload::Flow::parse(self.data)
-            .map_err(|e| Error::new(e.code(), ty, e.reason()))
+        }
+    }
+
+    pub(crate) fn sequence_data(&self) -> Result<(u64, &'a [u8]), Error> {
+        let (sequence, n) = varint::decode(self.data).ok_or_else(|| {
+            Error::protocol_violation(self.wire_type(), "truncated datagram sequence")
+        })?;
+        Ok((sequence, &self.data[n..]))
+    }
+
+    pub(crate) fn flow_data(
+        &self,
+        data: &'a [u8],
+    ) -> Result<(crate::proto::payload::Flow, &'a [u8]), Error> {
+        crate::proto::payload::Flow::parse(data)
+            .map_err(|e| Error::new(e.code(), self.wire_type(), e.reason()))
     }
 
     /// Length of the encoding.

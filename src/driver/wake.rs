@@ -104,6 +104,8 @@ pub struct Locked<'a, T: Defer> {
     panicking: bool,
     #[cfg(any(debug_assertions, all(test, loom)))]
     _held: held::Token,
+    #[cfg(all(feature = "tokio", not(loom)))]
+    _receipts: held::ReceiptScope,
     after: Option<T::After>,
 }
 
@@ -116,6 +118,8 @@ impl<'a, T: Defer> Locked<'a, T> {
             panicking: std::thread::panicking(),
             #[cfg(any(debug_assertions, all(test, loom)))]
             _held: held::Token::new(),
+            #[cfg(all(feature = "tokio", not(loom)))]
+            _receipts: held::ReceiptScope::new(),
             after: None,
         }
     }

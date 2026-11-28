@@ -132,7 +132,7 @@ impl zmux::adapter::ChunkWrite for BatchWriter {
     fn poll_write_chunks(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
-        _: &mut [bytes::Bytes],
+        _: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
         panic!("a batch carrier gets batches");
     }
@@ -144,7 +144,7 @@ impl zmux::adapter::ChunkWrite for BatchWriter {
     fn poll_write_message_batch(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
-        messages: &mut [bytes::Bytes],
+        messages: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
         self.calls.lock().unwrap().push(messages.len());
         let mut q = self.tx.lock().unwrap();
@@ -152,7 +152,7 @@ impl zmux::adapter::ChunkWrite for BatchWriter {
         for m in messages.iter_mut() {
             n += m.len();
             q.messages.push_back(m.to_vec());
-            *m = bytes::Bytes::new();
+            m.clear();
         }
         if let Some(w) = q.reader.take() {
             w.wake();

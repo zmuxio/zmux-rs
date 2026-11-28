@@ -10,6 +10,7 @@
       "initial_max_streams_uni": 16,
       "reset_stream_at": null,
       "zmux_goaway": null,
+      "zmux_datagram_family": null,
       "zmux_preamble": 4096,
       "zmux_priority": null,
       "zmux_pipe_ack": null,
@@ -48,6 +49,7 @@
       "initial_max_streams_bidi": 4,
       "initial_max_streams_uni": 4,
       "reset_stream_at": null,
+      "zmux_datagram_family": null,
       "zmux_goaway": null,
       "zmux_preamble": 512,
       "zmux_priority": null,
@@ -87,6 +89,7 @@
       "initial_max_streams_bidi": 4,
       "initial_max_streams_uni": 4,
       "reset_stream_at": null,
+      "zmux_datagram_family": null,
       "zmux_goaway": null,
       "zmux_preamble": 512,
       "zmux_priority": null,
@@ -96,8 +99,7 @@
         "max_lanes": 4,
         "lane_key": "7a6d75782d6c616e652d6b65792d4c4c"
       },
-      "max_datagram_frame_size": 1200,
-      "zmux_datagram_flows": null
+      "max_datagram_frame_size": 1200
     },
     "config": {
       "keep_alive_period": 0,
@@ -129,6 +131,7 @@
       "initial_max_streams_bidi": 4,
       "initial_max_streams_uni": 4,
       "reset_stream_at": null,
+      "zmux_datagram_family": null,
       "zmux_goaway": null,
       "zmux_preamble": 512,
       "zmux_priority": null,
@@ -174,6 +177,7 @@
       "initial_max_streams_bidi": 4,
       "initial_max_streams_uni": 4,
       "reset_stream_at": null,
+      "zmux_datagram_family": null,
       "zmux_goaway": null,
       "zmux_preamble": 512,
       "zmux_priority": null,
@@ -243,6 +247,7 @@
       "initial_max_streams_bidi": 4,
       "initial_max_streams_uni": 4,
       "reset_stream_at": null,
+      "zmux_datagram_family": null,
       "zmux_goaway": null,
       "zmux_preamble": 512,
       "zmux_priority": null,

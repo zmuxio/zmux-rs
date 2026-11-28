@@ -4,29 +4,38 @@
 //! once, not at the linger timeout; a peer that sends nothing more still ends at the linger.
 //! Every wait is bounded.
 
+#[path = "common/clock.rs"]
+mod clock;
+
 use std::any::Any;
+use std::convert::Infallible;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use clock::ManualClock;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use zmux::{Config, SessionError, StreamError, VarInt};
+use tokio::sync::{mpsc as async_mpsc, oneshot};
+use zmux::{ClockDomain, Config, MonotonicClock, SessionError, SessionState, StreamError, VarInt};
 
-/// The linger of the scenarios that must not wait for it.
-const LONG_LINGER: Duration = Duration::from_secs(2);
-/// What the carriers need to close once both closes crossed.
-const PROMPT: Duration = Duration::from_millis(100);
-/// How often each scenario repeats.
-const REPEAT: usize = 100;
+const WATCHDOG: Duration = Duration::from_secs(30);
+const LINGER: Duration = Duration::from_secs(2);
 
 fn config(linger: Duration) -> Config {
     let mut c = Config::default();
     c.test_hooks().linger_timeout = Some(linger);
     c
+}
+
+fn manual_config() -> (ManualClock, Config) {
+    let mut config = config(LINGER);
+    let (clock, domain) = ManualClock::domain(Duration::ZERO);
+    config.clock_domain = domain;
+    (clock, config)
 }
 
 fn hint() -> zmux::PipeHint {
@@ -39,26 +48,47 @@ fn closed_with_42(e: &SessionError) -> bool {
 
 // ---- tokio ------------------------------------------------------------------------------
 
-/// One object for both directions whose write side cannot be shut alone: a shutdown does
-/// nothing, and the carrier closes only when it is dropped. `deaf` makes the input silent
-/// (no byte, no end), as a peer that sends nothing more does. Counts the carriers alive.
-struct NoHalfClose<T: Send + 'static> {
-    io: Option<T>,
-    deaf: Arc<AtomicBool>,
-    alive: Arc<AtomicUsize>,
+/// Retains the underlying transports after the driver releases its wrappers,
+/// so EOF alone cannot settle the other endpoint's linger.
+type Retained = Arc<Mutex<Vec<Box<dyn Any + Send>>>>;
+
+/// The receiver ends when the driver has released every carrier half.
+struct CarrierLifetime {
+    retained: Retained,
+    open: async_mpsc::UnboundedSender<Infallible>,
 }
 
-/// The objects of dropped carriers, kept open: a peer whose carrier shows no end, so that
-/// only the `CONNECTION_CLOSE` can end a linger.
-static KEPT: Mutex<Vec<Box<dyn Any + Send>>> = Mutex::new(Vec::new());
+impl CarrierLifetime {
+    fn new() -> (Self, async_mpsc::UnboundedReceiver<Infallible>) {
+        let (open, remaining) = async_mpsc::unbounded_channel();
+        (
+            Self {
+                retained: Arc::default(),
+                open,
+            },
+            remaining,
+        )
+    }
+
+    fn retain(self) -> Retained {
+        self.retained
+    }
+}
+
+struct NoHalfClose<T: Send + 'static> {
+    io: Option<T>,
+    silence: Arc<Silence>,
+    retained: Retained,
+    _open: async_mpsc::UnboundedSender<Infallible>,
+}
 
 impl<T: Send + 'static> NoHalfClose<T> {
-    fn new(io: T, deaf: &Arc<AtomicBool>, alive: &Arc<AtomicUsize>) -> Self {
-        alive.fetch_add(1, Ordering::SeqCst);
+    fn new(io: T, silence: &Arc<Silence>, lifetime: &CarrierLifetime) -> Self {
         Self {
             io: Some(io),
-            deaf: deaf.clone(),
-            alive: alive.clone(),
+            silence: silence.clone(),
+            retained: lifetime.retained.clone(),
+            _open: lifetime.open.clone(),
         }
     }
 }
@@ -66,9 +96,8 @@ impl<T: Send + 'static> NoHalfClose<T> {
 impl<T: Send + 'static> Drop for NoHalfClose<T> {
     fn drop(&mut self) {
         if let Some(io) = self.io.take() {
-            KEPT.lock().unwrap().push(Box::new(io));
+            self.retained.lock().unwrap().push(Box::new(io));
         }
-        self.alive.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -78,7 +107,7 @@ impl<T: AsyncRead + Unpin + Send + 'static> AsyncRead for NoHalfClose<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.deaf.load(Ordering::SeqCst) {
+        if self.silence.deaf.load(Ordering::SeqCst) {
             // Woken by nothing: the carrier is dropped or it stays silent.
             return Poll::Pending;
         }
@@ -225,24 +254,24 @@ enum Kind {
 struct Pair {
     client: zmux::Session,
     server: zmux::Session,
-    deaf: Arc<AtomicBool>,
-    alive: Arc<AtomicUsize>,
+    silence: Arc<Silence>,
+    remaining: async_mpsc::UnboundedReceiver<Infallible>,
+    _retained: Retained,
     _listener: zmux::Listener,
 }
 
-async fn tokio_pair(kind: Kind, linger: Duration) -> Pair {
-    let deaf = Arc::new(AtomicBool::new(false));
-    let alive = Arc::new(AtomicUsize::new(0));
-    let listener = zmux::Listener::new(config(linger), zmux::ListenerConfig::default())
+async fn tokio_pair(kind: Kind, config: Config) -> Pair {
+    let silence = Arc::new(Silence::default());
+    let (lifetime, remaining) = CarrierLifetime::new();
+    let listener = zmux::Listener::new(config.clone(), zmux::ListenerConfig::default())
         .expect("valid listener configuration");
-    // The server's end is the one that may go deaf; the client's never does.
-    let never = Arc::new(AtomicBool::new(false));
+    let never = Arc::new(Silence::default());
     let (client_io, server_io) = match kind {
         Kind::Duplex => {
             let (a, b) = tokio::io::duplex(1 << 16);
             (
-                zmux::PipeIo::new(NoHalfClose::new(a, &never, &alive)),
-                zmux::PipeIo::new(NoHalfClose::new(b, &deaf, &alive)),
+                zmux::PipeIo::new(NoHalfClose::new(a, &never, &lifetime)),
+                zmux::PipeIo::new(NoHalfClose::new(b, &silence, &lifetime)),
             )
         }
         Kind::Tcp => {
@@ -252,8 +281,8 @@ async fn tokio_pair(kind: Kind, linger: Duration) -> Pair {
                 .unwrap();
             let (b, _) = l.accept().await.unwrap();
             (
-                zmux::PipeIo::new(NoHalfClose::new(a, &never, &alive)),
-                zmux::PipeIo::new(NoHalfClose::new(b, &deaf, &alive)),
+                zmux::PipeIo::new(NoHalfClose::new(a, &never, &lifetime)),
+                zmux::PipeIo::new(NoHalfClose::new(b, &silence, &lifetime)),
             )
         }
     };
@@ -261,24 +290,21 @@ async fn tokio_pair(kind: Kind, linger: Duration) -> Pair {
     tokio::spawn(async move {
         let _ = l.handle_pipe(server_io, hint()).await;
     });
-    let client = zmux::Session::connect(client_io, config(linger))
-        .await
-        .unwrap();
+    let client = zmux::Session::connect(client_io, config).await.unwrap();
     let server = listener.accept().await.unwrap();
     Pair {
         client,
         server,
-        deaf,
-        alive,
+        silence,
+        remaining,
+        _retained: lifetime.retain(),
         _listener: listener,
     }
 }
 
-/// Opens a stream, then has one side close with code 42 while the other reads: the code
-/// reaches it, and the time until both carriers are gone is returned. The carriers of
-/// dropped sessions are kept open (`KEPT`), so that the closing side's own end of input
-/// can come only from the peer's `CONNECTION_CLOSE`.
-async fn tokio_close(p: &Pair, server_closes: bool) -> Duration {
+/// Delivers the application's close code and waits for both carriers to be
+/// released without advancing their linger clocks.
+async fn tokio_close(mut p: Pair, server_closes: bool) {
     let (closer, other) = if server_closes {
         (&p.server, &p.client)
     } else {
@@ -293,7 +319,6 @@ async fn tokio_close(p: &Pair, server_closes: bool) -> Duration {
         .await
         .unwrap();
     let closer = closer.clone();
-    let began = Instant::now();
     let closing = tokio::spawn(async move {
         closer.close_with_error(VarInt::from_u32(42), b"done").await;
     });
@@ -303,71 +328,52 @@ async fn tokio_close(p: &Pair, server_closes: bool) -> Duration {
         zmux::ReadToEndError::Read(StreamError::SessionLost(e)) => assert!(closed_with_42(&e)),
         e => panic!("{e}"),
     }
-    while p.alive.load(Ordering::SeqCst) > 0 {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    let took = began.elapsed();
+    assert!(p.remaining.recv().await.is_none());
     closing.await.unwrap();
-    took
 }
 
-async fn tokio_prompt(kind: Kind, server_closes: bool) {
-    let mut worst = Duration::ZERO;
-    for i in 0..REPEAT {
-        let took = tokio::time::timeout(Duration::from_secs(10), async {
-            let p = tokio_pair(kind, LONG_LINGER).await;
-            tokio_close(&p, server_closes).await
+async fn tokio_prompt(kind: Kind) {
+    for server_closes in [true, false] {
+        tokio::time::timeout(WATCHDOG, async {
+            let (_, config) = manual_config();
+            tokio_close(tokio_pair(kind, config).await, server_closes).await;
         })
         .await
-        .unwrap_or_else(|_| panic!("{kind:?} iteration {i} in time"));
-        worst = worst.max(took);
-        assert!(
-            took < PROMPT,
-            "{kind:?} iteration {i} (server closes: {server_closes}): {took:?}"
-        );
+        .expect("both carriers settle while the linger clock is stopped");
     }
-    eprintln!("{kind:?}: worst {worst:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_close_without_half_close_ends_at_once_over_a_duplex() {
-    tokio_prompt(Kind::Duplex, true).await;
-    tokio_prompt(Kind::Duplex, false).await;
+    tokio_prompt(Kind::Duplex).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_close_without_half_close_ends_at_once_over_tcp() {
-    tokio_prompt(Kind::Tcp, true).await;
-    tokio_prompt(Kind::Tcp, false).await;
+    tokio_prompt(Kind::Tcp).await;
 }
 
 /// A peer that never sends its `CONNECTION_CLOSE` nor ends its input leaves the linger as the
 /// bound, and the carriers close at it.
 async fn tokio_silent(kind: Kind) {
-    let linger = Duration::from_millis(150);
-    for i in 0..10 {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let p = tokio_pair(kind, linger).await;
-            p.deaf.store(true, Ordering::SeqCst);
-            let began = Instant::now();
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                p.server.close_with_error(VarInt::from_u32(42), b"done"),
-            )
-            .await
-            .unwrap();
-            while p.alive.load(Ordering::SeqCst) > 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            let took = began.elapsed();
-            assert!(
-                took >= linger.mul_f32(0.9) && took < linger + Duration::from_secs(2),
-                "{kind:?} iteration {i}: {took:?}"
-            );
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{kind:?} iteration {i} in time"));
-    }
+    let (clock, config) = manual_config();
+    let mut timers = clock.registrations();
+    tokio::time::timeout(WATCHDOG, async {
+        let mut p = tokio_pair(kind, config).await;
+        p.silence.deaf.store(true, Ordering::SeqCst);
+        p.server
+            .close_with_error(VarInt::from_u32(42), b"done")
+            .await;
+        assert_eq!(p.server.state(), SessionState::Closing);
+        clock.advance(LINGER);
+        p.server.closed().await;
+        assert!(p.remaining.recv().await.is_none());
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let registered: Vec<_> = std::iter::from_fn(|| timers.try_recv().ok()).collect();
+        panic!("the silent carrier did not settle at the injected linger deadline; registered timers: {registered:?}");
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -413,39 +419,26 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for NeverShutdown<T> {
 /// closed and its last write had the time to finish, not left to hang: the
 /// bound is the linger (the close ends at it at the latest) and the final
 /// write time after it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn a_shutdown_that_never_completes_is_aborted() {
-    let linger = Duration::from_millis(250);
-    let listener = zmux::Listener::new(config(linger), zmux::ListenerConfig::default())
-        .expect("valid listener configuration");
-    let (a, b) = tokio::io::duplex(1 << 16);
-    let aborted = Arc::new(AtomicBool::new(false));
-    let flag = aborted.clone();
-    let client_io = zmux::PipeIo::new(NeverShutdown(a)).with_abort(move || {
-        flag.store(true, Ordering::SeqCst);
-    });
-    let l = listener.clone();
-    tokio::spawn(async move {
-        let _ = l.handle_pipe(zmux::PipeIo::new(b), hint()).await;
-    });
-    let client = zmux::Session::connect(client_io, config(linger))
-        .await
+    tokio::time::timeout(WATCHDOG, async {
+        let config = config(Duration::from_millis(250));
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (abort, aborted) = oneshot::channel();
+        let client_io = zmux::PipeIo::new(NeverShutdown(a)).with_abort(move || {
+            let _ = abort.send(());
+        });
+        let (client, _server) = tokio::try_join!(
+            zmux::Session::connect(client_io, config.clone()),
+            zmux::Session::accept(zmux::PipeIo::new(b), config),
+        )
         .unwrap();
-    let _server = listener.accept().await.unwrap();
-    let began = Instant::now();
-    tokio::time::timeout(Duration::from_secs(5), client.close())
-        .await
-        .expect("the close ends");
-    while !aborted.load(Ordering::SeqCst) {
-        assert!(
-            began.elapsed() < Duration::from_secs(4),
-            "the carrier was not aborted"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    tokio::time::timeout(Duration::from_secs(2), client.closed())
-        .await
-        .expect("the session's task is released");
+        client.close().await;
+        aborted.await.expect("the stalled shutdown was aborted");
+        client.closed().await;
+    })
+    .await
+    .expect("abort scenario timed out");
 }
 
 // ---- std driver -------------------------------------------------------------------------
@@ -455,54 +448,41 @@ async fn a_shutdown_that_never_completes_is_aborted() {
 #[derive(Default)]
 struct Silence {
     deaf: AtomicBool,
-    ended: AtomicBool,
+    ended: Mutex<bool>,
+    end_signal: Condvar,
 }
 
-/// A half of a carrier, counted while alive.
-struct Half<T: Send + 'static> {
-    io: Option<T>,
-    alive: Arc<AtomicUsize>,
-    silence: Arc<Silence>,
-}
+impl Silence {
+    fn end(&self) {
+        *self.ended.lock().unwrap() = true;
+        self.end_signal.notify_all();
+    }
 
-impl<T: Send + 'static> Half<T> {
-    fn new(io: T, alive: &Arc<AtomicUsize>, silence: &Arc<Silence>) -> Self {
-        alive.fetch_add(1, Ordering::SeqCst);
-        Self {
-            io: Some(io),
-            alive: alive.clone(),
-            silence: silence.clone(),
-        }
+    fn wait_end(&self) {
+        drop(
+            self.end_signal
+                .wait_while(self.ended.lock().unwrap(), |ended| !*ended)
+                .unwrap(),
+        );
     }
 }
 
-impl<T: Send + 'static> Drop for Half<T> {
-    fn drop(&mut self) {
-        if let Some(io) = self.io.take() {
-            KEPT.lock().unwrap().push(Box::new(io));
-        }
-        self.alive.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-impl<T: Read + Send + 'static> Read for Half<T> {
+impl<T: Read + Send + 'static> Read for NoHalfClose<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let n = self.io.as_mut().expect("open").read(buf)?;
             if !self.silence.deaf.load(Ordering::SeqCst) {
                 return Ok(n);
             }
-            while n == 0 && !self.silence.ended.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(2));
-            }
             if n == 0 {
+                self.silence.wait_end();
                 return Ok(0);
             }
         }
     }
 }
 
-impl<T: Write + Send + 'static> Write for Half<T> {
+impl<T: Write + Send + 'static> Write for NoHalfClose<T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.io.as_mut().expect("open").write(buf)
     }
@@ -515,18 +495,18 @@ impl<T: Write + Send + 'static> Write for Half<T> {
 /// [`Shutdown::Write`].
 fn blocking_carrier(
     s: TcpStream,
-    alive: &Arc<AtomicUsize>,
+    lifetime: &CarrierLifetime,
     silence: &Arc<Silence>,
 ) -> zmux::blocking::PipeIo {
     let close = zmux::blocking::PipeIo::tcp_closer(s.try_clone().unwrap());
     let silence_c = silence.clone();
     zmux::blocking::PipeIo::from_halves(
-        Half::new(s.try_clone().unwrap(), alive, silence),
-        Half::new(s, alive, silence),
+        NoHalfClose::new(s.try_clone().unwrap(), silence, lifetime),
+        NoHalfClose::new(s, silence, lifetime),
     )
     .with_closer(move |how| {
         if how != Shutdown::Write {
-            silence_c.ended.store(true, Ordering::SeqCst);
+            silence_c.end();
             close(how);
         }
     })
@@ -539,38 +519,41 @@ fn tcp_pair() -> (TcpStream, TcpStream) {
     (a, b)
 }
 
-/// Runs `f` on a thread and fails when it does not finish within `secs`.
-fn watchdog<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+/// Runs a blocking scenario off the test thread so a stalled driver cannot hang the harness.
+fn watchdog(f: impl FnOnce() + Send + 'static) {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
+    let scenario = std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
     });
-    match rx.recv_timeout(Duration::from_secs(secs)) {
-        Ok(v) => v,
-        Err(mpsc::RecvTimeoutError::Timeout) => panic!("{what}: did not resolve within {secs} s"),
-        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: panicked"),
+    if matches!(
+        rx.recv_timeout(WATCHDOG),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ) {
+        panic!("blocking close scenario timed out");
     }
+    scenario.join().unwrap();
 }
 
 /// A client and the server's session over one TCP carrier; the server's end listens to
 /// `silence`.
 fn blocking_pair(
-    linger: Duration,
-    alive: &Arc<AtomicUsize>,
+    config: Config,
+    lifetime: &CarrierLifetime,
     silence: &Arc<Silence>,
 ) -> (
     zmux::blocking::Session,
     zmux::blocking::Session,
     zmux::blocking::Listener,
 ) {
-    let l = zmux::blocking::Listener::new(config(linger), zmux::ListenerConfig::default(), None)
+    let l = zmux::blocking::Listener::new(config.clone(), zmux::ListenerConfig::default(), None)
         .expect("valid listener configuration");
     let (a, b) = tcp_pair();
-    let ca = blocking_carrier(a, alive, &Arc::new(Silence::default()));
-    let cb = blocking_carrier(b, alive, silence);
+    let ca = blocking_carrier(a, lifetime, &Arc::new(Silence::default()));
+    let cb = blocking_carrier(b, lifetime, silence);
     let ll = l.clone();
     let t = std::thread::spawn(move || ll.handle_pipe(cb, zmux::blocking::PipeHint::default()));
-    let client = zmux::blocking::Session::connect(ca, config(linger)).unwrap();
+    let client = zmux::blocking::Session::connect(ca, config).unwrap();
     t.join().unwrap().unwrap();
     let server = l
         .accept_timeout(Duration::from_secs(5))
@@ -580,14 +563,13 @@ fn blocking_pair(
     (client, server, l)
 }
 
-/// The server closes with 42 while the client reads: the code reaches the client; returns
-/// the time until every half of both carriers is dropped.
+/// Delivers the close code and waits for both carriers with the linger clock stopped.
 fn blocking_close(
     client: &zmux::blocking::Session,
     server: &zmux::blocking::Session,
     server_closes: bool,
-    alive: &Arc<AtomicUsize>,
-) -> Duration {
+    mut remaining: async_mpsc::UnboundedReceiver<Infallible>,
+) {
     let (closer, other) = if server_closes {
         (server, client)
     } else {
@@ -602,7 +584,6 @@ fn blocking_close(
     let mut got = [0; 7];
     sr.read_exact(&mut got).unwrap();
     let s = closer.clone();
-    let began = Instant::now();
     let closing = std::thread::spawn(move || s.close_with_error(VarInt::from_u32(42), b"done"));
     let e = r.read_to_end(1 << 10).unwrap_err();
     let _ = w.finish();
@@ -612,57 +593,39 @@ fn blocking_close(
         )) => assert!(closed_with_42(&e)),
         e => panic!("{e:?}"),
     }
-    while alive.load(Ordering::SeqCst) > 0 {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let took = began.elapsed();
+    assert!(remaining.blocking_recv().is_none());
     closing.join().unwrap();
-    took
 }
 
 #[test]
 fn a_blocking_close_without_half_close_ends_at_once_over_tcp() {
-    let mut worst = Duration::ZERO;
-    for i in 0..REPEAT {
-        let server_closes = i % 2 == 0;
-        let took = watchdog(10, &format!("iteration {i}"), move || {
-            let alive = Arc::new(AtomicUsize::new(0));
-            let (client, server, l) =
-                blocking_pair(LONG_LINGER, &alive, &Arc::new(Silence::default()));
-            let took = blocking_close(&client, &server, server_closes, &alive);
-            l.close();
-            took
+    for server_closes in [true, false] {
+        watchdog(move || {
+            let (_, config) = manual_config();
+            let (lifetime, remaining) = CarrierLifetime::new();
+            let (client, server, listener) =
+                blocking_pair(config, &lifetime, &Arc::new(Silence::default()));
+            let _retained = lifetime.retain();
+            blocking_close(&client, &server, server_closes, remaining);
+            listener.close();
         });
-        worst = worst.max(took);
-        assert!(
-            took < PROMPT,
-            "iteration {i} (server closes: {server_closes}): {took:?}"
-        );
     }
-    eprintln!("blocking: worst {worst:?}");
 }
 
 #[test]
 fn a_blocking_silent_peer_leaves_the_linger_as_the_bound() {
-    let linger = Duration::from_millis(150);
-    for i in 0..10 {
-        watchdog(10, &format!("iteration {i}"), move || {
-            let alive = Arc::new(AtomicUsize::new(0));
-            let silence = Arc::new(Silence::default());
-            let (client, server, l) = blocking_pair(linger, &alive, &silence);
-            silence.deaf.store(true, Ordering::SeqCst);
-            let began = Instant::now();
-            server.close_with_error(VarInt::from_u32(42), b"done");
-            while alive.load(Ordering::SeqCst) > 0 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            let took = began.elapsed();
-            assert!(
-                took >= linger.mul_f32(0.9) && took < linger + Duration::from_secs(2),
-                "iteration {i}: {took:?}"
-            );
-            drop(client);
-            l.close();
-        });
-    }
+    watchdog(|| {
+        let (clock, config) = manual_config();
+        let (lifetime, mut remaining) = CarrierLifetime::new();
+        let silence = Arc::new(Silence::default());
+        let (_client, server, listener) = blocking_pair(config, &lifetime, &silence);
+        let _retained = lifetime.retain();
+        silence.deaf.store(true, Ordering::SeqCst);
+        server.close_with_error(VarInt::from_u32(42), b"done");
+        assert_eq!(server.state(), SessionState::Closing);
+        clock.advance(LINGER);
+        server.closed().unwrap();
+        assert!(remaining.blocking_recv().is_none());
+        listener.close();
+    });
 }

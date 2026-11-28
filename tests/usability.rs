@@ -42,7 +42,7 @@ async fn no_secret_source_is_a_configuration_error() {
         let mut c = Config::multipath(auth.clone());
         let ((a, _), _b) = duplex(1 << 16);
         assert!(invalid(connect_alone(a, c.clone()).await).contains("secret source"));
-        c.max_pipes = 1;
+        c.session_policy.limits.steady_attachments = 1;
         c.resume_timeout = Some(Duration::from_secs(5));
         let ((a, _), _b) = duplex(1 << 16);
         assert!(invalid(connect_alone(a, c).await).contains("secret source"));
@@ -87,10 +87,8 @@ async fn bounds_are_errors() {
             c.pipe_auth = PipeAuth::psk(PSK);
             c.resume_timeout = Some(Duration::ZERO);
         }),
-        ("replay_window", |c| {
-            c.pipe_auth = PipeAuth::psk(PSK);
-            c.max_pipes = 8;
-            c.replay_window = zmux::Cap::Fixed(15);
+        ("steady_attachments", |c| {
+            c.session_policy.limits.steady_attachments = 0;
         }),
     ];
     for (name, f) in cases {
@@ -157,24 +155,33 @@ async fn a_suspension_without_a_redial_source_is_reported() {
         let mut client = Config::default();
         client.pipe_auth = PipeAuth::psk(PSK).with_end_to_end();
         client.resume_timeout = Some(Duration::from_secs(10));
-        client.redial_backoff.min = Duration::from_millis(50);
         client.logger = Some(logger);
-        if hooked {
+        let ((a, ca), (b, _cb)) = duplex(1 << 16);
+        let l = listener.clone();
+        tokio::spawn(async move { l.handle_pipe(b, zmux::PipeHint::default()).await });
+        let c = Session::connect(a, client).await.unwrap();
+        let _s = listener.accept().await.unwrap();
+        let controller = if hooked {
             let l = listener.clone();
-            client.redial = Some(zmux::Redial::new(move |_| {
+            let carrier = zmux::Candidate::new(zmux::CarrierKind::Streaming, move || {
                 let l = l.clone();
                 async move {
                     let ((a, _), (b, _)) = duplex(1 << 16);
                     tokio::spawn(async move { l.handle_pipe(b, zmux::PipeHint::default()).await });
                     Ok(a)
                 }
-            }));
-        }
-        let ((a, ca), (b, _cb)) = duplex(1 << 16);
-        let l = listener.clone();
-        tokio::spawn(async move { l.handle_pipe(b, zmux::PipeHint::default()).await });
-        let c = Session::connect(a, client).await.unwrap();
-        let _s = listener.accept().await.unwrap();
+            })
+            .with_identity("recovery", "recovery");
+            let options = zmux::ControllerOptions::new("usability-recovery", vec![carrier]);
+            let controller = zmux::SessionController::new(options).unwrap();
+            Some(
+                controller
+                    .manage(&c, zmux::SessionTarget::default())
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
         ca.fail();
         let mut seen = Vec::new();
         let r = tokio::time::timeout(Duration::from_secs(5), async {
@@ -195,7 +202,7 @@ async fn a_suspension_without_a_redial_source_is_reported() {
             .iter()
             .any(|e| matches!(e, SessionEvent::ResumeUnattended));
         assert_eq!(unattended, !hooked, "{seen:?}");
-        // Unread events coalesce: with a redial hook the resumption may
+        // Unread events coalesce: with a controller the resumption may
         // replace the suspension before it is read; the counter keeps it.
         assert_eq!(c.stats().suspensions, 1, "{seen:?}");
         assert!(
@@ -225,6 +232,9 @@ async fn a_suspension_without_a_redial_source_is_reported() {
             .count();
         assert_eq!(warns, usize::from(!hooked));
         c.close().await;
+        if let Some(control) = controller {
+            control.done().await;
+        }
         listener.close();
     }
 }

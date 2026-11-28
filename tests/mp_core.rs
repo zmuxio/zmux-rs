@@ -39,7 +39,7 @@ type Net = MpNet<(), Book>;
 
 fn config(policy: Scheduler, resume: bool) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.scheduler = policy;
     c.max_idle_timeout = Some(Duration::from_secs(60));
@@ -641,6 +641,81 @@ fn a_resumed_session_samples_its_new_pipe() {
     );
 }
 
+// A round trip takes nonzero logical time, so ACKs give both RTT and
+// delivery-rate samples even when data and control become ready together.
+fn exchange_with_one_ms_steps(n: &mut Net) {
+    for _ in 0..100 {
+        n.pump(4);
+        n.advance(1);
+    }
+}
+
+#[test]
+fn scheduler_views_follow_acks_after_reconnect() {
+    let mut n = net(Scheduler::SessionAffinity, true);
+    let second = n.add_pipe(&PipeOptions::default()).unwrap();
+    n.pump(10);
+    assert!(n.links[&second].attached());
+
+    n.open_and_write(20_000, false);
+    n.step(5000);
+    n.fail(0);
+    n.fail(second);
+    assert_eq!(n.ends[A].state(), State::Suspended);
+    assert_eq!(n.ends[B].state(), State::Suspended);
+    n.write_more(0, 10_000);
+
+    let replacement = n.add_pipe(&PipeOptions::default()).unwrap();
+    for flow in &mut n.links.get_mut(&replacement).unwrap().flows {
+        flow.delay = Duration::from_millis(1);
+    }
+    exchange_with_one_ms_steps(&mut n);
+
+    let replacement = PipeId::new(replacement);
+    assert!(matches!(n.ends[A].pipe_attached(replacement), Some(Ok(()))));
+    let stats = n.ends[A].pipe_info(replacement).unwrap();
+    assert_eq!(stats.min_rtt, Some(Duration::from_millis(2)));
+    assert!(stats.ack_delivery.is_some());
+    assert_eq!(n.ends[A].state(), State::Active);
+    assert_eq!(n.ends[B].state(), State::Active);
+    assert_eq!(n.s.recv[&0], n.s.sent[&0]);
+}
+
+#[test]
+fn scheduler_views_follow_acks_after_inbound_join_handoff() {
+    let mut n = net(Scheduler::SessionAffinity, false);
+    let uplink = n
+        .add_pipe_directed(false, true, &PipeOptions::default())
+        .unwrap();
+    n.links.get_mut(&uplink).unwrap().flows[A].delay = Duration::from_millis(20);
+    let downlink = n
+        .add_pipe_directed(true, false, &PipeOptions::default())
+        .unwrap();
+    n.links.get_mut(&downlink).unwrap().flows[B].delay = Duration::from_millis(20);
+    exchange_with_one_ms_steps(&mut n);
+
+    for id in [uplink, downlink] {
+        for end in &n.ends {
+            assert!(matches!(end.pipe_attached(PipeId::new(id)), Some(Ok(()))));
+        }
+    }
+    // The post-handoff traffic gets a better sample on the same carrier.
+    n.links.get_mut(&uplink).unwrap().flows[A].delay = Duration::from_millis(1);
+    n.links.get_mut(&downlink).unwrap().flows[B].delay = Duration::from_millis(1);
+    let uplink = PipeId::new(uplink);
+    let before = n.ends[A].pipe_info(uplink).unwrap();
+    assert_eq!(before.min_rtt, Some(Duration::from_millis(20)));
+    n.fail(0);
+    n.open_and_write(100_000, true);
+    exchange_with_one_ms_steps(&mut n);
+
+    assert_eq!(n.s.recv[&0], n.s.sent[&0]);
+    let stats = n.ends[A].pipe_info(uplink).unwrap();
+    assert!(stats.bytes_sent - before.bytes_sent >= 100_000);
+    assert_eq!(stats.min_rtt, Some(Duration::from_millis(2)));
+    assert!(stats.ack_delivery.is_some());
+}
+
 #[derive(Debug, Clone)]
 enum Op {
     Open(u16),
@@ -1131,8 +1206,8 @@ fn the_end_of_the_bootstrap_pair_is_no_failed_join() {
 #[test]
 fn held_joins_are_judged_one_by_one_at_the_cap() {
     let mut a_cfg = config(Scheduler::SpreadEta, true);
-    a_cfg.max_pipes = 1;
-    a_cfg.pipe_headroom = 1;
+    a_cfg.session_policy.limits.steady_attachments = 1;
+    a_cfg.session_policy.limits.join_headroom = 1;
     let mut b_cfg = config(Scheduler::SpreadEta, true);
     b_cfg.test_hooks().locator = b"server".to_vec();
     let mut n = Net::new(a_cfg, b_cfg, Book::default());
@@ -1204,8 +1279,8 @@ impl mp_net::Observe for Abandons {
 /// wrote in all.
 fn abandons_written(hold: bool, displace: bool) -> usize {
     let mut a_cfg = config(Scheduler::SpreadEta, true);
-    a_cfg.max_pipes = 1;
-    a_cfg.pipe_headroom = if displace { 1 } else { 2 };
+    a_cfg.session_policy.limits.steady_attachments = 1;
+    a_cfg.session_policy.limits.join_headroom = if displace { 1 } else { 2 };
     let mut b_cfg = config(Scheduler::SpreadEta, true);
     b_cfg.test_hooks().locator = b"server".to_vec();
     let mut n = MpNet::<Abandons, Book>::new(a_cfg, b_cfg, Book::default());
@@ -1694,4 +1769,39 @@ fn a_dead_timeout_below_one_second_is_invalid() {
         ..zmux::PipeLiveness::default()
     };
     assert!(p.validate().is_err());
+}
+
+/// A credited byte remains in the bounded writer queue across several ACKs. The same
+/// trace through the local pacer has a measurable rate but cannot prove capacity.
+#[test]
+fn ack_capacity_requires_continuous_unrestricted_demand() {
+    for unpaced in [true, false] {
+        let mut a = config(Scheduler::Affinity, false);
+        a.max_send_record = 8192;
+        a.test_hooks().unpaced = unpaced;
+        let mut b = config(Scheduler::Affinity, false);
+        b.initial_stream_receive_window = 4 * 1024 * 1024;
+        b.initial_connection_receive_window = 8 * 1024 * 1024;
+        b.test_hooks().locator = b"server".to_vec();
+        let mut n = Net::new(a, b, Book::default());
+        n.pump(10);
+        n.links.get_mut(&0).unwrap().cap = 4096;
+        n.open_and_write(3 * 1024 * 1024, false);
+        let mut measured = false;
+        let mut backlogged = false;
+        for _ in 0..32 {
+            n.advance(12);
+            n.step(usize::MAX);
+            if let Some(sample) = n.ends[A].pipes()[0].ack_delivery {
+                measured = true;
+                assert!(sample.end > sample.start);
+                if sample.load == zmux::DeliveryLoad::Backlogged {
+                    assert!(sample.bytes_per_second > 0);
+                    backlogged = true;
+                }
+            }
+        }
+        assert!(measured);
+        assert_eq!(backlogged, unpaced);
+    }
 }

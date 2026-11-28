@@ -74,7 +74,7 @@ fn listener(cred: Option<Credential>, psk: Vec<u8>) -> Listener {
 
 fn config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::none();
     c
 }
@@ -155,7 +155,7 @@ async fn a_session_joins_a_sealed_pipe() {
                 .await
         });
         let pipe = c
-            .begin_add_pipe(
+            .test_begin_join(
                 PipeIo::new(a),
                 PipeOptions::new().with_record_mode(RecordMode::Sealed),
             )
@@ -481,16 +481,16 @@ async fn the_handshake_shaper_plans_each_message() {
             ll.handle_pipe(PipeIo::new(d), zmux::PipeHint::default())
                 .await
         });
-        let begun = std::time::Instant::now();
         let (p, _) = tokio::time::timeout(Duration::from_secs(5), establish(PipeIo::new(a), &cfg))
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            begun.elapsed() >= Duration::from_millis(60),
-            "both of the client's delays"
-        );
         let c = Session::connect(p, config()).await.unwrap();
+        let stats = c.shaping_stats();
+        assert_eq!(stats.max_added_delay, Duration::from_micros(2000));
+        assert_eq!(stats.stall_spent, Duration::from_micros(4000));
+        assert_eq!(stats.wire_spent, 0);
+        assert_eq!(stats.handshake_measured_bytes == 0, no_padding);
         let s = l.accept().await.unwrap();
         echo_once(&c, &s).await;
         c.close().await;
@@ -603,7 +603,7 @@ async fn a_join_is_shaped_by_the_handshake_shaper() {
                 .await
         });
         let pipe = c
-            .begin_add_pipe(
+            .test_begin_join(
                 PipeIo::new(a),
                 PipeOptions::new().with_record_mode(RecordMode::Sealed),
             )
@@ -616,7 +616,7 @@ async fn a_join_is_shaped_by_the_handshake_shaper() {
         assert_eq!(*server_log.lock().unwrap(), ["reply"]);
         let st = c.shaping_stats();
         match (plan, fail) {
-            (Some(_), false) => assert!(st.wire_spent > 500, "{st:?}"),
+            (Some(_), false) => assert!(st.handshake_measured_bytes > 500, "{st:?}"),
             (None, _) => assert_eq!(st.handshake_unplanned, 2, "{st:?}"),
             (Some(_), true) => assert_eq!(st.faults, 2, "{st:?}"),
         }
@@ -906,7 +906,7 @@ async fn application_data_in_messages_1_2_and_3() {
         assert_eq!(r.message, 2);
         let peer = r.peer.expect("what is known of the client");
         assert_eq!(peer.peer_app_data[0].data, b"m1");
-        assert_eq!(peer.peer_static, []);
+        assert_eq!(peer.peer_static, b"");
         Box::pin(async { Ok(b"m2".to_vec()) })
     });
     let gate = Arc::new(SeesAdmission(std::sync::Mutex::new(Vec::new())));
@@ -1267,13 +1267,23 @@ async fn server_credential_decisions_name_their_reason() {
             KEYALG_X25519,
             &node_public(),
         ))));
-        let _ = tokio::time::timeout(Duration::from_secs(5), establish(PipeIo::new(a), &c)).await;
+        let _client_result =
+            tokio::time::timeout(Duration::from_secs(5), establish(PipeIo::new(a), &c))
+                .await
+                .expect("the client handshake ended");
         let r = tokio::time::timeout(Duration::from_secs(5), handled)
             .await
             .expect("in time")
             .expect("no panic escapes");
         assert_eq!(reasons.lock().unwrap().as_slice(), want.as_slice());
-        assert!(r.is_err());
+        assert_eq!(
+            r,
+            Err(if want.is_some() {
+                zmux::HandleError::Rejected
+            } else {
+                zmux::HandleError::SetupFailed
+            })
+        );
     }
 }
 
@@ -1629,4 +1639,82 @@ async fn hook_views_are_built_by_new() {
     assert_eq!(admission.handle, b"");
     admission.handle = b"h";
     assert_eq!(admission.peer.static_key, key);
+}
+
+#[tokio::test]
+async fn g4_establish_uses_the_sampled_session_profile_before_writing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zmux::shaping::{Budget, Caps, ProfileLimits, ShapedPipe, Shaper, ShapingBudget};
+
+    struct Noop;
+    impl Shaper for Noop {
+        fn capabilities(&self) -> Caps {
+            Caps::NONE
+        }
+    }
+
+    let counted_profile = |delay| {
+        let samples = Arc::new(AtomicUsize::new(0));
+        let mut config = config();
+        config.shaper = Some(Arc::new(|_: &ShapedPipe| {
+            Some(Box::new(Noop) as Box<dyn Shaper>)
+        }));
+        config.shaping_budget = Some(ShapingBudget::new({
+            let samples = samples.clone();
+            move || {
+                samples.fetch_add(1, Ordering::Relaxed);
+                Budget::new(
+                    None,
+                    Some(ProfileLimits::new(10, 50_000, 540, delay)),
+                    false,
+                )
+            }
+        }));
+        (config, samples)
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let client_delay = Duration::from_micros(500);
+        let server_delay = Duration::from_micros(3500);
+        let (mut client_session, client_samples) = counted_profile(client_delay);
+        let (mut server_session, server_samples) = counted_profile(server_delay);
+        let shaper =
+            HandshakeShaper::new(|_| Some(UnitPlan::default().with_delay(Duration::from_secs(1))));
+        let mut client_opts = client(Arc::new(PinVerifier::new(key_id(1, &node_public()))));
+        client_opts.shaper = Some(shaper.clone());
+        client_opts
+            .use_session_shaping(&mut client_session)
+            .unwrap();
+        let mut server_opts = ServerOptions {
+            shaper: Some(shaper),
+            ..Default::default()
+        };
+        server_opts
+            .use_session_shaping(&mut server_session)
+            .unwrap();
+        let server = ServerConfig::new(
+            Arc::new(TestGate {
+                psk: keys().psk.to_vec(),
+                cred: None,
+            }),
+            StaticKey::from_scalar(NODE),
+            server_opts,
+        )
+        .unwrap();
+        let mut listener = ListenerConfig::default();
+        listener.inbound_transform = Some(server.transform());
+        let listener = Listener::new(server_session, listener).unwrap();
+        let (carrier, _) = run(&listener, &client_opts).await.unwrap();
+        let client = Session::connect(carrier, client_session).await.unwrap();
+        let server = listener.accept().await.unwrap();
+
+        assert_eq!(client.shaping_stats().stall_spent, 2 * client_delay);
+        assert_eq!(client.shaping_stats().max_added_delay, client_delay);
+        assert_eq!(server.shaping_stats().stall_spent, server_delay);
+        assert_eq!(server.shaping_stats().max_added_delay, server_delay);
+        assert_eq!(client_samples.load(Ordering::Relaxed), 1);
+        assert_eq!(server_samples.load(Ordering::Relaxed), 1);
+    })
+    .await
+    .unwrap();
 }

@@ -11,7 +11,7 @@ use std::pin::Pin;
 use hyper_util::rt::TokioIo;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::http::{self, HeaderValue, Method, StatusCode, Version};
+use tokio_tungstenite::tungstenite::http::{self, HeaderValue, Method, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::Role;
 use zmux::adapter::{Admit, AdmitIo};
 use zmux::{CarrierInfo, Listener, PipeHint, PipeIo};
@@ -81,44 +81,6 @@ impl<B> std::fmt::Debug for RequestUpgrade<B> {
     }
 }
 
-/// Whether `req` is a WebSocket opening handshake:
-/// a `GET` with `Upgrade: websocket` and `Connection: upgrade` on HTTP/1.1,
-/// or an extended `CONNECT` with `:protocol` `websocket` on HTTP/2, version
-/// 13, with a key on HTTP/1.1.
-fn is_upgrade<B>(req: &http::Request<B>) -> bool {
-    let headers = req.headers();
-    let version_13 = headers
-        .get("Sec-WebSocket-Version")
-        .is_some_and(|v| v.as_bytes() == b"13");
-    if !version_13 {
-        return false;
-    }
-    if req.method() == Method::CONNECT {
-        return req
-            .extensions()
-            .get::<hyper::ext::Protocol>()
-            .is_some_and(|p| p.as_str().eq_ignore_ascii_case("websocket"));
-    }
-    req.method() == Method::GET
-        && req.version() <= Version::HTTP_11
-        && has_token(headers, "connection", "upgrade")
-        && has_token(headers, "upgrade", "websocket")
-        && headers.contains_key("Sec-WebSocket-Key")
-}
-
-fn tokens<'a>(headers: &'a http::HeaderMap, name: &str) -> impl Iterator<Item = &'a str> {
-    headers
-        .get_all(name)
-        .into_iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
-}
-
-fn has_token(headers: &http::HeaderMap, name: &str, token: &str) -> bool {
-    tokens(headers, name).any(|t| t.eq_ignore_ascii_case(token))
-}
-
 /// Upgrades `req`, a request a hyper server received from `peer` (the
 /// connection's remote address), to a WebSocket carrier, or refuses it,
 /// deciding on the request alone as [`accept`] does on a connection: it is
@@ -155,24 +117,27 @@ pub async fn accept_request<B, I>(
 where
     I: FnOnce(CarrierInfo) -> CarrierInfo,
 {
-    if !is_upgrade(&req) {
+    let protocol = req
+        .extensions()
+        .get::<hyper::ext::Protocol>()
+        .map(hyper::ext::Protocol::as_str);
+    let opening = zmux_http_head::websocket(req.method(), req.version(), req.headers(), protocol);
+    if opening == zmux_http_head::WebSocket::Other {
         return RequestUpgrade::Refused(req);
     }
-    let offered: Vec<String> = tokens(req.headers(), PROTOCOL_HEADER)
+    let Ok(source) = zmux_http_head::preprocess(listener, req.headers(), peer) else {
+        return RequestUpgrade::TooEarly;
+    };
+    if opening != zmux_http_head::WebSocket::Opening {
+        return RequestUpgrade::Refused(req);
+    }
+    let offered: Vec<String> = zmux_http_head::tokens(req.headers(), PROTOCOL_HEADER)
         .map(str::to_owned)
         .collect();
     let Some(protocol) = options.accept(&offered) else {
         return RequestUpgrade::Refused(req);
     };
-    if zmux::adapter::forwarded_early_data(req.headers()) {
-        listener.adapter().count_setup_failure();
-        return RequestUpgrade::TooEarly;
-    }
     let (mut parts, body) = req.into_parts();
-    let source = listener
-        .adapter()
-        .trusted_proxies()
-        .source(peer, &parts.headers);
     let Some(mut entry) = listener.adapter().enter(peer, Some(source)) else {
         // Not taken, nothing answered: the host's handler serves it.
         return RequestUpgrade::Refused(http::Request::from_parts(parts, body));
@@ -195,17 +160,7 @@ where
     match admit {
         Admit::Accept(_) | Admit::Defer | Admit::TakeOver(_) => {}
         Admit::Fallback(_) => {
-            if parts
-                .extensions
-                .get::<zmux::adapter::TrackRequestFallback>()
-                .is_some()
-            {
-                if let Some(outcome) = entry.request_fallback() {
-                    parts.extensions.insert(outcome);
-                }
-            } else {
-                entry.complete_request_fallback(true);
-            }
+            zmux_http_head::return_fallback(&mut entry, &mut parts.extensions);
             return RequestUpgrade::Refused(http::Request::from_parts(parts, body));
         }
         Admit::Stall => {

@@ -25,10 +25,10 @@ use std::task::{Context, Poll};
 /// - **Arguments.** `max` 0 takes nothing and returns 0 at once; `min` 0
 ///   is taken as 1 and `min` > `max` as `max`. `(n, n)` is an
 ///   all-or-nothing request, `(1, max)` one for as much as possible.
-/// - **Grant.** A successful grant takes and returns `n` with
-///   `min' <= n <= max`, where `min'` is `min`, or less when the limiter
-///   can never allow `min` at once (its burst). For an atomic unit (a
-///   datagram) asked as `(n, n)`, any grant means the whole unit may go.
+/// - **Grant.** A successful grant takes and returns `n` in the normalized
+///   inclusive range `min..=max`. An atomic request `(n, n)` must be
+///   granted in full. A request beyond the limiter's atomic capacity
+///   must fail immediately.
 ///   A limiter should not grant much less than its quantum (about 20 ms of
 ///   traffic at its rate) when `max` allows.
 /// - [`Limiter::poll_acquire`] waits until it can grant. A future dropped
@@ -42,15 +42,21 @@ use std::task::{Context, Poll};
 /// - Every method is safe under any number of concurrent callers, with no
 ///   fairness guarantee.
 ///
-/// zmux calls every method outside every lock of the session and never
-/// holds a buffer of its own while it waits, so a limiter may take a lock
-/// of its own (one shared by a group of sessions) or call into a session.
-/// A limiter that panics, or grants outside `1..=max` (0 or above `max`
-/// from `poll_acquire`, above `max` from `try_acquire`), fails the
+/// zmux calls every method outside session locks. Splice may retain a
+/// bounded output while waiting. A limiter that panics, or grants outside
+/// the normalized range (with 0 allowed from `try_acquire`), fails the
 /// acquisition that asked ([`LimitError`]) or, in `try_acquire`, counts as
 /// nothing taken; a panic in `refund` is ignored. The callers in zmux go
 /// through [`Permit`], which applies these rules.
 pub trait Limiter: Send + Sync {
+    /// Maximum atomic grant, independent of the current balance.
+    ///
+    /// Return `None` if the maximum is unknown, or `Some(u64::MAX)` for
+    /// unlimited capacity. Splice requires a declared maximum at installation.
+    fn max_burst_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Waits until the limiter can grant, then takes and returns the
     /// grant (see the trait's contract); `Err` takes nothing.
     fn poll_acquire(
@@ -77,7 +83,7 @@ pub struct LimitError(Cause);
 enum Cause {
     Limiter(Box<dyn StdError + Send + Sync>),
     Panicked,
-    InvalidGrant { granted: u64, max: u64 },
+    InvalidGrant { granted: u64, min: u64, max: u64 },
 }
 
 impl LimitError {
@@ -104,8 +110,8 @@ impl fmt::Display for LimitError {
         match &self.0 {
             Cause::Limiter(e) => write!(f, "limiter refused: {e}"),
             Cause::Panicked => f.write_str("limiter panicked"),
-            Cause::InvalidGrant { granted, max } => {
-                write!(f, "limiter granted {granted} bytes, outside 1..={max}")
+            Cause::InvalidGrant { granted, min, max } => {
+                write!(f, "limiter granted {granted} bytes, outside {min}..={max}")
             }
         }
     }
@@ -165,15 +171,19 @@ impl<'a> Permit<'a> {
             Ok(Poll::Ready(Err(e))) => return Poll::Ready(Err(e)),
             Ok(Poll::Ready(Ok(n))) => n,
         };
-        if got == 0 || got > max {
+        if !(min..=max).contains(&got) {
             refund(Some(limiter), got);
-            return Poll::Ready(Err(LimitError(Cause::InvalidGrant { granted: got, max })));
+            return Poll::Ready(Err(LimitError(Cause::InvalidGrant {
+                granted: got,
+                min,
+                max,
+            })));
         }
         Poll::Ready(Ok(Permit { limiter, left: got }))
     }
 
     /// A grant of `min..=max` bytes now ([`Limiter::try_acquire`]); `None`
-    /// when it is 0, the limiter panicked or granted above `max` (refunded
+    /// when it is 0, the limiter panicked or violated the range (refunded
     /// at once), or `max` is 0 (no call).
     pub fn try_acquire(limiter: &'a dyn Limiter, min: u64, max: u64) -> Option<Self> {
         if max == 0 {
@@ -181,7 +191,7 @@ impl<'a> Permit<'a> {
         }
         let min = min.clamp(1, max);
         let got = catch_unwind(AssertUnwindSafe(|| limiter.try_acquire(min, max))).unwrap_or(0);
-        if got > max {
+        if !(min..=max).contains(&got) {
             refund(Some(limiter), got);
             return None;
         }
@@ -205,6 +215,11 @@ impl<'a> Permit<'a> {
         self.left -= n.min(self.left);
     }
 
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn prepaid_remaining(&mut self) -> &mut u64 {
+        &mut self.left
+    }
+
     /// Uses every byte it holds; returns how many: the grant of an atomic
     /// unit, refunded with [`refund`] if the unit does not go on.
     pub(crate) fn take_all(mut self) -> u64 {
@@ -225,9 +240,9 @@ impl fmt::Debug for Permit<'_> {
 }
 
 /// Polices one datagram of `len` payload bytes: `try_acquire(len, len)`.
-/// The grant (which may be less than `len`, at the limiter's burst) when
-/// the datagram passes, to [`refund`] if it is then not queued; 0 when it
-/// is to be dropped. An empty datagram passes without a call (grant 0).
+/// The exact grant when the datagram passes, to [`refund`] if it is then
+/// not queued. Returns `None` when the datagram is to be dropped.
+/// An empty datagram passes without a call (grant 0).
 pub fn police(limiter: &dyn Limiter, len: u64) -> Option<u64> {
     if len == 0 {
         return Some(0);
@@ -378,6 +393,10 @@ mod tests {
         assert!(e.is_invalid_grant() && e.source().is_none());
         assert!(Permit::try_acquire(&over, 1, 8).is_none());
         assert_eq!(over.refunded.load(Ordering::SeqCst), 18);
+        let short = fixed(Some(7));
+        assert!(poll(&short, 8, 8).unwrap_err().is_invalid_grant());
+        assert_eq!(police(&short, 8), None);
+        assert_eq!(short.refunded.load(Ordering::SeqCst), 14);
         // 0 from acquire breaks the contract; from try it is a refusal.
         let zero = fixed(Some(0));
         assert!(poll(&zero, 1, 8).unwrap_err().is_invalid_grant());

@@ -2,6 +2,9 @@
 //! outlive them, what ended it is no authentication failure, and nothing starts on a carrier
 //! whose Confirm was written after the end.
 
+#[path = "common/clock.rs"]
+mod clock;
+
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,12 +12,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use clock::ManualClock;
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
 };
 use tokio::sync::{Notify, oneshot};
 use tokio::time::timeout;
 use zmux::proto::session::AllowRecordMode;
+use zmux::{ClockDomain, MonotonicClock};
 use zmux::{
     Config, HandleError, Listener, ListenerConfig, OnReject, PipeAuth, PipeDirection, PipeIo,
     PipeOptions, RejectAction, Session,
@@ -128,7 +133,7 @@ async fn a_join_without_a_reply_writer_releases_its_carrier() {
     let (client, server, listener) = sessions(Arc::default()).await;
     let (near, far) = duplex(1 << 16);
     let pipe = client
-        .begin_add_pipe(PipeIo::new(near), PipeOptions::default())
+        .test_begin_join(PipeIo::new(near), PipeOptions::default())
         .unwrap();
     let result = timeout(
         Duration::from_secs(3),
@@ -171,66 +176,50 @@ fn hold_confirm(mut near: DuplexStream, mut far: DuplexStream, replied: Arc<Noti
     });
 }
 
-fn record_joins(
-    c: &mut Config,
-) -> tokio::sync::mpsc::UnboundedReceiver<(zmux::PipeId, Option<zmux::JoinError>)> {
-    let (report, rx) = tokio::sync::mpsc::unbounded_channel();
-    c.join_outcome = Some(zmux::JoinOutcome::new(move |_, pipe, why| {
-        let _ = report.send((pipe, why));
-        zmux::Decision::Now(())
-    }));
-    rx
-}
-
-#[tokio::test(start_paused = true)]
-// HS-20, HS-24
-async fn unconfirmed_joins_report_their_exact_end() {
-    for ending in ["stop", "withdraw", "session", "timeout"] {
-        let mut cfg = config();
-        let mut outcomes = record_joins(&mut cfg);
-        let listener = Listener::new(cfg, ListenerConfig::default()).unwrap();
-        let (a, b) = duplex(65536);
-        let (client, bootstrap) = tokio::join!(
-            Session::connect(PipeIo::new(a), config()),
-            listener.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
+#[tokio::test]
+async fn acceptor_join_deadline_expires_while_confirm_is_held() {
+    timeout(Duration::from_secs(30), async {
+        let wait = Duration::from_secs(37);
+        let (clock, domain) = ManualClock::domain(Duration::from_secs(120));
+        let mut timers = clock.registrations();
+        let deadline = domain.now() + wait;
+        let mut accepting = config();
+        accepting.join_timeout = wait;
+        accepting.clock_domain = domain;
+        let listener = Listener::new(accepting, ListenerConfig::default()).unwrap();
+        let mut dialing = config();
+        dialing.join_timeout = Duration::from_secs(60);
+        let (near, far) = duplex(64 * 1024);
+        let (client, established) = tokio::join!(
+            Session::connect(PipeIo::new(near), dialing),
+            listener.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
         );
-        bootstrap.unwrap();
+        established.unwrap();
         let client = client.unwrap();
         let server = listener.accept().await.unwrap();
-        let (near, relay_a) = duplex(65536);
-        let (relay_b, far) = duplex(65536);
+
+        let (client_io, up) = duplex(64 * 1024);
+        let (down, server_io) = duplex(64 * 1024);
         let replied = Arc::new(Notify::new());
-        hold_confirm(relay_a, relay_b, replied.clone());
-        let l = listener.clone();
-        let handler = tokio::spawn(async move {
-            l.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
+        hold_confirm(up, down, replied.clone());
+        let _pipe = client
+            .test_begin_join(PipeIo::new(client_io), PipeOptions::default())
+            .unwrap();
+        let accepting = listener.clone();
+        let handled = tokio::spawn(async move {
+            accepting
+                .handle_pipe(PipeIo::new(server_io), zmux::PipeHint::default())
                 .await
         });
-        let pipe = client
-            .begin_add_pipe(PipeIo::new(near), PipeOptions::default())
-            .unwrap();
+        while timers.recv().await.unwrap() != deadline {}
         replied.notified().await;
-        match ending {
-            "stop" => listener.close(),
-            "withdraw" => handler.abort(),
-            "session" => server.abort(zmux::VarInt::from_u32(17), b"ending"),
-            _ => tokio::time::advance(config().join_timeout).await,
-        }
-        let (id, why) = outcomes.recv().await.unwrap();
-        assert_eq!(id, pipe.id());
-        assert!(
-            matches!(
-                (ending, &why),
-                ("stop", Some(zmux::JoinError::ListenerClosed))
-                    | ("withdraw", Some(zmux::JoinError::Cancelled))
-                    | ("session", Some(zmux::JoinError::SessionLost(_)))
-                    | ("timeout", Some(zmux::JoinError::Timeout))
-            ),
-            "{ending}: {why:?}"
-        );
-        let _ = handler.await;
-        assert!(outcomes.try_recv().is_err());
-    }
+        clock.advance(wait);
+        assert_eq!(handled.await.unwrap(), Err(HandleError::TimedOut));
+        assert_eq!(server.pipe_stats().len(), 1);
+        assert_eq!(listener.stats().timed_out, 1);
+    })
+    .await
+    .expect("acceptor Join timeout test watchdog");
 }
 
 #[tokio::test]
@@ -248,7 +237,7 @@ async fn an_unconfirmed_carrier_ends_with_session_and_listener() {
                 .await
         });
         let _pipe = client
-            .begin_add_pipe(PipeIo::new(near), PipeOptions::new())
+            .test_begin_join(PipeIo::new(near), PipeOptions::new())
             .unwrap();
         timeout(Duration::from_secs(5), replied.notified())
             .await
@@ -276,14 +265,9 @@ async fn an_unconfirmed_carrier_ends_with_session_and_listener() {
 // HS-24
 async fn an_evicted_unconfirmed_carrier_counts_as_refused() {
     let (a, b) = duplex(1 << 20);
-    let mut limits = ListenerConfig::default();
-    limits.limits.max_pending_per_session = 1;
-    let (reported, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
+    let limits = ListenerConfig::default();
     let mut cfg = config();
-    cfg.join_outcome = Some(zmux::JoinOutcome::new(move |_, pipe, error| {
-        reported.send((pipe, error)).unwrap();
-        zmux::Decision::Now(())
-    }));
+    cfg.session_policy.limits.pending_peer_joins = std::num::NonZeroUsize::MIN;
     let listener = Listener::new(cfg, limits).expect("valid listener configuration");
     let l = listener.clone();
     tokio::spawn(async move {
@@ -307,7 +291,7 @@ async fn an_evicted_unconfirmed_carrier_counts_as_refused() {
         }));
         pipes.push(
             client
-                .begin_add_pipe(PipeIo::new(near), PipeOptions::new())
+                .test_begin_join(PipeIo::new(near), PipeOptions::new())
                 .unwrap(),
         );
         timeout(Duration::from_secs(5), replied.notified())
@@ -321,30 +305,41 @@ async fn an_evicted_unconfirmed_carrier_counts_as_refused() {
         .expect("the evicted carrier's handler ended")
         .unwrap();
     assert_eq!(r.err(), Some(HandleError::Refused));
-    let (reported_id, error) = timeout(Duration::from_secs(2), outcomes.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(reported_id, pipes[0].id());
-    assert!(matches!(error, Some(zmux::JoinError::Evicted)), "{error:?}");
     let st = listener.stats();
     assert_eq!((st.refused, st.rejected, st.joins), (1, 0, 0));
     listener.close();
+}
+
+#[derive(Default)]
+struct ConfirmGate {
+    open: AtomicBool,
+    writer: atomic_waker::AtomicWaker,
+}
+
+impl ConfirmGate {
+    fn wait(&self, cx: &Context<'_>) -> bool {
+        self.writer.register(cx.waker());
+        !self.open.load(SeqCst)
+    }
+
+    fn release(&self) {
+        self.open.store(true, SeqCst);
+        self.writer.wake();
+    }
 }
 
 /// A carrier whose write of the Confirm waits for a gate, and which records its drop.
 struct Gated {
     inner: DuplexStream,
     writes: usize,
-    release: Arc<AtomicBool>,
-    gate: Arc<Notify>,
+    gate: Arc<ConfirmGate>,
     at_gate: Arc<Notify>,
-    dropped: Arc<AtomicBool>,
+    dropped: Arc<Notify>,
 }
 
 impl Drop for Gated {
     fn drop(&mut self) {
-        self.dropped.store(true, SeqCst);
+        self.dropped.notify_one();
     }
 }
 
@@ -365,14 +360,8 @@ impl AsyncWrite for Gated {
         b: &[u8],
     ) -> Poll<io::Result<usize>> {
         // The first write is the Hello, the second the Confirm.
-        if self.writes == 1 && !self.release.load(SeqCst) {
+        if self.writes == 1 && self.gate.wait(cx) {
             self.at_gate.notify_one();
-            let gate = self.gate.clone();
-            let w = cx.waker().clone();
-            tokio::spawn(async move {
-                gate.notified().await;
-                w.wake();
-            });
             return Poll::Pending;
         }
         let r = Pin::new(&mut self.inner).poll_write(cx, b);
@@ -402,22 +391,18 @@ async fn no_pipe_starts_after_its_end_during_the_confirm() {
             l.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
                 .await
         });
-        let (release, gate, at_gate, dropped) = (
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(Notify::new()),
-            Arc::new(Notify::new()),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let gate = Arc::new(ConfirmGate::default());
+        let at_gate = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
         let carrier = Gated {
             inner: near,
             writes: 0,
-            release: release.clone(),
             gate: gate.clone(),
             at_gate: at_gate.clone(),
             dropped: dropped.clone(),
         };
         let pipe = client
-            .begin_add_pipe(PipeIo::new(carrier), PipeOptions::new())
+            .test_begin_join(PipeIo::new(carrier), PipeOptions::new())
             .unwrap();
         timeout(Duration::from_secs(5), at_gate.notified())
             .await
@@ -427,19 +412,16 @@ async fn no_pipe_starts_after_its_end_during_the_confirm() {
         } else {
             client.close().await;
         }
-        release.store(true, SeqCst);
-        gate.notify_waiters();
+        gate.release();
         assert!(
             timeout(Duration::from_secs(5), pipe.joined())
                 .await
                 .unwrap()
                 .is_err()
         );
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !dropped.load(SeqCst) {
-            assert!(tokio::time::Instant::now() < deadline, "carrier left open");
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        timeout(Duration::from_secs(30), dropped.notified())
+            .await
+            .expect("carrier left open");
         listener.close();
     }
 }
@@ -477,11 +459,9 @@ impl AsyncWrite for ReplyWriter {
 // HS-04
 async fn authenticated_refusal_returns_before_reply_flush() {
     let mut acceptor = config();
-    let mut incoming = record_joins(&mut acceptor);
-    let mut dialer = config();
-    let mut outgoing = record_joins(&mut dialer);
-    acceptor.max_pipes = 2;
-    acceptor.pipe_headroom = 0;
+    let dialer = config();
+    acceptor.session_policy.limits.steady_attachments = 2;
+    acceptor.session_policy.limits.join_headroom = 0;
     let listener = Listener::new(acceptor, ListenerConfig::default()).unwrap();
     let mut limits = listener.limits();
     limits.max_pending = Some(1);
@@ -497,8 +477,8 @@ async fn authenticated_refusal_returns_before_reply_flush() {
     };
     let client = Session::connect(carrier(), dialer).await.unwrap();
     let _server = listener.accept().await.unwrap();
-    let first = client
-        .add_pipe(carrier(), PipeOptions::default())
+    client
+        .test_join(carrier(), PipeOptions::default())
         .await
         .unwrap();
     let (near, far) = duplex(1 << 16);
@@ -511,7 +491,7 @@ async fn authenticated_refusal_returns_before_reply_flush() {
         release: gate,
     };
     let refused = client
-        .begin_add_pipe(PipeIo::new(near), PipeOptions::default())
+        .test_begin_join(PipeIo::new(near), PipeOptions::default())
         .unwrap();
     let observer = listener.clone();
     let setup = tokio::spawn(async move {
@@ -542,13 +522,6 @@ async fn authenticated_refusal_returns_before_reply_flush() {
         Err(zmux::PipeError::Failed(zmux::PipeFailure::JoinRefused))
     ));
     assert!(observer.adapter().enter(source, None).is_some());
-    for queue in [&mut incoming, &mut outgoing] {
-        assert!(matches!(queue.recv().await, Some((id, None)) if id == first.id()));
-        assert!(
-            matches!(queue.recv().await, Some((id, Some(zmux::JoinError::Refused))) if id == refused.id())
-        );
-        assert!(queue.try_recv().is_err());
-    }
 }
 
 /// A carrier whose shutdown never completes; it says when it is first asked to.
@@ -604,7 +577,7 @@ async fn one_way_join_returns_with_unused_shutdown_pending() {
     // The client only sends: the acceptor's sending half is unused.
     let mut only_out = PipeOptions::new();
     only_out.direction = PipeDirection::Out;
-    let _pipe = client.begin_add_pipe(PipeIo::new(near), only_out).unwrap();
+    let _pipe = client.test_begin_join(PipeIo::new(near), only_out).unwrap();
     timeout(Duration::from_secs(5), at_shutdown)
         .await
         .expect("the handler reached the end of the unused half")
@@ -670,7 +643,7 @@ fn a_dropped_joiner_fails_its_join_at_once() {
         let pipe = {
             let _on_joiner_rt = joiner_rt.enter();
             client
-                .begin_add_pipe(PipeIo::new(near), PipeOptions::new())
+                .test_begin_join(PipeIo::new(near), PipeOptions::new())
                 .unwrap()
         };
         // The joiner's Hello is out, and nobody answers it.
@@ -731,144 +704,18 @@ async fn confirmed_join_returns_while_unused_reader_drops() {
     let handler = tokio::spawn(async move { l.handle_pipe(io, zmux::PipeHint::default()).await });
     let mut opt = PipeOptions::new();
     opt.direction = PipeDirection::In;
-    let _pipe = client.begin_add_pipe(PipeIo::new(near), opt).unwrap();
+    let _pipe = client.test_begin_join(PipeIo::new(near), opt).unwrap();
     dropping.await.unwrap();
     handler.await.unwrap().unwrap();
     release.send(()).unwrap();
 }
 
 #[tokio::test(start_paused = true)]
-// HS-21, HS-24, HS-25
-async fn outbound_outcome_survives_cancellation_and_distinguishes_handshake_failures() {
-    let mut cfg = config();
-    let mut reports = record_joins(&mut cfg);
-    let (near, far) = duplex(65536);
-    let listener = Listener::new(config(), ListenerConfig::default()).unwrap();
-    let (client, setup) = tokio::join!(
-        Session::connect(PipeIo::new(near), cfg),
-        listener.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
-    );
-    setup.unwrap();
-    let client = client.unwrap();
-    let _server = listener.accept().await.unwrap();
-    // The carrier is owned even if the future has never been polled.
-    let (near, _far) = duplex(65536);
-    drop(client.add_pipe(PipeIo::new(near), PipeOptions::default()));
-    assert!(matches!(
-        reports.recv().await,
-        Some((zmux::PipeId::UNASSIGNED, Some(zmux::JoinError::Cancelled)))
-    ));
-    // A syntactically unusable carrier is a join attempt without a local ID.
-    assert!(
-        client
-            .begin_add_pipe(PipeIo::reader(tokio::io::empty()), PipeOptions::default())
-            .is_err()
-    );
-    assert!(matches!(
-        reports.recv().await,
-        Some((
-            zmux::PipeId::UNASSIGNED,
-            Some(zmux::JoinError::Handshake(_))
-        ))
-    ));
-    for ending in ["gone", "aborted", "timeout", "session"] {
-        let (near, mut far) = duplex(65536);
-        let pipe = client
-            .begin_add_pipe(PipeIo::new(near), PipeOptions::default())
-            .unwrap();
-        assert_ne!(far.read(&mut [0; 4]).await.unwrap(), 0);
-        match ending {
-            "gone" => drop(far),
-            "aborted" => {
-                pipe.abort().unwrap();
-                let error = pipe.attached().await.unwrap_err();
-                assert!(error.is_gone());
-                assert!(matches!(
-                    error,
-                    zmux::PipeError::Failed(zmux::PipeFailure::Aborted)
-                ));
-            }
-            "session" => client.abort(zmux::VarInt::from_u32(57), b"terminal"),
-            _ => tokio::time::advance(config().join_timeout).await,
-        }
-        let (id, error) = reports.recv().await.unwrap();
-        assert_eq!(id, pipe.id());
-        assert_eq!(
-            error.as_ref().is_some_and(zmux::JoinError::is_gone),
-            matches!(ending, "gone" | "aborted")
-        );
-        assert!(
-            matches!(
-                (ending, &error),
-                ("gone", Some(zmux::JoinError::PipeGone))
-                    | ("aborted", Some(zmux::JoinError::PipeAborted))
-                    | ("timeout", Some(zmux::JoinError::Timeout))
-                    | ("session", Some(zmux::JoinError::SessionLost(_)))
-            ),
-            "{ending}: {error:?}"
-        );
-    }
-    assert!(reports.try_recv().is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// HS-26
-async fn a_join_callback_can_wait_for_its_own_session_to_close() {
-    let (entered, mut entering) = tokio::sync::mpsc::unbounded_channel();
-    let (left, mut leaving) = tokio::sync::mpsc::unbounded_channel();
-    let mut cfg = config();
-    cfg.join_outcome = Some(zmux::JoinOutcome::new(move |session, _, why| {
-        assert!(why.is_none());
-        let s = match session {
-            zmux::JoinSession::Tokio(s) => s,
-            #[cfg(feature = "blocking")]
-            zmux::JoinSession::Blocking(_) => unreachable!(),
-        };
-        let left = left.clone();
-        entered.send(()).unwrap();
-        zmux::Decision::later(async move {
-            let end = s.closed().await;
-            left.send(end).unwrap();
-        })
-    }));
-    let listener = Listener::new(cfg.clone(), ListenerConfig::default()).unwrap();
-    timeout(Duration::from_secs(5), async {
-        let (a, b) = duplex(65536);
-        let (client, setup) = tokio::join!(
-            Session::connect(PipeIo::new(a), cfg),
-            listener.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
-        );
-        setup.unwrap();
-        let client = client.unwrap();
-        let _server = listener.accept().await.unwrap();
-        let (a, b) = duplex(65536);
-        let (joined, setup) = tokio::join!(
-            client.add_pipe(PipeIo::new(a), PipeOptions::default()),
-            listener.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
-        );
-        setup.unwrap();
-        let pipe = joined.unwrap();
-        entering.recv().await.unwrap();
-        entering.recv().await.unwrap();
-        client.close().await;
-        leaving.recv().await.unwrap();
-        leaving.recv().await.unwrap();
-        pipe.attached().await.unwrap();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test(start_paused = true)]
 // HS-22
 async fn an_expired_join_cannot_be_revived_by_a_late_confirm() {
-    for (with_hook, on_reply) in [(true, false), (true, true), (false, false), (false, true)] {
+    {
         let mut cfg = config();
         cfg.join_timeout = Duration::from_secs(2);
-        let mut reports = record_joins(&mut cfg);
-        if !with_hook {
-            cfg.join_outcome = None;
-        }
         let listener = Listener::new(config(), ListenerConfig::default()).unwrap();
         let (a, b) = duplex(65536);
         let (client, setup) = tokio::join!(
@@ -879,10 +726,9 @@ async fn an_expired_join_cannot_be_revived_by_a_late_confirm() {
         let client = client.unwrap();
         let server = listener.accept().await.unwrap();
         let (near, far) = duplex(65536);
-        let (gate, allow) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let gate = Arc::new(ConfirmGate::default());
         let carrier = Gated {
             inner: near,
-            release: allow.clone(),
             gate: gate.clone(),
             writes: 0,
             at_gate: Arc::default(),
@@ -895,12 +741,9 @@ async fn an_expired_join_cannot_be_revived_by_a_late_confirm() {
                 .await
         });
         let joining = client.clone();
-        let mut adding = tokio::spawn(async move {
+        let adding = tokio::spawn(async move {
             joining
-                .add_pipe(
-                    PipeIo::new(carrier),
-                    PipeOptions::new().with_return_on_reply(on_reply),
-                )
+                .test_join(PipeIo::new(carrier), PipeOptions::new())
                 .await
         });
         entered.notified().await;
@@ -909,9 +752,6 @@ async fn an_expired_join_cannot_be_revived_by_a_late_confirm() {
             .into_iter()
             .find(|p| p.id().get() != 0)
             .unwrap();
-        if on_reply {
-            assert_eq!((&mut adding).await.unwrap().unwrap().id(), pipe.id());
-        }
         tokio::time::advance(Duration::from_secs(2)).await;
         let timed_out = |r| {
             matches!(
@@ -919,81 +759,13 @@ async fn an_expired_join_cannot_be_revived_by_a_late_confirm() {
                 Err(zmux::PipeError::Failed(zmux::PipeFailure::JoinTimedOut))
             )
         };
-        if !on_reply {
-            assert!(timed_out(adding.await.unwrap().map(|_| ())));
-        }
+        assert!(timed_out(adding.await.unwrap().map(|_| ())));
         assert!(timed_out(pipe.attached().await));
-        allow.store(true, SeqCst);
-        gate.notify_waiters();
+        gate.release();
         assert!(handler.await.unwrap().is_err());
         assert!(timed_out(pipe.attached().await));
-        if with_hook {
-            assert!(
-                matches!(reports.recv().await, Some((id, Some(zmux::JoinError::Timeout))) if id == pipe.id())
-            );
-        }
-        assert!(reports.try_recv().is_err());
         assert_eq!(server.pipe_stats().len(), 1);
     }
-}
-
-// HS-20, HS-27. Tracing and application delivery have independent queues.
-#[tokio::test]
-// HS-20, HS-27
-async fn application_events_wait_for_both_local_join_hooks() {
-    struct Trace;
-    impl zmux::Tracer for Trace {
-        fn trace(&self, _: zmux::SessionId, _: &zmux::TraceRecord) {}
-    }
-    let (tx, mut calls) = tokio::sync::mpsc::unbounded_channel();
-    let mut cfg = config();
-    cfg.tracer = Some(Arc::new(Trace));
-    cfg.join_outcome = Some(zmux::JoinOutcome::new(move |_, id, error| {
-        assert!(error.is_none());
-        let (release, gate) = oneshot::channel();
-        tx.send((id, release)).unwrap();
-        zmux::Decision::later(async move {
-            gate.await.unwrap();
-        })
-    }));
-    let l = Listener::new(cfg.clone(), ListenerConfig::default()).unwrap();
-    let (a, b) = duplex(65536);
-    let (client, boot) = tokio::join!(
-        Session::connect(PipeIo::new(a), cfg),
-        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
-    );
-    boot.unwrap();
-    let client = client.unwrap();
-    let server = l.accept().await.unwrap();
-    let (a, b) = duplex(65536);
-    let (pipe, join) = tokio::join!(
-        client.add_pipe(PipeIo::new(a), PipeOptions::default()),
-        l.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
-    );
-    join.unwrap();
-    let id = pipe.unwrap().id();
-    let gates = [calls.recv().await.unwrap(), calls.recv().await.unwrap()];
-    let events = async |s: &Session| {
-        loop {
-            if s.next_event().await.unwrap().pipe() == Some(id) {
-                break;
-            }
-        }
-    };
-    let mut a = Box::pin(events(&client));
-    let mut b = Box::pin(events(&server));
-    let mut cx = Context::from_waker(std::task::Waker::noop());
-    assert!(a.as_mut().poll(&mut cx).is_pending() && b.as_mut().poll(&mut cx).is_pending());
-    for (pipe, send) in gates {
-        assert_eq!(pipe, id);
-        send.send(()).unwrap();
-    }
-    tokio::time::timeout(Duration::from_secs(3), async {
-        tokio::join!(a, b);
-    })
-    .await
-    .unwrap();
-    assert!(calls.try_recv().is_err());
 }
 
 // HS-02. The only transport is the one whose setup caller withdraws.
@@ -1027,4 +799,168 @@ async fn cancellation_after_handoff_delivers_the_sessions_close() {
     assert!(
         matches!(client.closing().await, zmux::SessionError::ApplicationClosed {remote:true, code:c, reason,..} if c==code && reason.as_ref()==b"handed off")
     );
+}
+
+struct ReplyReceipt {
+    late_bytes: Option<usize>,
+    started: Option<oneshot::Sender<()>>,
+    released: oneshot::Receiver<()>,
+    dropped: Option<oneshot::Sender<usize>>,
+    accepted: usize,
+}
+
+impl ReplyReceipt {
+    fn entered(&mut self) {
+        if let Some(started) = self.started.take() {
+            started.send(()).unwrap();
+        }
+    }
+}
+
+impl AsyncWrite for ReplyReceipt {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.entered();
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl zmux::adapter::ChunkWrite for ReplyReceipt {
+    fn poll_write_chunks(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        chunks: &mut [zmux::Chunk],
+    ) -> Poll<io::Result<usize>> {
+        self.entered();
+        std::task::ready!(Pin::new(&mut self.released).poll(cx)).unwrap();
+        let [chunk] = chunks else {
+            panic!("one Join buffer")
+        };
+        let n = chunk.len().min(self.late_bytes.expect("submitted write"));
+        bytes::Buf::advance(chunk, n);
+        self.accepted += n;
+        Poll::Ready(Ok(n))
+    }
+
+    fn has_submitted_write(&self) -> bool {
+        self.late_bytes.is_some()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for ReplyReceipt {
+    fn drop(&mut self) {
+        let _ = self.dropped.take().unwrap().send(self.accepted);
+    }
+}
+
+#[tokio::test]
+async fn g4_cancelled_join_settles_only_a_submitted_adapters_late_prefix() {
+    timeout(Duration::from_secs(5), async {
+        for (chunked, late_bytes) in [
+            (false, None),
+            (true, None),
+            (true, Some(1)),
+            (true, Some(usize::MAX)),
+        ] {
+            use zmux::shaping::{HandshakeShaper, UnitPlan};
+
+            let wait = Duration::from_secs(2);
+            let (clock, domain) = ManualClock::domain(Duration::from_secs(120));
+            let mut cfg = config();
+            cfg.join_timeout = wait;
+            cfg.clock_domain = domain;
+            cfg.handshake_shaper = Some(HandshakeShaper::new(|v| {
+                (v.message == "reply").then_some(UnitPlan::new(1024, 0, 0))
+            }));
+            let listener = Listener::new(cfg, ListenerConfig::default()).unwrap();
+            let (near, far) = duplex(1 << 16);
+            let (client, setup) = tokio::join!(
+                Session::connect(PipeIo::new(near), config()),
+                listener.handle_pipe(PipeIo::new(far), zmux::PipeHint::default())
+            );
+            setup.unwrap();
+            let client = client.unwrap();
+            let server = listener.accept().await.unwrap();
+            let (near, far) = duplex(1 << 16);
+            let (reader, _writer) = tokio::io::split(far);
+            let (started, entered) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            let (dropped, finished) = oneshot::channel();
+            let writer = ReplyReceipt {
+                late_bytes,
+                started: Some(started),
+                released,
+                dropped: Some(dropped),
+                accepted: 0,
+            };
+            let io = if chunked {
+                PipeIo::from_chunk_halves(reader, writer)
+            } else {
+                PipeIo::from_halves(reader, writer)
+            };
+            let _join = client
+                .test_begin_join(PipeIo::new(near), PipeOptions::default())
+                .unwrap();
+            let handle =
+                tokio::spawn(
+                    async move { listener.handle_pipe(io, zmux::PipeHint::default()).await },
+                );
+
+            entered.await.unwrap();
+            let reserved = server.shaping_stats().handshake_reserved_bytes;
+            assert!(reserved > 0);
+            clock.advance(wait);
+            assert_eq!(handle.await.unwrap(), Err(HandleError::TimedOut));
+            let before = server.shaping_stats();
+            if late_bytes.is_some() {
+                assert_eq!(before.handshake_reserved_bytes, reserved);
+                release.send(()).unwrap();
+            }
+            let accepted = u64::try_from(finished.await.unwrap()).unwrap();
+            let stats = server.shaping_stats();
+            assert_eq!(stats.handshake_reserved_bytes, 0);
+            assert_eq!(stats.handshake_unresolved_bytes, 0);
+            let proved = match late_bytes {
+                None => {
+                    assert_eq!(accepted, 0);
+                    0
+                }
+                Some(1) => {
+                    // The byte-stream Size field is ordinary baseline.
+                    assert_eq!(accepted, 1);
+                    0
+                }
+                Some(_) => {
+                    assert!(accepted > reserved);
+                    reserved
+                }
+            };
+            assert_eq!(stats.handshake_measured_bytes, proved);
+            assert!(
+                stats.ledger.baseline_bytes - before.ledger.baseline_bytes >= accepted - proved
+            );
+            assert_eq!(server.pipe_stats().len(), 1);
+        }
+    })
+    .await
+    .unwrap();
 }

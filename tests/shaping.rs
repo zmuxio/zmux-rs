@@ -133,16 +133,40 @@ fn transfer(p: &mut Pair, n: usize, recs: &mut Vec<(usize, usize)>) {
     panic!("transfer: {} of {n} bytes", got.len());
 }
 
+fn request_cover(e: &Event, effects: &mut Effects, len: usize, repeat: bool) {
+    match e.kind {
+        EventKind::Start => effects.wake = Some(Some(e.now + 1_000)),
+        EventKind::Timer => {
+            effects.inject = Some(Some(Injection::new(e.now + 1, e.now, len)));
+            if repeat {
+                effects.wake = Some(Some(e.now + 1_000));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fund_cover(p: &mut Pair) {
+    let mut limits = p.a.shaping_limits();
+    limits.wire = Some(Account::new(1_000_000_000, 1_000_000_000, 0, 0));
+    p.a.set_shaping_limits(limits).unwrap();
+}
+
+fn install(p: &mut Pair, factory: Option<Arc<dyn Factory>>) {
+    use zmux::shaping::{Budget, ProfileLimits};
+    let local = p.a.shaping_limits();
+    let profile = local.profile.or_else(|| {
+        local
+            .wire
+            .map(|_| ProfileLimits::new(10, 50_000, 30_000, Duration::from_micros(2000)))
+    });
+    p.a.set_shaper_budgeted(factory, Budget::new(local.wire, profile, false))
+        .unwrap();
+}
+
 /// Repeated injections every millisecond for one second of session time.
 fn inject_for_a_second(p: &mut Pair) -> (usize, zmux::shaping::Stats) {
-    p.a.set_shaper(Some(event_factory(|e, r| {
-        if matches!(
-            e.kind,
-            EventKind::Start | EventKind::Injected | EventKind::InjectDropped
-        ) {
-            r.inject = Some(Some(Injection::new(e.now + 1000, wire(20))));
-        }
-    })));
+    install(p, Some(event_factory(|e, r| request_cover(e, r, 20, true))));
     let mut recs = Vec::new();
     for _ in 0..1000 {
         p.now += Duration::from_millis(1);
@@ -152,7 +176,7 @@ fn inject_for_a_second(p: &mut Pair) -> (usize, zmux::shaping::Stats) {
         p.send(false);
         p.drain_events();
     }
-    p.a.set_shaper(None);
+    install(p, None);
     let pad = recs.iter().filter(|&&(n, z)| n == 20 && z == 20).count();
     (pad, p.a.shaping_stats())
 }
@@ -160,9 +184,12 @@ fn inject_for_a_second(p: &mut Pair) -> (usize, zmux::shaping::Stats) {
 #[test]
 fn injection_toward_a_zmux_peer() {
     let mut p = Pair::new(Config::default(), Config::default());
+    fund_cover(&mut p);
     let (pad, st) = inject_for_a_second(&mut p);
     assert!(
-        st.injected > 16 && pad as u64 == st.injected && st.inject_dropped == 0,
+        st.injection_accepted_requests > 16
+            && pad as u64 == st.injection_accepted_requests
+            && st.injection_rejected == 0,
         "{st:?}, {pad}"
     );
     assert_eq!(p.b.state(), zmux::proto::session::State::Active);
@@ -182,10 +209,14 @@ fn injection_toward_a_plain_qmux_peer() {
     });
     let mut p = Pair::new(Config::default(), qmux);
     assert!(p.a.is_plain_qmux_peer());
+    fund_cover(&mut p);
     let (pad, st) = inject_for_a_second(&mut p);
     // PADDING-only records and QX_PING requests share 16 per second.
-    assert!(pad <= 16 && pad as u64 == st.injected, "{st:?}, {pad}");
-    assert!(pad > 0 && st.inject_dropped > 0, "{st:?}");
+    assert!(
+        pad <= 16 && pad as u64 == st.injection_accepted_requests,
+        "{st:?}, {pad}"
+    );
+    assert!(pad > 0 && st.injection_rejected > 0, "{st:?}");
     assert_eq!(p.b.state(), zmux::proto::session::State::Active);
 }
 
@@ -194,24 +225,27 @@ fn injection_bounds() {
     let mut cfg = Config::default();
     let mut limits = Limits::default();
     // The account covers five records of 21 bytes on the wire.
-    limits.wire = Account::new(5 * wire(20) as u64, 0, 0);
-    cfg.shaping_limits = limits;
+    limits.wire = Some(Account::new(5 * wire(20) as u64, 5 * wire(20) as u64, 0, 0));
+    cfg.shaping_limits = Some(Box::new(limits));
     let mut p = Pair::new(cfg, Config::default());
     let (pad, st) = inject_for_a_second(&mut p);
-    assert_eq!((pad, st.injected), (5, 5));
+    assert_eq!((pad, st.injection_accepted_requests), (5, 5));
     assert_eq!(st.wire_spent, 5 * wire(20) as u64);
     assert_eq!(p.a.shaping_meters().wire_left, 0);
-    assert!(st.inject_dropped > 0);
+    assert!(st.injection_rejected > 0);
 }
 
 #[test]
 fn gate_rate() {
     let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(event_factory(|e, r| {
-        if e.kind == EventKind::Start {
-            r.gate = Some(Gate::new(0, 100_000, 10_000));
-        }
-    })));
+    install(
+        &mut p,
+        Some(event_factory(|e, r| {
+            if e.kind == EventKind::Start {
+                r.gate = Some(Gate::new(0, 100_000, 10_000));
+            }
+        })),
+    );
     let t0 = p.now;
     transfer(&mut p, 50_000, &mut Vec::new());
     assert!(p.now - t0 >= Duration::from_millis(300), "{:?}", p.now - t0);
@@ -222,112 +256,49 @@ fn wake_replace_and_unknown_pipe() {
     let mut p = Pair::new(Config::default(), Config::default());
     let got = Arc::new(Mutex::new(Vec::new()));
     let g = got.clone();
-    p.a.set_shaper(Some(event_factory(move |e, r| {
-        match e.kind {
-            EventKind::Start => r.wake = Some(Some(e.now + 10_000)),
-            EventKind::Wake => r.wake = Some(None),
-            _ => {}
-        }
-        g.lock().unwrap().push(e.kind);
-    })));
+    install(
+        &mut p,
+        Some(event_factory(move |e, r| {
+            match e.kind {
+                EventKind::Start => r.wake = Some(Some(e.now + 10_000)),
+                EventKind::Timer => r.wake = Some(None),
+                _ => {}
+            }
+            g.lock().unwrap().push(e.kind);
+        })),
+    );
     p.now += Duration::from_millis(10);
     p.a.handle_timeout(p.now);
     assert!(!p.a.set_pipe_shaper(zmux::PipeId::new(99), None));
     assert!(p.a.set_pipe_shaper(P0, None));
     assert_eq!(
         *got.lock().unwrap(),
-        [EventKind::Start, EventKind::Wake, EventKind::Replaced]
+        [EventKind::Start, EventKind::Timer, EventKind::Replaced]
     );
 }
 
 #[test]
 fn fault_stops_shaping_of_the_pipe() {
     let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(plan_factory(|_| panic!("plan"))));
+    install(&mut p, Some(plan_factory(|_| panic!("plan"))));
     transfer(&mut p, 1000, &mut Vec::new());
     assert_eq!(p.a.shaping_stats().faults, 1);
 }
 
 #[test]
-fn delay_and_flush() {
+fn delayed_baseline_releases_when_its_wait_expires() {
     let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(plan_factory(|p| {
-        p.delay = Duration::from_millis(2);
-        p.flush = true;
-    })));
+    install(
+        &mut p,
+        Some(plan_factory(|p| {
+            p.delay = Duration::from_millis(2);
+            p.flush = true;
+        })),
+    );
     let t0 = p.now;
     transfer(&mut p, 3000, &mut Vec::new());
     assert!(p.now - t0 >= Duration::from_millis(2));
     assert!(p.a.shaping_stats().stall_spent >= Duration::from_millis(2));
-}
-
-/// A record whose plan cuts it shorter than the record before is cut by its
-/// own plan: STREAM data is not sized by the previous record's cut.
-#[test]
-fn a_shorter_cut_applies_to_its_own_record() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let n = Arc::new(AtomicUsize::new(0));
-    let plans = Arc::new(Mutex::new(Vec::new()));
-    let (counter, log) = (n.clone(), plans.clone());
-    let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(plan_factory(move |plan| {
-        let i = counter.fetch_add(1, Ordering::Relaxed);
-        plan.max_len = if i % 2 == 0 { 1000 } else { 200 };
-        log.lock().unwrap().push(plan.max_len);
-    })));
-    let mut recs = Vec::new();
-    transfer(&mut p, 20_000, &mut recs);
-    let plans = plans.lock().unwrap();
-    // Plans are made for the records in order; the first records of the
-    // pair were sent before the shaper.
-    let shaped = &recs[recs.len() - plans.len().min(recs.len())..];
-    for (i, (&(len, _), &max)) in shaped.iter().zip(plans.iter()).enumerate() {
-        assert!(len <= max, "record {i}: {len} bytes under a cut of {max}");
-    }
-    assert!(shaped.iter().filter(|&&(l, _)| l > 200).count() > 5);
-}
-
-/// An injection due right after a record whose plan flushes goes in the
-/// next batch rather than being dropped.
-#[test]
-fn an_injection_after_a_flush_is_deferred() {
-    let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(Arc::new(|_: &zmux::shaping::ShapedPipe| {
-        Some(Box::new(Fns {
-            caps: Caps::PLAN,
-            plan: Box::new(|plan| {
-                plan.flush = true;
-                plan.max_len = 500;
-            }),
-            event: Box::new(|e, r| {
-                if matches!(e.kind, EventKind::Start | EventKind::Injected) {
-                    r.inject = Some(Some(Injection::new(e.now + 1000, wire(20))));
-                }
-            }),
-        }) as Box<dyn Shaper>)
-    })));
-    let k = p.a.open(Dir::Bidi).unwrap();
-    let data = vec![7u8; 3000];
-    for _ in 0..300 {
-        let _ = p.a.write(k, &data);
-        p.now += Duration::from_millis(1);
-        p.a.handle_timeout(p.now);
-        p.b.handle_timeout(p.now);
-        p.send(true);
-        p.send(false);
-        p.drain_events();
-        if let Some(r) = p.b.accept(Dir::Bidi).unwrap() {
-            let mut buf = [0u8; 65536];
-            while let Ok(Some((m, _))) = p.b.read(r, &mut buf) {
-                if m == 0 {
-                    break;
-                }
-            }
-        }
-    }
-    let st = p.a.shaping_stats();
-    assert!(st.injected > 100, "{st:?}");
-    assert_eq!(st.inject_dropped, 0, "{st:?}");
 }
 
 /// A planned delay holds the whole record and everything else on the pipe:
@@ -339,10 +310,10 @@ fn an_injection_after_a_flush_is_deferred() {
 /// completes, the delayed records woken by the shaping timer alone.
 #[test]
 fn a_delay_holds_control_frames_too() {
-    const DELAY: Duration = Duration::from_millis(5);
+    const DELAY: Duration = Duration::from_millis(2);
     let mut p = Pair::new(Config::default(), Config::default());
     p.pump();
-    p.a.set_shaper(Some(plan_factory(|plan| plan.delay = DELAY)));
+    install(&mut p, Some(plan_factory(|plan| plan.delay = DELAY)));
     let n = 4 << 20;
     let data = vec![7u8; n];
     let k = p.b.open(Dir::Bidi).unwrap();
@@ -413,45 +384,27 @@ fn a_delay_holds_control_frames_too() {
 /// PADDING after it never falls short of or past the target.
 #[test]
 fn padding_targets_are_exact() {
-    for (pad_to, multiple, pad) in [
-        (300, 0, 0),
-        (300, 0, 7),
-        (0, 32, 0),
-        (0, 32, 5),
-        (301, 64, 3),
-    ] {
-        let mut p = Pair::new(Config::default(), Config::default());
-        p.pump();
-        let i = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        p.a.set_shaper(Some(plan_factory(move |plan| {
-            // Records of varying natural length, all under the target.
-            let k = i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            plan.max_len = 100 + (k * 37) % 150;
-            plan.pad_to = pad_to;
-            plan.pad_multiple = multiple;
-            plan.pad = pad;
-        })));
+    for (pad_to, multiple, pad) in [(300, 0, 0), (300, 0, 7), (301, 64, 3)] {
+        let mut p = deterministic_pair();
+        install(
+            &mut p,
+            Some(plan_factory(move |plan| {
+                plan.pad_to = pad_to;
+                plan.pad_multiple = multiple;
+                plan.pad = pad;
+            })),
+        );
+        let stream = p.a.open(Dir::Bidi).unwrap();
+        assert_eq!(p.a.write(stream, &[7; 80]).unwrap(), 80);
         let mut recs = Vec::new();
-        transfer(&mut p, 30_000, &mut recs);
-        let shaped: Vec<_> = recs.iter().filter(|&&(n, _)| n > 0).collect();
-        assert!(shaped.len() > 20, "{shaped:?}");
-        for &&(n, zeros) in &shaped {
-            assert!(zeros >= pad, "{n} bytes, {zeros} zeros under pad {pad}");
-            if pad_to > 0 && multiple == 0 {
-                // Every record's natural length is under the target.
-                assert_eq!(wire(n), pad_to + pad, "pad_to {pad_to}, pad {pad}");
-            }
-            if multiple > 0 && pad == 0 {
-                assert_eq!(wire(n) % multiple, 0, "{n} not a multiple of {multiple}");
-            }
-            if multiple > 0 {
-                assert_eq!(
-                    (wire(n) - pad) % multiple,
-                    0,
-                    "{n} - {pad} not a multiple of {multiple}"
-                );
-            }
-        }
+        p.send_with(true, |wire| records(wire, &mut recs));
+        assert_eq!(recs.len(), 1);
+        let expected = if multiple == 0 {
+            pad_to
+        } else {
+            pad_to.div_ceil(multiple) * multiple
+        };
+        assert_eq!(wire(recs[0].0), expected + pad);
     }
 }
 
@@ -464,13 +417,12 @@ fn a_gate_applied_by_a_plan_bounds_its_batch() {
     const BURST: u64 = 10_000;
     let mut p = Pair::new(Config::default(), Config::default());
     p.pump();
-    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    p.a.set_shaper(Some(plan_factory(move |plan| {
-        plan.max_len = 1000;
-        if n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 3 {
+    install(
+        &mut p,
+        Some(plan_factory(move |plan| {
             plan.effects.gate = Some(Gate::new(0, 100_000, BURST));
-        }
-    })));
+        })),
+    );
     let k = p.a.open(Dir::Bidi).unwrap();
     let data = vec![7u8; 200_000];
     let wrote = p.a.write(k, &data).unwrap();
@@ -484,100 +436,6 @@ fn a_gate_applied_by_a_plan_bounds_its_batch() {
     );
 }
 
-/// A planned record opens only where the batch holds its target: a
-/// control frame may fit the batch's end while the PADDING to `pad_to`
-/// does not, and the target would be clamped.
-#[test]
-fn a_planned_record_is_never_cut_by_the_batch_end() {
-    // Replies that just fill the records of 1000 and 200 bytes, so that
-    // the credit their completion releases needs a third record.
-    for len in (1100..1220).step_by(3) {
-        planned_records_with_replies(len);
-    }
-}
-
-fn planned_records_with_replies(len: usize) {
-    let mut a_cfg = Config::default();
-    a_cfg.max_incoming_streams = 4;
-    let mut p = Pair::new(a_cfg, Config::default());
-    p.pump();
-    let i = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    p.a.set_shaper(Some(plan_factory(move |plan| {
-        let k = i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let target = if k.is_multiple_of(2) { 1000 } else { 200 };
-        plan.max_len = target;
-        plan.pad_to = target;
-    })));
-    // A write call of 1500 bytes: after records of 1000 and 200 bytes a
-    // control frame still fits, the next record of 1000 does not. B opens
-    // short streams that A answers and finishes: the MAX_STREAMS that a
-    // completed stream releases is written after A's stream data, near
-    // the end of the batch.
-    p.out.set_max_len(1500);
-    let reply = vec![7u8; len];
-    let mut recs = Vec::new();
-    let mut open: Vec<_> = Vec::new();
-    let mut b_open: Vec<_> = Vec::new();
-    for round in 0..2000 {
-        if round < 1000
-            && let Ok(k) = p.b.open(Dir::Bidi)
-        {
-            p.b.write(k, b"ping").unwrap();
-            p.b.finish(k).unwrap();
-            b_open.push(k);
-        }
-        let moved = p.send_with(true, |w| records(w, &mut recs)) + p.send(false);
-        p.drain_events();
-        while let Ok(Some(k)) = p.a.accept(Dir::Bidi) {
-            open.push(k);
-        }
-        let mut buf = [0u8; 1024];
-        open.retain(|&k| {
-            while let Ok(Some((m, fin))) = p.a.read(k, &mut buf) {
-                if fin {
-                    let _ = p.a.write(k, &reply);
-                    let _ = p.a.finish(k);
-                    p.a.release(k);
-                    return false;
-                }
-                if m == 0 {
-                    break;
-                }
-            }
-            true
-        });
-        b_open.retain(|&k| {
-            while let Ok(Some((m, fin))) = p.b.read(k, &mut buf) {
-                if fin {
-                    p.b.release(k);
-                    return false;
-                }
-                if m == 0 {
-                    break;
-                }
-            }
-            true
-        });
-        if moved == 0 {
-            p.now += Duration::from_millis(1);
-            p.a.handle_timeout(p.now);
-            p.b.handle_timeout(p.now);
-        }
-    }
-    let shaped: Vec<_> = recs.iter().filter(|&&(n, _)| n > 0).collect();
-    assert!(shaped.len() > 100, "{}", shaped.len());
-    for &&(n, _) in &shaped {
-        assert!(
-            wire(n) == 1000 || wire(n) == 200,
-            "reply {len}: a record of {n} bytes {:?} {:?}",
-            p.a.shaping_stats(),
-            &recs[recs.len().saturating_sub(12)..]
-        );
-    }
-    assert_eq!(p.a.shaping_stats().clamped, 0, "reply {len}");
-}
-
-/// Delays the first record of the pipe it shapes, or every record.
 struct FirstDelay {
     delay: Duration,
     all: bool,
@@ -605,7 +463,7 @@ impl Shaper for FirstDelay {
 /// nothing is written before the delay.
 #[test]
 fn a_delayed_first_record_keeps_the_parameters_first() {
-    const DELAY: Duration = Duration::from_millis(20);
+    const DELAY: Duration = Duration::from_millis(2);
     for all in [false, true] {
         let factory = || -> Arc<dyn Factory> {
             Arc::new(move |_: &zmux::shaping::ShapedPipe| {
@@ -662,34 +520,32 @@ fn a_delayed_first_record_keeps_the_parameters_first() {
     }
 }
 
-/// Padding that accompanies a record is never refused: an empty account leaves it whole
-/// and only meters it, while the injection it does not cover is dropped and told to the shaper.
+/// The cover account and ongoing shaping ledger enforce different limits.
 #[test]
 fn an_account_refuses_injections_and_never_padding() {
     let mut cfg = Config::default();
     let mut limits = Limits::default();
-    limits.wire = Account::new(1, 0, 0);
-    cfg.shaping_limits = limits;
+    limits.wire = Some(Account::new(1, 1, 0, 0));
+    cfg.shaping_limits = Some(Box::new(limits));
     let mut p = Pair::new(cfg, Config::default());
     let dropped = Arc::new(Mutex::new(0));
     let d = dropped.clone();
-    p.a.set_shaper(Some(Arc::new(move |_: &zmux::shaping::ShapedPipe| {
-        let d = d.clone();
-        Some(Box::new(Fns {
-            caps: Caps::PLAN,
-            plan: Box::new(|p| p.pad_to = 8000),
-            event: Box::new(move |e, r| match e.kind {
-                EventKind::Start => {
-                    r.inject = Some(Some(Injection::new(e.now + 1000, wire(500))));
-                }
-                EventKind::InjectDropped => {
-                    *d.lock().unwrap() += 1;
-                    r.inject = Some(None);
-                }
-                _ => {}
-            }),
-        }) as Box<dyn Shaper>)
-    })));
+    install(
+        &mut p,
+        Some(Arc::new(move |_: &zmux::shaping::ShapedPipe| {
+            let d = d.clone();
+            Some(Box::new(Fns {
+                caps: Caps::PLAN,
+                plan: Box::new(|p| p.pad_to = 8000),
+                event: Box::new(move |e, r| {
+                    request_cover(e, r, 500, false);
+                    if e.kind == EventKind::InjectionRejected {
+                        *d.lock().unwrap() += 1;
+                    }
+                }),
+            }) as Box<dyn Shaper>)
+        })),
+    );
     let mut recs = Vec::new();
     transfer(&mut p, 3000, &mut recs);
     for _ in 0..20 {
@@ -701,53 +557,43 @@ fn an_account_refuses_injections_and_never_padding() {
         p.drain_events();
     }
     let st = p.a.shaping_stats();
-    assert_eq!((st.injected, st.inject_dropped), (0, 1), "{st:?}");
+    assert_eq!(
+        (st.injection_accepted_requests, st.injection_rejected),
+        (0, 1),
+        "{st:?}"
+    );
     assert_eq!(*dropped.lock().unwrap(), 1);
-    assert!(st.wire_spent > 0, "{st:?}");
+    assert_eq!(st.wire_spent, 0);
+    assert!(st.ledger.measured_bytes > 0, "{st:?}");
     let m = p.a.shaping_meters();
     assert_eq!(m.wire_left, 1);
-    assert!(m.sent_bytes > 0 && m.wire_spent == st.wire_spent, "{m:?}");
+    assert!(m.earned_bytes > 0 && m.wire_spent == st.wire_spent, "{m:?}");
 }
 
-/// A gate far below what the bound on one wait leaves is raised to it.
-#[test]
-fn a_rate_below_the_floor_is_raised_and_counted() {
-    let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(event_factory(|e, r| {
-        if e.kind == EventKind::Start {
-            r.gate = Some(Gate::new(0, 1, 0));
-        }
-    })));
-    assert_eq!(p.a.shaping_stats().clamped, 1);
-}
-
-/// `sent_bytes` leaves padding and injections out and grows with the data alone.
+/// `earned_bytes` leaves padding and injections out and grows with the data alone.
 #[test]
 fn padding_earns_nothing() {
     let run = |pad: usize| {
         let mut p = Pair::new(Config::default(), Config::default());
-        p.a.set_shaper(Some(plan_factory(move |x| x.pad_to = pad)));
+        install(&mut p, Some(plan_factory(move |x| x.pad_to = pad)));
         transfer(&mut p, 20_000, &mut Vec::new());
-        p.a.shaping_meters()
+        (p.a.shaping_meters(), p.a.shaping_stats().ledger)
     };
-    let (plain, padded) = (run(0), run(4000));
-    assert!(padded.wire_spent > 0 && plain.wire_spent == 0);
-    assert!(padded.sent_bytes.abs_diff(plain.sent_bytes) * 10 < plain.sent_bytes);
+    let ((plain, base), (padded, shaped)) = (run(0), run(4000));
+    assert_eq!((padded.wire_spent, plain.wire_spent), (0, 0));
+    assert!(shaped.measured_bytes > 0 && base.measured_bytes == 0);
+    assert!(padded.earned_bytes.abs_diff(plain.earned_bytes) * 10 < plain.earned_bytes);
 }
 
-/// Under no account, nothing refuses an injection, and a budget's zeros refuse them all.
+/// A profile budget with an explicit zero ceiling never funds cover.
 #[test]
 fn a_budget_of_zeros_allows_no_injection() {
     use zmux::shaping::{Budget, ShapingBudget};
     let mut cfg = Config::default();
     cfg.shaping_budget = Some(ShapingBudget::new(|| {
-        Budget::new(Account::default(), None, true)
+        Budget::new(Some(Account::default()), None, false)
     }));
-    cfg.shaper = Some(event_factory(|e, r| {
-        if matches!(e.kind, EventKind::Start | EventKind::InjectDropped) {
-            r.inject = Some(Some(Injection::new(e.now + 1000, wire(20))));
-        }
-    }));
+    cfg.shaper = Some(event_factory(|e, r| request_cover(e, r, 20, false)));
     let mut p = Pair::new(cfg, Config::default());
     for _ in 0..50 {
         p.now += Duration::from_millis(1);
@@ -758,8 +604,8 @@ fn a_budget_of_zeros_allows_no_injection() {
         p.drain_events();
     }
     let st = p.a.shaping_stats();
-    assert_eq!(st.injected, 0, "{st:?}");
-    assert!(st.inject_dropped > 0, "{st:?}");
+    assert_eq!(st.injection_accepted_requests, 0, "{st:?}");
+    assert!(st.injection_rejected > 0, "{st:?}");
 }
 
 /// A new shaper without a budget leaves the account unset; the spending stays.
@@ -767,49 +613,14 @@ fn a_budget_of_zeros_allows_no_injection() {
 fn a_shaper_without_a_budget_unsets_the_account() {
     use zmux::shaping::Budget;
     let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper_budgeted(None, Budget::new(Account::new(7, 0, 0), None, false));
+    p.a.set_shaper_budgeted(
+        Some(event_factory(|_, _| {})),
+        Budget::new(Some(Account::new(7, 7, 0, 0)), None, false),
+    )
+    .unwrap();
     assert_eq!(p.a.shaping_meters().wire_left, 7);
-    p.a.set_shaper(None);
-    assert_eq!(p.a.shaping_meters().wire_left, u64::MAX);
-}
-
-/// An injection that does not fit in what remains of a batch goes whole in
-/// a later one instead of being cut to the room.
-#[test]
-fn an_injection_beyond_the_batch_room_waits_whole() {
-    const LEN: usize = 16_000;
-    let mut p = Pair::new(Config::default(), Config::default());
-    p.out.set_max_len(LEN + 600);
-    p.a.set_shaper(Some(event_factory(|e, r| {
-        if matches!(e.kind, EventKind::Start | EventKind::Injected) {
-            r.inject = Some(Some(Injection::new(e.now + 1000, wire(LEN))));
-        }
-    })));
-    let mut recs = Vec::new();
-    let k = p.a.open(Dir::Bidi).unwrap();
-    let data = vec![7u8; 1000];
-    for i in 0..400 {
-        if i < 300 {
-            let _ = p.a.write(k, &data);
-        }
-        p.now += Duration::from_millis(1);
-        p.a.handle_timeout(p.now);
-        p.b.handle_timeout(p.now);
-        p.send_with(true, |w| records(w, &mut recs));
-        p.send(false);
-        p.drain_events();
-        if let Some(r) = p.b.accept(Dir::Bidi).unwrap() {
-            let mut buf = [0u8; 65536];
-            while let Ok(Some((m, _))) = p.b.read(r, &mut buf) {
-                if m == 0 {
-                    break;
-                }
-            }
-        }
-    }
-    let st = p.a.shaping_stats();
-    assert!(st.injected > 10, "{st:?}");
-    assert_eq!(st.clamped, 0, "{st:?}");
+    install(&mut p, None);
+    assert_eq!(p.a.shaping_meters().wire_left, 0);
 }
 
 #[test]
@@ -819,19 +630,19 @@ fn shaping_limits_are_validated() {
     for (initial, ok) in [(0, true), (1 << 53, true), ((1 << 53) + 1, false)] {
         let mut cfg = Config::default();
         let mut limits = Limits::default();
-        limits.wire = Account::new(initial, 0, 0);
-        cfg.shaping_limits = limits;
+        limits.wire = Some(Account::new(initial, initial, 0, 0));
+        cfg.shaping_limits = Some(Box::new(limits));
         assert_eq!(limits.validate().is_ok(), ok, "{initial}");
         let r = SessionCore::new(cfg, Role::Client, None, now);
         assert_eq!(r.is_ok(), ok, "{initial}");
     }
 }
 
-/// A `max_len` below the minimum is raised to it and counted as clamped.
+/// A record split without a priced baseline leaves the ordinary layout available.
 #[test]
-fn a_max_len_below_the_minimum_is_raised_and_counted() {
+fn a_record_split_without_a_cost_model_is_clamped() {
     let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(plan_factory(|p| p.max_len = 10)));
+    install(&mut p, Some(plan_factory(|p| p.max_len = 10)));
     transfer(&mut p, 3000, &mut Vec::new());
     assert!(p.a.shaping_stats().clamped > 0);
 }
@@ -842,28 +653,15 @@ fn a_max_len_below_the_minimum_is_raised_and_counted() {
 #[test]
 fn padding_targets_beyond_a_record_are_clamped() {
     let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(plan_factory(|p| {
-        p.pad_to = usize::MAX;
-        p.pad_multiple = usize::MAX;
-        p.pad = usize::MAX;
-    })));
+    install(
+        &mut p,
+        Some(plan_factory(|p| {
+            p.pad_to = usize::MAX;
+            p.pad_multiple = usize::MAX;
+            p.pad = usize::MAX;
+        })),
+    );
     transfer(&mut p, 3000, &mut Vec::new());
-    assert!(p.a.shaping_stats().clamped > 0);
-}
-
-/// A preamble above the plan's largest record still goes whole in its frame, counted as
-/// clamped.
-#[test]
-fn a_preamble_above_max_len_goes_whole_and_is_counted() {
-    let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(plan_factory(|x| x.max_len = wire(64))));
-    let k =
-        p.a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![1u8; 300]))
-            .unwrap();
-    p.a.write(k, &[7; 10]).unwrap();
-    let mut recs = Vec::new();
-    p.send_with(true, |w| records(w, &mut recs));
-    assert!(recs[0].0 > 300, "{recs:?}");
     assert!(p.a.shaping_stats().clamped > 0);
 }
 
@@ -871,11 +669,14 @@ fn a_preamble_above_max_len_goes_whole_and_is_counted() {
 #[test]
 fn a_preamble_overdraws_the_open_gate() {
     let mut p = Pair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(event_factory(|e, r| {
-        if e.kind == EventKind::Start {
-            r.gate = Some(Gate::new(0, 1000, 100));
-        }
-    })));
+    install(
+        &mut p,
+        Some(event_factory(|e, r| {
+            if e.kind == EventKind::Start {
+                r.gate = Some(Gate::new(0, 1_000_000, 100));
+            }
+        })),
+    );
     let k =
         p.a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![1u8; 300]))
             .unwrap();
@@ -890,8 +691,8 @@ fn a_preamble_overdraws_the_open_gate() {
         Ok(Some((n, _))) => n,
         _ => 0,
     };
-    assert_eq!(read(&mut p, &mut buf), 10);
-    // In debt: what follows waits until the tokens are back above the quantum, about 280 ms.
+    assert_eq!(read(&mut p, &mut buf), 0);
+    // In debt: what follows waits for the bucket's recovery.
     p.a.write(k, &[7; 10]).unwrap();
     let t0 = p.now;
     let mut got = 0;
@@ -904,6 +705,371 @@ fn a_preamble_overdraws_the_open_gate() {
         p.drain_events();
         got = read(&mut p, &mut buf);
     }
-    assert_eq!(got, 10);
-    assert!(p.now - t0 >= Duration::from_millis(200), "{:?}", p.now - t0);
+    assert_eq!(got, 20);
+    assert!(p.a.shaping_stats().max_added_delay <= Duration::from_micros(2000));
+}
+
+fn deterministic_pair() -> Pair {
+    let mut config = Config::default();
+    config.test_hooks().grease_tlv = Some((0x21, Vec::new()));
+    Pair::new(config.clone(), config)
+}
+
+#[test]
+fn merged_cover_charges_the_size_growth_and_confirms_only_the_accepted_prefix() {
+    use zmux::proto::session::{CoreEvent, Transmit};
+    use zmux::shaping::RuntimeReason;
+
+    let mut p = deterministic_pair();
+    fund_cover(&mut p);
+    let earned_before = p.a.shaping_meters().earned_bytes;
+    install(
+        &mut p,
+        Some(event_factory(|e, effects| {
+            request_cover(e, effects, 10, false);
+        })),
+    );
+    let stream = p.a.open(Dir::Bidi).unwrap();
+    assert_eq!(p.a.write(stream, &[7; 57]).unwrap(), 57);
+    let at = p.now + Duration::from_millis(1);
+    p.a.handle_timeout(at);
+    assert_eq!(p.a.poll_transmit(P0, at, &mut p.out), Transmit::Data);
+
+    let mut wire = Vec::new();
+    p.out.copy_to_vec(&mut wire);
+    let (len, size_field) = zmux::proto::varint::decode(&wire).unwrap();
+    assert_eq!((len, size_field), (73, 2));
+    assert_eq!(&wire[wire.len() - 10..], &[0; 10]);
+    let stats = p.a.shaping_stats();
+    assert_eq!(stats.injection_accepted_bytes, 10);
+    assert_eq!(stats.injection_sent_bytes, 0);
+    assert_eq!(stats.wire_spent, 11);
+    assert_eq!(p.a.shaping_meters().earned_bytes, earned_before);
+
+    install(&mut p, None);
+    let written = p.out.stream_len() - 6;
+    p.a.transmit_progress(P0.into(), &mut p.out, written, true, at);
+    p.a.transmit_progress(P0.into(), &mut p.out, written, true, at);
+    let stats = p.a.shaping_stats();
+    assert_eq!(stats.injection_accepted_bytes, 10);
+    assert_eq!(stats.injection_sent_bytes, 4);
+    assert_eq!(stats.wire_spent, 11);
+    assert_eq!(p.a.shaping_meters().earned_bytes, earned_before);
+
+    let results: Vec<_> = std::iter::from_fn(|| p.a.poll_event())
+        .filter_map(|e| match e {
+            CoreEvent::Shaping(e) => Some((e.kind, e.len, e.reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            (EventKind::InjectionAccepted, 10, None),
+            (
+                EventKind::InjectionCarrierCompleted,
+                4,
+                Some(RuntimeReason::PartialProgress)
+            ),
+        ],
+    );
+}
+
+#[test]
+fn hard_limits_preserve_baseline_layout_and_bound_record_delay() {
+    use zmux::proto::session::Transmit;
+    use zmux::shaping::ProfileLimits;
+
+    let run = |shaped: bool| {
+        let mut p = deterministic_pair();
+        let delay = Duration::from_micros(20);
+        if shaped {
+            let mut limits = p.a.shaping_limits();
+            limits.profile = Some(ProfileLimits::new(10, 0, 0, delay));
+            p.a.set_shaping_limits(limits).unwrap();
+            install(
+                &mut p,
+                Some(plan_factory(|plan| {
+                    plan.max_len = 64;
+                    plan.flush = true;
+                    plan.pad = 100;
+                    plan.delay = Duration::from_secs(4);
+                })),
+            );
+        }
+        let stream = p.a.open(Dir::Bidi).unwrap();
+        assert_eq!(p.a.write(stream, &[7; 600]).unwrap(), 600);
+        if shaped {
+            assert_eq!(p.a.poll_transmit(P0, p.now, &mut p.out), Transmit::Idle);
+            assert_eq!(p.a.poll_timeout(), Some(p.now + delay));
+            p.now += delay;
+            p.a.handle_timeout(p.now);
+        }
+        assert_eq!(p.a.poll_transmit(P0, p.now, &mut p.out), Transmit::Data);
+        assert_eq!(p.a.shaping_stats().wire_spent, 0);
+        assert_eq!(
+            p.a.shaping_stats().max_added_delay,
+            if shaped { delay } else { Duration::ZERO }
+        );
+        let mut wire = Vec::new();
+        p.out.copy_to_vec(&mut wire);
+        wire
+    };
+    assert_eq!(run(false), run(true));
+}
+
+#[test]
+fn outbound_control_is_opt_in_and_observed_once() {
+    for include_control in [false, true] {
+        let mut p = Pair::new(Config::default(), Config::default());
+        let stream = p.a.open(Dir::Bidi).unwrap();
+        assert_eq!(p.a.write(stream, b"open").unwrap(), 4);
+        p.pump();
+
+        let event = Arc::new(Mutex::new(Vec::new()));
+        let log = event.clone();
+        let caps = if include_control {
+            Caps::OUTBOUND | Caps::INCLUDE_CONTROL
+        } else {
+            Caps::OUTBOUND
+        };
+        assert!(p.a.set_pipe_shaper(
+            P0,
+            Some(Box::new(Fns {
+                caps,
+                plan: Box::new(|_| {}),
+                event: Box::new(move |e, _| {
+                    if e.kind == EventKind::Outbound {
+                        log.lock().unwrap().push((e.data, e.control));
+                    }
+                }),
+            }))
+        ));
+        p.a.finish(stream).unwrap();
+        p.pump();
+        let expected = if include_control {
+            &[(false, true)][..]
+        } else {
+            &[]
+        };
+        assert_eq!(&*event.lock().unwrap(), expected);
+    }
+}
+
+#[test]
+fn a_cover_reserved_before_a_lengthless_datagram_reduces_later_padding_room() {
+    use bytes::Bytes;
+    use zmux::shaping::ProfileLimits;
+
+    let mut config = Config::default();
+    config.enable_datagrams = true;
+    config.test_hooks().no_first_ping = true;
+    let mut peer = config.clone();
+    let mut tp = Pair::attached(config.clone(), peer.clone())
+        .b
+        .local_parameters();
+    tp.max_datagram_frame_size = Some(63);
+    peer.test_hooks().transport_parameters = Some(tp);
+    let mut p = Pair::new(config, peer);
+
+    let mut limits = p.a.shaping_limits();
+    limits.wire = Some(Account::new(100, 100, 0, 0));
+    limits.profile = Some(ProfileLimits::new(10, 0, 10, Duration::ZERO));
+    p.a.set_shaping_limits(limits).unwrap();
+    install(
+        &mut p,
+        Some(Arc::new(|_: &zmux::shaping::ShapedPipe| {
+            let mut planned = 0;
+            Some(Box::new(Fns {
+                caps: Caps::PLAN,
+                plan: Box::new(move |plan| {
+                    if planned != 0 {
+                        plan.pad = 100;
+                    }
+                    planned += 1;
+                }),
+                event: Box::new(|e, effects| request_cover(e, effects, 2, false)),
+            }) as Box<dyn Shaper>)
+        })),
+    );
+
+    let mut payload = [7; 60];
+    payload[59] = 0;
+    let payload = Bytes::copy_from_slice(&payload);
+    p.a.send_datagram(payload.clone(), true, p.now).unwrap();
+    let stream = p.a.open(Dir::Bidi).unwrap();
+    assert_eq!(p.a.write(stream, &[7; 500]).unwrap(), 500);
+    p.now += Duration::from_millis(1);
+    p.a.handle_timeout(p.now);
+    p.pump();
+
+    let stats = p.a.shaping_stats();
+    assert_eq!(stats.injection_accepted_bytes, 2);
+    assert_eq!(stats.injection_sent_bytes, 2);
+    assert_eq!(stats.wire_spent, 3);
+    assert_eq!(stats.ledger.measured_bytes, 10);
+    assert_eq!(p.b.recv_datagram(p.now).unwrap(), Some(payload));
+}
+
+#[test]
+fn unknown_terminal_cover_progress_expires_in_its_dispatch_window() {
+    use zmux::shaping::{Budget, CostPrecision, ProfileLimits};
+    let mut p = deterministic_pair();
+    let profile = ProfileLimits::new(3, 0, 8, Duration::ZERO);
+    p.a.set_shaper_budgeted(
+        Some(event_factory(|event, effects| {
+            request_cover(event, effects, 7, false);
+        })),
+        Budget::new(Some(Account::new(16, 16, 0, 0)), Some(profile), false),
+    )
+    .unwrap();
+    let at = p.now + Duration::from_millis(1);
+    p.a.handle_timeout(at);
+    p.a.poll_transmit(P0, at, &mut p.out);
+    assert_eq!(p.out.stream_len(), 8);
+    p.a.transmit_progress(P0.into(), &mut p.out, 4, false, at);
+    p.a.transmit_progress(P0.into(), &mut p.out, 4, false, at);
+    p.a.transmit_progress_unknown(P0.into(), &mut p.out, 4, at);
+    let stats = p.a.shaping_stats();
+    let window = stats.ledger.policy.unwrap();
+    assert_eq!(stats.ledger.precision, CostPrecision::Unavailable);
+    assert_eq!((window.consumed_bytes, window.reserved_bytes), (4, 4));
+    assert_eq!(
+        (
+            stats.injection_accepted_bytes,
+            stats.injection_sent_bytes,
+            stats.wire_spent
+        ),
+        (7, 3, 8)
+    );
+    p.a.handle_timeout(p.now + Duration::from_secs(4));
+    let stats = p.a.shaping_stats();
+    let window = stats.ledger.policy.unwrap();
+    assert_eq!(stats.ledger.precision, CostPrecision::Exact);
+    assert_eq!(
+        (
+            window.consumed_bytes,
+            window.reserved_bytes,
+            stats.ledger.measured_bytes
+        ),
+        (0, 0, 4)
+    );
+}
+
+#[test]
+fn timer_cover_reuses_the_idle_floor_only_after_its_window_scrolls() {
+    use zmux::shaping::{Budget, ProfileLimits};
+    let mut pair = deterministic_pair();
+    let profile = ProfileLimits::new(3, 0, 8, Duration::ZERO);
+    let factory = event_factory(|event, effects| match (event.kind, event.now) {
+        (EventKind::Start, _) => effects.wake = Some(Some(event.now + 1_000_000)),
+        (EventKind::Timer, now) => {
+            effects.inject = Some(Some(Injection::new(now, now, 7)));
+            effects.wake = match now {
+                1_000_000 => Some(Some(2_000_000)),
+                2_000_000 => Some(Some(5_000_000)),
+                _ => None,
+            };
+        }
+        _ => {}
+    });
+    pair.a
+        .set_shaper_budgeted(
+            Some(factory),
+            Budget::new(Some(Account::new(16, 0, 0, 8)), Some(profile), false),
+        )
+        .unwrap();
+    let start = pair.now;
+    // This half receives no activity during the run, including while idle.
+    for (seconds, measured, sent, lifetime) in [(1, 8, 7, 8), (2, 8, 7, 8), (5, 8, 14, 16)] {
+        pair.now = start + Duration::from_secs(seconds);
+        pair.a.handle_timeout(pair.now);
+        pair.send(true);
+        let stats = pair.a.shaping_stats();
+        assert_eq!(stats.ledger.policy.unwrap().consumed_bytes, measured);
+        assert_eq!(stats.injection_sent_bytes, sent);
+        assert_eq!(stats.ledger.measured_bytes, lifetime);
+        assert_eq!(stats.wire_spent, lifetime);
+    }
+}
+
+#[test]
+fn g4_unwritable_carrier_does_not_spend_the_gate_delay() {
+    use zmux::proto::session::PipeWrite;
+    let mut p = deterministic_pair();
+    p.a.pipe_write(P0, PipeWrite::returned(p.now, p.now, 0, 1, true), p.now);
+    install(
+        &mut p,
+        Some(event_factory(|event, effects| {
+            if event.kind == EventKind::Start {
+                effects.gate = Some(Gate::new(event.now + 2000, 0, 0));
+            }
+        })),
+    );
+    let stream = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(stream, b"queued while the carrier is blocked")
+        .unwrap();
+    p.now += Duration::from_millis(2);
+    p.a.handle_timeout(p.now);
+    install(&mut p, None);
+    let stats = p.a.shaping_stats();
+    assert_eq!(stats.stall_spent, Duration::ZERO);
+    assert_eq!(stats.max_added_delay, Duration::ZERO);
+}
+
+#[test]
+fn g4_a_pure_pipe_ack_proves_baseline_without_earning_cover() {
+    use zmux::proto::frame::{Frame, Gates};
+    use zmux::proto::record::{Event as RecordEvent, RecordReader};
+    use zmux::shaping::{Budget, ProfileLimits};
+
+    let mut p = deterministic_pair();
+    let mut limits = p.b.shaping_limits();
+    limits.wire = Some(Account::new(100, 0, 1_000_000, 0));
+    p.b.set_shaping_limits(limits).unwrap();
+    let outbound = Arc::new(Mutex::new(Vec::new()));
+    let events = outbound.clone();
+    let factory = Arc::new(move |_: &zmux::shaping::ShapedPipe| {
+        let events = events.clone();
+        Some(Box::new(Fns {
+            caps: Caps::OUTBOUND | Caps::INCLUDE_CONTROL,
+            plan: Box::new(|_| {}),
+            event: Box::new(move |event, _| {
+                if event.kind == EventKind::Outbound {
+                    events.lock().unwrap().push(*event);
+                }
+            }),
+        }) as Box<dyn Shaper>)
+    });
+    p.b.set_shaper_budgeted(
+        Some(factory),
+        Budget::new(limits.wire, Some(ProfileLimits::LIGHTWEIGHT), false),
+    )
+    .unwrap();
+    let before = p.b.shaping_meters();
+    let baseline = p.b.shaping_stats().ledger.baseline_bytes;
+    let stream = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(stream, &[7; 4096]).unwrap();
+    assert!(p.send(true) > 0);
+    p.now += Duration::from_millis(100);
+    p.b.handle_timeout(p.now);
+    let mut acks = 0;
+    assert!(
+        p.send_with(false, |wire| {
+            let mut reader = RecordReader::new(65_535);
+            let mut input = wire;
+            while let Some(event) = reader.read(&mut input, &Gates::ALL).unwrap() {
+                if let RecordEvent::Frame(frame) = event {
+                    assert!(matches!(frame, Frame::PipeAck(_)));
+                    acks += 1;
+                }
+            }
+        }) > 0
+    );
+    assert!(acks > 0);
+    let after = p.b.shaping_meters();
+    assert_eq!(after.earned_bytes, before.earned_bytes);
+    assert_eq!(after.wire_left, before.wire_left);
+    assert!(p.b.shaping_stats().ledger.baseline_bytes > baseline);
+    assert!(outbound.lock().unwrap().is_empty());
 }

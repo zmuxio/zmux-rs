@@ -19,24 +19,26 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{Notify, oneshot};
-use zmux::PipeIo;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{Notify, oneshot, watch};
 use zmux::adapter::{
-    ChannelDemux, ChannelReceiver, ChannelRegistration, ChunkWrite, DRAIN_LIMIT, DatagramChannel,
-    Lane,
+    AdmitIo, Admitted, ChannelDemux, ChannelReceiver, ChannelRegistration, ChunkWrite, DRAIN_LIMIT,
+    DatagramChannel, DatagramChannelPrefix, Entry, Lane,
 };
+use zmux::{CarrierInfo, Listener, PipeHint, PipeIo};
 
-/// What a carrier's streams keep alive: the state of their connection,
-/// whose drop closes it.
+/// The connection state a carrier's streams keep alive.
 pub type Keep = Arc<dyn Any + Send + Sync>;
 
 /// A QUIC stream's sending part as the adapter's layer has it.
 pub trait SendPart: Unpin + Send + 'static {
+    /// Writes borrowed bytes during admission fallback.
+    fn poll_write(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>>;
+
     /// Takes bytes from the front of `chunks` without copying, as
     /// [`ChunkWrite::poll_write_chunks`]: a call that returns `Pending`
     /// took nothing and registered the waker.
-    fn poll_write_chunks(
+    fn poll_send_bytes(
         &mut self,
         cx: &mut Context<'_>,
         chunks: &mut [Bytes],
@@ -76,6 +78,7 @@ type Stopped = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// with it. A pipe's does so as the pipe's drain ([`pipe`]), a lane's
 /// as the lane's drain.
 pub struct QuicSend<S: SendPart> {
+    staged: Vec<Bytes>,
     stream: S,
     finished: bool,
     keep: Option<Keep>,
@@ -89,6 +92,7 @@ impl<S: SendPart> QuicSend<S> {
     pub fn new(stream: S) -> Self {
         Self {
             stream,
+            staged: Vec::new(),
             finished: false,
             keep: None,
             drain: None,
@@ -132,9 +136,26 @@ impl<S: SendPart> ChunkWrite for QuicSend<S> {
     fn poll_write_chunks(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        chunks: &mut [Bytes],
+        chunks: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
-        self.stream.poll_write_chunks(cx, chunks)
+        let this = self.as_mut().get_mut();
+        if this.staged.is_empty() {
+            this.staged
+                .extend(chunks.iter().cloned().map(zmux::Chunk::into_bytes));
+        }
+        let result = std::task::ready!(this.stream.poll_send_bytes(cx, &mut this.staged));
+        this.staged.clear();
+        let taken = result?;
+        let mut remaining = taken;
+        for chunk in chunks {
+            let n = remaining.min(chunk.len());
+            bytes::Buf::advance(chunk, n);
+            remaining -= n;
+            if remaining == 0 {
+                break;
+            }
+        }
+        Poll::Ready(Ok(taken))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -149,6 +170,24 @@ impl<S: SendPart> ChunkWrite for QuicSend<S> {
             self.finished = true;
         }
         r
+    }
+}
+
+impl<S: SendPart> AsyncWrite for QuicSend<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.stream.poll_write(cx, bytes)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ChunkWrite::poll_flush(self, cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ChunkWrite::poll_shutdown(self, cx)
     }
 }
 
@@ -300,28 +339,24 @@ impl<T> AcceptQueue<T> {
     }
 }
 
-/// A stream the peer opened, as the adapter's layer has it.
-pub enum Accepted<S, R> {
-    /// A bidirectional stream: a pipe.
-    Bi(S, R),
-    /// A unidirectional stream: a lane.
-    Uni(R),
-}
-
-/// A connection whose streams the peer opens, as the adapter's layer has
-/// them.
+/// A connection with independently accepted pipe and lane streams.
 pub trait StreamConn: Send + Sync + 'static {
     /// Its streams' sending part.
     type Send: SendPart;
     /// Its streams' receiving part.
     type Recv: RecvPart;
 
-    /// The next stream the peer opened, bidirectional or not; `None` once
-    /// the connection is closed.
-    fn accept(&self) -> impl Future<Output = Option<Accepted<Self::Send, Self::Recv>>> + Send;
+    /// The default hint for a newly received stream without an admitted source.
+    fn hints(&self, listener: Option<&Listener>) -> impl Fn() -> PipeHint + Send + Sync;
+
+    /// Accepts one pipe stream. Cancel safe.
+    fn accept_bi(&self) -> impl Future<Output = Option<(Self::Send, Self::Recv)>> + Send;
+
+    /// Accepts one lane stream. Cancel safe.
+    fn accept_uni(&self) -> impl Future<Output = Option<Self::Recv>> + Send;
 }
 
-/// A carrier's state as [`accept_loop`] needs it: how a bidirectional
+/// A carrier's state as the receivers need it: how a bidirectional
 /// stream becomes a pipe, the connection's identity and carrier kind, and
 /// the queue of the pipes nobody took.
 pub trait CarrierState<S: SendPart, R: RecvPart>: Send + Sync + 'static {
@@ -329,57 +364,362 @@ pub trait CarrierState<S: SendPart, R: RecvPart>: Send + Sync + 'static {
     fn pipe(self: &Arc<Self>, send: QuicSend<S>, recv: QuicRecv<R>) -> PipeIo;
     /// The connection's identity.
     fn conn_id(&self) -> zmux::adapter::CarrierConnId;
+    /// The carrier's close responsibility.
+    fn close(&self) -> &ConnectionClose;
     /// The carrier kind of its lanes.
     fn kind(&self) -> zmux::CarrierKind;
     /// The pipes the peer opened that nobody took (without a listener).
     fn accepted(&self) -> &AcceptQueue<(QuicSend<S>, QuicRecv<R>)>;
 }
 
-/// Hands every stream the peer opens on `conn` to zmux until the
-/// connection closes or the carrier (`state`) is gone: a pipe to
-/// `listener` with `hint()`, or to the queue without one; a lane to
-/// `listener`, or to its session's lane without one. Each stream is wrapped
-/// at once, so that one dropped from here on is reset or stopped, never
-/// ended gracefully.
-pub async fn accept_loop<C, I>(
-    conn: C,
-    state: std::sync::Weak<I>,
-    listener: Option<zmux::Listener>,
-    hint: impl Fn() -> zmux::PipeHint,
+/// Starts receivers for a carrier whose caller owns its lifetime.
+pub fn start_receivers<C, I>(conn: C, state: &Arc<I>, listener: Option<Listener>)
+where
+    C: StreamConn,
+    I: CarrierState<C::Send, C::Recv>,
+{
+    state.close().claim();
+    let state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        let hint = conn.hints(listener.as_ref());
+        tokio::join!(
+            accept_pipes(
+                &conn,
+                &state,
+                listener.as_ref(),
+                &hint,
+                None,
+                admission_end(listener.as_ref())
+            ),
+            accept_lanes(
+                &conn,
+                &state,
+                listener.as_ref(),
+                &hint,
+                std::future::pending()
+            ),
+        );
+    });
+}
+
+async fn admission_end(listener: Option<&Listener>) {
+    match listener {
+        Some(listener) => listener.adapter().closed().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Stop {
+    Running,
+    Admission,
+    All,
+}
+
+/// Controls pipe setup and lane reception for an adopted connection.
+/// Dropping it stops setup; transferred pipes retain lane reception.
+pub struct ConnectionService {
+    stop: watch::Sender<Stop>,
+    admission: watch::Receiver<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ConnectionService {
+    /// Starts an adapter's admission and delivery task.
+    pub fn start<F>(run: impl FnOnce(Delivery) -> F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (stop, stopped) = watch::channel(Stop::Running);
+        let (admission_done, admission) = watch::channel(());
+        let task = tokio::spawn(run(Delivery {
+            stopped,
+            admission_done,
+        }));
+        Self {
+            stop,
+            admission,
+            task: Some(task),
+        }
+    }
+
+    /// Stops new pipe admission and cancels pending setup.
+    pub fn stop_admission(&self) {
+        self.stop_at(Stop::Admission);
+    }
+
+    /// Stops both receivers, leaving transferred pipes with their owners.
+    pub fn stop(&self) {
+        self.stop_at(Stop::All);
+    }
+
+    fn stop_at(&self, target: Stop) {
+        self.stop.send_if_modified(|stop| {
+            if *stop >= target {
+                return false;
+            }
+            *stop = target;
+            true
+        });
+    }
+
+    /// Waits until the admission receiver and its pending setups have stopped.
+    pub async fn admission_stopped(&self) {
+        let _ = self.admission.clone().changed().await;
+    }
+
+    /// Waits until both receivers have finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the connection service task failed.
+    pub async fn wait(&mut self) -> io::Result<()> {
+        if let Some(task) = &mut self.task {
+            let result = task.await.map_err(io::Error::other);
+            self.task = None;
+            result?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ConnectionService {
+    fn drop(&mut self) {
+        self.stop_admission();
+    }
+}
+
+async fn stopping(mut state: watch::Receiver<Stop>, target: Stop) {
+    if state.wait_for(|state| *state >= target).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Owns pending setup and the carrier until pipe admission stops.
+pub struct Delivery {
+    stopped: watch::Receiver<Stop>,
+    admission_done: watch::Sender<()>,
+}
+
+/// Stages the carrier made from the first stream, until the listener accepts it.
+pub struct FirstStream<C, I> {
+    staged: oneshot::Sender<(C, Arc<I>)>,
+}
+
+impl<C, I> FirstStream<C, I>
+where
+    C: StreamConn,
+    I: CarrierState<C::Send, C::Recv>,
+{
+    /// Gives the first stream to admission. The transport adds its fallback
+    /// connection metadata and creates carrier state on conversion.
+    pub fn prepare(
+        self,
+        send: C::Send,
+        recv: C::Recv,
+        make: impl FnOnce() -> (C, Arc<I>) + Send + 'static,
+    ) -> AdmitIo {
+        let streams = tokio::io::join(QuicRecv::new(recv), QuicSend::new(send));
+        AdmitIo::stream(streams, move |streams| {
+            let (recv, send) = streams.into_inner();
+            let (conn, state) = make();
+            let pipe = state.pipe(send, recv);
+            let _ = self.staged.send((conn, state));
+            pipe
+        })
+    }
+}
+
+impl Delivery {
+    /// Runs first-stream admission and starts delivery only after it succeeds.
+    /// If fallback is running when admission is cancelled, its return guard
+    /// or the detached host retains close responsibility.
+    pub async fn admit<C, I, F>(
+        self,
+        listener: Listener,
+        mut entry: Entry,
+        first: impl FnOnce(FirstStream<C, I>) -> F,
+        close_unclaimed: impl FnOnce(),
+    ) where
+        C: StreamConn,
+        I: CarrierState<C::Send, C::Recv>,
+        F: Future<Output = io::Result<(CarrierInfo, AdmitIo)>>,
+    {
+        let (staged, mut state) = oneshot::channel();
+        let mut stream_open = false;
+        let first = async {
+            let io = first(FirstStream { staged }).await?;
+            stream_open = true;
+            Ok(io)
+        };
+        let Some(accepted) = zmux::adapter::while_open(
+            stopping(self.stopped.clone(), Stop::Admission),
+            entry.admit_first_with_info(first),
+        )
+        .await
+        else {
+            // Before the first stream exists, nobody else can own the close.
+            // Once it enters admission, a running fallback may already have it.
+            if !stream_open {
+                entry.end_unclaimed_connection(close_unclaimed);
+            }
+            return;
+        };
+        let (Some(pipe), Ok((conn, state))) = (accepted, state.try_recv()) else {
+            entry.end_unclaimed_connection(close_unclaimed);
+            return;
+        };
+        let admitted = entry.admitted();
+        let first = (pipe, PipeHint::from_entry(entry));
+        self.serve(conn, state, listener, admitted, Some(first))
+            .await;
+    }
+
+    /// Delivers subsequent streams after a first-stream or head handoff.
+    pub async fn serve<C, I>(
+        self,
+        conn: C,
+        state: Arc<I>,
+        listener: Listener,
+        admitted: Option<Admitted>,
+        first: Option<(PipeIo, PipeHint)>,
+    ) where
+        C: StreamConn,
+        I: CarrierState<C::Send, C::Recv>,
+    {
+        state.close().claim();
+        let weak = Arc::downgrade(&state);
+        let default_hint = conn.hints(Some(&listener));
+        let hint = || match &admitted {
+            Some(admitted) => PipeHint::from_admitted(admitted.clone()),
+            None => default_hint(),
+        };
+        let stop = async {
+            tokio::select! {
+                () = stopping(self.stopped.clone(), Stop::Admission) => {},
+                () = admission_end(Some(&listener)) => {},
+            }
+        };
+        let pipes = async {
+            accept_pipes(&conn, &weak, Some(&listener), &hint, first, stop).await;
+            drop(state);
+            drop(self.admission_done);
+        };
+        tokio::join!(
+            pipes,
+            accept_lanes(
+                &conn,
+                &weak,
+                Some(&listener),
+                &hint,
+                stopping(self.stopped.clone(), Stop::All)
+            ),
+        );
+    }
+}
+
+/// Accepts pipes and owns all untransferred setup futures until admission stops.
+async fn accept_pipes<C, I>(
+    conn: &C,
+    state: &std::sync::Weak<I>,
+    listener: Option<&zmux::Listener>,
+    hint: &(impl Fn() -> zmux::PipeHint + Sync),
+    first: Option<(PipeIo, zmux::PipeHint)>,
+    stop: impl Future<Output = ()>,
 ) where
     C: StreamConn,
     I: CarrierState<C::Send, C::Recv>,
 {
-    let handle = |l: &zmux::Listener, io: PipeIo| {
-        let (l, hint) = (l.clone(), hint());
-        tokio::spawn(async move { l.handle_pipe(io, hint).await });
-    };
-    while let Some(stream) = conn.accept().await {
-        let stream = match stream {
-            Accepted::Bi(send, recv) => Accepted::Bi(QuicSend::new(send), QuicRecv::new(recv)),
-            Accepted::Uni(recv) => Accepted::Uni(QuicRecv::new(recv)),
-        };
-        let Some(state) = state.upgrade() else {
-            break;
-        };
-        match (stream, &listener) {
-            (Accepted::Bi(send, recv), Some(l)) => handle(l, state.pipe(send, recv)),
-            (Accepted::Bi(send, recv), None) => state.accepted().push((send, recv)),
-            (Accepted::Uni(recv), l) => {
-                let io = PipeIo::reader(recv)
-                    .with_carrier(state.kind())
-                    .with_carrier_conn(state.conn_id());
-                match l {
-                    Some(l) => handle(l, io),
-                    None => {
-                        tokio::spawn(zmux::adapter::handle_lane(io));
-                    }
+    let mut setups = tokio::task::JoinSet::new();
+    let mut stop = pin!(stop);
+    if let (Some((pipe, hint)), Some(listener)) = (first, listener) {
+        let listener = listener.clone();
+        setups.spawn(async move { listener.handle_pipe(pipe, hint).await });
+    }
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut stop => break,
+            joined = setups.join_next(), if !setups.is_empty() => { drop(joined); }
+            stream = conn.accept_bi() => {
+                let Some((send, recv)) = stream else { break };
+                let (send, recv) = (QuicSend::new(send), QuicRecv::new(recv));
+                let Some(state) = state.upgrade() else { break };
+                if let Some(listener) = listener {
+                    let (listener, pipe, hint) = (listener.clone(), state.pipe(send, recv), hint());
+                    setups.spawn(async move { listener.handle_pipe(pipe, hint).await });
+                } else {
+                    state.accepted().push((send, recv));
                 }
             }
         }
     }
+    setups.shutdown().await;
     if let Some(state) = state.upgrade() {
         state.accepted().close();
+    }
+}
+
+/// Accepts lane streams independently of pipe admission. QUIC stream credit
+/// bounds the number of reads awaiting a lane header on this connection.
+pub(crate) async fn accept_lanes<C, I>(
+    conn: &C,
+    state: &std::sync::Weak<I>,
+    listener: Option<&zmux::Listener>,
+    hint: &(impl Fn() -> zmux::PipeHint + Sync),
+    stop: impl Future<Output = ()>,
+) where
+    C: StreamConn,
+    I: CarrierState<C::Send, C::Recv>,
+{
+    let mut setups = tokio::task::JoinSet::new();
+    let mut stop = pin!(stop);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut stop => break,
+            joined = setups.join_next(), if !setups.is_empty() => { drop(joined); }
+            stream = conn.accept_uni() => {
+                let Some(recv) = stream else { break };
+                let recv = QuicRecv::new(recv);
+                let Some(state) = state.upgrade() else { break };
+                let io = PipeIo::reader(recv)
+                    .with_carrier_transport(state.kind(), state.conn_id());
+                if let Some(listener) = listener {
+                    let (listener, hint) = (listener.clone(), hint());
+                    setups.spawn(async move { listener.handle_pipe(io, hint).await });
+                } else {
+                    setups.spawn(zmux::adapter::handle_lane(io));
+                }
+            }
+        }
+    }
+    setups.shutdown().await;
+}
+
+/// The transport close responsibility and the last pipe's close code.
+#[derive(Default)]
+pub struct ConnectionClose {
+    owned: std::sync::atomic::AtomicBool,
+    code: std::sync::atomic::AtomicU64,
+}
+
+impl ConnectionClose {
+    /// Claims the connection once admission transferred it to zmux.
+    fn claim(&self) {
+        self.owned.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Remembers the application code of the last pipe to finish.
+    pub fn set_code(&self, code: u64) {
+        self.code.store(code, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Closes the transport with the last recorded code if zmux owns it.
+    pub fn close(&self, close: impl FnOnce(u64)) {
+        if self.owned.load(std::sync::atomic::Ordering::Relaxed) {
+            close(self.code.load(std::sync::atomic::Ordering::Relaxed));
+        }
     }
 }
 
@@ -407,6 +747,7 @@ pub struct Datagrams<C: DatagramConn> {
     conn: C,
     demux: ChannelDemux,
     receiving: OnceLock<tokio::task::AbortHandle>,
+    capacity: OnceLock<usize>,
 }
 
 impl<C: DatagramConn> std::fmt::Debug for Datagrams<C> {
@@ -433,6 +774,7 @@ impl<C: DatagramConn> Datagrams<C> {
             conn,
             demux: ChannelDemux::new(),
             receiving: OnceLock::new(),
+            capacity: OnceLock::new(),
         })
     }
 
@@ -445,21 +787,28 @@ impl<C: DatagramConn> Datagrams<C> {
     /// (its QUIC stream ID): a [`DatagramChannel`] for
     /// [`PipeIo::with_datagram_channel`].
     pub fn channel(self: &Arc<Self>, id: u64) -> Arc<QuicChannel<C>> {
-        self.channel_when(id, None)
+        self.channel_with_routing(id, None)
     }
 
-    /// [`Datagrams::channel`] that takes datagrams only while `usable`
-    /// says so (for example once the peer's HTTP/3 SETTINGS enabled HTTP
-    /// Datagrams); it must be cheap and must not wait.
-    pub fn channel_when(
+    /// The HTTP Datagrams of a request. The Quarter Stream ID is carrier
+    /// framing. The channel is available when the peer negotiated HTTP Datagrams.
+    pub fn http_datagram_channel(
+        self: &Arc<Self>,
+        quarter_stream_id: u64,
+        enabled: Box<dyn Fn() -> bool + Send + Sync>,
+    ) -> Arc<QuicChannel<C>> {
+        self.channel_with_routing(quarter_stream_id, Some(enabled))
+    }
+
+    fn channel_with_routing(
         self: &Arc<Self>,
         id: u64,
-        usable: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+        http_enabled: Option<Box<dyn Fn() -> bool + Send + Sync>>,
     ) -> Arc<QuicChannel<C>> {
         Arc::new(QuicChannel {
             datagrams: self.clone(),
             id: std::sync::atomic::AtomicU64::new(id),
-            usable,
+            http_enabled,
         })
     }
 
@@ -481,7 +830,7 @@ impl<C: DatagramConn> Datagrams<C> {
 pub struct QuicChannel<C: DatagramConn> {
     datagrams: Arc<Datagrams<C>>,
     id: std::sync::atomic::AtomicU64,
-    usable: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    http_enabled: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl<C: DatagramConn> std::fmt::Debug for QuicChannel<C> {
@@ -506,15 +855,27 @@ impl<C: DatagramConn> QuicChannel<C> {
 }
 
 impl<C: DatagramConn> DatagramChannel for QuicChannel<C> {
-    fn channel_id(&self) -> Option<u64> {
-        Some(self.id())
+    fn channel_prefix(&self) -> DatagramChannelPrefix {
+        if self.http_enabled.is_some() {
+            DatagramChannelPrefix::Carrier(self.id())
+        } else {
+            DatagramChannelPrefix::Pipe(self.id())
+        }
     }
 
-    fn max_datagram_size(&self) -> usize {
-        if self.usable.as_ref().is_some_and(|u| !u()) {
-            return 0;
+    fn datagram_capacity(&self) -> (usize, usize) {
+        if self.http_enabled.as_ref().is_some_and(|u| !u()) {
+            return (0, 0);
         }
-        self.datagrams.conn.max_datagram_size()
+        let room = self.datagrams.conn.max_datagram_size();
+        // The carrier exposes the minimum of its MTU and the peer's limit.
+        // Declare the first usable size as this connection's service capacity.
+        let capacity = if room > 0 {
+            *self.datagrams.capacity.get_or_init(|| room)
+        } else {
+            self.datagrams.capacity.get().copied().unwrap_or(0)
+        };
+        (capacity, room.min(capacity))
     }
 
     fn send(&self, datagram: Bytes) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {

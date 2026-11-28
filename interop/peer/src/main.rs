@@ -54,6 +54,7 @@
 //! prints `CLOSED <reason>`.
 
 mod matrix;
+mod support;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,32 +62,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zmux::helpers::{PacketOptions, PacketStream, SendPolicy};
 use zmux::sched::Scheduler;
-use zmux::{
-    Config, Listener, ListenerConfig, PipeAuth, PipeOptions, Preamble, RecvStream, SendStream,
-    Session, StreamError, VarInt,
-};
 
-fn config(multipath: bool) -> Config {
-    let mut c = Config::default();
-    c.enable_datagrams = true;
-    c.max_incoming_uni_streams = zmux::UniCredit::Limit(16);
-    if multipath {
-        c.max_pipes = 4;
-        c.pipe_auth = PipeAuth::psk(b"zmux interop pre-shared key 0123".to_vec()).with_end_to_end();
-        c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode::new(|_, _, _| true));
-    }
-    c
-}
+use support::{
+    NoVerify, config, hex, join_carrier, provider, tls_client_config, tls_server_config,
+};
+use zmux::{
+    Config, Listener, ListenerConfig, PipeAuth, Preamble, RecvStream, SendStream, Session,
+    StreamError, VarInt,
+};
 
 /// The QUIC modes' sessions: multipath (PSK), carrier early data.
 fn quic_config(exporter: bool) -> Config {
     let mut c = config(true);
-    c.early_data = zmux::EarlyData::for_zmux_peer().with_carrier_early_data(true);
+    c.early_data = zmux::EarlyData::default().with_carrier_early_data(true);
     if exporter {
         c.pipe_auth = PipeAuth::exporter().with_end_to_end();
         c.allow_record_mode = Some(zmux::proto::session::AllowRecordMode::new(|_, _, _| true));
@@ -100,23 +92,19 @@ fn quic_options(memory: &zmux_quinn::ParameterMemory) -> zmux_quinn::Options {
         .with_zero_rtt(memory.clone())
 }
 
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
-}
-
 /// Whether `close` replies `closing` before it closes (the QUIC drivers'
 /// contract).
 static CLOSE_REPLY: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
-    tokio::time::timeout(Duration::from_secs(90), run())
+    let args: Vec<String> = std::env::args().collect();
+    tokio::time::timeout(Duration::from_secs(90), run(&args))
         .await
         .expect("interop peer deadline");
 }
 
-async fn run() {
-    let args: Vec<String> = std::env::args().collect();
+async fn run(args: &[String]) {
     let mode = args.get(1).map_or("server", String::as_str);
     let mut endpoint = None;
     let mut serving = None;
@@ -167,29 +155,13 @@ async fn run() {
                 .await
                 .expect("establish");
             let joined = TcpStream::connect(addr).await.expect("connect joined pipe");
-            let pipe = session
-                .begin_add_pipe(
-                    zmux::PipeIo::from_tcp(joined),
-                    PipeOptions::default().with_record_mode(zmux::proto::seal::RecordMode::Trusted),
-                )
-                .expect("add pipe");
-            let ready = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if pipe
-                        .stats()
-                        .is_some_and(|p| p.outbound == Some(zmux::OutboundState::Active))
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-            })
-            .await;
-            assert!(
-                ready.is_ok(),
-                "joined pipe not active: {:?}",
-                session.pipe_stats()
-            );
+            join_carrier(
+                &session,
+                zmux::PipeIo::from_tcp(joined),
+                zmux::RecordMode::Trusted,
+            )
+            .await
+            .expect("confirmed join");
             session
         }
         "seal-server" => {
@@ -237,16 +209,9 @@ async fn run() {
 
 async fn quic_server(n: usize, exporter: bool) {
     CLOSE_REPLY.store(true, Ordering::Relaxed);
-    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).expect("cert");
-    let der = CertificateDer::from(cert.cert.der().to_vec());
-    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("tls")
-        .with_no_client_auth()
-        .with_single_cert(vec![der], PrivateKeyDer::Pkcs8(key))
-        .expect("tls");
-    tls.alpn_protocols = zmux::alpn_protocols(&[]);
+    let protocols = zmux::alpn_protocols(&[]);
+    let protocols: Vec<_> = protocols.iter().map(Vec::as_slice).collect();
+    let tls = tls_server_config(&protocols);
     let opts = quic_options(&zmux_quinn::ParameterMemory::new());
     let sc = zmux_quinn::server_config(tls, &opts).expect("server config");
     let ep = quinn::Endpoint::server(sc, "127.0.0.1:0".parse().unwrap()).expect("bind");
@@ -357,7 +322,7 @@ fn print_keys(session: &Session) {
     let v = session
         .export_keying_material(APP_LABEL, b"", 16)
         .expect("export");
-    println!("KEYS {}", matrix::hex(&v));
+    println!("KEYS {}", hex(&v));
 }
 
 /// Prints the keys once the carrier's handshake gives them (a session on
@@ -484,16 +449,7 @@ fn x25519_dalek_public(secret: [u8; 32]) -> Vec<u8> {
 /// bidirectional bootstrap carrier and a join, or a split bootstrap and a
 /// join, as the client's first bytes say.
 async fn tls_server() -> (Session, Listener) {
-    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).expect("cert");
-    let der = CertificateDer::from(cert.cert.der().to_vec());
-    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-    let tls = rustls::ServerConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("tls")
-        .with_no_client_auth()
-        .with_single_cert(vec![der], PrivateKeyDer::Pkcs8(key))
-        .expect("tls");
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_server_config(&[])));
     let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     println!("LISTEN {}", tcp.local_addr().expect("addr"));
     let listener = Listener::new(tls_config(), ListenerConfig::default())
@@ -529,33 +485,6 @@ async fn tls_server() -> (Session, Listener) {
     session.established().await.expect("established");
     print_keys(&session);
     (session, listener)
-}
-
-/// A self-signed certificate for `localhost`, offering `alpn`.
-fn tls_server_config(alpn: &[&[u8]]) -> rustls::ServerConfig {
-    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).expect("cert");
-    let der = CertificateDer::from(cert.cert.der().to_vec());
-    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("tls")
-        .with_no_client_auth()
-        .with_single_cert(vec![der], PrivateKeyDer::Pkcs8(key))
-        .expect("tls");
-    tls.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
-    tls
-}
-
-/// TLS 1.3 to a self-signed peer, unverified, offering `alpn`.
-fn tls_client_config(alpn: &[&[u8]]) -> rustls::ClientConfig {
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("tls")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
-    tls.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
-    tls
 }
 
 /// WebSocket over TLS 1.3 (`wss://`, any path): a listener whose carriers
@@ -596,16 +525,9 @@ async fn wss_client(addr: &str) -> Session {
     let join = zmux_websocket::dial_tls(url.as_str(), &tls, &options)
         .await
         .expect("dial join");
-    let pipe = session
-        .begin_add_pipe(
-            join,
-            PipeOptions::default().with_record_mode(zmux::proto::seal::RecordMode::Bound),
-        )
-        .expect("add pipe");
-    tokio::time::timeout(Duration::from_secs(10), pipe.joined())
+    join_carrier(&session, join, zmux::RecordMode::Bound)
         .await
-        .expect("joined in time")
-        .expect("joined");
+        .expect("confirmed join");
     session
 }
 
@@ -653,16 +575,13 @@ async fn tls_client(addr: &str, split: bool) -> Session {
         .expect("establish");
     session.established().await.expect("established");
     print_keys(&session);
-    let pipe = session
-        .begin_add_pipe(
-            zmux_rustls::over_tcp(dial(b'J').await),
-            PipeOptions::default().with_record_mode(zmux::proto::seal::RecordMode::Bound),
-        )
-        .expect("add pipe");
-    tokio::time::timeout(Duration::from_secs(10), pipe.joined())
-        .await
-        .expect("joined in time")
-        .expect("joined");
+    join_carrier(
+        &session,
+        zmux_rustls::over_tcp(dial(b'J').await),
+        zmux::RecordMode::Bound,
+    )
+    .await
+    .expect("confirmed join");
     session
 }
 
@@ -672,58 +591,6 @@ async fn linger(ep: quinn::Endpoint) {
     tokio::time::sleep(Duration::from_millis(300)).await;
     ep.close(0u32.into(), b"");
     ep.wait_idle().await;
-}
-
-/// Accepts the server's certificate unverified: a self-signed one of a
-/// local test.
-#[derive(Debug)]
-struct NoVerify;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        m: &[u8],
-        c: &CertificateDer<'_>,
-        d: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            m,
-            c,
-            d,
-            &provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        m: &[u8],
-        c: &CertificateDer<'_>,
-        d: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            m,
-            c,
-            d,
-            &provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }
 
 /// Answers the session's streams and datagrams until it ends.

@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use super::SessionCore;
-use super::config::{Cap, DEFAULT_SEND_BUFFER_MAX, SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR};
+use super::config::{Cap, STREAM_WINDOW_FLOOR};
 use super::stream::StreamKey;
 
 /// The largest window an automatic cap lets grow: what keeps every limit
@@ -47,7 +47,11 @@ impl SessionCore {
                     .local_recv_open()
                     .saturating_mul(tp.window_bidi_local),
             );
-        s.max(self.config.session_window_base())
+        let window = match self.config.max_connection_receive_window {
+            Cap::Fixed(cap) => cap,
+            Cap::Auto => self.streams.recv_flow().window,
+        };
+        s.max(window)
     }
 
     /// Bytes received on streams. `buffered` bytes went into stream
@@ -74,6 +78,9 @@ impl SessionCore {
         }
         let cap = self.buffer_cap();
         self.streams.credit_consumed(cap, n);
+        if self.streams.memory_pressure() {
+            self.reclaim_receive_space(false);
+        }
     }
 
     /// The `MAX_DATA` value to send now, after auto-tuning.
@@ -92,48 +99,23 @@ impl SessionCore {
         self.streams.recv_flow().credit()
     }
 
-    /// What the session holds that its memory budget counts, in constant
-    /// time: buffered receive data, retained data (which includes what a
-    /// suspended session keeps) and the session window's growth.
-    pub(super) fn budget_used(&self) -> u64 {
-        let retained = self.retained();
-        self.streams.recv_flow().buffered + retained + self.window_growth() + self.carrier_memory
-    }
-
-    /// What the memory budget has left for the session to grow by: the
-    /// listener's allowance less what the session took since, or its own
-    /// `memory_budget` less what it holds; `None` is unlimited.
-    pub(super) fn budget_left(&self) -> Option<u64> {
-        let used = self.budget_used();
-        match self.memory_allowance {
-            Some((left, at)) => left.map(|l| l.saturating_sub(used.saturating_sub(at))),
-            None => self.config.memory_budget().map(|b| b.saturating_sub(used)),
-        }
-    }
-
-    /// The largest session window the memory budget allows.
+    /// The largest receive window that could be backed at this instant.
     fn session_allowance(&self) -> u64 {
-        self.budget_left().map_or(u64::MAX, |l| {
-            self.streams.recv_flow().window.saturating_add(l)
-        })
+        self.receive_credit
+            .as_ref()
+            .map_or(u64::MAX, super::memory::ReceiveCredit::possible)
     }
 
-    /// The largest session window now: a fixed cap within the memory
-    /// allowance, or the automatic cap, the 96 MiB floor and above it the
-    /// allowance.
     fn session_window_limit(&self) -> u64 {
-        let allowance = self.session_allowance();
+        let allowance = self
+            .session_allowance()
+            .min(super::recv_store::ReceiveStore::MAX_POSITIONS);
         match self.config.max_connection_receive_window {
-            Cap::Fixed(v) => v.min(allowance),
-            Cap::Auto => SESSION_WINDOW_FLOOR.max(allowance).min(MAX_WINDOW),
+            Cap::Fixed(value) => value.min(allowance),
+            Cap::Auto => allowance.min(MAX_WINDOW),
         }
     }
 
-    /// The largest stream window the memory budget allows now, through the
-    /// session window: for a stream whose cap is automatic (the session's, or
-    /// the one `set_receive_window` made automatic with a `max` of 0, whatever
-    /// the session's cap is), at least the 64 MiB floor; a fixed cap is the
-    /// stream's own `max_window`.
     fn stream_window_limit(&self, automatic_cap: bool) -> u64 {
         let allowance = self.session_allowance();
         if automatic_cap {
@@ -209,59 +191,18 @@ impl SessionCore {
         }
     }
 
-    /// A listener's memory budget has `bytes` left (`None`: it is
-    /// unlimited): the session grows its windows and retained data by at
-    /// most that much from now on, until the listener says again. From the first call
-    /// the listener's budget replaces the session's own `memory_budget`.
-    pub fn set_memory_allowance(&mut self, bytes: Option<u64>) {
-        self.memory_allowance = Some((bytes, self.budget_used()));
-    }
-
-    /// Counts `bytes` that a carrier holds for the session (a QUIC
-    /// connection's receive window) in
-    /// its memory budget until [`SessionCore::release_carrier_memory`]: window
-    /// growth stops that much earlier.
-    pub fn charge_carrier_memory(&mut self, bytes: u64) {
-        self.carrier_memory = self.carrier_memory.saturating_add(bytes);
-    }
-
-    /// Releases a charge of [`SessionCore::charge_carrier_memory`]: the
-    /// carrier holds those bytes for the session no more.
-    pub fn release_carrier_memory(&mut self, bytes: u64) {
-        self.carrier_memory = self.carrier_memory.saturating_sub(bytes);
-    }
-
-    /// Whether the session grew what the memory budget charges since its
-    /// last allowance: the listener shares what is left between the
-    /// sessions that grow.
-    pub fn grew_since_allowance(&self) -> bool {
-        self.memory_allowance
-            .is_some_and(|(_, at)| self.budget_used() > at)
-    }
-
-    /// The largest send buffer, which also caps the retransmit budget: a fixed
-    /// `max`, or the 64 MiB floor and
-    /// above it the retained data plus what the memory budget has left.
+    /// The per-session cap on send buffering and retransmit retention.
     pub(super) fn send_buffer_limit(&self) -> u64 {
         match self.config.send_buffer_max {
             Cap::Fixed(v) => v,
-            Cap::Auto => {
-                let retained = self.retained();
-                let grant = self
-                    .budget_left()
-                    .map_or(u64::MAX, |l| retained.saturating_add(l));
-                DEFAULT_SEND_BUFFER_MAX.max(grant)
-            }
+            Cap::Auto => u64::MAX,
         }
     }
 
-    /// How far the session window grew above its initial size: what the
-    /// listener's memory budget charges for it.
+    /// How far the tuned session window grew from the advertised initial window.
     pub fn window_growth(&self) -> u64 {
-        self.streams
-            .recv_flow()
-            .window
-            .saturating_sub(self.config.initial_connection_receive_window)
+        let flow = self.streams.recv_flow();
+        flow.window.saturating_sub(flow.initial_window)
     }
 
     /// The `MAX_STREAM_DATA` value to send now for a stream, after
@@ -303,6 +244,7 @@ impl SessionCore {
         // An endpoint that sent GOAWAY raises MAX_STREAMS no more.
         let raise = !self.goaway_announced();
         self.streams.count_discarded(d, raise);
+        self.release_peer_receive(d);
     }
 }
 
@@ -319,7 +261,7 @@ mod tests {
     #[test]
     fn resets_release_lost_bytes_once() {
         use super::super::stream::RecvPart;
-        let part = || RecvPart::with_buf(2048, 2048, bytes::BytesMut::new());
+        let part = || RecvPart::new(2048, 2048);
         // 2 bytes arrived; RESET_STREAM_AT(1500) then RESET_STREAM.
         let mut r = part();
         assert_eq!(r.arrive(0, 2), 2);
@@ -360,7 +302,7 @@ mod tests {
     #[test]
     fn gaps_release_credit_on_arrival_only() {
         use super::super::stream::RecvPart;
-        let mut r = RecvPart::with_buf(4096, 4096, bytes::BytesMut::new());
+        let mut r = RecvPart::new(4096, 4096);
         assert_eq!(r.arrive(1000, 1100), 100, "only the frame's own bytes");
         assert_eq!(r.arrive(1050, 1200), 100);
         assert_eq!(r.arrive(0, 500), 500);
@@ -377,48 +319,110 @@ mod tests {
         assert_eq!(r.credit_owed(), 0);
     }
 
+    #[test]
+    fn discard_keeps_only_missing_offsets_and_reset_preserves_statistics() {
+        use super::super::stream::RecvPart;
+
+        let mut r = RecvPart::new(8192, 8192);
+        for offset in (1..8192).step_by(2) {
+            assert_eq!(r.arrive(offset, offset + 1), 1);
+        }
+        assert_eq!(r.arrive(2, 8192), 4095);
+        r.received = 8192;
+        assert!(r.memory() >= 1024);
+        r.discard_arrival_data();
+        assert!(r.memory() < 256);
+        assert_eq!(r.arrived_from(0), 8191);
+        assert_eq!(r.arrive(0, 3), 1);
+        assert_eq!(r.arrived_from(0), 8192);
+
+        let mut r = RecvPart::new(8192, 8192);
+        assert_eq!(r.arrive(16, 64), 48);
+        assert_eq!(r.credit_reset(32, 128), 64);
+        assert_eq!(r.credit_reset(8, 128), 8);
+        assert_eq!(r.arrived_from(0), 48);
+        assert_eq!(r.arrive(0, 128), 8);
+        assert_eq!(r.arrived_from(0), 56);
+    }
+
+    #[test]
+    fn stop_then_out_of_order_arrival_extends_the_known_extent_without_filling_holes() {
+        use super::super::stream::RecvPart;
+
+        let mut r = RecvPart::new(8192, 8192);
+        assert_eq!(r.arrive(0, 10), 10);
+        assert_eq!(r.arrive(20, 30), 10);
+        r.received = 30;
+        r.cold_mut().stopped = Some(0);
+        r.discard_arrival_data();
+        assert_eq!(r.arrive(40, 50), 10);
+        assert_eq!(r.arrived_to, 10);
+        assert_eq!(r.arrived_in(10, 20), 0);
+        assert_eq!(r.arrived_in(30, 40), 0);
+        assert_eq!(r.arrive(40, 50), 0);
+        assert_eq!(r.arrive(35, 45), 5);
+        assert_eq!(r.arrive(10, 35), 15);
+        assert_eq!(r.arrived_to, 50);
+        assert_eq!(r.arrived_from(0), 50);
+    }
+
+    #[test]
+    fn stop_and_reliable_reset_settle_only_their_own_offsets() {
+        use super::super::stream::RecvPart;
+
+        for stop_first in [false, true] {
+            let mut r = RecvPart::new(8192, 8192);
+            assert_eq!(r.arrive(0, 10), 10);
+            assert_eq!(r.arrive(25, 30), 5);
+            r.received = 30;
+            r.final_size = Some(60);
+            let stop = |r: &mut RecvPart| {
+                r.cold_mut().stopped = Some(0);
+                r.discard_arrival_data();
+            };
+            if stop_first {
+                stop(&mut r);
+            }
+            assert_eq!(r.credit_reset(40, 60), 20);
+            if !stop_first {
+                stop(&mut r);
+            }
+            assert_eq!(r.arrive(35, 50), 5);
+            assert_eq!(r.credit_owed(), 20);
+            assert_eq!(r.credit_reset(20, 60), 10);
+            assert_eq!(r.arrived_from(0), 20);
+            assert_eq!(r.credit_owed(), 10);
+            assert_eq!(r.arrive(10, 60), 10);
+            assert_eq!(r.credit_owed(), 0);
+        }
+    }
+
     fn session(c: super::super::Config) -> SessionCore {
         let role = super::super::Role::Client;
         SessionCore::new(c, role, None, Instant::now()).unwrap()
     }
 
     #[test]
-    fn automatic_caps_grow_beyond_the_floors_within_the_budget() {
+    fn automatic_connection_window_cannot_exceed_its_committable_positions() {
         const MIB: u64 = 1 << 20;
-        let mut c = super::super::Config {
+        let mut config = super::super::Config {
             memory_budget: Some(256 * MIB),
             ..Default::default()
         };
-        let mut s = session(c.clone());
-        s.grow_session_window(1 << 40);
-        // The window's growth counts against the budget.
-        assert_eq!(s.streams.recv_flow().window, 257 * MIB);
-        assert_eq!(s.stream_window_limit(true), 257 * MIB);
-        // The receive buffer cap stays at the floor: the DoS bound does not
-        // grow with the window.
-        assert_eq!(s.buffer_cap(), 96 * MIB);
-        // A budget below the floors leaves the floors.
-        c.memory_budget = Some(MIB);
-        let mut s = session(c.clone());
-        s.grow_session_window(1 << 40);
-        assert_eq!(s.streams.recv_flow().window, 96 * MIB);
-        assert_eq!(s.send_buffer_limit(), 64 * MIB);
-        // A listener's budget replaces the session's own.
-        s.set_memory_allowance(Some(500 * MIB));
-        s.grow_session_window(1 << 40);
-        assert_eq!(s.streams.recv_flow().window, 596 * MIB);
-        // The window took what the listener had left.
-        assert_eq!(s.send_buffer_limit(), 64 * MIB);
-        // Fixed caps are fixed, whatever the budget.
-        c.memory_budget = None;
-        c.max_connection_receive_window = Cap::Fixed(8 * MIB);
-        c.send_buffer_max = Cap::Fixed(2 * MIB);
-        c.send_buffer = 2 * MIB;
-        let mut s = session(c);
-        s.grow_session_window(1 << 40);
-        assert_eq!(s.streams.recv_flow().window, 8 * MIB);
-        assert_eq!(s.buffer_cap(), 68 * MIB);
-        assert_eq!(s.send_buffer_limit(), 2 * MIB);
+        let mut core = session(config.clone());
+        let affordable = core.session_allowance();
+        assert!(affordable >= 8 * MIB, "{affordable} bytes can be committed");
+        core.grow_session_window(1 << 40);
+        assert_eq!(core.streams.recv_flow().window, affordable);
+        assert!(core.buffer_cap() >= affordable);
+        config.memory_budget = None;
+        config.max_connection_receive_window = Cap::Fixed(8 * MIB);
+        config.send_buffer_max = Cap::Fixed(2 * MIB);
+        config.send_buffer = 2 * MIB;
+        let mut core = session(config);
+        core.grow_session_window(1 << 40);
+        assert_eq!(core.streams.recv_flow().window, 8 * MIB);
+        assert_eq!(core.send_buffer_limit(), 2 * MIB);
     }
 
     #[test]
@@ -488,7 +492,7 @@ mod tests {
         let initial = super::super::Config::default().initial_stream_receive_window;
         let c = super::super::Config {
             max_stream_receive_window: Cap::Fixed(4 * initial),
-            memory_budget: Some(1 << 20),
+            memory_budget: Some(32 << 20),
             ..Default::default()
         };
         let mut s = session(c);

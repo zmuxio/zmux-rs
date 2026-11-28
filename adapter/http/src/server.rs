@@ -22,7 +22,7 @@ use zmux::adapter::CarrierConnId;
 use zmux::{CarrierInfo, Listener, PipeHint, PipeIo};
 
 use crate::body::{self, BodyReader, PipeBody, ReplayBody};
-use crate::classify::{RequestClass, classify, forwarded_early_data};
+use crate::classify::{RequestClass, classify};
 use crate::tls::binding_of;
 use crate::{Options, PairField};
 use zmux_rustls::TlsBinding;
@@ -231,6 +231,17 @@ where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    if pair
+        .check_ticket_header(
+            listener
+                .adapter()
+                .admission()
+                .and_then(zmux::Admission::prefix_ticket_header),
+        )
+        .is_err()
+    {
+        return Err(Unhandled::Abort);
+    }
     let (mut parts, body) = req.into_parts();
     let version = parts.version;
     let binding = parts.extensions.get::<TlsBinding>().cloned();
@@ -246,12 +257,10 @@ where
             ReplayBody::new([Bytes::new(), Bytes::new()], Some(body)),
         ))));
     };
-    if forwarded_early_data(&parts.headers) {
-        listener.adapter().count_setup_failure();
-        return Ok(too_early());
-    }
     let peer = peer.unwrap_or(NO_ADDR);
-    let source = request_source(listener, &parts.headers, Some(peer)).unwrap_or(peer);
+    let Ok(source) = zmux_http_head::preprocess(listener, &parts.headers, peer) else {
+        return Ok(too_early());
+    };
     let Some(mut entry) = listener.adapter().enter(peer, Some(source)) else {
         // Not taken, nothing written: the host's fallback serves it.
         return Err(Unhandled::Fallback(Box::new(Request::from_parts(
@@ -313,9 +322,9 @@ where
                 }
             };
             let io = io.with_abort(move || abort.run());
-            let io = match conn {
-                Some(c) => io.with_carrier_conn(c),
-                None => io,
+            let io = match (conn, io.carrier()) {
+                (Some(conn), Some(kind)) => io.with_carrier_transport(kind, conn),
+                _ => io,
             };
             (io, held, probe)
         }
@@ -414,17 +423,7 @@ where
                 Ok(carrier_response(class, version, resp_body.with_head(sent)))
             }
             Admit::Fallback(prefix) => {
-                if parts
-                    .extensions
-                    .get::<zmux::adapter::TrackRequestFallback>()
-                    .is_some()
-                {
-                    if let Some(outcome) = entry.request_fallback() {
-                        parts.extensions.insert(outcome);
-                    }
-                } else {
-                    entry.complete_request_fallback(true);
-                }
+                zmux_http_head::return_fallback(&mut entry, &mut parts.extensions);
                 let mut body = reader.replay(prefix.into());
                 body.stop_with(listener.clone());
                 Err(Unhandled::Fallback(Box::new(Request::from_parts(
@@ -513,7 +512,7 @@ impl zmux::adapter::ChunkWrite for StartWriter {
     fn poll_write_chunks(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        chunks: &mut [Bytes],
+        chunks: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
         if let Some(s) = self.started.take() {
             s.send_replace(true);
@@ -746,8 +745,7 @@ pub async fn serve_connection_with<IO, H, HF>(
     let inbox = Arc::new(HeadInbox::default());
     let heads = inbox.clone();
     let service = service_fn(move |mut req: Request<Incoming>| {
-        req.extensions_mut()
-            .insert(zmux::adapter::TrackRequestFallback);
+        zmux_http_head::track_fallback(req.extensions_mut());
         if let Some(transport) = &transport {
             req.extensions_mut().insert(Arc::downgrade(transport));
         }
@@ -803,14 +801,7 @@ pub async fn serve_connection_with<IO, H, HF>(
                     ));
                 }
             };
-            req.extensions_mut()
-                .remove::<zmux::adapter::TrackRequestFallback>();
-            if let Some(outcome) = req
-                .extensions_mut()
-                .remove::<zmux::adapter::RequestFallback>()
-            {
-                outcome.complete(fallback.is_some());
-            }
+            zmux_http_head::finish_fallback(req.extensions_mut(), fallback.is_some());
             let resp = match &fallback {
                 Some(f) => {
                     seen.store(true, Ordering::Relaxed);
@@ -941,6 +932,9 @@ pub async fn route_request(
     conn: Option<CarrierConnId>,
     options: &Options,
 ) -> Result<Response<PipeBody>, Unhandled<Incoming>> {
+    if options.validate_server(listener).is_err() {
+        return Err(Unhandled::Abort);
+    }
     let path = req.uri().path().to_owned();
     let (parts, body) = req.into_parts();
     let class = classify(&parts, &options.pair_field);

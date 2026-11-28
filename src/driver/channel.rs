@@ -15,19 +15,21 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 
+use super::deadline::sleep;
 use super::handle::{Shared, State};
-use super::tokio::{Tokio, now};
+use super::tokio::Tokio;
 use super::wait::{List, Wait};
 use crate::proto::frame::channel;
-use crate::proto::session::PipeId;
+use crate::proto::session::{NativeDatagram, NativeDatagramOutcome, NativeDatagramResult, PipeId};
 
 /// The datagram channel of a pipe's carrier, an optional capability of a
 /// carrier ([`crate::PipeIo::with_datagram_channel`]): an unreliable
@@ -40,35 +42,33 @@ use crate::proto::session::PipeId;
 /// datagram instead of delaying every later one; nothing changes for the
 /// application.
 ///
-/// A channel datagram is the varint [`DatagramChannel::channel_id`], when
+/// A channel datagram is the varint [`DatagramChannel::channel_prefix`], when
 /// the channel has one, then one DATAGRAM frame without its Length field
 /// (the [`channel`] frame module).
 pub trait DatagramChannel: Send + Sync + 'static {
-    /// The varint each channel datagram of the pipe starts with, by which
-    /// the peer's carrier routes it to the pipe: the Pipe Stream ID (the
-    /// carrier stream ID of the pipe) on a channel that the streams of a
-    /// connection share. An HTTP/3 carrier whose channel is the QUIC
-    /// datagrams of its connection gives the request stream's Quarter
-    /// Stream ID, which makes each channel datagram a whole HTTP Datagram.
-    /// `None`: the channel is the pipe's own and its datagrams are the
-    /// frame alone. It may change while the pipe is used (a stream
-    /// replaced after rejected early data).
-    fn channel_id(&self) -> Option<u64>;
+    /// The encoded routing prefix, if the carrier requires one. A carrier-owned
+    /// prefix is outside zmux's shaping measurements.
+    fn channel_prefix(&self) -> channel::Prefix;
 
-    /// The largest channel datagram the channel takes now,
-    /// [`DatagramChannel::channel_id`] included; 0 while it takes none
-    /// (the carrier did not negotiate datagrams, or has not yet). Called
-    /// outside the session's lock whenever the pipe's channel task wakes;
-    /// it must not wait.
-    fn max_datagram_size(&self) -> usize;
+    /// Returns the structural capacity and current room, including the pipe ID.
+    /// A capacity of zero means the carrier has no usable datagram service.
+    /// Room may change as the path or the transport's send queues change.
+    /// Called outside the session lock and must not wait.
+    fn datagram_capacity(&self) -> (usize, usize);
 
-    /// Sends one channel datagram. It may wait while the carrier's own
-    /// queue is full (the session's datagram queue drops its oldest
-    /// datagrams meanwhile); an error drops the datagram.
+    /// A carrier notification that its most recent capacity snapshot may have changed.
+    /// If provided, the subscription must also observe changes that race with the read.
+    fn capacity_changed(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send + '_>>> {
+        None
+    }
+
+    /// Sends one channel datagram. Several submissions can be pending,
+    /// polled first in dispatch order. An error drops that datagram.
+    /// Dropping a pending future cancels its submission.
     fn send(&self, datagram: Bytes) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
 
     /// Starts handing the channel datagrams received for the pipe,
-    /// [`DatagramChannel::channel_id`] removed, to `receiver`, until the
+    /// [`DatagramChannel::channel_prefix`] removed, to `receiver`, until the
     /// registration returned is dropped.
     fn receive(&self, receiver: ChannelReceiver) -> ChannelRegistration;
 }
@@ -93,7 +93,7 @@ impl ChannelReceiver {
     }
 
     /// Delivers one received channel datagram, its
-    /// [`DatagramChannel::channel_id`] removed: the DATAGRAM frame. It
+    /// [`DatagramChannel::channel_prefix`] removed: the DATAGRAM frame. It
     /// never waits: the session takes it from a bounded queue of the pipe,
     /// which drops (and counts) what does not fit.
     pub fn deliver(&self, frame: Bytes) {
@@ -129,14 +129,16 @@ impl ChannelRegistration {
 impl Drop for ChannelRegistration {
     fn drop(&mut self) {
         if let Some(stop) = self.0.take() {
-            stop();
+            // Host cleanup must allow the other carrier resources to drop,
+            // including when this registration is itself dropped during unwind.
+            drop(std::panic::catch_unwind(std::panic::AssertUnwindSafe(stop)));
         }
     }
 }
 
 /// Routes the channel datagrams of one carrier connection shared by several
 /// pipes, such as a QUIC connection or a WebTransport session, to those
-/// pipes by the varint they start with ([`DatagramChannel::channel_id`]).
+/// pipes by the varint they start with ([`DatagramChannel::channel_prefix`]).
 /// An adapter runs one receive loop per connection that passes every
 /// datagram to [`ChannelDemux::deliver`], and its pipes'
 /// [`DatagramChannel::receive`] register with [`ChannelDemux::register`].
@@ -293,14 +295,24 @@ async fn run(
     ch: Arc<dyn DatagramChannel>,
     _receiving: Receiving,
 ) {
-    let mut out = Vec::new();
+    let clock = shared.lock().core.config().clock_domain.clone();
+    let mut writes = ChannelWrites {
+        shared: &shared,
+        pipe,
+        staged: Vec::new(),
+        pending: Vec::new(),
+    };
     loop {
-        // The carrier's maximum may grow with its path, or shrink.
-        let (id, max) = (ch.channel_id(), ch.max_datagram_size());
+        // Subscribe before reading the current capacity.
+        let changed = ch.capacity_changed();
+        let prefix = ch.channel_prefix();
+        let (capacity, room) = ch.datagram_capacity();
         let generation = {
             let mut st = shared.lock();
-            st.core.set_pipe_channel(pipe, id, max);
-            let live = st.core.poll_channel(pipe, &mut out, now());
+            let time = st.now();
+            st.core.tick(time);
+            st.core.set_pipe_channel(pipe, prefix, capacity, room);
+            let live = st.core.poll_channel(pipe, &mut writes.staged, time);
             let generation = st.core.channel_generation();
             st.after_command();
             if !live {
@@ -308,36 +320,150 @@ async fn run(
             }
             generation
         };
-        if !out.is_empty() {
-            let mut failed = 0;
-            // A send that waits for room ends with the channel's use (the
-            // session closing): what is left is dropped with the task.
-            let shut = Wait::new(&shared.inner, List::Channel, |st: &mut State<Tokio>| {
-                (!st.core.channel_live(pipe)).then_some(())
+        let dispatched = !writes.staged.is_empty();
+        for NativeDatagram { bytes, outcome } in writes.staged.drain(..) {
+            writes.pending.push(PendingSend {
+                io: Some(Box::pin(send_datagram(
+                    ch.as_ref(),
+                    bytes,
+                    &clock,
+                    outcome.expiry,
+                ))),
+                outcome: Some(outcome),
+                result: None,
+                polling: false,
             });
-            let sent = super::sealed::until(shut, async {
-                for b in out.drain(..) {
-                    if ch.send(b).await.is_err() {
-                        failed += 1;
-                    }
-                }
-            })
-            .await;
-            if sent.is_none() {
-                return;
-            }
-            if failed > 0 {
-                let mut st = shared.lock();
-                st.core.channel_send_failed(failed);
-                st.after_command();
-            }
-            continue;
         }
-        Wait::new(&shared.inner, List::Channel, |st: &mut State<Tokio>| {
+        let wake = Wait::new(&shared.inner, List::Channel, |st: &mut State<Tokio>| {
             (st.core.channel_generation() != generation || !st.core.channel_live(pipe))
                 .then_some(())
-        })
-        .await;
+        });
+        tokio::select! {
+            biased;
+            () = wake => {}
+            () = poll_fn(|cx| writes.poll(cx, dispatched)) => {}
+            () = async {
+                match changed {
+                    Some(changed) => changed.await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+        }
+    }
+}
+
+type SendFuture<'a> = Pin<Box<dyn Future<Output = NativeDatagramResult> + Send + 'a>>;
+
+struct PendingSend<'a> {
+    io: Option<SendFuture<'a>>,
+    outcome: Option<NativeDatagramOutcome>,
+    result: Option<NativeDatagramResult>,
+    polling: bool,
+}
+
+/// The channel task owns all its receipts. Drop also runs on abort and on
+/// unwind from a host callback, without a follow-up task on the runtime.
+struct ChannelWrites<'a> {
+    shared: &'a Shared<Tokio>,
+    pipe: PipeId,
+    staged: Vec<NativeDatagram>,
+    pending: Vec<PendingSend<'a>>,
+}
+
+impl ChannelWrites<'_> {
+    fn poll(&mut self, cx: &mut Context<'_>, dispatched: bool) -> Poll<()> {
+        let mut completed = false;
+        for send in &mut self.pending {
+            // If the adapter panics in this poll, it may have already
+            // transferred ownership. Keep the structural reservation.
+            send.polling = true;
+            if let Poll::Ready(result) = send.io.as_mut().expect("pending send").as_mut().poll(cx) {
+                send.result = Some(result);
+                completed = true;
+            }
+            send.polling = false;
+        }
+        if completed {
+            let mut st = self.shared.lock();
+            let now = st.now();
+            for send in &mut self.pending {
+                if let Some(result) = send.result
+                    && let Some(outcome) = send.outcome.take()
+                {
+                    st.core.channel_done(self.pipe, outcome, result, now);
+                }
+            }
+            st.after_command();
+            drop(st);
+            self.pending.retain(|send| send.outcome.is_some());
+        }
+        if completed || dispatched {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for ChannelWrites<'_> {
+    fn drop(&mut self) {
+        // Cancel carrier futures before releasing their slots, outside the session lock.
+        for send in &mut self.pending {
+            let io = send.io.take();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(io))).is_err()
+                && send.result.is_none()
+            {
+                send.polling = true;
+            }
+        }
+        let mut st = self.shared.lock();
+        let now = st.now();
+        for send in &mut self.pending {
+            let result = send.result.unwrap_or(if send.polling {
+                NativeDatagramResult::Unresolved
+            } else {
+                NativeDatagramResult::Cancelled
+            });
+            if let Some(outcome) = send.outcome.take() {
+                st.core.channel_done(self.pipe, outcome, result, now);
+            }
+        }
+        for datagram in self.staged.drain(..) {
+            st.core.channel_done(
+                self.pipe,
+                datagram.outcome,
+                NativeDatagramResult::Cancelled,
+                now,
+            );
+        }
+        st.core.tick(now);
+        st.core.stop_pipe_channel(self.pipe);
+        st.after_command();
+    }
+}
+
+async fn send_datagram(
+    channel: &dyn DatagramChannel,
+    bytes: Bytes,
+    clock: &crate::ClockDomain,
+    expiry: Option<std::time::Instant>,
+) -> NativeDatagramResult {
+    if expiry.is_some_and(|at| clock.now() >= at) {
+        return NativeDatagramResult::Expired;
+    }
+    let send = channel.send(bytes);
+    let accepted = if expiry.is_some() {
+        let Some(result) = super::sealed::until(sleep::<Tokio>(clock, expiry), send).await else {
+            return NativeDatagramResult::Expired;
+        };
+        result
+    } else {
+        send.await
+    };
+    if accepted.is_ok() {
+        NativeDatagramResult::Accepted
+    } else {
+        NativeDatagramResult::Rejected
     }
 }
 
@@ -401,7 +527,7 @@ impl Shared<Tokio> {
     fn receive_channel(&self, pipe: PipeId, batch: &mut VecDeque<Bytes>, dropped: u64) {
         let mut st = self.lock();
         let due = st.core.poll_timeout();
-        let now = now();
+        let now = st.now();
         st.core.channel_dropped(dropped);
         for frame in batch.drain(..) {
             st.core.receive_channel_datagram(pipe, &frame, now);

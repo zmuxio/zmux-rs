@@ -6,6 +6,9 @@
 
 mod support;
 
+#[path = "../../test-support/ticket.rs"]
+mod ticket;
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,39 +56,30 @@ fn admitted(mut limits: ListenerConfig, admission: zmux::Admission) -> ListenerC
 }
 
 fn prefix_auth() -> (zmux::PrefixAuth, zmux::Admission) {
-    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
-    (auth, zmux::Admission::prefix_auth(verifier))
+    let (auth, verifier) = ticket::fixture(zmux::PrefixBinding::AllowCleartext);
+    (
+        auth,
+        zmux::Admission::prefix_auth(verifier, zmux::PrefixRejection::Fallback),
+    )
 }
 
 #[test]
 fn split_bootstrap_over_http1_and_http2() {
     support::run(2, 90, || async {
         tokio::time::timeout(Duration::from_secs(60), async {
-            for admitted in [false, true] {
-                let (auth, admission) = prefix_auth();
-                let mut limits = ListenerConfig::default();
-                let client_opts = if admitted {
-                    limits.admission = Some(admission);
-                    Options::default().with_carrier_credential(Arc::new(auth))
-                } else {
-                    Options::default()
-                };
-                let (addr, listener) =
-                    server_with(Config::default(), limits, Options::default()).await;
-                let client = zmux_http::connect_http1_split(&addr, &client_opts, Config::default())
-                    .await
-                    .unwrap();
-                exchange(client, listener.accept().await.unwrap()).await;
-                let h2 = Http2Connection::connect(&addr, client_opts.clone())
-                    .await
-                    .unwrap();
-                let client = h2.connect_split_session(Config::default()).await.unwrap();
-                let server = listener.accept().await.unwrap();
-                assert_kind([&client, &server], zmux::CarrierKind::Split);
-                exchange(client, server).await;
-                assert_eq!(listener.stats().sessions, 2, "admitted {admitted}");
-            }
+            let limits = ListenerConfig::default();
+            let client_opts = Options::default();
+            let (addr, listener) = server_with(Config::default(), limits, Options::default()).await;
+            let client = zmux_http::connect_http1_split(&addr, &client_opts, Config::default())
+                .await
+                .unwrap();
+            exchange(client, listener.accept().await.unwrap()).await;
+            let h2 = Http2Connection::connect(&addr, client_opts).await.unwrap();
+            let client = h2.connect_split_session(Config::default()).await.unwrap();
+            let server = listener.accept().await.unwrap();
+            assert_kind([&client, &server], zmux::CarrierKind::Split);
+            exchange(client, server).await;
+            assert_eq!(listener.stats().sessions, 2);
         })
         .await
         .unwrap();
@@ -150,7 +144,7 @@ fn split_bootstrap_without_a_credential_is_refused() {
 
 fn multipath() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"http-carriers-psk-0123456789abcd").with_end_to_end();
     c
 }
@@ -201,13 +195,24 @@ fn a_split_carrier_joins() {
                 })
                 .await
                 .expect("joined in time");
-                joined.unwrap();
+                let joined = joined.unwrap();
                 assert_eq!(client.pipes().len(), 2, "http2 {http2}");
-                // The joiner is done once Confirm is written; the listener counts the join when
-                // it has read that, and the exchange ends with a close of the session.
-                while listener.stats().joins == 0 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                let [join] = joined.as_slice() else {
+                    panic!("split Join produced {joined:?}");
+                };
+                let peer_join = async {
+                    loop {
+                        if let Some(pipe) = server.pipe(join.id()) {
+                            break pipe;
+                        }
+                        server
+                            .next_event()
+                            .await
+                            .expect("session ended before Join");
+                    }
                 }
+                .await;
+                peer_join.attached().await.unwrap();
                 exchange(client, server).await;
                 assert_eq!(listener.stats().joins, 1);
             }
@@ -237,13 +242,11 @@ async fn raw(addr: &str, request: &str) -> String {
     String::from_utf8_lossy(&got).to_lowercase()
 }
 
-/// A downlink's response asks proxies neither to cache nor to buffer it and
-/// has no length; a carrier request forwarded from early data is answered
+/// Cleartext downlink ticket headers are refused. A request forwarded from early data is answered
 /// 425 before any admission, and a request of no carrier is not.
 #[test]
-fn downlink_headers_and_early_data() {
-    support::run(2, 90, || async {
-        tokio::time::timeout(Duration::from_secs(30), async {
+fn cleartext_downlink_ticket_and_early_data() {
+    support::run(2, 30, || async {
         let (auth, admission) = prefix_auth();
         let (addr, listener) = server_with(
             Config::default(),
@@ -251,18 +254,6 @@ fn downlink_headers_and_early_data() {
             Options::default(),
         )
         .await;
-        let token = zmux::PrefixAuth::header_value(&auth.token(None).unwrap());
-        let get = format!(
-            "GET /zmux HTTP/1.1\r\nHost: x\r\nZmux-Pipe-Pair: AAECAwQFBgcICQoLDA0ODw\r\n\
-             Zmux-Prefix-Auth: {token}\r\n\r\n"
-        );
-        let head = raw(&addr, &get).await;
-        assert!(head.starts_with("http/1.1 200"), "{head}");
-        assert!(head.contains("cache-control: no-store"), "{head}");
-        assert!(head.contains("x-accel-buffering: no"), "{head}");
-        assert!(head.contains("connection: close"), "{head}");
-        assert!(head.contains("transfer-encoding: chunked"), "{head}");
-        assert!(!head.contains("content-length"), "{head}");
         for request in [
             "POST /zmux HTTP/1.1\r\nHost: x\r\nEarly-Data: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
             "GET /zmux HTTP/1.1\r\nHost: x\r\nEarly-Data: 1\r\nZmux-Pipe-Pair: AAECAwQFBgcICQoLDA0ODw\r\n\r\n",
@@ -271,13 +262,21 @@ fn downlink_headers_and_early_data() {
             assert!(head.starts_with("http/1.1 425"), "{head}");
         }
         // Each 425 is a setup failure, its connection not counted again.
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(listener.stats().setup_failures, 2);
-        let head = raw(&addr, "GET /zmux HTTP/1.1\r\nHost: x\r\nEarly-Data: 1\r\n\r\n").await;
+        let head = raw(
+            &addr,
+            "GET /zmux HTTP/1.1\r\nHost: x\r\nEarly-Data: 1\r\n\r\n",
+        )
+        .await;
         assert!(head.starts_with("http/1.1 404"), "{head}");
-    })
-    .await
-    .unwrap();
+
+        let token = zmux::PrefixAuth::header_value(&auth.token(&zmux::CarrierInfo::new()).unwrap());
+        let get = format!(
+            "GET /zmux HTTP/1.1\r\nHost: x\r\nZmux-Pipe-Pair: AAECAwQFBgcICQoLDA0ODw\r\n\
+             Zmux-Prefix-Auth: {token}\r\n\r\n"
+        );
+        let head = raw(&addr, &get).await;
+        assert!(head.starts_with("http/1.1 404"), "{head}");
     });
 }
 

@@ -5,7 +5,7 @@
 //!
 //! - [`connect`] dials TCP, runs the TLS handshake and establishes a
 //!   session; [`dial`] makes the carrier alone, for further pipes
-//!   ([`Session::add_pipe`], `maintain_pipes`);
+//!   ([`Session::begin_change`], `SessionController`);
 //! - [`serve`] accepts TCP connections, runs each handshake in a task of
 //!   its own within the listener's `handshake_timeout`, and hands the
 //!   carriers to a [`Listener`].
@@ -321,6 +321,8 @@ pub fn carrier_info<IO>(stream: &tokio_rustls::server::TlsStream<IO>) -> Carrier
     connection::tls_info(
         conn.alpn_protocol(),
         conn.server_name(),
+        !conn.is_handshaking(),
+        connection::is_bound(conn),
         connection::snapshot_exporter(conn),
     )
 }
@@ -336,6 +338,8 @@ fn client_carrier_info(
     let info = connection::tls_info(
         conn.alpn_protocol(),
         Some(server_name),
+        !conn.is_handshaking(),
+        connection::is_bound(conn),
         connection::snapshot_exporter(conn),
     );
     match tcp.peer_addr() {

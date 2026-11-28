@@ -2,7 +2,13 @@
 //! listener's handshake timeout ends it, and so does its close, whatever the
 //! session configuration's own handshake timeout (none here).
 
-use std::time::{Duration, Instant};
+#[path = "common/clock.rs"]
+mod clock;
+
+use std::time::Duration;
+
+use clock::ManualClock;
+use zmux::{ClockDomain, MonotonicClock};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use zmux::{Config, HandleError, Listener, ListenerConfig, PipeHint, PipeIo, Session};
@@ -35,19 +41,34 @@ fn listener(handshake: Duration) -> Listener {
 
 #[tokio::test]
 async fn a_valid_first_record_that_stalls_times_out() {
-    let first = first_bytes().await;
-    let l = listener(Duration::from_millis(200));
-    let (mut near, far) = duplex(1 << 16);
-    near.write_all(&first).await.unwrap();
-    let begun = Instant::now();
-    let r = tokio::time::timeout(LIMIT, l.handle_pipe(PipeIo::new(far), PipeHint::default()))
-        .await
-        .unwrap();
-    assert_eq!(r, Err(HandleError::TimedOut));
-    assert!(begun.elapsed() < Duration::from_secs(3));
-    assert_eq!(l.stats().timed_out, 1);
-    drop(near);
-    l.close();
+    tokio::time::timeout(LIMIT, async {
+        let first = first_bytes().await;
+        let wait = Duration::from_secs(90);
+        let (clock, domain) = ManualClock::domain(Duration::from_secs(120));
+        let mut timers = clock.registrations();
+        let deadline = domain.now() + wait;
+        let mut config = Config::default();
+        config.handshake_timeout = None;
+        config.clock_domain = domain;
+        let mut limits = ListenerConfig::default();
+        limits.handshake_timeout = wait;
+        let l = Listener::new(config, limits).unwrap();
+        let (mut near, far) = duplex(1 << 16);
+        near.write_all(&first).await.unwrap();
+        let accepting = l.clone();
+        let handled = tokio::spawn(async move {
+            accepting
+                .handle_pipe(PipeIo::new(far), PipeHint::default())
+                .await
+        });
+        while timers.recv().await.unwrap() != deadline {}
+        clock.advance(wait);
+        assert_eq!(handled.await.unwrap(), Err(HandleError::TimedOut));
+        assert_eq!(l.stats().timed_out, 1);
+        l.close();
+    })
+    .await
+    .expect("listener establishment timeout test watchdog");
 }
 
 #[tokio::test]

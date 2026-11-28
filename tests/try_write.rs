@@ -17,8 +17,8 @@ mod common;
 use std::future::poll_fn;
 use std::time::Duration;
 
-use bytes::Bytes;
 use common::{connect, small_windows, tcp, watchdog};
+use zmux::Chunk;
 use zmux::{Config, PipeIo, SendStream, Session, VarInt};
 
 async fn pair() -> (Session, Session) {
@@ -108,7 +108,7 @@ async fn try_write_takes_what_fits_and_never_waits() {
         let ended = poll_fn(|cx| send.poll_writable(cx)).await;
         assert!(ended.is_err(), "{ended:?}");
         assert!(send.try_write(b"x").is_err(), "after STOP_SENDING");
-        let mut chunk = Bytes::from_static(b"x");
+        let mut chunk = Chunk::from_static(b"x");
         assert!(send.try_write_chunk(&mut chunk).is_err());
         assert_eq!(chunk.len(), 1, "an error takes nothing");
     })
@@ -169,7 +169,7 @@ async fn try_write_chunk_advances_and_reset_ends_it() {
         let (mut send, _recv) = client.open_bi().await.unwrap();
         send.set_send_buffer(1).unwrap();
         let window = send.send_capacity() as usize;
-        let data = Bytes::from(vec![3u8; window * 4]);
+        let data = Chunk::from(vec![3u8; window * 4]);
         let mut chunk = data.clone();
         let n = send.try_write_chunk(&mut chunk).unwrap();
         assert!(n > 0 && n < data.len(), "partial: {n}");
@@ -220,7 +220,7 @@ fn blocking_try_write_never_waits() {
     // The driver runs on its own thread and may free buffer space between
     // calls, so a chunk may take part of itself or nothing, never wait, and
     // only the bytes it took (`Ok(0)` takes none) reach the peer.
-    let mut chunk = Bytes::from(vec![9u8; 2]);
+    let mut chunk = Chunk::from(vec![9u8; 2]);
     let n = send.try_write_chunk(&mut chunk).unwrap();
     assert!(
         n <= 2 && chunk.len() == 2 - n,
@@ -308,7 +308,7 @@ async fn readable_then_try_read_loses_nothing() {
         h.readable().await;
         assert_eq!(
             recv.try_read_chunk(100).unwrap(),
-            TryRead::Data(Bytes::from_static(b"hello"))
+            TryRead::Data(Chunk::from_static(b"hello"))
         );
         assert_eq!(recv.try_read_chunk(100).unwrap(), TryRead::WouldBlock);
         send.finish().unwrap();

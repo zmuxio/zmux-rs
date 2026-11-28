@@ -221,6 +221,11 @@ impl Epochs {
         }
     }
 
+    fn previous_expired(&self, now: Instant) -> bool {
+        matches!(self.st, St::Switched { since }
+            if now.saturating_duration_since(since) >= EPOCH_RETENTION)
+    }
+
     fn set_own(&mut self, own: Option<Own>) {
         self.own = own;
         self.sent.clear();
@@ -252,6 +257,19 @@ impl SessionCore {
     /// The epochs this end accepts as acceptor, ascending.
     pub(in crate::proto::session) fn accepted_epochs(&self) -> Vec<u64> {
         self.epochs().map_or_else(|| vec![0], Epochs::accepted)
+    }
+
+    /// Whether an opened Hello's epoch is still accepted at the commit point,
+    /// including expiry before the timer has run.
+    pub(in crate::proto::session) fn accepts_join_epoch(&self, epoch: u64) -> bool {
+        let Some(ep) = self.epochs() else {
+            return false;
+        };
+        if epoch == ep.d {
+            !ep.previous_expired(self.now)
+        } else {
+            epoch == ep.d + 1 && matches!(ep.st, St::Answered | St::Switched { .. })
+        }
     }
 
     /// The epoch new local joins use; `None` outside a multipath session.
@@ -406,7 +424,7 @@ impl SessionCore {
             return;
         }
         match mp.epochs.st {
-            St::Switched { since } if now.saturating_duration_since(since) >= EPOCH_RETENTION => {
+            St::Switched { .. } if mp.epochs.previous_expired(now) => {
                 self.enter_stable(now);
             }
             St::Stable => {
@@ -737,7 +755,7 @@ impl SessionCore {
         }
     }
 
-    /// A Hello of epoch `epoch` verified: the peer uses it, so an answering end switches;
+    /// An authorized Hello of epoch `epoch` completed its key exchange, so an answering end switches;
     /// its answer repeats until a record that carried it is acknowledged.
     pub(in crate::proto::session) fn epoch_peer_joined(&mut self, epoch: u64, now: Instant) {
         if let Some(mp) = self.mp.as_deref()

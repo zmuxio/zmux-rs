@@ -6,6 +6,11 @@ rust-version = "1.95"
 publish = false
 description = "A scripted zmux peer for cross-implementation interoperability tests over TCP and QUIC"
 
+[[bin]]
+name = "zmux-interop-peer"
+test = false
+bench = false
+
 # Standalone: not a member of the zmux workspace.
 #   cargo build --release --manifest-path interop/peer/Cargo.toml
 [workspace]
@@ -16,7 +21,7 @@ tokio = { version = "1.54", features = ["full"] }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 zmux-testcert = { path = "../../testcert" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-zmux = { path = "../.." }
+zmux = { path = "../..", features = ["test-hooks"] }
 zmux-quinn = { path = "../../adapter/quinn" }
 zmux-rustls = { path = "../../adapter/rustls" }
 zmux-seal = { path = "../../seal" }

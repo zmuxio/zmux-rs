@@ -53,7 +53,7 @@ type Net = MpNet<(), Seen>;
 
 fn config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.max_idle_timeout = Some(Duration::from_secs(60));
     c.liveness.suspect_floor = Duration::from_millis(100);

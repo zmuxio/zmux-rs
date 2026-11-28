@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 
-use super::attachment::{Attachment, PipeOutcome};
+use super::attachment::{Attachment, JoinResources, PipeOutcome};
 use super::events::EventQueue;
 use super::hooks::{HookStart, TraceQueue, WindowHook, ask, trace};
 use super::resources::{Kind, Live};
@@ -53,7 +53,7 @@ use crate::proto::session::{Piece, PieceCursor, TransmitBuf};
 /// A driver of sessions: the tokio driver (`Tokio`, feature `tokio`) or the
 /// std driver (`Blocking`, feature `blocking`). Sealed: its items are the
 /// drivers' internals.
-pub trait Driver: sealed::Sealed + Sized + Send + Sync + 'static {
+pub trait Driver: std::fmt::Debug + Clone + sealed::Sealed + Sized + Send + Sync + 'static {
     /// The driver's part of the session state, under the core lock.
     #[doc(hidden)]
     type Io: Send;
@@ -75,15 +75,37 @@ pub trait Driver: sealed::Sealed + Sized + Send + Sync + 'static {
     type Dial: Clone + Send + Sync + 'static;
 
     #[doc(hidden)]
-    fn join_session(s: Session<Self>) -> JoinSession;
+    fn spawn_controller(future: impl Future<Output = ()> + Send + 'static);
+
+    #[doc(hidden)]
+    fn candidate_metadata(
+        io: &mut Self::Carrier,
+        kind: crate::CarrierKind,
+        variant: Option<&Arc<str>>,
+    );
+
+    #[doc(hidden)]
+    fn hold_cleanup(io: &mut Self::Carrier, guard: impl Send + 'static);
+
+    #[doc(hidden)]
+    fn controller_bootstrap(
+        io: Self::Carrier,
+        config: Arc<Config>,
+    ) -> Result<Arc<Shared<Self>>, ConnectError>;
 
     #[doc(hidden)]
     fn spawn_join(shared: &Shared<Self>, f: impl Future<Output = ()> + Send + 'static);
 
     #[doc(hidden)]
-    fn join_callback(
-        call: impl FnOnce() -> crate::Decision<()> + Send + 'static,
-    ) -> impl Future<Output = Option<crate::Decision<()>>> + Send;
+    fn join_callback<T: Send + 'static>(
+        call: impl FnOnce() -> crate::Decision<T> + Send + 'static,
+    ) -> impl Future<Output = Option<crate::Decision<T>>> + Send;
+
+    #[doc(hidden)]
+    fn sleep_until(deadline: Instant) -> impl Future<Output = ()> + Send;
+
+    #[doc(hidden)]
+    fn resolve_join_exporter(carrier: &Self::Carrier) -> impl Future<Output = ()> + Send + 'static;
 
     /// The session clock.
     #[doc(hidden)]
@@ -101,9 +123,10 @@ pub trait Driver: sealed::Sealed + Sized + Send + Sync + 'static {
     /// carriers have no lanes refuses it, which costs the pipe nothing.
     #[doc(hidden)]
     fn open_lane(state: &mut State<Self>, lane: LaneId) {
+        let now = state.now();
         state
             .core
-            .write_failed(lane, std::io::ErrorKind::Unsupported, Self::now());
+            .write_failed(lane, std::io::ErrorKind::Unsupported, now);
     }
 
     /// The core resets an outbound lane not confirmed in time.
@@ -200,6 +223,10 @@ mod sealed {
 
 /// What the core needs to know about a carrier.
 pub struct CarrierInfo {
+    pub(crate) connection_memory: u64,
+    #[cfg(feature = "tokio")]
+    pub(crate) writer_memory: u64,
+    pub(crate) accounting_sources: crate::CarrierHalfSources,
     pub(crate) attachment: Arc<Attachment>,
     pub(crate) inbound: Option<Framing>,
     pub(crate) outbound: Option<Framing>,
@@ -214,8 +241,9 @@ pub struct CarrierInfo {
     /// The largest record the carrier takes ([`crate::PipeIo::with_max_record`]).
     pub(crate) max_record: Option<usize>,
     /// The padding of a handshake run on the carrier before the session.
-    pub(crate) handshake_padding: u64,
+    pub(crate) establish_receipts: crate::shaping::EstablishReceipts,
     pub(crate) admitted: Option<crate::AdmittedValue>,
+    pub(crate) bound_prefix: Option<[u8; 16]>,
     /// The carrier declares the Bound contract ([`crate::PipeIo::with_carrier_secure`]).
     pub(crate) secure: bool,
     /// A split carrier: no Bound.
@@ -279,7 +307,6 @@ impl CarrierInfo {
             // Checked before: `connect` (`check_pipe_record_limit`).
             let _ = core.set_pipe_max_record(id, max);
         }
-        core.shaping_spend_handshake(self.handshake_padding);
         core.set_pipe_admitted(id, self.admitted.clone());
     }
 }
@@ -307,14 +334,15 @@ impl DatagramAllowance<'_> {
     }
 
     /// The datagram's outcome: its allowance stays taken if it was queued.
-    pub(crate) fn queued(
-        mut self,
-        queued: Result<bool, DatagramError>,
-    ) -> Result<(), DatagramError> {
-        if matches!(queued, Ok(true)) {
-            self.granted = Some(0);
+    pub(crate) fn queued(mut self, queued: Result<(), DatagramError>) -> Result<(), DatagramError> {
+        if queued.is_ok() {
+            self.commit();
         }
-        queued.map(|_| ())
+        queued
+    }
+
+    pub(crate) fn commit(&mut self) {
+        self.granted = Some(0);
     }
 }
 
@@ -407,7 +435,7 @@ impl<T> LocatorTable<T> {
     }
 
     /// Any live session, for tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn any(&self) -> Option<Arc<T>> {
         self.lock().0.values().find_map(Weak::upgrade)
     }
@@ -462,6 +490,21 @@ impl<D: Driver> LocatorTable<Shared<D>> {
 /// whenever an epoch changes them.
 pub(crate) type LocatorHook = Box<dyn FnMut(&[Vec<u8>]) + Send>;
 
+#[derive(Default)]
+pub(super) struct ControlState {
+    pub(super) changes: super::capacity_change::Changes,
+    pub(super) demand: Option<super::controller::RecoveryDemand>,
+    pub(super) feedback: Option<super::controller::ControllerFeedback>,
+    pub(super) origins:
+        std::collections::BTreeMap<crate::MemberId, super::controller::MemberOrigin>,
+}
+
+#[derive(Default)]
+struct CarrierSelection {
+    chosen: Option<(crate::CarrierKind, Option<Arc<str>>)>,
+    tries: VecDeque<crate::CandidateResult>,
+}
+
 pub struct State<D: Driver> {
     pub(super) core: core::SessionCore,
     /// The listener's table of this session's Locators.
@@ -471,6 +514,8 @@ pub struct State<D: Driver> {
     pub(super) waiters: Waiters<StreamKey>,
     /// Wake-ups decided under the lock, delivered after it.
     pub(super) wakes: WakeList,
+    #[cfg(all(feature = "test-hooks", feature = "tokio"))]
+    revision: tokio::sync::watch::Sender<()>,
     /// The driver's work for after the lock.
     pub(super) deferred: D::Deferred,
     /// Application handles (sessions and streams) alive.
@@ -480,12 +525,12 @@ pub struct State<D: Driver> {
     goaway: Option<GoAway>,
     /// The carrier kind a carrier mode chose, and its tries
     /// ([`State::report_carrier`]).
-    carrier: Option<Box<(crate::CarrierKind, Option<Arc<str>>)>>,
-    carrier_tries: VecDeque<crate::CandidateResult>,
+    carrier_selection: Option<Box<CarrierSelection>>,
     /// Session events for the application.
     events: EventQueue,
     /// Pipe state changes and suspensions seen so far ([`Session::pipes_changed_op`]).
     pipe_changes: u64,
+    pub(super) control: Option<Box<ControlState>>,
     /// The outcome slots of the unretired pipes that have handles
     /// ([`Pipe::end`]).
     pipe_ends: std::collections::HashMap<u64, Weak<PipeOutcome>>,
@@ -507,6 +552,9 @@ pub struct State<D: Driver> {
     datagram_limiter: DatagramLimiter,
     /// The value of the admission that accepted the bootstrap carrier.
     admitted: Option<crate::AdmittedValue>,
+    bound_prefix: Option<[u8; 16]>,
+    /// Host authorization work and carriers that can outlast protocol Join.
+    join_resources: Option<Arc<JoinResources>>,
     /// Received datagrams on their way past the receive limiter (reused).
     datagram_batch: Vec<ReceivedDatagram>,
     /// The redial sources running: the `redial` hook's and the pools'
@@ -519,7 +567,6 @@ pub struct State<D: Driver> {
     pub(super) io: D::Io,
 }
 
-#[cfg(feature = "tokio")]
 /// The tries of carrier candidates a session's statistics keep, the
 /// latest: a session that retries a kind for hours keeps a bounded
 /// history.
@@ -547,7 +594,8 @@ impl<D: Driver> Defer for State<D> {
     /// still can do of it, with no second panic out of a drop.
     fn poison(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.core.fail_internal("internal error", D::now());
+            let now = self.now();
+            self.core.fail_internal("internal error", now);
             // Nothing else runs for this lock: the close must go out.
             self.after_command();
         }));
@@ -570,6 +618,60 @@ const fn di(dir: Dir) -> usize {
 }
 
 impl<D: Driver> State<D> {
+    pub(super) fn session_id(&self) -> crate::SessionId {
+        self.id
+    }
+
+    pub(super) fn controller_current(&self, stamp: (u64, u64)) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|pool| pool.changes.current(stamp))
+    }
+
+    pub(super) fn advance_controller_epoch(&mut self, stamp: (u64, u64), policy: u64) -> bool {
+        self.controller_current(stamp)
+            && self.core.session_policy().revision == policy
+            && self.core.advance_epoch(self.now()).is_ok()
+    }
+
+    pub(super) fn refresh_controller_demand(&mut self) {
+        if self
+            .control
+            .as_ref()
+            .is_none_or(|pool| pool.demand.is_none())
+        {
+            return;
+        }
+        if self.core.error().is_some() {
+            self.control.as_mut().expect("installed control").demand = None;
+            return;
+        }
+        let capacity = self.capacity();
+        let policy = self.core.session_policy();
+        if let Some(demand) = self.control.as_mut().and_then(|pool| pool.demand.as_mut()) {
+            demand.refresh(capacity, policy);
+        }
+    }
+
+    pub(super) fn control_paths(&self) -> Vec<PipeStats> {
+        let now = self.now();
+        let mut paths = self.core.pipes_at(now);
+        let bootstrap = self.bootstrap.upgrade();
+        for path in &mut paths {
+            let end = self.pipe_ends.get(&path.pipe.0).and_then(Weak::upgrade);
+            let cache = if path.pipe == PipeId(0) {
+                bootstrap
+                    .as_ref()
+                    .and_then(|pipe| pipe.sample_cache())
+                    .or_else(|| end.as_ref().and_then(|end| end.sample.get()))
+            } else {
+                end.as_ref().and_then(|end| end.sample.get())
+            };
+            path.carrier_loss = cache.and_then(|cache| cache.loss(now));
+        }
+        paths
+    }
+
     /// Registers (or refreshes) the stream wait holding `slot` in `list`.
     fn wait_stream(&mut self, list: List<StreamKey>, slot: &mut Option<Ticket>, waker: &Waker) {
         self.waiters.register(list, slot, waker);
@@ -639,8 +741,9 @@ impl<D: Driver> State<D> {
         locator: Option<&[u8]>,
         carrier: CarrierInfo,
         io: D::Io,
+        listener_budget: Option<Arc<crate::proto::memory::Ledger>>,
     ) -> Result<Self, ConnectError> {
-        let now = D::now();
+        let now = config.clock_domain.now_with(D::now);
         if config.pipe_auth.exporter && carrier.exporter.is_none() {
             return Err(ConnectError::InvalidConfig(crate::InvalidConfig::new(
                 "pipe_auth",
@@ -660,8 +763,19 @@ impl<D: Driver> State<D> {
         let datagram_limiter = config.datagram_limiter.clone();
         let log_dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let logger = session_logger(&config, id, &log_dropped);
-        let mut core = core::SessionCore::new(config, role, transport, now)
-            .map_err(ConnectError::InvalidConfig)?;
+        let carrier_memory = carrier.connection_memory;
+        #[cfg(feature = "tokio")]
+        let carrier_memory = carrier_memory
+            .checked_add(carrier.writer_memory)
+            .ok_or(ConnectError::MemoryBudget)?;
+        let mut core = core::SessionCore::new_in(
+            config,
+            role,
+            transport,
+            now,
+            listener_budget,
+            carrier_memory,
+        )?;
         if let Some(l) = locator {
             core.set_locator(l).map_err(ConnectError::InvalidConfig)?;
         }
@@ -677,7 +791,18 @@ impl<D: Driver> State<D> {
         if let Some(mode) = carrier.first_mode {
             core.set_secure_first_pipe(mode);
         }
+        core.complete_establish(carrier.establish_receipts)
+            .map_err(ConnectError::InvalidConfig)?;
         core.attach_bootstrap(carrier.inbound, carrier.outbound, now);
+        carrier
+            .attachment
+            .enable_accounting(&mut core, id, PipeId(0), carrier.accounting_sources.clone())
+            .map_err(ConnectError::InvalidConfig)?;
+        if let Some(grant) = core.take_bootstrap_reader()
+            && carrier.inbound.is_some()
+        {
+            carrier.attachment.hold_reader_memory(grant);
+        }
         carrier.describe(&mut core, PipeId(0));
         let admitted = carrier.admitted.clone();
         let boot_exporter = carrier.exporter.clone().map(Box::new);
@@ -686,14 +811,16 @@ impl<D: Driver> State<D> {
             boot_exporter,
             waiters: Waiters::default(),
             wakes: WakeList::default(),
+            #[cfg(all(feature = "test-hooks", feature = "tokio"))]
+            revision: tokio::sync::watch::Sender::new(()),
             deferred: D::Deferred::default(),
             handles: 0,
             dialer: transport.map(|r| r == Role::Client),
             goaway: None,
-            carrier: None,
-            carrier_tries: VecDeque::new(),
+            carrier_selection: None,
             events,
             pipe_changes: 0,
+            control: None,
             locator_hook: None,
             bootstrap: Arc::downgrade(&carrier.attachment),
             pipe_ends: std::collections::HashMap::new(),
@@ -705,6 +832,8 @@ impl<D: Driver> State<D> {
             start_hook,
             datagram_limiter,
             admitted,
+            bound_prefix: carrier.bound_prefix,
+            join_resources: None,
             datagram_batch: Vec::new(),
             redial_sources: 0,
             logs: LogBatch {
@@ -716,8 +845,67 @@ impl<D: Driver> State<D> {
         })
     }
 
+    pub(super) fn now(&self) -> Instant {
+        self.core.config().clock_domain.now_with(D::now)
+    }
+
+    pub(super) fn capacity(&self) -> crate::CapacitySnapshot {
+        let (authorizing, joined_carriers) = self.join_resources.as_ref().map_or_else(
+            || (0, 0),
+            |resources| (resources.authorizing.used(), resources.carriers.used()),
+        );
+        let bootstrap = usize::from(self.bootstrap.strong_count() != 0);
+        let mut snapshot = self
+            .core
+            .capacity_snapshot(authorizing, joined_carriers + bootstrap);
+        snapshot.observed = self.pipe_changes;
+        {
+            snapshot.reserved_attachments = self.reserved_joins();
+            if let Some(resources) = &self.join_resources {
+                snapshot.observed = snapshot.observed.wrapping_add(resources.released());
+            }
+        }
+        snapshot
+    }
+
+    pub(super) fn observe_carrier_release(&mut self) -> tokio::sync::watch::Receiver<()> {
+        self.join_resources.get_or_insert_default().subscribe()
+    }
+
+    pub(super) fn enable_pipe_accounting(
+        &mut self,
+        attachment: &Attachment,
+        pipe: PipeId,
+        sources: crate::CarrierHalfSources,
+    ) -> Result<(), crate::InvalidConfig> {
+        attachment.enable_accounting(&mut self.core, self.id, pipe, sources)
+    }
+
+    fn take_carrier(&mut self, carrier: &Attachment) -> bool {
+        let bootstrap = usize::from(self.bootstrap.strong_count() != 0);
+        let room = self.core.local_carrier_limit().saturating_sub(bootstrap);
+        let resources = self.join_resources.get_or_insert_default();
+        carrier.take_carrier(resources, room)
+    }
+
+    pub(super) fn reserve_carriers(
+        &mut self,
+        count: usize,
+    ) -> Option<super::attachment::CarrierReservation> {
+        let bootstrap = usize::from(self.bootstrap.strong_count() != 0);
+        let limit = self.core.local_carrier_limit().saturating_sub(bootstrap);
+        let resources = self.join_resources.get_or_insert_default();
+        super::attachment::CarrierReservation::new(resources, count, limit)
+    }
+
     /// The outcome slot that the handles of pipe `id` share.
-    fn pipe_end(&mut self, id: PipeId) -> Arc<PipeOutcome> {
+    pub(super) fn verified_reply(&self, id: PipeId, at: Instant) {
+        if let Some(end) = self.pipe_ends.get(&id.0).and_then(Weak::upgrade) {
+            end.verified_reply(at);
+        }
+    }
+
+    pub(super) fn pipe_end(&mut self, id: PipeId) -> Arc<PipeOutcome> {
         if let Some(end) = self.pipe_ends.get(&id.0).and_then(Weak::upgrade) {
             return end;
         }
@@ -746,17 +934,22 @@ impl<D: Driver> State<D> {
     /// Drains the core's events and wakes the operations they concern.
     pub(crate) fn dispatch(&mut self) {
         self.dispatch_events();
+        self.refresh_controller_demand();
         // A close's hand-off follows the carriers' writes, which raise no
         // event.
         if self.core.close_handed_off() || self.core.close_returned() {
             self.waiters.wake_list(List::Close, &mut self.wakes);
         }
+        #[cfg(all(feature = "test-hooks", feature = "tokio"))]
+        let _ = self.revision.send(());
     }
 
     fn dispatch_events(&mut self) {
+        let mut members_retired = false;
         while let Some(e) = self.core.poll_event() {
             let w = &mut self.waiters;
             let wakes = &mut self.wakes;
+            members_retired |= matches!(e, CoreEvent::PipeRetired { .. });
             match e {
                 CoreEvent::Established { protocol, .. } => {
                     // The carrier's own protocol (ALPN) wins.
@@ -777,6 +970,7 @@ impl<D: Driver> State<D> {
                 CoreEvent::DatagramReceived => w.wake_list(List::DatagramRecv, wakes),
                 CoreEvent::DatagramsUnblocked => w.wake_list(List::DatagramSend, wakes),
                 CoreEvent::ChannelDatagrams => w.wake_list(List::Channel, wakes),
+                CoreEvent::Shaping(event) => self.app_event(AppEvent::Shaping(event)),
                 CoreEvent::GoAway {
                     max_bidi,
                     max_uni,
@@ -808,13 +1002,25 @@ impl<D: Driver> State<D> {
                         self.app_event(event);
                     }
                 }
+                CoreEvent::PipeHealthChanged(change) => {
+                    if let Some(end) = self.pipe_ends.get(&change.pipe.0).and_then(Weak::upgrade) {
+                        end.report_health(&change);
+                    }
+                    self.pipe_changes += 1;
+                    self.waiters.wake_list(List::Pipes, &mut self.wakes);
+                    self.app_event(AppEvent::PipeHealthChanged(change));
+                }
                 CoreEvent::PipeReceiving { .. } => {
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
+                }
+                CoreEvent::MemberRotationDue => {
+                    self.notify_capacity_change();
                 }
                 CoreEvent::PipeAttached { pipe } => {
                     if let Some(end) = self.pipe_ends.get(&pipe.0).and_then(Weak::upgrade) {
                         let _ = end.join.set(Ok(()));
                     }
+                    self.enroll_confirmed_members(Some(pipe));
                     self.pipe_changes += 1;
                     self.waiters.wake_list(List::Pipes, &mut self.wakes);
                 }
@@ -848,6 +1054,8 @@ impl<D: Driver> State<D> {
                 // for an epoch in use, wait on the state list.
                 CoreEvent::JoinKeysReady | CoreEvent::EpochInUse(_) => {
                     w.wake_list(List::State, wakes);
+                    self.pipe_changes += 1;
+                    w.wake_list(List::Pipes, wakes);
                 }
                 CoreEvent::EpochCommitted(epoch) => {
                     self.app_event(AppEvent::EpochCommitted { epoch });
@@ -905,14 +1113,19 @@ impl<D: Driver> State<D> {
                 CoreEvent::CapacityRestored { rate } => {
                     self.app_event(AppEvent::CapacityRestored { rate });
                 }
-                CoreEvent::DatagramPathChanged { size } => {
-                    self.app_event(AppEvent::DatagramPathChanged { size });
+                CoreEvent::DatagramPathChanged { path } => {
+                    self.app_event(AppEvent::DatagramPathChanged { path });
                 }
                 CoreEvent::Suspended => {
                     self.pipe_changes += 1;
                     w.wake_list(List::Pipes, wakes);
+                    super::capacity_change::tighten_suspended_attempts(self);
                     self.app_event(AppEvent::SessionSuspended);
-                    if self.redial_sources == 0 && self.core.can_rejoin() {
+                    let managed = self
+                        .control
+                        .as_ref()
+                        .is_some_and(|c| c.changes.controller.is_some());
+                    if !managed && self.redial_sources == 0 && self.core.can_rejoin() {
                         self.app_event(AppEvent::ResumeUnattended);
                         self.log(
                             LogLevel::Warn,
@@ -929,6 +1142,9 @@ impl<D: Driver> State<D> {
                 }
                 CoreEvent::PingAnswered { .. } => w.wake_list(List::Ping, wakes),
                 CoreEvent::Closed(e) => {
+                    super::capacity_change::close_batches(self);
+                    self.transfer_controller_feedback(None);
+                    let (w, wakes) = (&mut self.waiters, &mut self.wakes);
                     for end in self.pipe_ends.values().filter_map(Weak::upgrade) {
                         end.join
                             .get_or_init(|| Err(PipeError::SessionLost(e.clone())));
@@ -947,9 +1163,11 @@ impl<D: Driver> State<D> {
                 _ => {}
             }
         }
+        if members_retired {
+            self.prune_controller_members();
+        }
     }
 
-    #[cfg(feature = "tokio")]
     /// Records the tries of a carrier mode's candidates and, with
     /// `chosen`, its choice of kind: events, and the statistics, which
     /// keep the latest [`CARRIER_TRIES_KEPT`] tries.
@@ -959,10 +1177,11 @@ impl<D: Driver> State<D> {
         chosen: Option<(crate::CarrierKind, Option<Arc<str>>)>,
     ) {
         for r in results {
-            if self.carrier_tries.len() == CARRIER_TRIES_KEPT {
-                self.carrier_tries.pop_front();
+            let tries = &mut self.carrier_selection.get_or_insert_default().tries;
+            if tries.len() == CARRIER_TRIES_KEPT {
+                tries.pop_front();
             }
-            self.carrier_tries.push_back(r.clone());
+            tries.push_back(r.clone());
             self.app_event(AppEvent::CarrierCandidate {
                 kind: r.kind,
                 variant: r.variant.clone(),
@@ -971,16 +1190,23 @@ impl<D: Driver> State<D> {
             });
         }
         if let Some((kind, variant)) = chosen {
-            self.carrier = Some(Box::new((kind, variant.clone())));
+            self.carrier_selection.get_or_insert_default().chosen = Some((kind, variant.clone()));
             self.app_event(AppEvent::CarrierChosen(kind, variant));
         }
     }
 
-    fn wake_events(&mut self) {
-        self.waiters.wake_list(List::Events, &mut self.wakes);
+    pub(super) fn reserved_joins(&self) -> usize {
+        self.control
+            .as_ref()
+            .map_or(0, |pool| pool.changes.reserved())
     }
 
-    fn app_event(&mut self, e: AppEvent) {
+    pub(super) fn notify_capacity_change(&mut self) {
+        self.pipe_changes += 1;
+        self.waiters.wake_list(List::Pipes, &mut self.wakes);
+    }
+
+    pub(super) fn app_event(&mut self, e: AppEvent) {
         if self.traces.is_some() {
             self.trace(&TraceRecord::Event(e.clone()));
         }
@@ -1092,24 +1318,23 @@ fn stream_command<D: Driver, R>(
 
 /// Sends a datagram on stream `key` with Context ID `context`: the one
 /// implementation behind `SendStream::send_datagram` and
-/// `StreamHandle::send_datagram`, and the relay helper's `try_send_datagram`.
+/// `StreamHandle::send_datagram` and the relay helper.
 /// It acts on the core's stream, so it does not need the sending part and is
-/// not affected by a write in flight. Never waits; `Ok(false)`: the session's
-/// datagram limiter refused it; [`DatagramError::ClosedStream`] when the
-/// stream is gone, released or ended.
+/// not affected by a write in flight. Never waits.
 fn stream_send_datagram<D: Driver>(
     shared: &Shared<D>,
     key: StreamKey,
     context: u64,
     data: Bytes,
-) -> Result<bool, DatagramError> {
+    options: crate::DatagramSendOptions,
+) -> Result<(), DatagramError> {
     let allowance = shared.datagram_allowed(data.len());
     let allowed = allowance.allowed();
     let queued = stream_command(shared, key, |c, k| {
-        c.send_stream_datagram(k, context, data, allowed, D::now())
-    })?;
-    allowance.queued(Ok(queued))?;
-    Ok(queued)
+        let now = c.config().clock_domain.now_with(D::now);
+        c.send_stream_datagram_with(k, context, data, options, allowed, now)
+    });
+    allowance.queued(queued)
 }
 
 /// The largest datagram payload on stream `key` with Context ID `context`:
@@ -1124,15 +1349,12 @@ fn stream_max_datagram_size<D: Driver>(
     shared.lock().core.max_stream_datagram_size(key, context)
 }
 
-/// The largest datagram payload on stream `key` with Context ID `context`
-/// that leaves as one carrier datagram: the one implementation behind
-/// `SendStream::path_datagram_size` and `StreamHandle::path_datagram_size`.
-fn stream_path_datagram_size<D: Driver>(
+fn stream_datagram_path<D: Driver>(
     shared: &Shared<D>,
     key: StreamKey,
     context: u64,
-) -> Option<usize> {
-    shared.lock().core.path_stream_datagram_size(key, context)
+) -> crate::DatagramPath {
+    shared.lock().core.stream_datagram_path(key, context)
 }
 
 /// A stream's runtime-setting setters: the one implementation behind the
@@ -1177,6 +1399,13 @@ impl<D: Driver> StreamSetters<'_, D> {
             c.set_peer_priority(k, priority)
         })
     }
+
+    fn datagram_options(&self, options: crate::DatagramSendOptions) -> Result<(), DatagramError> {
+        stream_command(self.shared, self.key, |c, k| {
+            c.tick(c.config().clock_domain.now_with(D::now));
+            c.set_stream_datagram_options(k, options)
+        })
+    }
 }
 
 /// The core's answer to opening a stream, for the openers' queue.
@@ -1213,6 +1442,32 @@ pub struct Shared<D: Driver> {
 }
 
 impl<D: Driver> Shared<D> {
+    pub(super) fn reserve_reader_memory(&self, carrier: &Attachment) -> Result<(), PipeError> {
+        if let Some(grant) = self.lock().core.reserve_reader()? {
+            carrier.hold_reader_memory(grant);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close_reason(&self) -> Option<SessionError> {
+        self.lock().core.error().cloned()
+    }
+
+    #[cfg(feature = "blocking")]
+    pub(crate) fn begin_redial(
+        &self,
+        hook: &crate::Redial,
+        direction: crate::PipeDirection,
+        cause: crate::RedialCause,
+    ) -> core::RedialCompletion {
+        let id = self.lock().core.next_redial_attempt();
+        hook.completion(crate::RedialAttempt {
+            id,
+            direction,
+            cause,
+        })
+    }
+
     pub(crate) fn new(mut state: State<D>, paths: D::Paths) -> Self {
         // The std driver has no paths.
         #[cfg(not(feature = "tokio"))]
@@ -1286,18 +1541,17 @@ impl<D: Driver> Shared<D> {
     }
 
     /// Runs one command and ends it.
-    fn command<R>(&self, f: impl FnOnce(&mut State<D>) -> R) -> R {
+    pub(super) fn command<R>(&self, f: impl FnOnce(&mut State<D>) -> R) -> R {
         let mut st = self.lock();
         let r = f(&mut st);
         st.after_command();
         r
     }
 
-    #[cfg(feature = "tokio")]
     /// Abandons the session if it is not established yet: closed without
     /// `CONNECTION_CLOSE` (the core's `abandon`).
     pub(crate) fn abandon(&self) {
-        self.command(|st| st.core.abandon(D::now()));
+        self.command(|st| st.core.abandon(st.now()));
     }
 
     /// Waits until the session is established. The handle is counted at
@@ -1435,7 +1689,8 @@ impl<D: Driver> Drop for ConnRef<D> {
         let mut st = self.0.lock();
         st.handles -= 1;
         if st.handles == 0 {
-            st.core.close(VarInt::ZERO, b"", D::now());
+            let now = st.now();
+            st.core.close(VarInt::ZERO, b"", now);
             st.after_command();
         }
     }
@@ -1451,8 +1706,10 @@ impl<D: Driver> std::ops::Deref for ConnRef<D> {
 
 /// A running redial source of a session (the redial hook's or a pipe pool's), counted
 /// while it lives: a suspension without one is unattended.
+#[cfg(feature = "blocking")]
 pub(crate) struct RedialSource<D: Driver>(Arc<Shared<D>>);
 
+#[cfg(feature = "blocking")]
 impl<D: Driver> RedialSource<D> {
     pub(crate) fn new(shared: &Arc<Shared<D>>) -> Self {
         shared.lock().redial_sources += 1;
@@ -1460,6 +1717,7 @@ impl<D: Driver> RedialSource<D> {
     }
 }
 
+#[cfg(feature = "blocking")]
 impl<D: Driver> Drop for RedialSource<D> {
     fn drop(&mut self) {
         let mut st = self.0.lock();
@@ -1472,23 +1730,15 @@ impl<D: Driver> Drop for RedialSource<D> {
 /// attached it ([`Pipe::attached`](crate::Pipe::attached)). Closing the member a replacement
 /// replaces before the peer attached it could leave the peer with no live
 /// pipe, and the session would end.
-pub(crate) fn usable<D: Driver>(pipe: &Pipe<D>, info: &PipeStats) -> bool {
-    let serves = match info.outbound {
-        None => info.inbound == Some(InboundState::Open),
-        Some(s) => s == OutboundState::Active && !info.in_probation,
-    };
-    serves && pipe.is_attached()
+#[cfg(feature = "blocking")]
+pub(crate) fn usable(info: &PipeStats) -> bool {
+    info.health.can_carry()
 }
 
 /// A pipe no longer serves its direction.
+#[cfg(feature = "blocking")]
 pub(crate) fn dead(info: Option<&PipeStats>) -> bool {
-    info.is_none_or(|i| match i.outbound {
-        None => matches!(i.inbound, Some(InboundState::Ended) | None),
-        Some(s) => matches!(
-            s,
-            OutboundState::Failed | OutboundState::Closed | OutboundState::Draining
-        ),
-    })
+    info.is_none_or(|i| i.health.ending())
 }
 
 /// A reference to a session that does not keep it in use: a background
@@ -1523,30 +1773,32 @@ impl<D: Driver> WeakSession<D> {
     }
 }
 
-/// Ready once the session is closing or the application dropped its last
-/// handle.
-#[cfg(feature = "tokio")]
-pub(crate) fn closed_wait<D: Driver>(shared: &Shared<D>) -> impl Future<Output = ()> + '_ {
-    Wait::new(&shared.inner, List::State, |st: &mut State<D>| {
-        (st.handles == 0 || st.core.error().is_some()).then_some(())
-    })
-}
-
 /// Ready once a local join's handshake ended without its carrier: the attachment failed
 /// (its handshake timeout, a removal) or the session ended.
 pub(crate) fn join_failed_wait<D: Driver>(
     shared: &Shared<D>,
     id: PipeId,
 ) -> impl Future<Output = ()> + '_ {
-    Wait::new(&shared.inner, List::Pipes, move |st: &mut State<D>| {
+    Wait::new(&shared.inner, List::Join, move |st: &mut State<D>| {
         matches!(st.core.pipe_joined(id), Some(Err(_))).then_some(())
     })
 }
 
 /// Ready once the session ended.
 pub(crate) fn session_ended_wait<D: Driver>(shared: &Shared<D>) -> impl Future<Output = ()> + '_ {
-    Wait::new(&shared.inner, List::State, |st: &mut State<D>| {
+    Wait::new(&shared.inner, List::Join, |st: &mut State<D>| {
         st.core.error().is_some().then_some(())
+    })
+}
+
+pub(super) fn capacity_changed<D: Driver>(
+    shared: &Shared<D>,
+    observed: u64,
+) -> impl Future<Output = crate::CapacitySnapshot> + '_ {
+    Wait::new(&shared.inner, List::Pipes, move |state: &mut State<D>| {
+        let capacity = state.capacity();
+        (capacity.observed != observed || state.handles == 0 || state.core.error().is_some())
+            .then_some(capacity)
     })
 }
 
@@ -1555,7 +1807,7 @@ pub(crate) fn join_released_wait<D: Driver>(
     shared: &Shared<D>,
     id: PipeId,
 ) -> impl Future<Output = ()> + '_ {
-    Wait::new(&shared.inner, List::Pipes, move |st: &mut State<D>| {
+    Wait::new(&shared.inner, List::Join, move |st: &mut State<D>| {
         (!st.core.join_deferred(id)).then_some(())
     })
 }
@@ -1563,7 +1815,7 @@ pub(crate) fn join_released_wait<D: Driver>(
 /// Ready once the join keys no longer wait for the deferred key: `true`, or
 /// `false` when the session ended first.
 pub(crate) fn join_keys_wait<D: Driver>(shared: &Shared<D>) -> impl Future<Output = bool> + '_ {
-    Wait::new(&shared.inner, List::State, |st: &mut State<D>| {
+    Wait::new(&shared.inner, List::Join, |st: &mut State<D>| {
         if st.core.error().is_some() {
             return Some(false);
         }
@@ -1586,7 +1838,8 @@ impl<D: Driver> Shared<D> {
         if !admit(st.core.state() == CoreState::Suspended) {
             return None;
         }
-        let v = st.core.open_hello(hello, binding, D::now());
+        let now = st.now();
+        let v = st.core.open_hello(hello, binding, now);
         st.after_command();
         Some(v)
     }
@@ -1594,19 +1847,20 @@ impl<D: Driver> Shared<D> {
     /// A listener stopped before the application accepted this session.
     pub(crate) fn close_unaccepted(&self) {
         const UNACCEPTED_CLOSE_CODE: VarInt = VarInt::ZERO;
-        self.command(|st| st.core.close(UNACCEPTED_CLOSE_CODE, b"", D::now()));
+        self.command(|st| st.core.close(UNACCEPTED_CLOSE_CODE, b"", st.now()));
     }
 
     /// Queues `CONNECTION_REFUSED` for the session driver to flush within its close deadline.
     pub(crate) fn refuse(&self, reason: Bytes) {
-        self.command(|st| st.core.refuse_with_reason(reason, D::now()));
+        self.command(|st| st.core.refuse_with_reason(reason, st.now()));
     }
 
     /// Ends the session while it is suspended (the suspended-session
     /// limit of the listener's account).
     pub(crate) fn close_suspended(&self) {
         let mut st = self.lock();
-        st.core.close_suspended(D::now());
+        let now = st.now();
+        st.core.close_suspended(now);
         st.after_command();
     }
 
@@ -1628,10 +1882,7 @@ impl<D: Driver> Shared<D> {
         let (shaper, limits) = {
             let st = self.lock();
             let c = st.core.config();
-            (
-                c.handshake_shaper.clone(),
-                st.core.shaping_limits_in_force(),
-            )
+            (c.handshake_shaper.clone(), st.core.join_shaping_limits())
         };
         let Some(shaper) = shaper else {
             return UnitPlan::default();
@@ -1641,24 +1892,109 @@ impl<D: Driver> Shared<D> {
         self.lock().core.note_join_plan(answer)
     }
 
+    /// Admits an authenticated carrier and captures its authorization work.
+    pub(super) fn begin_join_authorization(
+        self: &Arc<Self>,
+        join: &core::PeerJoin,
+        carrier_kind: Option<crate::CarrierKind>,
+        admitted: Option<&crate::AdmittedValue>,
+        sources: &crate::CarrierHalfSources,
+        carrier: &Attachment,
+        deadline: Option<Instant>,
+    ) -> Result<Option<crate::Decision<bool>>, JoinError> {
+        let mut st = self.lock();
+        Self::check_join_admission(&mut st, deadline)?;
+        let policy = st.core.session_policy();
+        let auth_generation = join.auth_generation();
+        if policy.auth_generation != auth_generation {
+            return Err(JoinError::AuthorizationChanged);
+        }
+        if !policy.permits_join_sources(Some(sources), join.halves()) {
+            return Err(JoinError::UnknownSource);
+        }
+        let authorize = policy.authorize_join.clone();
+        let limit = policy.limits.pending_peer_joins.get();
+        let work = if let Some(authorize) = authorize {
+            let resources = st.join_resources.get_or_insert_default();
+            if !resources.authorizing.try_acquire(limit) {
+                return Err(JoinError::Capacity);
+            }
+            Some((authorize, AuthorizationPermit(resources.clone())))
+        } else {
+            None
+        };
+        if !st.take_carrier(carrier) {
+            return Err(JoinError::Capacity);
+        }
+        let Some((authorize, permit)) = work else {
+            return Ok(None);
+        };
+        let session = st.id;
+        let principal = st.admitted.clone();
+        drop(st);
+        let request = crate::JoinAuthorization {
+            session,
+            auth_generation,
+            join_epoch: join.epoch(),
+            principal,
+            sources: sources.clone(),
+            pipe_id: PipeId(join.pipe().id),
+            direction: join.direction(),
+            record_mode: join.mode(),
+            carrier_kind,
+            admitted: admitted.cloned(),
+            first_batch: join.first_batch(),
+        };
+        Ok(Some(crate::Decision::later(async move {
+            let work = D::join_callback(move || {
+                let answer = authorize.allows(request);
+                crate::Decision::later(async move {
+                    let _permit = permit;
+                    answer.settle().await == Some(Some(true))
+                })
+            })
+            .await;
+            match work {
+                Some(answer) => answer.settle().await.unwrap_or(false),
+                None => false,
+            }
+        })))
+    }
+
     /// The rest of step 7.
     pub(crate) fn claim_hello(
         &self,
         join: &mut crate::proto::session::PeerJoin,
-        carrier: crate::proto::session::PeerCarrier,
+        carrier: &crate::proto::session::PeerCarrier,
         plan: &crate::shaping::UnitPlan,
-    ) -> crate::proto::session::ClaimedHello {
+        deadline: Option<Instant>,
+    ) -> Result<crate::proto::session::ClaimedHello, JoinError> {
         let mut st = self.lock();
-        let v = st.core.claim_hello(join, carrier, plan, D::now());
+        let now = Self::check_join_admission(&mut st, deadline)?;
+        let v = st.core.claim_hello(join, carrier, plan, now);
         st.after_command();
-        v
+        Ok(v)
+    }
+
+    fn check_join_admission(
+        st: &mut State<D>,
+        deadline: Option<Instant>,
+    ) -> Result<Instant, JoinError> {
+        let now = st.core.join_clock(st.now());
+        if deadline.is_some_and(|limit| now >= limit) {
+            return Err(JoinError::Timeout);
+        }
+        if let Some(e) = st.core.error() {
+            return Err(JoinError::SessionLost(e.clone()));
+        }
+        Ok(now)
     }
 
     /// Step 8.
     pub(crate) fn confirm_join(
         &self,
         join: crate::proto::session::PeerJoin,
-        carrier: crate::proto::session::PeerCarrier,
+        carrier: &crate::proto::session::PeerCarrier,
         outcome: &Arc<PipeOutcome>,
         deadline: Option<Instant>,
         (kind, overhead, admitted, reports_failure): (
@@ -1670,13 +2006,13 @@ impl<D: Driver> Shared<D> {
     ) -> Result<crate::proto::session::ConfirmedJoin, JoinError> {
         use crate::proto::session::ConfirmedJoin;
         let mut st = self.lock();
-        let now = st.core.join_clock(D::now());
-        if deadline.is_some_and(|limit| now >= limit) {
-            return Err(JoinError::Timeout);
-        }
-        if let Some(e) = st.core.error() {
-            return Err(JoinError::SessionLost(e.clone()));
-        }
+        let now = match Self::check_join_admission(&mut st, deadline) {
+            Ok(now) => now,
+            Err(error) => {
+                st.core.cancel_peer_join(&join);
+                return Err(error);
+            }
+        };
         let v = st.core.confirm_join(join, carrier, now);
         if let ConfirmedJoin::Attached { pipe, .. } = &v {
             // Before the session's first record on it.
@@ -1692,8 +2028,17 @@ impl<D: Driver> Shared<D> {
     }
 }
 
+struct AuthorizationPermit(Arc<JoinResources>);
+
+impl Drop for AuthorizationPermit {
+    fn drop(&mut self) {
+        self.0.authorizing.release();
+    }
+}
+
 /// What replaces `pipe` in `replace_pipes`: a carrier of its direction, joined with its
 /// options. `None` once it is gone.
+#[cfg(feature = "blocking")]
 pub(crate) fn replacement<D: Driver>(
     pipe: &Pipe<D>,
 ) -> Option<(super::PipeDirection, PipeOptions)> {
@@ -1705,7 +2050,6 @@ pub(crate) fn replacement<D: Driver>(
     };
     let mut opts = PipeApi::options(pipe);
     opts.direction = direction;
-    opts.return_on_reply = false;
     // Unmanaged is reported only, never joined: the replacement chooses its own.
     if opts.record_mode == crate::Inherit::Set(crate::RecordMode::Unmanaged) {
         opts.record_mode = crate::Inherit::Session;
@@ -1716,6 +2060,7 @@ pub(crate) fn replacement<D: Driver>(
 /// Ready once a pipe changed state or the session was suspended or resumed
 /// after `seen` changes, or the session is closing or the application
 /// dropped its last handle. Holds no handle.
+#[cfg(feature = "blocking")]
 pub(crate) fn pipes_changed_wait<D: Driver>(
     shared: &Shared<D>,
     seen: u64,
@@ -1742,8 +2087,10 @@ impl<D: Driver> Drop for CloseOnDrop<'_, D> {
 /// Aborts a pipe that `add_pipe` started unless the call succeeded, also
 /// when its future is dropped: a failed or cancelled call leaves no pipe
 /// behind.
-pub(crate) struct AbortUnlessAdded<'a, D: Driver>(pub(crate) Option<&'a Pipe<D>>, pub(crate) bool);
+#[cfg(feature = "test-hooks")]
+pub(crate) struct AbortUnlessAdded<'a, D: Driver>(pub(crate) Option<&'a Pipe<D>>);
 
+#[cfg(feature = "test-hooks")]
 impl<D: Driver> AbortUnlessAdded<'_, D> {
     /// The call succeeded: the pipe stays.
     pub(crate) fn added(mut self) {
@@ -1751,6 +2098,7 @@ impl<D: Driver> AbortUnlessAdded<'_, D> {
     }
 }
 
+#[cfg(feature = "test-hooks")]
 impl<D: Driver> Drop for AbortUnlessAdded<'_, D> {
     fn drop(&mut self) {
         if let Some(p) = self.0.take() {
@@ -1759,77 +2107,12 @@ impl<D: Driver> Drop for AbortUnlessAdded<'_, D> {
                     core,
                     id,
                     &p.end,
-                    self.1,
+                    false,
                     PipeError::CallerCancelled(None),
                     D::now(),
                 );
             });
         }
-    }
-}
-
-/// Cancellation receipt for a binding whose runtime can withdraw a join
-/// synchronously, before it schedules the Rust future's destruction.
-#[cfg(feature = "tokio")]
-pub struct JoinCancellation {
-    session: Weak<Shared<super::tokio::Tokio>>,
-    end: Arc<PipeOutcome>,
-    reply: bool,
-}
-
-#[cfg(feature = "tokio")]
-impl std::fmt::Debug for JoinCancellation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JoinCancellation").finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl JoinCancellation {
-    pub(super) fn new(
-        session: &Arc<Shared<super::tokio::Tokio>>,
-        end: &Arc<PipeOutcome>,
-        reply: bool,
-    ) -> Self {
-        Self {
-            session: Arc::downgrade(session),
-            end: end.clone(),
-            reply,
-        }
-    }
-
-    /// Competes with attachment on its session lock. A receipt does not keep
-    /// the session alive. A submitted carrier without an ID can also be withdrawn.
-    /// Returns whether this cancellation chose the outcome. Otherwise the
-    /// binding must deliver the result already committed for its caller.
-    #[must_use]
-    pub fn cancel(&self, error: std::io::Error) -> bool {
-        let Some(session) = self.session.upgrade() else {
-            return false;
-        };
-        session.command(|st| {
-            if self.end.join.get().is_some() {
-                return false;
-            }
-            if let Some(&id) = self.end.id.get() {
-                withdraw_join(
-                    &mut st.core,
-                    id,
-                    &self.end,
-                    self.reply,
-                    PipeError::CallerCancelled(Some(Arc::new(error))),
-                    super::tokio::Tokio::now(),
-                )
-            } else if let Some(e) = st.core.error() {
-                let _ = self.end.join.set(Err(PipeError::SessionLost(e.clone())));
-                false
-            } else {
-                self.end
-                    .join
-                    .set(Err(PipeError::CallerCancelled(Some(Arc::new(error)))))
-                    .is_ok()
-            }
-        })
     }
 }
 
@@ -1840,17 +2123,6 @@ fn shutdown_result(e: SessionError) -> Result<(), SessionError> {
         SessionError::ApplicationClosed { remote: false, .. } => Ok(()),
         e => Err(e),
     }
-}
-
-/// The endpoint whose join completed.
-#[derive(Debug, Clone)]
-pub enum JoinSession {
-    /// A Tokio session.
-    #[cfg(feature = "tokio")]
-    Tokio(crate::Session),
-    /// A blocking session.
-    #[cfg(feature = "blocking")]
-    Blocking(crate::blocking::Session),
 }
 
 /// Why a join ended before peer attachment.
@@ -1864,6 +2136,14 @@ pub enum JoinError {
     Timeout,
     /// The authorized carrier was refused.
     Refused,
+    /// Local authorization denied the authenticated Hello.
+    Denied,
+    /// The authorization generation changed before Claim or confirmation.
+    AuthorizationChanged,
+    /// The local carrier source is unknown or outside the trusted routes.
+    UnknownSource,
+    /// The authorization execution budget is occupied.
+    Capacity,
     /// Another pending join evicted it.
     Evicted,
     /// Setup was withdrawn.
@@ -1911,111 +2191,6 @@ impl From<PipeError> for JoinError {
     }
 }
 
-type JoinedFn = dyn Fn(JoinSession, PipeId, Option<JoinError>) -> crate::Decision<()> + Send + Sync;
-
-/// A join completion callback. A join that ended before allocation reports
-/// [`PipeId::UNASSIGNED`].
-#[derive(Clone)]
-pub struct JoinOutcome(Arc<JoinedFn>);
-impl std::fmt::Debug for JoinOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("JoinOutcome(..)")
-    }
-}
-impl JoinOutcome {
-    /// Creates a callback. Its decision may complete asynchronously.
-    pub fn new(
-        f: impl Fn(JoinSession, PipeId, Option<JoinError>) -> crate::Decision<()>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self(Arc::new(f))
-    }
-}
-
-struct HeldJoinKey<D: Driver> {
-    shared: Arc<Shared<D>>,
-    pipe: PipeId,
-}
-
-impl<D: Driver> Drop for HeldJoinKey<D> {
-    fn drop(&mut self) {
-        let mut st = self.shared.lock();
-        st.events.release_hold(self.pipe.0);
-        st.wake_events();
-    }
-}
-
-pub(super) struct JoinReport<D: Driver> {
-    shared: Arc<Shared<D>>,
-    callback: Option<JoinOutcome>,
-    submitted: Option<Arc<PipeOutcome>>,
-    pipe: Option<PipeId>,
-}
-
-impl<D: Driver> JoinReport<D> {
-    pub(super) fn new(shared: &Arc<Shared<D>>, pipe: Option<PipeId>) -> Option<Self> {
-        let mut st = shared.lock();
-        let callback = st.core.config().join_outcome.clone()?;
-        if let Some(id) = pipe {
-            st.events.hold(id.0);
-        }
-        Some(Self {
-            shared: shared.clone(),
-            callback: Some(callback),
-            submitted: None,
-            pipe,
-        })
-    }
-
-    #[cfg(feature = "tokio")]
-    pub(super) fn observe(&mut self, end: &Arc<PipeOutcome>) {
-        self.submitted = Some(end.clone());
-    }
-
-    pub(super) fn complete(mut self, error: Option<JoinError>) {
-        self.dispatch(error);
-    }
-
-    fn dispatch(&mut self, error: Option<JoinError>) {
-        let Some(callback) = self.callback.take() else {
-            return;
-        };
-        let shared = self.shared.clone();
-        let pipe = self.pipe;
-        let session = D::join_session(Session {
-            conn: ConnRef::new(shared.clone()),
-        });
-        let mut key = pipe.map(|pipe| HeldJoinKey { shared, pipe });
-        let pipe = pipe.unwrap_or(PipeId::UNASSIGNED);
-        if error.is_some() {
-            drop(key.take());
-        }
-        D::spawn_join(&self.shared, async move {
-            let _key = key;
-            if let Some(decision) = D::join_callback(move || callback.0(session, pipe, error)).await
-            {
-                decision.settle().await;
-            }
-        });
-    }
-}
-
-impl<D: Driver> Drop for JoinReport<D> {
-    fn drop(&mut self) {
-        if self.callback.is_some() {
-            let reason = self
-                .submitted
-                .as_ref()
-                .and_then(|end| end.join.get()?.as_ref().err())
-                .cloned()
-                .map_or(JoinError::Cancelled, Into::into);
-            self.dispatch(Some(reason));
-        }
-    }
-}
-
 // ---- sessions ------------------------------------------------------------------------
 
 /// A zmux session: `zmux::Session` with the tokio
@@ -2027,6 +2202,41 @@ pub struct Session<D: Driver> {
 }
 
 impl<D: Driver> Session<D> {
+    #[cfg(all(feature = "test-hooks", feature = "tokio"))]
+    pub(crate) fn revisions(&self) -> tokio::sync::watch::Receiver<()> {
+        self.conn.lock().revision.subscribe()
+    }
+
+    #[cfg(all(feature = "test-hooks", feature = "tokio"))]
+    pub(crate) fn fixture_reliable_setup_end(&self, pipes: &[PipeId]) -> Option<Vec<u64>> {
+        self.conn.lock().core.reliable_setup_end(pipes)
+    }
+
+    #[cfg(all(feature = "test-hooks", feature = "tokio"))]
+    pub(crate) fn test_read_loan_slots(&self, slots: usize) -> bool {
+        self.conn.lock().core.test_read_loan_slots(slots)
+    }
+
+    #[cfg(all(feature = "test-hooks", feature = "tokio"))]
+    pub(crate) fn fixture_splice_receive_datagram(
+        &self,
+        stream: u64,
+        context: u64,
+        data: crate::Chunk,
+        expires: Option<Instant>,
+    ) -> bool {
+        self.conn.command(|state| {
+            state
+                .core
+                .fixture_splice_receive_datagram(stream, context, data, expires)
+        })
+    }
+
+    #[cfg(all(feature = "test-hooks", feature = "tokio"))]
+    pub(crate) fn fixture_splice_receive_state(&self, stream: u64) -> Option<(usize, usize, u64)> {
+        self.conn.lock().core.fixture_splice_receive_state(stream)
+    }
+
     /// How often an outbound pipe became suspect, a DRAINING one included
     /// (`test_hooks::suspects`).
     #[cfg(all(feature = "test-hooks", feature = "tokio"))]
@@ -2057,14 +2267,142 @@ impl<D: Driver> Session<D> {
         &self.conn.0
     }
 
-    fn command<R>(&self, f: impl FnOnce(&mut State<D>) -> R) -> R {
+    /// The session's current capacity and authorization policy.
+    pub fn session_policy(&self) -> crate::SessionPolicy {
+        self.conn.lock().core.session_policy().clone()
+    }
+
+    /// The clock domain selected when creating this session.
+    pub fn clock_domain(&self) -> crate::ClockDomain {
+        self.conn.lock().core.config().clock_domain.clone()
+    }
+
+    /// Current capacity and direction coverage from the session owner.
+    pub fn capacity(&self) -> crate::CapacitySnapshot {
+        self.conn.lock().capacity()
+    }
+
+    /// The members currently indexed by the session owner.
+    pub fn members(&self) -> Vec<crate::MemberSnapshot> {
+        self.conn.lock().core.members()
+    }
+
+    /// Looks up the member from any of its currently indexed attachments.
+    pub fn member_for_pipe(&self, pipe: PipeId) -> Option<crate::MemberId> {
+        self.conn.lock().core.member_for_pipe(pipe)
+    }
+
+    pub(super) fn assign_bootstrap(&self, candidate: crate::CandidateId, attempts: u64) {
+        self.command(|st| {
+            st.control
+                .get_or_insert_default()
+                .changes
+                .seed_attempts(attempts);
+            st.core.assign_member(
+                PipeId(0),
+                crate::MemberId(1),
+                Some(candidate),
+                crate::Directions::BOTH,
+                1,
+            );
+        });
+    }
+
+    /// Atomically plans the graceful retirement of the given attachments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unknown or repeated pipes, unavailable multipath,
+    /// or a loss of coverage.
+    pub fn drain_attachments(&self, pipes: &[PipeId]) -> Result<(), PipeError> {
+        self.command(|st| st.core.drain_attachments(pipes, st.now(), |_| Ok(())))
+    }
+
+    /// Commits a newer local capacity and authorization policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session closed, the revision conflicts, or
+    /// the limits exceed the initial attachment envelope.
+    pub fn set_session_policy(
+        &self,
+        policy: crate::SessionPolicy,
+    ) -> Result<(), crate::SessionPolicyError> {
+        let _submitted_authorizer = policy.authorize_join.clone();
+        let (result, _retained_authorizer) = self.command(|st| {
+            let old = st.core.session_policy().authorize_join.clone();
+            let result = st.core.set_session_policy(policy, st.now());
+            if result.is_ok() {
+                let revision = st.core.session_policy().revision;
+                super::capacity_change::invalidate_batches(st, revision, false, st.now());
+                st.notify_capacity_change();
+            }
+            (result, old)
+        });
+        result
+    }
+
+    pub(super) fn command<R>(&self, f: impl FnOnce(&mut State<D>) -> R) -> R {
         self.conn.command(f)
     }
 
-    /// Logs a warning through the configuration's logger, if any.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn log_warn(&self, message: String) {
-        self.command(|st| st.log(LogLevel::Warn, message));
+    /// Queues a session datagram with per-packet settings.
+    pub fn send_datagram_with(
+        &self,
+        data: Bytes,
+        options: crate::DatagramSendOptions,
+    ) -> Result<(), DatagramError> {
+        let allowance = self.conn.datagram_allowed(data.len());
+        let allowed = allowance.allowed();
+        let queued =
+            self.command(|st| st.core.send_datagram_with(data, options, allowed, st.now()));
+        allowance.queued(queued)
+    }
+
+    /// Current original-copy payload capacities for session datagrams.
+    pub fn datagram_path(&self) -> crate::DatagramPath {
+        self.conn.lock().core.datagram_path()
+    }
+
+    /// Additional datagram outcome counters.
+    pub fn datagram_stats(&self) -> crate::DatagramStats {
+        self.conn.lock().core.datagram_stats()
+    }
+
+    /// Latest arrival feedback matched to this outbound pipe and carrier mode.
+    pub fn datagram_feedback(
+        &self,
+        pipe: PipeId,
+        channel: crate::DatagramChannelKind,
+    ) -> Option<crate::DatagramFeedback> {
+        let st = self.conn.lock();
+        st.core.datagram_feedback_at(pipe, channel, st.now())
+    }
+
+    /// Publishes final outcomes attributed by a provider to original datagrams on this path.
+    ///
+    /// # Errors
+    /// Returns [`crate::DatagramLossSourceExpired`] if this path now has a different identity
+    /// and the sample still uses the previous source generation.
+    pub fn report_datagram_loss(
+        &self,
+        pipe: PipeId,
+        channel: crate::DatagramChannelKind,
+        sample: crate::DatagramLossSample,
+    ) -> Result<bool, crate::DatagramLossSourceExpired> {
+        self.command(|st| {
+            st.core
+                .report_datagram_loss(pipe, channel, sample, st.now())
+        })
+    }
+
+    /// Reportable arrivals on this live inbound pipe and carrier mode.
+    pub fn datagram_arrivals(
+        &self,
+        pipe: PipeId,
+        channel: crate::DatagramChannelKind,
+    ) -> Option<crate::DatagramArrivals> {
+        self.conn.lock().core.datagram_arrivals(pipe, channel)
     }
 
     fn send_stream(&self, (key, meter, last): Opened) -> SendStream<D> {
@@ -2182,9 +2520,10 @@ impl<D: Driver> Session<D> {
                 if allowed && st.core.datagram_queue_full() && st.core.error().is_none() {
                     return None;
                 }
+                let now = st.now();
                 let r = st
                     .core
-                    .send_datagram(data.take().unwrap_or_default(), allowed, D::now());
+                    .send_datagram(data.take().unwrap_or_default(), allowed, now);
                 st.after_command();
                 Some(r)
             },
@@ -2197,7 +2536,7 @@ impl<D: Driver> Session<D> {
         &self,
     ) -> impl Future<Output = Result<Bytes, SessionError>> + '_ {
         Wait::new(&self.conn.inner, List::DatagramRecv, |st: &mut State<D>| {
-            st.core.recv_datagram(D::now()).transpose()
+            st.core.recv_datagram(st.now()).transpose()
         })
     }
 
@@ -2207,7 +2546,7 @@ impl<D: Driver> Session<D> {
         reason: &[u8],
     ) -> Result<(), SessionError> {
         self.command(|st| {
-            st.core.shutdown(code, reason, D::now());
+            st.core.shutdown(code, reason, st.now());
             // No stream opens from now on: waiting openers fail.
             st.waiters.fail_opens(&mut st.wakes);
         });
@@ -2238,10 +2577,11 @@ impl<D: Driver> Session<D> {
     /// The pipes, the epoch and the advance come from one critical section,
     /// so that an epoch switch or a pipe added meanwhile cannot fall between
     /// them.
+    #[cfg(feature = "blocking")]
     pub(crate) fn begin_replace_pipes(&self) -> Result<(Vec<Pipe<D>>, u64), PipeError> {
         let (ids, before) = self.command(|st| {
             let before = st.core.epoch().ok_or(PipeError::NotNegotiated)?;
-            st.core.advance_epoch(D::now())?;
+            st.core.advance_epoch(st.now())?;
             let ids: Vec<_> = st.core.pipe_ids();
             let ids: Vec<_> = ids.into_iter().map(|id| (id, st.pipe_slots(id))).collect();
             Ok::<_, PipeError>((ids, before))
@@ -2261,6 +2601,7 @@ impl<D: Driver> Session<D> {
 
     /// Resolves once new joins of this end use an epoch after `before`, or the session
     /// ended.
+    #[cfg(feature = "blocking")]
     pub(crate) fn epoch_in_use_op(
         &self,
         before: u64,
@@ -2298,12 +2639,12 @@ impl<D: Driver> Session<D> {
 
     /// Starts a graceful close (the core's `close`) without waiting.
     pub(crate) fn begin_close(&self, code: VarInt, reason: &[u8]) {
-        self.command(|st| st.core.close(code, reason, D::now()));
+        self.command(|st| st.core.close(code, reason, st.now()));
     }
 
     /// Aborts (the core's `abort`); never waits.
     pub(crate) fn abort_op(&self, code: VarInt, reason: &[u8]) {
-        self.command(|st| st.core.abort(code, reason, D::now()));
+        self.command(|st| st.core.abort(code, reason, st.now()));
     }
 
     /// Waits until a close no longer holds its caller: `CONNECTION_CLOSE`
@@ -2315,29 +2656,19 @@ impl<D: Driver> Session<D> {
         })
     }
 
-    /// A dial has returned a carrier. The dial held only shared state, so
-    /// dropping the last application handle already initiated close. Let the
-    /// core judge the returned carrier even if that close won the race.
-    pub(crate) fn after_dial(shared: Arc<Shared<D>>) -> Self {
-        Self {
-            conn: ConnRef::new(shared),
-        }
-    }
-
-    pub(super) fn join_report(&self) -> Option<JoinReport<D>> {
-        JoinReport::new(&self.conn.0, None)
-    }
-
-    pub(super) fn start_join(
+    pub(super) fn start_join_inner(
         &self,
         mut pipe: D::Carrier,
         opts: &PipeOptions,
-        mut report: Option<JoinReport<D>>,
         deadline: Option<core::JoinDeadline>,
+        mut submission: Option<(
+            &super::capacity_change::Submission,
+            &mut super::attachment::CarrierReservation,
+        )>,
     ) -> Result<Pipe<D>, PipeError> {
         let c = D::carrier_info(&mut pipe);
         let end = c.attachment.outcome().clone();
-        let result = (|| {
+        (|| {
             D::check_carrier(&self.conn.0, &pipe)?;
             opts.validate()?;
             // The handshake needs both directions, whatever the attachment's.
@@ -2387,7 +2718,7 @@ impl<D: Driver> Session<D> {
                 D::register_carrier_stats(&mut pipe);
             }
             let (id, slots) = self.command(|st| {
-                let now = st.core.join_clock(D::now());
+                let now = st.core.join_clock(st.now());
                 if let Some(Err(e)) = c.attachment.outcome().join.get() {
                     return Err(e.clone());
                 }
@@ -2397,6 +2728,35 @@ impl<D: Driver> Session<D> {
                 if let Some(d) = deadline.filter(|d| now >= d.at()) {
                     return Err(PipeError::Failed(d.cause()));
                 }
+                let accounting = st.core.config().accounting;
+                if accounting.strict
+                    && c.accounting_sources.over_budget(
+                        outbound.is_some(),
+                        inbound.is_some(),
+                        accounting,
+                    )
+                {
+                    return Err(PipeError::InvalidOptions(crate::InvalidConfig::new(
+                        "accounting",
+                        "carrier source limit",
+                    )));
+                }
+                if submission.is_none()
+                    && st.reserved_joins() != 0
+                    && st.core.join_room(now) <= st.reserved_joins()
+                {
+                    return Err(PipeError::Deferred);
+                }
+                if let Some((submission, _)) = &submission {
+                    submission.check(st, now)?;
+                }
+                let admitted = match &mut submission {
+                    Some((_, reservation)) => reservation.transfer(&c.attachment),
+                    None => st.take_carrier(&c.attachment),
+                };
+                if !admitted {
+                    return Err(PipeError::Deferred);
+                }
                 let id = st.core.add_pipe_with_deadline(
                     (inbound, outbound),
                     opts,
@@ -2404,13 +2764,14 @@ impl<D: Driver> Session<D> {
                     binding.as_deref(),
                     deadline,
                 )?;
+                st.enable_pipe_accounting(&c.attachment, id, c.accounting_sources.clone())
+                    .map_err(PipeError::InvalidOptions)?;
                 end.id.set(id).expect("one ID per submitted carrier");
-                if let Some(report) = &mut report {
-                    st.events.hold(id.0);
-                    report.pipe = Some(id);
-                }
                 c.describe(&mut st.core, id);
                 st.pipe_ends.insert(id.0, Arc::downgrade(&end));
+                if let Some((submission, _)) = &submission {
+                    submission.record(st, id, now);
+                }
                 Ok::<_, PipeError>((id, st.pipe_slots(id)))
             })?;
             self.attach(id, slots, pipe)
@@ -2424,44 +2785,30 @@ impl<D: Driver> Session<D> {
                 .err()
                 .cloned()
                 .unwrap_or(cause)
-        });
-        if let Some(report) = report {
-            match &result {
-                Ok(pipe) => {
-                    let end = pipe.end.clone();
-                    let id = pipe.id;
-                    D::spawn_join(&self.conn, async move {
-                        let wait =
-                            Wait::new(&report.shared.inner, List::Pipes, |st: &mut State<D>| {
-                                attachment_result(&st.core, id, &end)
-                            });
-                        let result = wait.await;
-                        report.complete(result.err().map(JoinError::from));
-                    });
-                }
-                Err(e) => report.complete(Some(JoinError::from(e.clone()))),
-            }
-        }
-        result
+        })
     }
 
-    #[cfg(feature = "tokio")]
+    #[cfg(all(feature = "tokio", feature = "test-hooks"))]
     pub(crate) fn pipe_signals(&self) -> Vec<PipeStats> {
         let mut st = self.conn.lock();
-        st.core.tick(D::now());
+        let now = st.now();
+        st.core.tick(now);
         st.core.pipes()
     }
 
     /// The configured deadline for an individual submitted carrier.
+    #[cfg(feature = "test-hooks")]
     pub(crate) fn join_deadline(&self) -> Option<core::JoinDeadline> {
         let mut st = self.conn.lock();
+        let now = st.now();
         st.core
-            .join_clock(D::now())
+            .join_clock(now)
             .checked_add(st.core.config().join_wait())
             .map(core::JoinDeadline::Protocol)
     }
 
     /// The count of pipe state changes and suspensions so far.
+    #[cfg(feature = "blocking")]
     pub(crate) fn pipe_changes(&self) -> u64 {
         self.conn.lock().pipe_changes
     }
@@ -2487,10 +2834,12 @@ impl<D: Driver> Session<D> {
     /// Whether this endpoint has room for a join of its own now (see the
     /// core's `join_wanted`).
     pub(crate) fn join_wanted(&self) -> bool {
-        self.conn.lock().core.join_wanted(D::now())
+        {
+            let state = self.conn.lock();
+            state.core.join_wanted(state.now())
+        }
     }
 
-    #[cfg(feature = "tokio")]
     /// Records carrier tries and a choice of kind (`State::report_carrier`).
     pub(crate) fn report_carrier(
         &self,
@@ -2498,15 +2847,6 @@ impl<D: Driver> Session<D> {
         chosen: Option<(crate::CarrierKind, Option<Arc<str>>)>,
     ) {
         self.command(|st| st.report_carrier(results, chosen));
-    }
-
-    #[cfg(feature = "tokio")]
-    /// Whether a carrier mode chose this kind and variant last.
-    pub(crate) fn carrier_is(&self, kind: crate::CarrierKind, variant: Option<&Arc<str>>) -> bool {
-        let st = self.conn.lock();
-        st.carrier
-            .as_deref()
-            .is_some_and(|(k, v)| *k == kind && v.as_ref() == variant)
     }
 
     /// A reference that does not keep the session in use.
@@ -2519,7 +2859,7 @@ impl<D: Driver> Session<D> {
     /// close once no stream remains.
     pub(crate) fn begin_shutdown(&self, code: VarInt, reason: &[u8]) {
         self.command(|st| {
-            st.core.shutdown(code, reason, D::now());
+            st.core.shutdown(code, reason, st.now());
             st.waiters.fail_opens(&mut st.wakes);
         });
     }
@@ -2536,7 +2876,7 @@ impl<D: Driver> Session<D> {
             drop(end);
             self.command(|st| {
                 st.pipe_ends.remove(&id.0);
-                let _ = st.core.remove_pipe(id, false, D::now());
+                let _ = st.core.remove_pipe(id, false, st.now());
             });
             return Err(e);
         }
@@ -2548,12 +2888,17 @@ impl<D: Driver> Session<D> {
         })
     }
 
+    pub(crate) fn observe_pipe_health_events(&self) {
+        self.conn.lock().events.observe_health();
+    }
+
     pub(crate) fn next_event_op(&self) -> impl Future<Output = Option<AppEvent>> + '_ {
         Wait::new(&self.conn.inner, List::Events, |st: &mut State<D>| {
+            st.events.observe_health();
             if let Some(e) = st.events.pop() {
                 return Some(Some(e));
             }
-            (st.core.error().is_some() && !st.events.holding()).then_some(None)
+            (st.core.error().is_some()).then_some(None)
         })
     }
 
@@ -2572,6 +2917,7 @@ impl<D: Driver> Session<D> {
         let (waits, closing, new_pipes, lane_state) = D::io_tables(&st.io);
         super::resources::Tables {
             waits: st.waiters.entries() + waits,
+            join_waits: st.waiters.join_waits(),
             pipe_events: st.events.len(),
             closing,
             new_pipes,
@@ -2601,26 +2947,67 @@ pub struct Pipe<D: Driver> {
 }
 
 impl<D: Driver> Pipe<D> {
-    pub(crate) fn pipe_signals(&self) -> Option<PipeStats> {
-        let mut st = self.conn.lock();
-        st.core.tick(D::now());
-        st.core.pipe_info(self.id)
+    #[cfg(feature = "blocking")]
+    pub(crate) fn record_replacement(&self, replacement: &Self) {
+        self.end
+            .successor
+            .store(replacement.id.0, std::sync::atomic::Ordering::Release);
     }
 
-    /// Resolves once the pipe's inbound direction received a record, or
-    /// it has none, or the pipe or session is gone: woken by the core's
-    /// `PipeReceiving` and the pipe changes.
-    #[cfg(feature = "tokio")]
-    pub(crate) async fn inbound_received(&self) {
-        let id = self.id;
-        Wait::new(&self.conn.0.inner, List::Pipes, |st: &mut State<D>| {
-            let waiting = st
-                .core
-                .pipe_info(id)
-                .is_some_and(|s| s.inbound.is_some() && s.records_received == 0);
-            (!waiting || st.core.error().is_some()).then_some(())
-        })
-        .await;
+    #[cfg(feature = "blocking")]
+    pub(crate) fn replacement_id(&self) -> Option<PipeId> {
+        let id = self
+            .end
+            .successor
+            .load(std::sync::atomic::Ordering::Acquire);
+        (id != 0).then_some(PipeId(id))
+    }
+
+    /// Sets the local outbound failure domain used by independent replicas.
+    /// Use the same domain for pipes sharing a physical point of failure.
+    pub fn set_replica_domain(
+        &self,
+        domain: Option<std::num::NonZeroU64>,
+    ) -> Result<(), PipeError> {
+        self.command(|core, id| core.set_pipe_replica_domain(id, domain))
+    }
+
+    #[cfg(feature = "blocking")]
+    pub(crate) fn last_health_fault(&self) -> Option<crate::PipeHealthChange> {
+        self.end
+            .fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|journal| journal.latest.as_deref())
+            .cloned()
+    }
+
+    pub(crate) fn health_snapshot(&self) -> Option<core::PipeHealth> {
+        let mut st = self.conn.lock();
+        let now = st.now();
+        st.core.tick(now);
+        st.core.pipe_health(self.id)
+    }
+
+    pub(crate) fn accounting_ticket(&self) -> Option<crate::AccountingTicket> {
+        super::accounting::AccountingTicket::from_outcome(&self.end)
+    }
+
+    pub(crate) fn request_stability(&self) {
+        let mut st = self.conn.lock();
+        let now = st.now();
+        st.core.observe_pipe_stability(self.id, now);
+        st.after_command();
+    }
+
+    pub(crate) fn pipe_signals(&self) -> Option<PipeStats> {
+        let mut st = self.conn.lock();
+        let now = st.now();
+        st.core.tick(now);
+        let mut info = st.core.pipe_info(self.id)?;
+        info.carrier_loss = self.end.sample.get().and_then(|cache| cache.loss(now));
+        Some(info)
     }
 }
 
@@ -2671,6 +3058,7 @@ fn added_result(
     attachment_result(core, id, end).or_else(|| reply.then(|| core.pipe_joined(id)).flatten())
 }
 
+#[cfg(feature = "test-hooks")]
 fn withdraw_join(
     core: &mut core::SessionCore,
     id: PipeId,
@@ -2695,13 +3083,29 @@ fn withdraw_join(
 }
 
 impl<D: Driver> Pipe<D> {
+    /// Applies physical failure evidence from the registered carrier adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unknown attachments, a mismatched connection
+    /// identity, or a retry delay the session clock cannot represent.
+    pub fn report_carrier_failure(
+        &self,
+        report: crate::CarrierFailureReport,
+    ) -> Result<bool, PipeError> {
+        self.conn.command(|state| {
+            let now = state.now();
+            state.core.report_carrier_failure(self.id, report, now)
+        })
+    }
+
     /// Removes the pipe, warning through the logger when that leaves a
     /// direction without a pipe while streams are open.
     pub(crate) fn remove(&self, graceful: bool) -> Result<(), PipeError> {
         let id = self.id;
         self.conn.command(|st| {
             let stranding = st.core.is_multipath() && st.core.removal_strands_streams(id);
-            let r = st.core.remove_pipe(id, graceful, D::now());
+            let r = st.core.remove_pipe(id, graceful, st.now());
             if r.is_ok() && stranding {
                 st.log(
                     LogLevel::Warn,
@@ -2732,6 +3136,41 @@ impl<D: Driver> Pipe<D> {
 }
 
 impl<D: Driver> Pipe<D> {
+    pub(super) fn into_attempt_attachment(self) -> (PipeId, Arc<PipeOutcome>) {
+        (self.id, self.end)
+    }
+
+    pub(super) fn attempt_progress(
+        shared: &Shared<D>,
+        pipes: &[(PipeId, Arc<PipeOutcome>)],
+    ) -> (Vec<PipeId>, Vec<PipeId>, Option<PipeError>) {
+        let state = shared.lock();
+        let mut replied = Vec::new();
+        let mut confirmed = Vec::new();
+        let mut failure = None;
+        for (id, end) in pipes {
+            match attachment_result(&state.core, *id, end) {
+                Some(Ok(())) => {
+                    replied.push(*id);
+                    confirmed.push(*id);
+                }
+                Some(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                None => {
+                    if state
+                        .core
+                        .pipe_joined(*id)
+                        .is_some_and(|result| result.is_ok())
+                    {
+                        replied.push(*id);
+                    }
+                }
+            }
+        }
+        (replied, confirmed, failure)
+    }
+
     /// Waits until the peer attached the pipe (see the core's
     /// `pipe_attached`).
     pub(crate) fn attached_op(&self) -> impl Future<Output = Result<(), PipeError>> + '_ {
@@ -2739,28 +3178,6 @@ impl<D: Driver> Pipe<D> {
         Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
             attachment_result(&st.core, id, end)
         })
-    }
-
-    /// What `add_pipe` waits for: the verified Reply with
-    /// `return_on_reply`, else the peer's attachment. The core's join
-    /// timeout runs from carrier submission: [`core::PipeFailure::JoinTimedOut`].
-    pub(crate) fn added_op(
-        &self,
-        return_on_reply: bool,
-    ) -> impl Future<Output = Result<(), PipeError>> + '_ {
-        let (id, end) = (self.id, &self.end);
-        Wait::new(&self.conn.inner, List::Pipes, move |st: &mut State<D>| {
-            added_result(&st.core, id, end, return_on_reply)
-        })
-    }
-
-    /// Whether the peer attached the pipe now (see the core's
-    /// `pipe_attached`).
-    pub(crate) fn is_attached(&self) -> bool {
-        matches!(
-            attachment_result(&self.conn.lock().core, self.id, &self.end),
-            Some(Ok(()))
-        )
     }
 
     /// Waits until the pipe ended (see the core's `pipe_closed`). Once the
@@ -3005,7 +3422,14 @@ impl<D: Driver> StreamHandle<D> {
     /// [`SendStream::path_datagram_size`]); `None` without datagram flows
     /// or once the session discarded the stream.
     pub fn path_datagram_size(&self, context: u64) -> Option<usize> {
-        stream_path_datagram_size(&self.shared, self.key, context)
+        self.datagram_path(context).payload
+    }
+
+    /// Current original-copy payload capacities for this flow and Context ID.
+    /// Works while the sending part is busy. Returns an empty path when the
+    /// outgoing flow is unavailable.
+    pub fn datagram_path(&self, context: u64) -> crate::DatagramPath {
+        stream_datagram_path(&self.shared, self.key, context)
     }
 
     /// Sends a datagram on the stream (see [`SendStream::send_datagram`]).
@@ -3017,7 +3441,25 @@ impl<D: Driver> StreamHandle<D> {
     /// the stream ended, its sending part was released or the session
     /// discarded it.
     pub fn send_datagram(&self, context: u64, data: Bytes) -> Result<(), DatagramError> {
-        stream_send_datagram(&self.shared, self.key, context, data).map(|_| ())
+        self.send_datagram_with(context, data, crate::DatagramSendOptions::default())
+    }
+
+    /// Queues a datagram on the stream with local per-packet settings.
+    pub fn send_datagram_with(
+        &self,
+        context: u64,
+        data: Bytes,
+        options: crate::DatagramSendOptions,
+    ) -> Result<(), DatagramError> {
+        stream_send_datagram(&self.shared, self.key, context, data, options)
+    }
+
+    /// Sets the outgoing flow's default datagram options.
+    pub fn set_datagram_options(
+        &self,
+        options: crate::DatagramSendOptions,
+    ) -> Result<(), DatagramError> {
+        self.setters().datagram_options(options)
     }
 
     /// Sets the sending part's local scheduling priority (see
@@ -3181,6 +3623,29 @@ impl<D: Driver> std::fmt::Debug for SendStream<D> {
 }
 
 impl<D: Driver> SendStream<D> {
+    /// Current original-copy payload capacities for this flow and Context ID.
+    pub fn datagram_path(&self, context: u64) -> crate::DatagramPath {
+        stream_datagram_path(&self.conn.0, self.key, context)
+    }
+
+    /// Queues an outgoing stream datagram with per-packet settings.
+    pub fn send_datagram_with(
+        &self,
+        context: u64,
+        data: Bytes,
+        options: crate::DatagramSendOptions,
+    ) -> Result<(), DatagramError> {
+        stream_send_datagram(&self.conn.0, self.key, context, data, options)
+    }
+
+    /// Sets the outgoing flow's defaults.
+    pub fn set_datagram_options(
+        &self,
+        options: crate::DatagramSendOptions,
+    ) -> Result<(), DatagramError> {
+        self.setters().datagram_options(options)
+    }
+
     /// Runs one of the handle's own polls with its wait slot.
     pub(crate) fn with_slot<R>(&mut self, f: impl FnOnce(&Self, &mut Option<Ticket>) -> R) -> R {
         let mut slot = self.slot.take();
@@ -3293,7 +3758,7 @@ impl<D: Driver> SendStream<D> {
 
     pub(crate) fn write_chunk_op(
         &self,
-        mut data: Bytes,
+        mut data: crate::Chunk,
     ) -> impl Future<Output = Result<(), StreamError>> + '_ {
         StreamWait::new(
             &self.conn,
@@ -3332,7 +3797,7 @@ impl<D: Driver> SendStream<D> {
 
     pub(crate) fn write_chunks_op<'a>(
         &'a self,
-        bufs: &'a mut [Bytes],
+        bufs: &'a mut [crate::Chunk],
     ) -> impl Future<Output = Result<Written, StreamError>> + 'a {
         StreamWait::new(
             &self.conn,
@@ -3478,18 +3943,96 @@ impl<D: Driver> SendStream<D> {
         &self.conn.0
     }
 
-    /// [`SendStream::send_datagram`](crate::SendStream#method.send_datagram) that tells whether the datagram was queued:
-    /// `Ok(false)` when the session's datagram limiter refused it.
-    pub(crate) fn try_send_datagram(
+    /// Selects the representation and queues a datagram in the session owner.
+    pub(crate) fn admit_packet(
         &self,
         context: u64,
         data: Bytes,
-    ) -> Result<bool, DatagramError> {
-        stream_send_datagram(&self.conn.0, self.key, context, data)
+        options: crate::DatagramSendOptions,
+        policy: core::SendPolicy,
+    ) -> Result<core::PacketAdmission, DatagramError> {
+        if self.conn.0.datagram_limiter.send.is_none() {
+            return stream_command(&self.conn.0, self.key, |core, key| {
+                let now = core.config().clock_domain.now_with(D::now);
+                core.admit_stream_packet((key, context), data, options, policy, true, now)
+            });
+        }
+        let (options, representation) = stream_command(&self.conn.0, self.key, |c, key| {
+            let now = c.config().clock_domain.now_with(D::now);
+            c.prepare_stream_packet((key, context), data.len(), options, policy, now)
+        })?;
+        if matches!(representation, core::PacketRepresentation::Capsule) {
+            return Ok(core::PacketAdmission::Capsule {
+                data,
+                deadline: options.deadline,
+            });
+        }
+        let allowance = self.conn.datagram_allowed(data.len());
+        let queued = stream_command(&self.conn.0, self.key, |core, key| {
+            core.tick(core.config().clock_domain.now_with(D::now));
+            core.commit_stream_packet(key, context, data, options, allowance.allowed())
+        });
+        allowance.queued(queued)?;
+        Ok(core::PacketAdmission::Datagram)
+    }
+
+    pub(crate) fn resolve_splice_datagram_options(
+        &self,
+        options: crate::DatagramSendOptions,
+        admitted: Instant,
+    ) -> Result<core::ResolvedDatagramOptions, DatagramError> {
+        let st = self.conn.lock();
+        st.core
+            .stream_datagram_options(self.key, options)
+            .resolve(admitted)
+    }
+
+    pub(crate) fn datagram_allowance(&self, len: usize) -> DatagramAllowance<'_> {
+        self.conn.datagram_allowed(len)
+    }
+
+    /// Plans each member before the splice requests its exact grant.
+    pub(crate) fn datagram_group(
+        &self,
+        context: u64,
+        sizes: &[usize],
+        options: core::ResolvedDatagramOptions,
+        policy: core::SendPolicy,
+    ) -> Result<core::PacketRepresentation, DatagramError> {
+        stream_command(&self.conn.0, self.key, |core, key| {
+            core.tick(core.config().clock_domain.now_with(D::now));
+            core.plan_splice_datagrams((key, context), sizes.iter().copied(), options, policy)
+        })
+    }
+
+    /// Rechecks and commits the group in a single target owner turn.
+    pub(crate) fn commit_datagram_group(
+        &self,
+        context: u64,
+        data: &[Bytes],
+        options: core::ResolvedDatagramOptions,
+        policy: core::SendPolicy,
+        payment: Option<&mut core::splice_handoff::Prepayment<'_>>,
+    ) -> Result<core::PacketRepresentation, DatagramError> {
+        stream_command(&self.conn.0, self.key, |core, key| {
+            core.tick(core.config().clock_domain.now_with(D::now));
+            core.commit_splice_datagrams((key, context), data, options, policy, payment)
+        })
+    }
+
+    pub(crate) fn packet_clock(&self) -> crate::ClockDomain {
+        self.conn.lock().core.config().clock_domain.clone()
+    }
+
+    pub(crate) fn expire_packet(&self) -> DatagramError {
+        stream_command(&self.conn.0, self.key, |core, _| {
+            core.drop_datagram_admission(crate::DatagramDrop::Deadline)
+        })
     }
 
     /// Whether `recv` is the receiving part of this part's stream.
-    pub(crate) fn same_stream(&self, recv: &RecvStream<D>) -> bool {
+    #[must_use]
+    pub fn same_stream(&self, recv: &RecvStream<D>) -> bool {
         Arc::ptr_eq(&self.conn.0, &recv.conn.0) && self.key == recv.key
     }
 
@@ -3525,11 +4068,35 @@ impl<D: Driver> SendStream<D> {
         &self,
         waker: &Waker,
         slot: &mut Option<Ticket>,
-        data: &mut Bytes,
+        data: &mut crate::Chunk,
     ) -> Poll<Result<usize, StreamError>> {
+        self.poll_write_part_before(waker, slot, data, None, None)
+            .map_ok(|written| written.expect("write without a deadline"))
+    }
+
+    /// Serializes expiry with first-byte acceptance by the target writer.
+    pub(crate) fn poll_write_part_before(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
+        data: &mut crate::Chunk,
+        deadline: Option<Instant>,
+        payment: Option<&mut core::splice_handoff::Prepayment<'_>>,
+    ) -> Poll<Result<Option<usize>, StreamError>> {
         let mut st = self.conn.lock();
         st.leave_stream(List::Writable(self.key), slot);
-        match st.core.write_chunk(self.key, data.clone()) {
+        if let Some(deadline) = deadline {
+            st.core.write_room(self.key)?;
+            if st.now() >= deadline {
+                return Poll::Ready(Ok(None));
+            }
+        }
+        let written = if let Some(payment) = payment {
+            st.core.write_splice_chunk(self.key, data.clone(), payment)
+        } else {
+            st.core.write_chunk(self.key, data.clone())
+        };
+        match written {
             Ok(0) if !data.is_empty() => {
                 st.wait_stream(List::Writable(self.key), slot, waker);
                 st.after_command();
@@ -3538,7 +4105,7 @@ impl<D: Driver> SendStream<D> {
             Ok(n) => {
                 data.advance(n);
                 D::finish_write(&self.conn, st);
-                Poll::Ready(Ok(n))
+                Poll::Ready(Ok(Some(n)))
             }
             Err(e) => {
                 st.after_command();
@@ -3547,16 +4114,17 @@ impl<D: Driver> SendStream<D> {
         }
     }
 
-    /// `Ready` once every byte written was passed to a carrier, or with the
-    /// error that ended the part.
+    /// `Ready` once the requested prefix was passed to a carrier, or with
+    /// the error that ended the part. None waits for all bytes written.
     pub(crate) fn poll_sent(
         &self,
         waker: &Waker,
         slot: &mut Option<Ticket>,
+        through: Option<u64>,
     ) -> Poll<Result<(), StreamError>> {
         let mut st = self.conn.lock();
         st.leave_stream(List::Writable(self.key), slot);
-        match st.core.data_sent(self.key) {
+        match st.core.data_sent_through(self.key, through) {
             Ok(true) => Poll::Ready(Ok(())),
             Ok(false) => {
                 st.wait_stream(List::Writable(self.key), slot, waker);
@@ -3581,9 +4149,12 @@ impl<D: Driver> SendStream<D> {
         self.command(|c, k| c.reset(k, code))
     }
 
-    /// [`SendStream::set_reliable_boundary`](crate::SendStream#method.set_reliable_boundary) through a shared reference.
-    pub(crate) fn set_reliable_boundary_shared(&self) -> Result<(), StreamError> {
-        self.command(core::SessionCore::set_reliable_boundary)
+    /// Marks the given prefix as reliable. None marks all bytes written.
+    pub(crate) fn set_reliable_boundary_shared(
+        &self,
+        through: Option<u64>,
+    ) -> Result<(), StreamError> {
+        self.command(|c, k| c.set_reliable_boundary_at(k, through))
     }
 
     /// One write of at most `limit` bytes of a batch from byte `from` on,
@@ -3703,60 +4274,65 @@ impl<D: Driver> std::fmt::Debug for RecvStream<D> {
     }
 }
 
-/// Pieces of received data one `read` takes under the core lock.
-const READ_PIECES: usize = 32;
-
-/// The received data a `read` took from the core under its lock: copied
-/// into the application's buffer after the lock is released, so that the
-/// copy holds back neither the session task nor other streams.
-#[derive(Default)]
-struct Taken {
-    pieces: [Bytes; READ_PIECES],
-    count: usize,
-    len: usize,
-    fin: bool,
-}
-
-impl Taken {
-    /// Copies the pieces into `buf`; `None` at the end of the stream.
-    fn copy_into(self, buf: &mut [u8]) -> Option<usize> {
-        let mut at = 0;
-        for p in &self.pieces[..self.count] {
-            buf[at..at + p.len()].copy_from_slice(p);
-            at += p.len();
-        }
-        (at > 0 || !self.fin).then_some(at)
-    }
-}
-
-/// One `read` command for up to `max` bytes: `None` while there is
-/// nothing to read. An error after data is reported by the next read.
-fn take_read(
+/// Bounds the copy in one session-owner turn to the same amount as a
+/// `read_to_end` step. `None` means the stream has no result yet.
+fn read_into(
     core: &mut core::SessionCore,
     key: StreamKey,
-    max: usize,
-) -> Option<Result<Taken, StreamError>> {
-    let mut t = Taken::default();
-    while t.count < READ_PIECES && t.len < max {
-        match core.read_chunk(key, max - t.len) {
-            Ok(None) if t.count == 0 => return None,
-            Err(e) if t.count == 0 => return Some(Err(e)),
-            Ok(None) | Err(_) => break,
-            Ok(Some((b, fin))) => {
-                if !b.is_empty() {
-                    t.len += b.len();
-                    t.pieces[t.count] = b;
-                    t.count += 1;
-                }
-                if fin {
-                    t.fin = true;
-                    break;
-                }
-            }
-        }
+    buf: &mut [u8],
+) -> Option<Result<Option<usize>, StreamError>> {
+    if buf.is_empty() {
+        return Some(Ok(Some(0)));
     }
-    Some(Ok(t))
+    let len = buf.len().min(READ_STEP);
+    core.read(key, &mut buf[..len])
+        .transpose()
+        .map(|result| result.map(|(n, fin)| (n > 0 || !fin).then_some(n)))
 }
+
+/// A stream's next readable range. Dropping it leaves the stream unchanged.
+#[derive(Debug)]
+pub struct PreparedRead<'a, D: Driver> {
+    recv: &'a mut RecvStream<D>,
+    len: usize,
+    chunk: Option<Bytes>,
+}
+
+impl<D: Driver> PreparedRead<'_, D> {
+    /// Number of planned application bytes, zero for end of stream.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the range is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// An immutable leased prefix in chunk mode. Clones share the lease.
+    pub fn chunk(&self) -> Option<&Bytes> {
+        self.chunk.as_ref()
+    }
+
+    /// Commits the range and fills an exactly sized destination in copy mode.
+    /// Returns false without consuming if it became unavailable.
+    pub fn copy_into(self, dst: &mut [u8]) -> bool {
+        self.chunk.is_none() && dst.len() == self.len && self.commit(Some(dst))
+    }
+
+    /// Commits the leased prefix. Returns false without consuming if the
+    /// peer truncated it or the receiving part ended during preparation.
+    pub fn consume(self) -> bool {
+        self.chunk.is_some() && self.commit(None)
+    }
+
+    fn commit(self, dst: Option<&mut [u8]>) -> bool {
+        self.recv
+            .command(|core, key| core.commit_read(key, self.len, dst))
+    }
+}
+
+const READ_STEP: usize = 64 * 1024;
 
 impl<D: Driver> RecvStream<D> {
     /// Runs one of the handle's own polls with its wait slot.
@@ -3779,17 +4355,43 @@ impl<D: Driver> RecvStream<D> {
     ///
     /// The error that ended the receiving part (a reset among them).
     pub fn try_read(&mut self, buf: &mut [u8]) -> Result<TryRead<usize>, StreamError> {
-        let max = buf.len();
-        let taken = self
-            .conn
-            .command(|st| take_read(&mut st.core, self.key, max));
-        Ok(match taken {
+        let read = self.command(|core, key| read_into(core, key, buf));
+        Ok(match read {
             None => TryRead::WouldBlock,
-            Some(t) => match t?.copy_into(buf) {
+            Some(read) => match read? {
                 Some(n) => TryRead::Data(n),
                 None => TryRead::Finished,
             },
         })
+    }
+
+    /// Prepares a nonblocking read without returning credit or advancing the
+    /// stream. In chunk mode a lease keeps the selected backing alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that ended this receiving part, or a recoverable
+    /// [`StreamError::BorrowLimit`] in chunk mode.
+    pub fn prepare_read(
+        &mut self,
+        max: std::num::NonZeroUsize,
+        chunk: bool,
+    ) -> Result<Option<PreparedRead<'_, D>>, StreamError> {
+        let max = max.get();
+        let max = if chunk { max } else { max.min(READ_STEP) };
+        let ready = {
+            let mut state = self.conn.lock();
+            let ready = state.core.prepare_read(self.key, max, chunk);
+            if ready.is_err() {
+                state.after_command();
+            }
+            ready?
+        };
+        Ok(ready.map(|(len, chunk)| PreparedRead {
+            recv: self,
+            len,
+            chunk,
+        }))
     }
 
     /// Takes one chunk of at most `max` bytes that is there now, without
@@ -3798,7 +4400,7 @@ impl<D: Driver> RecvStream<D> {
     /// # Errors
     ///
     /// The error that ended the receiving part (a reset among them).
-    pub fn try_read_chunk(&mut self, max: usize) -> Result<TryRead<Bytes>, StreamError> {
+    pub fn try_read_chunk(&mut self, max: usize) -> Result<TryRead<crate::Chunk>, StreamError> {
         self.conn
             .command(|st| match st.core.read_chunk(self.key, max) {
                 Ok(None) => Ok(TryRead::WouldBlock),
@@ -3894,9 +4496,7 @@ impl<D: Driver> RecvStream<D> {
         slot: &mut Option<Ticket>,
         buf: &mut [u8],
     ) -> Poll<Result<Option<usize>, StreamError>> {
-        let max = buf.len();
-        self.poll_read_cmd(waker, slot, |core, key| take_read(core, key, max))
-            .map(|r| r.map(|t| t.copy_into(buf)))
+        self.poll_read_cmd(waker, slot, |core, key| read_into(core, key, buf))
     }
 
     fn read_wait<'a, R>(
@@ -3914,9 +4514,7 @@ impl<D: Driver> RecvStream<D> {
         &'a self,
         buf: &'a mut [u8],
     ) -> impl Future<Output = Result<Option<usize>, StreamError>> + 'a {
-        let max = buf.len();
-        let taken = self.read_wait(move |core, key| take_read(core, key, max));
-        async move { Ok(taken.await?.copy_into(buf)) }
+        self.read_wait(move |core, key| read_into(core, key, buf))
     }
 
     pub(crate) async fn read_exact_op(&self, buf: &mut [u8]) -> Result<(), ReadExactError> {
@@ -3934,21 +4532,41 @@ impl<D: Driver> RecvStream<D> {
         Ok(())
     }
 
+    fn chunk_step(
+        core: &mut core::SessionCore,
+        key: StreamKey,
+        max: usize,
+    ) -> Option<Result<Option<crate::Chunk>, StreamError>> {
+        Self::segment_step(core, key, max).map(|read| {
+            read.map(|chunk| {
+                chunk.map(|segment| crate::Chunk::backed(segment.bytes, segment.backing))
+            })
+        })
+    }
+
+    fn segment_step(
+        core: &mut core::SessionCore,
+        key: StreamKey,
+        max: usize,
+    ) -> Option<Result<Option<core::Segment>, StreamError>> {
+        match core.read_segment(key, max) {
+            Ok(None) => None,
+            Ok(Some((b, true))) if b.bytes.is_empty() => Some(Ok(None)),
+            Ok(Some((b, _))) => Some(Ok(Some(b))),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     pub(crate) fn read_chunk_op(
         &self,
         max: usize,
-    ) -> impl Future<Output = Result<Option<Bytes>, StreamError>> + '_ {
-        self.read_wait(move |core, key| match core.read_chunk(key, max) {
-            Ok(None) => None,
-            Ok(Some((b, true))) if b.is_empty() => Some(Ok(None)),
-            Ok(Some((b, _))) => Some(Ok(Some(b))),
-            Err(e) => Some(Err(e)),
-        })
+    ) -> impl Future<Output = Result<Option<crate::Chunk>, StreamError>> + '_ {
+        self.read_wait(move |core, key| Self::chunk_step(core, key, max))
     }
 
     pub(crate) fn read_chunks_op<'a>(
         &'a self,
-        bufs: &'a mut [Bytes],
+        bufs: &'a mut [crate::Chunk],
     ) -> impl Future<Output = Result<Option<usize>, StreamError>> + 'a {
         self.read_wait(move |core, key| {
             let mut n = 0;
@@ -3975,7 +4593,7 @@ impl<D: Driver> RecvStream<D> {
         self.read_wait(|core, key| {
             loop {
                 // One byte beyond the limit tells a stream that is too long.
-                let max = (limit.saturating_add(1) - out.len()).min(64 * 1024);
+                let max = (limit.saturating_add(1) - out.len()).min(READ_STEP);
                 match core.read_append(key, &mut out, max) {
                     Ok(None) => return None,
                     Ok(Some((_, true))) => return Some(Ok(())),
@@ -4015,7 +4633,7 @@ impl<D: Driver> RecvStream<D> {
         Wait::new(
             &self.conn.inner,
             List::StreamDatagrams(key),
-            move |st: &mut State<D>| stream_datagram(st.core.recv_stream_datagram(key, D::now())),
+            move |st: &mut State<D>| stream_datagram(st.core.recv_stream_datagram(key, st.now())),
         )
     }
 
@@ -4030,7 +4648,7 @@ impl<D: Driver> RecvStream<D> {
                 &conn.inner,
                 List::StreamDatagrams(key),
                 move |st: &mut State<D>| {
-                    stream_datagram(st.core.recv_stream_datagram(key, D::now()))
+                    stream_datagram(st.core.recv_stream_datagram(key, st.now()))
                 },
             )
             .await
@@ -4104,8 +4722,19 @@ impl<D: Driver> RecvStream<D> {
         waker: &Waker,
         slot: &mut Option<Ticket>,
         max: usize,
-    ) -> Poll<Result<Option<Bytes>, StreamError>> {
+    ) -> Poll<Result<Option<crate::Chunk>, StreamError>> {
         self.poll_read_cmd(waker, slot, |core, key| Self::chunk_step(core, key, max))
+    }
+
+    /// Reads a range for a nested carrier, keeping its original backing.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn poll_read_segment(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
+        max: usize,
+    ) -> Poll<Result<Option<core::Segment>, StreamError>> {
+        self.poll_read_cmd(waker, slot, |core, key| Self::segment_step(core, key, max))
     }
 
     /// [`RecvStream::poll_read_chunk`](crate::RecvStream#method.poll_read_chunk) that leaves the reader registered
@@ -4116,7 +4745,7 @@ impl<D: Driver> RecvStream<D> {
         waker: &Waker,
         slot: &mut Option<Ticket>,
         max: usize,
-    ) -> Poll<Result<Option<Bytes>, StreamError>> {
+    ) -> Poll<Result<Option<crate::Chunk>, StreamError>> {
         self.poll_read_keep(
             waker,
             slot,
@@ -4125,17 +4754,59 @@ impl<D: Driver> RecvStream<D> {
         )
     }
 
-    fn chunk_step(
-        core: &mut core::SessionCore,
-        key: StreamKey,
+    pub(crate) fn poll_take_splice_chunk(
+        &self,
+        waker: &Waker,
+        slot: &mut Option<Ticket>,
         max: usize,
-    ) -> Option<Result<Option<Bytes>, StreamError>> {
-        match core.read_chunk(key, max) {
-            Ok(None) => None,
-            Ok(Some((b, true))) if b.is_empty() => Some(Ok(None)),
-            Ok(Some((b, _))) => Some(Ok(Some(b))),
-            Err(e) => Some(Err(e)),
+        mut fits_root: impl FnMut(core::Backing) -> bool,
+        mut fits_copy: impl FnMut(usize) -> bool,
+    ) -> Poll<Result<Option<(crate::Chunk, bool)>, StreamError>> {
+        self.poll_read_keep(
+            waker,
+            slot,
+            |core, key| match core.read_splice_chunk(key, max, &mut fits_root, &mut fits_copy) {
+                Ok(None) => None,
+                Ok(Some((0, true, _))) => Some(Ok(None)),
+                Ok(Some((_, _, chunk))) => Some(Ok(Some((chunk.data, chunk.copied)))),
+                Err(error) => Some(Err(error)),
+            },
+            |result| matches!(result, Ok(Some(_))),
+        )
+    }
+
+    pub(crate) fn splice_datagram_slot(&self) -> WaitSlot<'_, D> {
+        WaitSlot {
+            conn: &self.conn,
+            list: List::StreamDatagrams(self.key),
+            ticket: None,
         }
+    }
+
+    pub(crate) fn poll_splice_datagram(
+        &self,
+        cx: &Context<'_>,
+        slot: &mut WaitSlot<'_, D>,
+        max: usize,
+        fits_root: impl FnOnce(core::Backing) -> bool,
+        fits_copy: impl FnOnce(usize) -> bool,
+    ) -> Poll<Result<core::SpliceDatagram, StreamError>> {
+        let mut st = self.conn.lock();
+        let now = st.now();
+        st.leave_stream(slot.list, &mut slot.ticket);
+        let result = st
+            .core
+            .read_splice_datagram(self.key, now, max, fits_root, fits_copy);
+        let poll = match result {
+            Ok(Some(packet)) => Poll::Ready(Ok(packet)),
+            Ok(None) => {
+                st.wait_stream(slot.list, &mut slot.ticket, cx.waker());
+                Poll::Pending
+            }
+            Err(error) => Poll::Ready(Err(error)),
+        };
+        st.after_command();
+        poll
     }
 
     /// [`RecvStream::stop`](crate::RecvStream#method.stop) through a shared reference.
@@ -4203,6 +4874,7 @@ pub(crate) trait SessionApi<D: Driver> {
     fn rtt(&self) -> Option<Duration>;
     fn goaway(&self) -> Option<GoAway>;
     fn admitted(&self) -> Option<crate::AdmittedValue>;
+    fn bound_prefix_principal(&self) -> Option<[u8; 16]>;
     fn is_plain_qmux_peer(&self) -> bool;
     fn is_established(&self) -> bool;
     fn tls(&self) -> Option<crate::TlsState>;
@@ -4225,6 +4897,8 @@ pub(crate) trait SessionApi<D: Driver> {
     fn role_nonces(&self) -> Option<(u64, u64)>;
     fn set_scheduler(&self, policy: Scheduler);
     fn scheduler(&self) -> Scheduler;
+    fn set_receive_scheduler(&self, policy: Scheduler);
+    fn receive_scheduler(&self) -> Scheduler;
     fn set_join_secret(&self, psk: &[u8]) -> Result<(), PipeError>;
     fn join_pending(&self) -> bool;
     fn set_shaping_limits(&self, limits: core::shaping::Limits)
@@ -4248,7 +4922,7 @@ pub(crate) trait SessionApi<D: Driver> {
         &self,
         factory: Option<Arc<dyn core::shaping::Factory>>,
         budget: Option<core::shaping::ShapingBudget>,
-    );
+    ) -> Result<(), crate::InvalidConfig>;
     fn shaping_meters(&self) -> core::shaping::Meters;
     fn shaping_stats(&self) -> core::shaping::Stats;
     fn set_quality_band(&self, band: Option<QualityBand>) -> Result<(), PipeError>;
@@ -4256,7 +4930,6 @@ pub(crate) trait SessionApi<D: Driver> {
     fn quality_band(&self) -> Option<QualityBand>;
     fn capacity_floor(&self) -> Option<CapacityFloor>;
     fn shaper(&self) -> Option<Arc<dyn core::shaping::Factory>>;
-    fn begin_add_pipe(&self, pipe: D::Carrier, opts: PipeOptions) -> Result<Pipe<D>, PipeError>;
     fn join_ready(&self) -> bool;
     fn join_room(&self) -> usize;
     fn declare_end_to_end(&self);
@@ -4290,10 +4963,7 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     }
 
     fn send_datagram(&self, data: Bytes) -> Result<(), DatagramError> {
-        let allowance = self.conn.datagram_allowed(data.len());
-        let allowed = allowance.allowed();
-        let queued = self.command(|st| st.core.send_datagram(data, allowed, D::now()));
-        allowance.queued(queued)
+        self.send_datagram_with(data, crate::DatagramSendOptions::default())
     }
 
     fn max_datagram_size(&self) -> Option<usize> {
@@ -4305,7 +4975,7 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     }
 
     fn close_reason(&self) -> Option<SessionError> {
-        self.conn.lock().core.error().cloned()
+        self.conn.0.close_reason()
     }
 
     fn role(&self) -> Role {
@@ -4322,6 +4992,10 @@ impl<D: Driver> SessionApi<D> for Session<D> {
 
     fn admitted(&self) -> Option<crate::AdmittedValue> {
         self.conn.lock().admitted.clone()
+    }
+
+    fn bound_prefix_principal(&self) -> Option<[u8; 16]> {
+        self.conn.lock().bound_prefix
     }
 
     fn is_plain_qmux_peer(&self) -> bool {
@@ -4357,10 +5031,13 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     fn stats(&self) -> SessionStats {
         let mut st = self.conn.lock();
         // The durations since an event are current.
-        st.core.tick(D::now());
+        let now = st.now();
+        st.core.tick(now);
         let mut stats = st.core.stats();
-        stats.carrier = st.carrier.as_deref().map(|c| c.0);
-        stats.carrier_candidates = st.carrier_tries.iter().cloned().collect();
+        if let Some(selection) = &st.carrier_selection {
+            stats.carrier = selection.chosen.as_ref().map(|c| c.0);
+            stats.carrier_candidates = selection.tries.iter().cloned().collect();
+        }
         stats.log_lines_dropped = st.log_dropped.load(std::sync::atomic::Ordering::Relaxed);
         stats
     }
@@ -4421,6 +5098,14 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         self.conn.lock().core.scheduler()
     }
 
+    fn set_receive_scheduler(&self, policy: Scheduler) {
+        self.conn.lock().core.set_receive_scheduler(policy);
+    }
+
+    fn receive_scheduler(&self) -> Scheduler {
+        self.conn.lock().core.receive_scheduler()
+    }
+
     fn set_join_secret(&self, psk: &[u8]) -> Result<(), PipeError> {
         self.command(|st| st.core.set_join_secret(psk))
     }
@@ -4433,7 +5118,11 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         &self,
         limits: core::shaping::Limits,
     ) -> Result<(), crate::InvalidConfig> {
-        self.command(|st| st.core.set_shaping_limits(limits))
+        self.command(|st| {
+            let now = st.now();
+            st.core.tick(now);
+            st.core.set_shaping_limits(limits)
+        })
     }
 
     fn shaping_limits(&self) -> core::shaping::Limits {
@@ -4479,7 +5168,7 @@ impl<D: Driver> SessionApi<D> for Session<D> {
 
     fn release_first_flight(&self) {
         self.command(|st| {
-            st.core.release_first_flight(D::now());
+            st.core.release_first_flight(st.now());
         });
     }
 
@@ -4487,17 +5176,31 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         &self,
         factory: Option<Arc<dyn core::shaping::Factory>>,
         budget: Option<core::shaping::ShapingBudget>,
-    ) {
-        let b = budget.map(|b| b.ask()).unwrap_or_default();
-        self.command(|st| st.core.set_shaper_budgeted(factory, b));
+    ) -> Result<(), crate::InvalidConfig> {
+        let b = budget
+            .as_ref()
+            .map(core::shaping::ShapingBudget::ask)
+            .transpose()?
+            .unwrap_or_default();
+        self.command(|st| {
+            let now = st.now();
+            st.core.tick(now);
+            st.core.set_shaper_budgeted(factory, b)
+        })
     }
 
     fn shaping_meters(&self) -> core::shaping::Meters {
-        self.conn.lock().core.shaping_meters()
+        {
+            let state = self.conn.lock();
+            state.core.shaping_meters_at(state.now())
+        }
     }
 
     fn shaping_stats(&self) -> core::shaping::Stats {
-        self.conn.lock().core.shaping_stats()
+        let mut state = self.conn.lock();
+        let now = state.now();
+        state.core.tick(now);
+        state.core.shaping_stats()
     }
 
     fn set_quality_band(&self, band: Option<QualityBand>) -> Result<(), PipeError> {
@@ -4520,16 +5223,17 @@ impl<D: Driver> SessionApi<D> for Session<D> {
         self.conn.lock().core.shaper()
     }
 
-    fn begin_add_pipe(&self, pipe: D::Carrier, opts: PipeOptions) -> Result<Pipe<D>, PipeError> {
-        self.start_join(pipe, &opts, self.join_report(), self.join_deadline())
-    }
-
     fn join_ready(&self) -> bool {
-        self.conn.lock().core.join_ready(D::now())
+        {
+            let state = self.conn.lock();
+            state.core.join_ready(state.now())
+        }
     }
 
     fn join_room(&self) -> usize {
-        self.conn.lock().core.join_room(D::now())
+        let st = self.conn.lock();
+        let room = st.core.join_room(st.now());
+        room.saturating_sub(st.reserved_joins())
     }
 
     fn declare_end_to_end(&self) {
@@ -4571,10 +5275,10 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     }
 
     fn pipe_stats(&self) -> Vec<PipeStats> {
-        let now = D::now();
         let mut refreshes = Vec::new();
         let pipes = {
             let mut st = self.conn.lock();
+            let now = st.now();
             st.core.tick(now);
             let mut pipes = st.core.pipes();
             let bootstrap = st.bootstrap.upgrade();
@@ -4591,6 +5295,7 @@ impl<D: Driver> SessionApi<D> for Session<D> {
                 if let Some(cache) = cache {
                     let (sample, refresh) = cache.read(now);
                     stats.carrier_sample = sample;
+                    stats.carrier_loss = cache.loss(now);
                     refreshes.extend(refresh);
                 }
             }
@@ -4603,11 +5308,11 @@ impl<D: Driver> SessionApi<D> for Session<D> {
     }
 
     fn revalidate_pipes(&self) -> Result<(), PipeError> {
-        self.command(|st| st.core.revalidate_pipes(None, D::now()))
+        self.command(|st| st.core.revalidate_pipes(None, st.now()))
     }
 
     fn advance_epoch(&self) -> Result<(), PipeError> {
-        self.command(|st| st.core.advance_epoch(D::now()))
+        self.command(|st| st.core.advance_epoch(st.now()))
     }
 
     fn epoch(&self) -> Option<u64> {
@@ -4651,29 +5356,22 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::try_open_uni_with(self, preamble)
         }
 
-        /// Queues a session datagram. Never waits: when the queue is full the
-        /// oldest datagram is dropped.
+        /// Queues a session datagram. Never waits. At capacity, queued originals
+        /// make room in arrival order. If carrier outcomes occupy every slot,
+        /// the new datagram is dropped.
         pub fn send_datagram(&self, data: ::bytes::Bytes) -> Result<(), crate::DatagramError> {
             <Self as crate::driver::handle::SessionApi<$d>>::send_datagram(self, data)
         }
 
         /// The largest session datagram payload the peer currently accepts,
-        /// the MTU of a packet interface: 65533 for a zmux peer with
-        /// datagram flows, 65534 without, 16381 for a plain QMux peer at the
-        /// default record size; `None` when the peer accepts no datagrams.
-        /// Every pipe of a multipath session takes it.
+        /// the MTU of a packet interface. The bound reflects the next
+        /// Sequence width, Flow and the peer's negotiated limits.
         pub fn max_datagram_size(&self) -> Option<usize> {
             <Self as crate::driver::handle::SessionApi<$d>>::max_datagram_size(self)
         }
 
-        /// The largest session datagram payload that leaves as one datagram
-        /// of the carrier instead of in a record: on a carrier with a
-        /// datagram channel (a QUIC connection, HTTP/3, WebTransport) what
-        /// one of its datagrams takes as the carrier last reported it, path
-        /// MTU discovery included; elsewhere [`Self::max_datagram_size`],
-        /// since every datagram rides the records there. A packet forwarder
-        /// uses it as its MTU; `SessionEvent::DatagramPathChanged` reports
-        /// changes. `None` when the peer accepts no datagrams.
+        /// Largest session datagram payload on an eligible path.
+        /// [`Self::datagram_path`] also reports the native channel capacity.
         pub fn path_datagram_size(&self) -> Option<usize> {
             <Self as crate::driver::handle::SessionApi<$d>>::path_datagram_size(self)
         }
@@ -4705,6 +5403,14 @@ macro_rules! session_api {
         /// a client.
         pub fn admitted(&self) -> Option<crate::AdmittedValue> {
             <Self as crate::driver::handle::SessionApi<$d>>::admitted(self)
+        }
+
+        /// Ticket ID verified by bound presentation on the accepted bootstrap
+        /// carrier (the uplink of a split bootstrap). An unbound presentation
+        /// supplies no principal.
+        #[must_use]
+        pub fn bound_prefix_principal(&self) -> Option<[u8; 16]> {
+            <Self as crate::driver::handle::SessionApi<$d>>::bound_prefix_principal(self)
         }
 
         /// Whether the peer is a plain QMux implementation.
@@ -4832,6 +5538,16 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::scheduler(self)
         }
 
+        /// Sets the local receive scheduling preference.
+        pub fn set_receive_scheduler(&self, policy: crate::sched::Scheduler) {
+            <Self as crate::driver::handle::SessionApi<$d>>::set_receive_scheduler(self, policy);
+        }
+
+        /// Returns the local receive scheduling preference.
+        pub fn receive_scheduler(&self) -> crate::sched::Scheduler {
+            <Self as crate::driver::handle::SessionApi<$d>>::receive_scheduler(self)
+        }
+
         /// Supplies the deferred pre-shared key
         /// ([`PipeAuth::deferred_psk`](crate::PipeAuth::deferred_psk)), of at
         /// least 16 bytes; only once. After establishment it derives the
@@ -4908,8 +5624,8 @@ macro_rules! session_api {
         /// Raises the number of bidirectional and of unidirectional streams
         /// the peer may have open, and sends the credit. The credit only
         /// grows: 0 raises nothing. [`MAX_STREAM_CREDIT`](crate::MAX_STREAM_CREDIT)
-        /// grants as many as the protocol can count; a value above it is
-        /// refused and changes nothing.
+        /// is the encoding limit. Both values must fit the memory budget
+        /// before either is raised.
         pub fn raise_incoming_streams(
             &self,
             bidi: u64,
@@ -4925,11 +5641,16 @@ macro_rules! session_api {
         /// this session's budget, which cannot widen the shaping limits;
         /// `None`: no budget of the configuration. The account carries
         /// over.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the sampled budget is invalid for the session.
         pub fn set_shaper(
             &self,
             factory: Option<std::sync::Arc<dyn crate::shaping::Factory>>,
             budget: Option<crate::shaping::ShapingBudget>,
-        ) where
+        ) -> Result<(), crate::InvalidConfig>
+        where
             $d: 'static,
         {
             <Self as crate::driver::handle::SessionApi<$d>>::set_shaper_budgeted(
@@ -5005,22 +5726,15 @@ macro_rules! session_api {
             <Self as crate::driver::handle::SessionApi<$d>>::shaper(self)
         }
 
-        /// Starts adding a pipe as `add_pipe` does, without waiting: the
-        /// local endpoint runs the Join handshake on the carrier, which needs
-        /// both of its directions; the options choose the attachment's
-        /// direction and record mode. Nothing but the handshake reaches the
-        /// carrier until the Reply verifies, and after it the pipe is in
-        /// probation for a while. `Pipe::joined` and `Pipe::attached` wait
-        /// for the rest, and a pipe that the caller gives up on is the
-        /// caller's to abort.
-        /// [`PipeOptions::return_on_reply`](crate::PipeOptions::return_on_reply)
-        /// plays no part here.
-        pub fn begin_add_pipe(
+        /// Starts a raw Join for protocol fixtures that exercise incomplete handshakes.
+        #[cfg(feature = "test-hooks")]
+        #[doc(hidden)]
+        pub fn test_begin_join(
             &self,
             pipe: $carrier,
             opts: crate::PipeOptions,
         ) -> Result<Pipe, crate::PipeError> {
-            <Self as crate::driver::handle::SessionApi<$d>>::begin_add_pipe(self, pipe, opts)
+            self.start_join_inner(pipe, &opts, self.join_deadline(), None)
         }
 
         /// States that the host has proven pipe 0 end to end: a first pipe outside the
@@ -5138,7 +5852,7 @@ macro_rules! session_adapter {
 
             /// How many pipes may be added now: 0 unless
             /// [`join_ready`](Self::join_ready), else the room under
-            /// `max_pipes`. Dial at most this many carriers at once.
+            /// the steady attachment limit. Dial at most this many carriers at once.
             pub fn join_room(&self) -> usize {
                 <Session as crate::driver::handle::SessionApi<$d>>::join_room(self.session)
             }
@@ -5173,7 +5887,7 @@ impl<D: Driver> PipeApi<D> for Pipe<D> {
     fn stats(&self) -> Option<PipeStats> {
         let mut stats = self.pipe_signals()?;
         if let Some(cache) = self.end.sample.get() {
-            let (sample, refresh) = cache.read(D::now());
+            let (sample, refresh) = cache.read(self.conn.lock().now());
             stats.carrier_sample = sample;
             if let Some(refresh) = refresh {
                 refresh.submit();
@@ -5219,7 +5933,10 @@ impl<D: Driver> PipeApi<D> for Pipe<D> {
     }
 
     fn revalidate(&self) -> Result<(), PipeError> {
-        self.command(|c, p| c.revalidate_pipes(Some(p), D::now()))
+        self.command(|c, p| {
+            let now = c.config().clock_domain.now_with(D::now);
+            c.revalidate_pipes(Some(p), now)
+        })
     }
 }
 
@@ -5242,6 +5959,23 @@ macro_rules! pipe_api {
         /// session keeps its state.
         pub fn stats(&self) -> Option<crate::PipeStats> {
             <Self as crate::driver::handle::PipeApi<$d>>::stats(self)
+        }
+
+        /// The committed directional health of the attachment.
+        #[must_use]
+        pub fn health(&self) -> Option<crate::PipeHealth> {
+            self.health_snapshot()
+        }
+
+        /// The final record accounting ticket, when enabled on this session.
+        #[must_use]
+        pub fn accounting(&self) -> Option<crate::AccountingTicket> {
+            self.accounting_ticket()
+        }
+
+        /// Requests current-round stability proof on this attachment.
+        pub fn observe_stability(&self) {
+            self.request_stability();
         }
 
         /// The value of the admission that accepted the carrier that
@@ -5335,7 +6069,7 @@ pub(crate) trait SendStreamApi<D: Driver> {
     ) -> Poll<Result<u64, StreamError>>;
     fn poll_writable(&mut self, cx: &mut Context<'_>) -> Poll<Result<u64, StreamError>>;
     fn try_write(&mut self, buf: &[u8]) -> Result<usize, StreamError>;
-    fn try_write_chunk(&mut self, chunk: &mut Bytes) -> Result<usize, StreamError>;
+    fn try_write_chunk(&mut self, chunk: &mut crate::Chunk) -> Result<usize, StreamError>;
 }
 
 impl<D: Driver> SendStreamApi<D> for SendStream<D> {
@@ -5396,11 +6130,11 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
     }
 
     fn path_datagram_size(&self, context: u64) -> Option<usize> {
-        stream_path_datagram_size(&self.conn.0, self.key, context)
+        self.datagram_path(context).payload
     }
 
     fn send_datagram(&self, context: u64, data: Bytes) -> Result<(), DatagramError> {
-        stream_send_datagram(&self.conn.0, self.key, context, data).map(|_| ())
+        self.send_datagram_with(context, data, crate::DatagramSendOptions::default())
     }
 
     fn meter(&self) -> &Arc<Meter> {
@@ -5438,7 +6172,7 @@ impl<D: Driver> SendStreamApi<D> for SendStream<D> {
         r
     }
 
-    fn try_write_chunk(&mut self, chunk: &mut Bytes) -> Result<usize, StreamError> {
+    fn try_write_chunk(&mut self, chunk: &mut crate::Chunk) -> Result<usize, StreamError> {
         let mut st = self.conn.lock();
         // Like `try_write`: whatever the outcome, the call ends with `finish_write`.
         let r = st.core.write_chunk(self.key, chunk.clone());
@@ -5657,7 +6391,7 @@ macro_rules! sendstream_api {
         /// the bytes taken; `Ok(0)` leaves it unchanged.
         pub fn try_write_chunk(
             &mut self,
-            chunk: &mut ::bytes::Bytes,
+            chunk: &mut crate::Chunk,
         ) -> Result<usize, crate::StreamError> {
             <Self as crate::driver::handle::SendStreamApi<$d>>::try_write_chunk(self, chunk)
         }

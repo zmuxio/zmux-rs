@@ -73,7 +73,7 @@ const STEP: u64 = 10;
 
 fn config(edit: &dyn Fn(&mut Config)) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 8;
+    c.session_policy.limits.steady_attachments = 8;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.max_idle_timeout = None;
     c.probation = None;
@@ -399,12 +399,15 @@ fn probes_are_shaped_and_a_delay_is_no_stall() {
     );
     let plans = Arc::new(AtomicU64::new(0));
     let p = plans.clone();
-    n.ends[A].set_shaper(Some(Arc::new(move |_: &zmux::shaping::ShapedPipe| {
-        Some(Box::new(Delay {
-            plans: p.clone(),
-            by: Duration::from_millis(400),
-        }) as Box<dyn Shaper>)
-    })));
+    install_probe_shaper(
+        &mut n.ends[A],
+        Arc::new(move |_: &zmux::shaping::ShapedPipe| {
+            Some(Box::new(Delay {
+                plans: p.clone(),
+                by: Duration::from_millis(400),
+            }) as Box<dyn Shaper>)
+        }),
+    );
     ping_times(&mut n, 0, 2000);
     let (p0, k0) = (plans.load(Ordering::Relaxed), n.links[&0].a_pings);
     ping_times(&mut n, 0, 20_000);
@@ -444,8 +447,24 @@ fn the_bootstrap_pipe_draws_its_first_wait_from_the_whole_interval() {
     assert!(draws.iter().any(|d| *d < k * 3 / 4), "{draws:?}");
 }
 
+fn install_probe_shaper(
+    core: &mut zmux::proto::session::SessionCore,
+    factory: Arc<dyn zmux::shaping::Factory>,
+) {
+    use zmux::shaping::{Budget, ProfileLimits};
+    core.set_shaper_budgeted(
+        Some(factory),
+        Budget::new(
+            None,
+            Some(ProfileLimits::new(10, 50_000, 540, Duration::from_secs(3))),
+            false,
+        ),
+    )
+    .unwrap();
+}
+
 /// The probe deadline: it is measured to the carrier. Records
-/// that shaping may hold for up to `max_delay` (here held 2 s each) are
+/// that shaping may hold for up to `max_added_delay` (here held 2 s each) are
 /// built that much before the interval ends, so that each `PIPE_PING` is
 /// handed to the carrier at most k after the previous one.
 #[test]
@@ -454,18 +473,20 @@ fn probes_reach_the_carrier_within_the_interval_despite_shaping_holds() {
     let mut n = net(
         &|c| {
             c.liveness.probe_interval = Some(k);
-            c.shaping_limits.max_delay = Some(Duration::from_secs(3));
         },
         &|_| {},
     );
     let plans = Arc::new(AtomicU64::new(0));
     let p = plans.clone();
-    n.ends[A].set_shaper(Some(Arc::new(move |_: &zmux::shaping::ShapedPipe| {
-        Some(Box::new(Delay {
-            plans: p.clone(),
-            by: Duration::from_secs(2),
-        }) as Box<dyn Shaper>)
-    })));
+    install_probe_shaper(
+        &mut n.ends[A],
+        Arc::new(move |_: &zmux::shaping::ShapedPipe| {
+            Some(Box::new(Delay {
+                plans: p.clone(),
+                by: Duration::from_secs(2),
+            }) as Box<dyn Shaper>)
+        }),
+    );
     let g = gaps(&ping_times(&mut n, 0, 60_000));
     assert!(g.len() >= 4, "{g:?}");
     // The answers to B's PIPE_PINGs, held 2 s, carry PIPE_PINGs of their
@@ -478,12 +499,12 @@ fn probes_reach_the_carrier_within_the_interval_despite_shaping_holds() {
     );
 }
 
-/// A shaper that sees records but plans none of them.
+/// A shaper that observes outbound activity without planning records.
 struct Unplanned;
 
 impl Shaper for Unplanned {
     fn capabilities(&self) -> Caps {
-        Caps::RECORD_IN
+        Caps::OUTBOUND
     }
 
     fn on_event(&mut self, _: &Event, _: &mut Effects) {}
@@ -491,7 +512,7 @@ impl Shaper for Unplanned {
 
 /// `H_p` is nonzero only for a pipe whose shaper plans its records: a
 /// shaper that plans none holds nothing, so the probes keep the full
-/// interval k although `max_delay` is set.
+/// interval k although `max_added_delay` is set.
 #[test]
 fn probes_of_a_pipe_without_plans_keep_the_whole_interval() {
     let k = Duration::from_secs(10);
@@ -499,13 +520,13 @@ fn probes_of_a_pipe_without_plans_keep_the_whole_interval() {
         &|c| {
             c.liveness.probe_interval = Some(k);
             c.liveness.probe_jitter = 0.0;
-            c.shaping_limits.max_delay = Some(Duration::from_secs(3));
         },
         &|c| c.liveness.probe_jitter = 0.0,
     );
-    n.ends[A].set_shaper(Some(Arc::new(|_: &zmux::shaping::ShapedPipe| {
-        Some(Box::new(Unplanned) as Box<dyn Shaper>)
-    })));
+    install_probe_shaper(
+        &mut n.ends[A],
+        Arc::new(|_: &zmux::shaping::ShapedPipe| Some(Box::new(Unplanned) as Box<dyn Shaper>)),
+    );
     let g = gaps(&ping_times(&mut n, 0, 60_000));
     assert!(g.len() >= 3, "{g:?}");
     let slack = Duration::from_millis(3 * STEP);
@@ -694,17 +715,19 @@ fn a_shaping_delay_keeps_acknowledgements_in_time() {
     let mut n = net(
         &|c| {
             c.liveness.probe_interval = Some(Duration::from_secs(15));
-            c.shaping_limits.max_delay = Some(Duration::from_secs(3));
         },
-        &|c| c.shaping_limits.max_delay = Some(Duration::from_secs(3)),
+        &|_| {},
     );
     for end in [A, B] {
-        n.ends[end].set_shaper(Some(Arc::new(|_: &zmux::shaping::ShapedPipe| {
-            Some(Box::new(Delay {
-                plans: Arc::new(AtomicU64::new(0)),
-                by: Duration::from_secs(2),
-            }) as Box<dyn Shaper>)
-        })));
+        install_probe_shaper(
+            &mut n.ends[end],
+            Arc::new(|_: &zmux::shaping::ShapedPipe| {
+                Some(Box::new(Delay {
+                    plans: Arc::new(AtomicU64::new(0)),
+                    by: Duration::from_secs(2),
+                }) as Box<dyn Shaper>)
+            }),
+        );
     }
     ping_times(&mut n, 0, 20_000);
     let pings = pings_in(&mut n, 0, 60_000);

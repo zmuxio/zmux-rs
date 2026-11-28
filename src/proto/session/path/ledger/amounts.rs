@@ -46,6 +46,13 @@ fn seed() -> u64 {
 }
 
 impl Amounts {
+    pub(super) const EMPTY: Self = Self {
+        nodes: Vec::new(),
+        free: Vec::new(),
+        root: None,
+        draws: 0,
+    };
+
     /// The amounts, counted with multiplicity.
     #[cfg(test)]
     fn len(&self) -> u64 {

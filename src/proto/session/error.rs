@@ -65,7 +65,7 @@ impl InvalidConfig {
         Self { field, reason }
     }
 
-    /// The setting, by its field or option name (`max_pipes`,
+    /// The setting, by its field or option name (`steady_attachments`,
     /// `ListenerConfig::instance_id`, ...).
     #[must_use]
     pub const fn field(&self) -> &'static str {
@@ -466,6 +466,10 @@ pub enum StreamError {
     /// The stream was opened before establishment beyond the peer's stream
     /// limit; its identifier follows a `MAX_STREAMS`.
     Blocked,
+    /// An external read lease could not be reserved. No bytes were consumed.
+    BorrowLimit,
+    /// The backing to write is larger than the memory domain can hold.
+    MemoryBudget,
     /// The session ended.
     SessionLost(SessionError),
 }
@@ -489,8 +493,10 @@ impl StreamError {
             Self::Rejected | Self::GoingAway => io::ErrorKind::ConnectionRefused,
             Self::ClosedLocally | Self::NotEstablished => io::ErrorKind::NotConnected,
             Self::NotNegotiated => io::ErrorKind::Unsupported,
-            Self::PreambleTooLarge { .. } | Self::InvalidArgument => io::ErrorKind::InvalidInput,
-            Self::Blocked => io::ErrorKind::WouldBlock,
+            Self::PreambleTooLarge { .. } | Self::InvalidArgument | Self::MemoryBudget => {
+                io::ErrorKind::InvalidInput
+            }
+            Self::Blocked | Self::BorrowLimit => io::ErrorKind::WouldBlock,
             Self::SessionLost(e) => e.kind(),
         }
     }
@@ -509,6 +515,8 @@ impl fmt::Display for StreamError {
             Self::NotNegotiated => f.write_str("not negotiated with the peer"),
             Self::NotEstablished => f.write_str("session not established"),
             Self::Blocked => f.write_str("waiting for stream credit"),
+            Self::BorrowLimit => f.write_str("stream read lease limit reached"),
+            Self::MemoryBudget => f.write_str("stream write backing exceeds the memory budget"),
             Self::SessionLost(e) => write!(f, "session lost: {e}"),
         }
     }
@@ -536,6 +544,8 @@ pub enum OpenError {
     /// No stream credit now; wait for [`super::CoreEvent::StreamsAvailable`]
     /// (the drivers' waiting opens do), or try later.
     Blocked,
+    /// The budget cannot admit the receiving half of a bidirectional stream.
+    MemoryBudget,
     /// The peer sent GOAWAY, or the session is shutting down; the stream
     /// may be opened on another session.
     GoingAway,
@@ -577,6 +587,7 @@ impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Blocked => f.write_str("no stream credit"),
+            Self::MemoryBudget => f.write_str("stream receive memory budget exhausted"),
             Self::GoingAway => f.write_str("the peer is going away; retryable"),
             Self::NotEstablished => f.write_str("session not established"),
             Self::NotNegotiated => f.write_str("preambles not negotiated with the peer"),
@@ -600,6 +611,7 @@ impl From<OpenError> for io::Error {
     fn from(e: OpenError) -> Self {
         let kind = match &e {
             OpenError::Blocked => io::ErrorKind::WouldBlock,
+            OpenError::MemoryBudget => io::ErrorKind::OutOfMemory,
             OpenError::GoingAway => io::ErrorKind::ConnectionRefused,
             OpenError::NotEstablished => io::ErrorKind::NotConnected,
             OpenError::NotNegotiated => io::ErrorKind::Unsupported,
@@ -616,9 +628,15 @@ impl From<OpenError> for io::Error {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DatagramError {
+    /// The effective options are incompatible or exceed the owner clock.
+    InvalidOptions(InvalidConfig),
+    /// Local admission dropped the original for this reason.
+    Dropped(super::DatagramDrop),
     /// The peer does not accept datagrams, or datagram flows are not in use
     /// for a stream datagram.
     NotNegotiated,
+    /// The send direction has used its last Datagram sequence.
+    SequenceExhausted,
     /// The datagram does not fit in one DATAGRAM frame; `max` is the largest
     /// payload that does.
     TooLarge {
@@ -646,7 +664,10 @@ impl DatagramError {
 impl fmt::Display for DatagramError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidOptions(e) => e.fmt(f),
+            Self::Dropped(reason) => write!(f, "datagram dropped: {reason:?}"),
             Self::NotNegotiated => f.write_str("datagrams not negotiated with the peer"),
+            Self::SequenceExhausted => f.write_str("datagram sequence space exhausted"),
             Self::TooLarge { max } => write!(f, "datagram larger than {max} bytes"),
             Self::ClosedStream => f.write_str("stream cannot carry datagrams"),
             Self::Blocked => f.write_str("stream not opened yet: the peer's stream limit"),
@@ -658,6 +679,7 @@ impl fmt::Display for DatagramError {
 impl std::error::Error for DatagramError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::InvalidOptions(e) => Some(e),
             Self::SessionLost(e) => Some(e),
             _ => None,
         }
@@ -668,7 +690,15 @@ impl From<DatagramError> for io::Error {
     fn from(e: DatagramError) -> Self {
         let kind = match &e {
             DatagramError::NotNegotiated => io::ErrorKind::Unsupported,
-            DatagramError::TooLarge { .. } => io::ErrorKind::InvalidInput,
+            DatagramError::Dropped(reason) => match reason {
+                super::DatagramDrop::Deadline => io::ErrorKind::TimedOut,
+                super::DatagramDrop::NoNativePath => io::ErrorKind::Unsupported,
+                _ => io::ErrorKind::WouldBlock,
+            },
+            DatagramError::SequenceExhausted => io::ErrorKind::Other,
+            DatagramError::TooLarge { .. } | DatagramError::InvalidOptions(_) => {
+                io::ErrorKind::InvalidInput
+            }
             DatagramError::ClosedStream => io::ErrorKind::NotConnected,
             DatagramError::Blocked => io::ErrorKind::WouldBlock,
             DatagramError::SessionLost(s) => s.kind(),
@@ -717,11 +747,15 @@ pub enum PipeError {
     NotNegotiated,
     /// The session is not established yet.
     NotEstablished,
-    /// The endpoint may not join now: it has `max_pipes` + H unretired
+    /// The endpoint may not join now: it has reached its limit of unretired
     /// attachments of its own, or a join was refused recently; retry later.
     Deferred,
     /// No such pipe (it was retired).
     UnknownPipe,
+    /// A planned drain would leave the session without a required direction.
+    NoDirectionCoverage,
+    /// The memory budget could not reserve this carrier's working space.
+    MemoryBudget,
     /// The carrier cannot be used so: a join needs both of its directions, and Bound a
     /// `Secure` declaration and an exporter on one connection.
     InvalidArgument,
@@ -766,7 +800,10 @@ impl PipeError {
     /// ([`PipeError::SessionLost`]).
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::NotEstablished | Self::Deferred | Self::JoinPending(_) => true,
+            Self::NotEstablished
+            | Self::Deferred
+            | Self::JoinPending(_)
+            | Self::NoDirectionCoverage => true,
             Self::SessionLost(e) => e.is_retryable(),
             _ => false,
         }
@@ -785,6 +822,10 @@ impl fmt::Display for PipeError {
             Self::NotEstablished => f.write_str("session not established"),
             Self::Deferred => f.write_str("joining is deferred"),
             Self::UnknownPipe => f.write_str("unknown pipe"),
+            Self::NoDirectionCoverage => {
+                f.write_str("planned drain would leave a direction uncovered")
+            }
+            Self::MemoryBudget => f.write_str("carrier memory budget exhausted"),
             Self::InvalidArgument => f.write_str("carrier not usable as this pipe"),
             Self::InvalidOptions(e) => write!(f, "pipe options not valid: {e}"),
             Self::Failed(e) => write!(f, "pipe failed: {e}"),
@@ -814,9 +855,12 @@ impl From<PipeError> for io::Error {
                 io::ErrorKind::TimedOut
             }
             PipeError::IdExhausted => io::ErrorKind::QuotaExceeded,
+            PipeError::MemoryBudget => io::ErrorKind::OutOfMemory,
             PipeError::NotNegotiated => io::ErrorKind::Unsupported,
             PipeError::NotEstablished => io::ErrorKind::NotConnected,
-            PipeError::Deferred | PipeError::JoinPending(_) => io::ErrorKind::WouldBlock,
+            PipeError::Deferred | PipeError::JoinPending(_) | PipeError::NoDirectionCoverage => {
+                io::ErrorKind::WouldBlock
+            }
             PipeError::JoinSecretSet => io::ErrorKind::AlreadyExists,
             PipeError::UnknownPipe => io::ErrorKind::NotFound,
             PipeError::InvalidArgument | PipeError::InvalidOptions(_) | PipeError::CarrierLoop => {

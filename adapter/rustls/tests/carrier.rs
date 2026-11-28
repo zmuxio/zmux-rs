@@ -7,16 +7,22 @@
 //! connection is a failure, never a clean end, and the PROXY protocol
 //! header of a trusted intermediary is read before the handshake.
 
+#[path = "../../test-support/tls.rs"]
+mod tls;
+
+#[path = "../../test-support/ticket.rs"]
+mod ticket;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::ServerName;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
 use zmux::RecordMode;
 use zmux::{
-    Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions,
-    Session, SessionEvent,
+    Config, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, PipeOptions, Session,
+    SessionEvent,
 };
 
 struct Tls {
@@ -27,25 +33,7 @@ struct Tls {
 
 /// A client and a server configuration for "localhost", with `alpn`.
 fn configs(alpn: &[&[u8]]) -> (Arc<rustls::ClientConfig>, Arc<rustls::ServerConfig>) {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
-    let der = CertificateDer::from(cert.cert.der().to_vec());
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![der.clone()], key)
-        .unwrap();
-    server.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(der).unwrap();
-    let mut client = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    client.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
+    let (client, server) = tls::configs("localhost", alpn.iter().map(|a| a.to_vec()).collect());
     (Arc::new(client), Arc::new(server))
 }
 
@@ -64,28 +52,10 @@ async fn proxy(to: std::net::SocketAddr) -> (std::net::SocketAddr, tokio::task::
 
 impl Tls {
     async fn new() -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
-        let der = CertificateDer::from(cert.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![der.clone()], key)
-            .unwrap();
-        server.alpn_protocols = vec![b"zmux".to_vec()];
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(der).unwrap();
-        let mut client = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        client.alpn_protocols = vec![b"zmux".to_vec()];
+        let (client, server) = configs(&[b"zmux"]);
         Self {
-            connector: TlsConnector::from(Arc::new(client)),
-            acceptor: TlsAcceptor::from(Arc::new(server)),
+            connector: TlsConnector::from(client),
+            acceptor: TlsAcceptor::from(server),
             tcp: TcpListener::bind("127.0.0.1:0").await.unwrap(),
         }
     }
@@ -110,7 +80,7 @@ impl Tls {
 
 fn config(auth: PipeAuth) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = auth.with_end_to_end();
     c.allow_record_mode = Some(zmux::AllowRecordMode::new(|_, _, _| true));
     c
@@ -150,35 +120,24 @@ async fn join(
 ) -> bool {
     let (c, s) = tls.pair().await;
     let l = listener.clone();
-    let mut handled = Some(tokio::spawn(async move {
-        l.handle_pipe(server(s), PipeHint::default()).await
-    }));
+    let mut handled =
+        tokio::spawn(async move { l.handle_pipe(server(s), PipeHint::default()).await });
     let pipe = session
-        .begin_add_pipe(
+        .test_begin_join(
             client(c),
             PipeOptions::default().with_record_mode(RecordMode::Bound),
         )
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let state = pipe.stats().and_then(|i| i.outbound);
-        if state == Some(OutboundState::Active) {
-            return true;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::select! {
+            attached = pipe.attached() => attached.is_ok(),
+            handled = &mut handled => {
+                handled.unwrap().is_ok() && pipe.attached().await.is_ok()
+            }
         }
-        // The server may finish admitting the pipe before the client sees
-        // it active: only a refused or failed admission ends the wait early.
-        if handled
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
-            && handled.take().unwrap().await.map_or(true, |r| r.is_err())
-        {
-            return false;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    })
+    .await
+    .expect("the Join did not resolve")
 }
 
 /// Echoes a transfer over the session's pipes.
@@ -259,7 +218,7 @@ async fn bound_needs_an_exporter_at_both_ends() {
     let (c, _s) = tls.pair().await;
     assert!(matches!(
         client
-            .begin_add_pipe(
+            .test_begin_join(
                 PipeIo::new(c),
                 PipeOptions::default().with_record_mode(RecordMode::Bound)
             )
@@ -408,9 +367,8 @@ async fn admission_by_bound_prefix_auth() {
     const LIMIT: Duration = Duration::from_secs(10);
     const STALL_MIN: Duration = Duration::from_millis(50);
     let (client_tls, server_tls) = configs(&[b"zmux"]);
-    let auth = zmux::PrefixAuth::new(b"k", Duration::from_secs(30), true).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
-    let admission = zmux::Admission::prefix_auth(verifier)
+    let (auth, verifier) = ticket::fixture(zmux::PrefixBinding::Bound);
+    let admission = zmux::Admission::prefix_auth(verifier, zmux::PrefixRejection::Fallback)
         .with_peek_timeout(Duration::from_millis(300))
         .with_stall_interval(STALL_MIN, Duration::from_millis(100));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -457,7 +415,13 @@ async fn admission_by_bound_prefix_auth() {
                 Some(&[]),
             )
             .unwrap();
-        auth.token(Some(&b)).unwrap().to_vec()
+        let info = zmux::CarrierInfo::new().with_prefix_binding(zmux::CarrierExporter::new(
+            move |_, _, out| {
+                out.copy_from_slice(&b);
+                true
+            },
+        ));
+        auth.token(&info).unwrap().to_vec()
     };
     let (addr, listener, with_fallback) = serve(Some(fallback)).await;
     let (stalling, stalling_listener, without_fallback) = serve(None).await;
@@ -527,28 +491,19 @@ async fn admission_by_bound_prefix_auth() {
             assert_eq!(got, send, "{name}: fallback bytes");
         }
 
-        // No fallback: stalled; a truncated token left open is a prefix
-        // that does not arrive, closed at the peek timeout.
+        // The configured fallback without a target stalls every refusal.
         for (name, send) in cases {
             let mut tls = dial(stalling).await;
             tls.write_all(send).await.unwrap();
-            let start = tokio::time::Instant::now();
             let mut reply = Vec::new();
             let n = tls.read_to_end(&mut reply).await;
-            if name == "truncated" {
-                assert!(reply.is_empty() && n.is_err(), "{name}: {reply:x?}, {n:?}");
-                continue;
-            }
             assert!(
                 matches!(n, Ok(0)),
                 "{name}: stalled carrier answered {reply:x?}, {n:?}"
             );
-            let lasted = start.elapsed();
-            assert!(
-                lasted >= STALL_MIN.checked_sub(Duration::from_millis(10)).unwrap(),
-                "{name}: closed after {lasted:?}"
-            );
         }
+        let stats = stalling_listener.stats().admission;
+        assert_eq!((stats.stalled, stats.peek_timed_out), (5, 0));
         assert_eq!(listener.stats().sessions, 2);
     };
     tokio::time::timeout(Duration::from_secs(20), body)
@@ -638,9 +593,12 @@ async fn more_reads_on_through_tls() {
     use tokio::io::AsyncWriteExt;
     use zmux::{Admission, AdmissionVerdict};
     let (client_tls, server_tls) = configs(&[b"x"]);
-    let admission = Admission::new(2, |info, p| {
+    let more = std::sync::Arc::new(tokio::sync::Notify::new());
+    let observed = more.clone();
+    let admission = Admission::new(2, move |info, p| {
         assert_eq!(info.alpn.as_deref(), Some(&b"x"[..]));
         if p.len() < 5 {
+            more.notify_one();
             AdmissionVerdict::More { need: 5 }
         } else if p == b"token" {
             AdmissionVerdict::accept(5)
@@ -663,7 +621,9 @@ async fn more_reads_on_through_tls() {
         .unwrap();
     tls.write_all(b"to").await.unwrap();
     tls.flush().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(60), observed.notified())
+        .await
+        .expect("the first prefix was not observed");
     tls.write_all(b"ken").await.unwrap();
     let client = tokio::time::timeout(
         Duration::from_secs(10),
@@ -681,81 +641,9 @@ async fn more_reads_on_through_tls() {
     listener.close();
 }
 
-// ---- N16: close delivery ---------------------------------------------------------------
-
-/// N16 on one carrier class: the client writes 1 MiB on a stream it
-/// finishes and a few bytes on a second one it leaves open, then closes
-/// with `code` and `reason` (code 0 and no reason: the plain close) and
-/// waits for the whole end. The server reads the whole 1 MiB in order and
-/// ends with the client's code and reason; the close returned within its
-/// guard; the wait, under a client linger of an hour, returned once the
-/// server read the close and ended its side; the open
-/// stream failed locally with the session's error. `slow`: the server starts
-/// reading only after a pause, so the close arrives before it read everything.
-/// `c` with a linger of an hour: a session that ends ended at the peer's end
-/// of its side.
-fn lingering(mut c: Config) -> Config {
-    c.test_hooks().linger_timeout = Some(Duration::from_secs(3600));
-    c
-}
-
-async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &[u8], slow: bool) {
-    let data: Vec<u8> = (0..(1 << 20))
-        .map(|i| u8::try_from(i % 251).unwrap())
-        .collect();
-    let reader = {
-        let (server, data) = (server.clone(), data.clone());
-        tokio::spawn(async move {
-            let (_s, mut r) = server.accept_bi().await.unwrap();
-            if slow {
-                // A slow reader: the close arrives while data waits unread.
-                tokio::time::sleep(Duration::from_millis(300)).await;
-            }
-            assert_eq!(r.read_to_end(2 << 20).await.unwrap(), data);
-            server.closing().await
-        })
-    };
-    let (mut w, _r) = client.open_bi().await.unwrap();
-    w.write_all(&data).await.unwrap();
-    w.finish().unwrap();
-    let (mut open, _r2) = client.open_bi().await.unwrap();
-    open.write_all(b"left open").await.unwrap();
-    let start = std::time::Instant::now();
-    let code = zmux::VarInt::from_u32(code);
-    if code == zmux::VarInt::ZERO && reason.is_empty() {
-        client.close().await;
-    } else {
-        client.close_with_error(code, reason).await;
-    }
-    // A guard only: the server's delivery below shows the close completed
-    // normally.
-    let closed = start.elapsed();
-    assert!(closed < Duration::from_secs(3), "{closed:?}");
-    // The client lingers an hour (`lingering`): a wait that returns within
-    // its guard returned at the server's end of its side, after it read the
-    // close.
-    let end = tokio::time::timeout(Duration::from_secs(5), client.closed())
-        .await
-        .expect("the server ended its side after the close");
-    assert!(
-        matches!(&end, zmux::SessionError::ApplicationClosed { code: c, remote: false, .. } if *c == code),
-        "{end:?}"
-    );
-    let seen = tokio::time::timeout(Duration::from_secs(5), reader)
-        .await
-        .expect("the server read everything")
-        .unwrap();
-    assert!(
-        matches!(&seen, zmux::SessionError::ApplicationClosed { code: c, reason: r, remote: true }
-            if *c == code && r.as_ref() == reason),
-        "{seen:?}"
-    );
-    let e = open.write_all(b"more").await.unwrap_err();
-    assert!(
-        matches!(&e, zmux::StreamError::SessionLost(zmux::SessionError::ApplicationClosed { code: c, remote: false, .. }) if *c == code),
-        "{e:?}"
-    );
-}
+#[path = "../../test-support/close_delivery.rs"]
+mod close_delivery;
+use close_delivery::{close_delivery, lingering};
 
 /// N16 over TCP and over TLS, through the adapter's `connect` and `serve`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

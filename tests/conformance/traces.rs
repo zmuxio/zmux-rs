@@ -290,6 +290,7 @@ fn check_trace_bytes(rel: &str, trace: &Trace, totals: &mut Totals) {
                 messages_hex,
                 chunks,
                 invalid,
+                ..
             } => {
                 if messages.is_some() || messages_hex.is_some() {
                     check_messages(&at, step, messages_hex.as_deref(), totals);

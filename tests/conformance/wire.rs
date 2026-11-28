@@ -74,7 +74,7 @@ pub fn param_value(id: u64, value: Option<&ParamValue>) -> Vec<u8> {
         .and_then(|p| p.2.as_deref());
     let mut buf = [0u8; 512];
     let n = match (format, value) {
-        (Some("empty"), None) => 0,
+        (Some("empty") | None, None) => 0,
         (Some("varint"), Some(ParamValue::Int(v))) => varint::encode(*v, &mut buf).unwrap(),
         (Some("role"), Some(ParamValue::Role(r))) => {
             let role = match (r.role, r.nonce) {
@@ -251,11 +251,37 @@ pub fn encode_frame(spec: &FrameSpec, out: &mut Vec<u8>, sent: Sent<'_>) {
                 explicit_len: *has_len,
             }),
         ),
+        FrameSpec::DatagramAck {
+            pipe,
+            channel,
+            largest,
+            delay,
+            first_range,
+            ranges,
+        } => {
+            use zmux::proto::frame::{DatagramAck, DatagramChannelKind};
+            let channel = match channel {
+                0 => DatagramChannelKind::Record,
+                1 => DatagramChannelKind::Native,
+                _ => panic!("bad ACK channel in a valid vector"),
+            };
+            let mut encoded = Vec::new();
+            for range in ranges {
+                for value in [range.gap, range.length] {
+                    let mut bytes = [0; 8];
+                    let n = varint::encode(value, &mut bytes).unwrap();
+                    encoded.extend_from_slice(&bytes[..n]);
+                }
+            }
+            let ack =
+                DatagramAck::new(*pipe, channel, *delay, *largest, *first_range, &encoded).unwrap();
+            push(out, &Frame::DatagramAck(ack));
+        }
         FrameSpec::QxTransportParameters { params } => {
             let block = param_block(params);
             push(
                 out,
-                &Frame::TransportParameters(QxTransportParameters { block: &block }),
+                &Frame::TransportParameters(QxTransportParameters::from_block(&block)),
             );
         }
         FrameSpec::QxPing { response, seq } => push(
@@ -478,6 +504,20 @@ pub fn frame_json(frame: &Frame<'_>) -> Value {
         }),
         Frame::Datagram(f) => {
             json!({"type": "DATAGRAM", "data": to_hex(f.data), "has_len": f.explicit_len})
+        }
+        Frame::DatagramAck(f) => {
+            let mut ranges = f.ranges();
+            let (mut previous, largest) = ranges.next().unwrap();
+            let first_range = largest - previous;
+            let rest: Vec<Value> = ranges
+                .map(|(start, end)| {
+                    let gap = previous - end - 2;
+                    previous = start;
+                    json!({"gap": gap, "length": end - start})
+                })
+                .collect();
+            json!({"type": "DATAGRAM_ACK", "pipe": f.pipe, "channel": f.channel as u8,
+                "largest": largest, "delay": f.delay_micros, "first_range": first_range, "ranges": rest})
         }
         Frame::TransportParameters(f) => {
             let tp = f.parameters().expect("validated by decode");

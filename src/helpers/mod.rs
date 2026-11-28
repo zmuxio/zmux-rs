@@ -3,7 +3,6 @@
 //! those operations send. Anything they do, an application can do with the
 //! session's operations alone.
 //!
-//! - `maintain_pipes` keeps a pool of pipes up (tokio driver);
 //! - `splice` forwards two streams into each other, how a relay connects
 //!   them (tokio driver);
 //! - `PacketStream` carries packets over a stream, as datagrams or
@@ -13,18 +12,9 @@
 //!   two endpoints (tokio here, `zmux::blocking::helpers::resolve_duplicate` for the
 //!   std driver).
 
-/// How often a redial source (a pool, the std driver's redial hook) looks at its pipes,
-/// at most.
-#[cfg(any(feature = "tokio", feature = "blocking"))]
-pub(crate) const POLL: std::time::Duration = std::time::Duration::from_millis(100);
-
 #[cfg_attr(any(not(feature = "tokio"), loom), allow(dead_code))]
 pub(crate) mod capsule;
 pub(crate) mod duplicate;
-#[cfg(feature = "tokio")]
-mod maintain;
-#[cfg(feature = "tokio")]
-mod policy_exec;
 
 /// Packet streams live in the driver: they read and write with its
 /// low-level stream operations.
@@ -37,18 +27,19 @@ pub use crate::driver::packet::{
 /// with the drivers' own low-level stream operations.
 #[cfg(feature = "tokio")]
 pub use crate::driver::splice::{
-    SpliceAbort, SpliceDirection, SpliceEnd, SpliceError, SpliceOptions, SpliceResult, splice,
-    splice_packets,
+    ControlledSpliceOptions, SpliceAbort, SpliceBudget, SpliceCommandError, SpliceControl,
+    SpliceController, SpliceDecision, SpliceDirection, SpliceDisposition, SpliceDropReason,
+    SpliceDrops, SpliceEditor, SpliceEnd, SpliceError, SpliceEvent, SpliceEventSink, SpliceHook,
+    SpliceHooks, SpliceInjection, SpliceInjectionStatus, SpliceKind, SpliceLimits, SpliceMeta,
+    SpliceMirror, SpliceMirrorMode, SpliceMirrorReceiver, SpliceOptions, SplicePause,
+    SplicePayloads, SpliceReceipt, SpliceResult, SpliceRoute, SpliceSample, SpliceSignal,
+    SpliceUnit, SpliceWait, controlled_splice, controlled_splice_packets, splice, splice_packets,
 };
 pub(crate) use duplicate::duplicate_api;
 pub use duplicate::{DuplicateError, DuplicateRule};
 
 #[cfg(feature = "tokio")]
 duplicate_api!(crate::driver::tokio::Tokio, crate::Session, crate::Dial);
-#[cfg(feature = "tokio")]
-pub use maintain::{
-    AsyncPoolPolicy, MIN_RECHECK, MaintainHandle, OwnedPoolView, PipePool, PolicyError,
-    PolicyFuture, PoolDecision, PoolMember, PoolPolicy, PoolView, Rotation, maintain_pipes,
-};
-#[cfg(feature = "tokio")]
-pub(crate) use maintain::{maintain_choice, maintain_redial};
+
+#[cfg(all(feature = "tokio", not(loom)))]
+pub use crate::proto::session::splice_handoff::{SpliceHandoffStats, SpliceHandoffs};

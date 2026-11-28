@@ -101,7 +101,12 @@ fn carrier(link: Link) -> (PipeIo, PipeIo) {
 fn config() -> Config {
     // Default probation and scheduler: the joined pipe takes no new data at first.
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
+    // Within the 6 s measurement the joined pipe must finish probation and
+    // prove current delivery, even while it has no application data to send.
+    c.stability.hold_for = Duration::ZERO;
+    c.liveness.probe_interval = Some(Duration::from_secs(1));
+    c.liveness.probe_jitter = 0.0;
     c.pipe_auth = PipeAuth::psk(*b"slow-path-test-psk-0123456789abc").with_end_to_end();
     c
 }
@@ -112,9 +117,13 @@ async fn echoed(first: Link, joined: Link) -> usize {
     echoed_with(config(), first, joined).await.0
 }
 
-/// As [`echoed`] with `config` on both ends; also the client's reinjected bytes, the
-/// bytes it sent on the bootstrap pipe and its opportunistic copies.
-async fn echoed_with(config: Config, first: Link, joined: Link) -> (usize, u64, u64, u64) {
+/// As [`echoed`] with `config` on both ends; also the client's statistics
+/// and the bytes it sent on the bootstrap pipe.
+async fn echoed_with(
+    config: Config,
+    first: Link,
+    joined: Link,
+) -> (usize, zmux::SessionStats, u64) {
     let config = || config.clone();
     let listener = Listener::new(config(), ListenerConfig::default()).unwrap();
     let serve = |p: PipeIo| {
@@ -128,7 +137,7 @@ async fn echoed_with(config: Config, first: Link, joined: Link) -> (usize, u64, 
     let (near, far) = carrier(joined);
     serve(far);
     client
-        .add_pipe(near, PipeOptions::default())
+        .test_join(near, PipeOptions::default())
         .await
         .expect("the fast pipe joins");
     let echo = tokio::spawn(async move {
@@ -169,12 +178,7 @@ async fn echoed_with(config: Config, first: Link, joined: Link) -> (usize, u64, 
         .find(|p| p.pipe.get() == 0)
         .map_or(0, |p| p.bytes_sent);
     client.close().await;
-    (
-        got,
-        stats.bytes_reinjected,
-        slow_sent,
-        stats.bytes_opportunistic,
-    )
+    (got, stats, slow_sent)
 }
 
 const SLOW: Link = Link {
@@ -224,13 +228,19 @@ async fn a_penalty_resends_what_a_moved_direction_left_on_the_slow_pipe() {
     let mut c = config();
     c.initial_stream_receive_window = 16 << 20;
     c.initial_connection_receive_window = 16 << 20;
-    let (got, reinjected, slow_sent, opportunistic) = echoed_with(c, SLOW, FAST).await;
+    let (got, stats, slow_sent) = echoed_with(c, SLOW, FAST).await;
     assert!(
         got >= 8 << 20,
         "echoed {got} bytes in 6 s with 16 MiB windows"
     );
     assert!(
-        reinjected <= slow_sent + opportunistic,
-        "re-sent {reinjected} bytes, the slow pipe sent {slow_sent} and {opportunistic} were copied"
+        stats.penalties > 0 && stats.bytes_reinjected > 0,
+        "{stats:?}"
+    );
+    assert!(
+        stats.bytes_reinjected <= slow_sent + stats.bytes_opportunistic,
+        "re-sent {} bytes, the slow pipe sent {slow_sent} and {} were copied",
+        stats.bytes_reinjected,
+        stats.bytes_opportunistic
     );
 }

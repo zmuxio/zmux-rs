@@ -45,7 +45,7 @@ impl ServerConfig {
             // Bounded by the listener's handshake timeout, set on the
             // carrier's waits: the host's futures are dropped past it.
             let wait = p.handshake_wait();
-            wait.block_on(self.accept(p, hint.source))?
+            wait.block_on(self.accept(p, hint.source, &zmux::ClockDomain::default(), None))?
         })
     }
 }

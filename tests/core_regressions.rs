@@ -171,6 +171,15 @@ fn memory_pressure_rejects_before_offering() {
 
 #[test]
 fn shutdown_completed_by_release_still_writes_close() {
+    shutdown_completed_by_stream_fin_still_writes_close(true);
+}
+
+#[test]
+fn shutdown_completed_with_a_live_handle_still_writes_close() {
+    shutdown_completed_by_stream_fin_still_writes_close(false);
+}
+
+fn shutdown_completed_by_stream_fin_still_writes_close(release: bool) {
     let mut p = Pair::new(Config::default(), Config::default());
     let k = p.a.open(Dir::Bidi).unwrap();
     p.a.write(k, b"x").unwrap();
@@ -182,6 +191,7 @@ fn shutdown_completed_by_release_still_writes_close() {
     p.b.handle_timeout(p.now);
     p.b.shutdown(VarInt::ZERO, b"bye", p.now);
     p.pump();
+    assert_eq!(p.b.state(), State::Draining);
     let mut buf = [0u8; 16];
     loop {
         match p.b.read(s, &mut buf).unwrap() {
@@ -191,16 +201,37 @@ fn shutdown_completed_by_release_still_writes_close() {
         }
     }
     p.b.finish(s).unwrap();
-    p.b.release(s);
-    // The FIN goes out, the stream is discarded and the shutdown closes.
+    if release {
+        p.b.release(s);
+    }
+    // Once FIN goes out, the stream is drained and shutdown can close.
     p.b.poll_transmit(P0, p.now, &mut p.out);
     assert_eq!(p.b.state(), State::Closing);
     // The std driver runs due timers before it transmits.
     p.b.handle_timeout(p.now);
     assert_eq!(p.b.state(), State::Closing, "the close is still written");
     let wire = take(&mut p.b, &mut p.out, p.now);
-    assert_ne!(wire, Vec::new());
+    assert_ne!(wire, b"");
     assert!(p.b.poll_timeout().unwrap() > p.now, "lingers from now");
+}
+
+#[test]
+fn shutdown_completes_when_a_live_stream_discards_its_final_bytes() {
+    let mut p = Pair::new(Config::default(), Config::default());
+    let k = p.a.open(Dir::Bidi).unwrap();
+    p.a.write(k, b"unread").unwrap();
+    p.a.finish(k).unwrap();
+    p.pump();
+    let s = p.b.accept(Dir::Bidi).unwrap().unwrap();
+    p.b.finish(s).unwrap();
+    p.pump();
+
+    p.b.shutdown(VarInt::ZERO, b"", p.now);
+    p.pump();
+    assert_eq!(p.b.state(), State::Draining);
+    // The peer already sent FIN, so there is no STOP_SENDING to write.
+    p.b.stop(s, VarInt::ZERO).unwrap();
+    assert_eq!(p.b.state(), State::Closing);
 }
 
 /// B shuts down while A's stream 0 is open; returns B's final GOAWAY
@@ -217,7 +248,7 @@ fn goaway_setup() -> (Pair, Vec<u8>) {
     let w = take(&mut p.a, &mut p.out, p.now);
     p.b.receive(P0, &w, p.now);
     let held = take(&mut p.b, &mut p.out, p.now);
-    assert_ne!(held, Vec::new());
+    assert_ne!(held, b"");
     (p, held)
 }
 
@@ -391,6 +422,7 @@ fn pinned_openings_go_out_in_identifier_order() {
         initial_max_stream_data_bidi_remote: Some(65536),
         initial_max_stream_data_bidi_local: Some(65536),
         initial_max_stream_data_uni: Some(65536),
+        zmux_datagram_family: true,
         zmux_preamble: Some(4096),
         reset_stream_at: true,
         zmux_pipe_ack: true,
@@ -597,7 +629,7 @@ struct Line {
     rate: f64,
     owd: Duration,
     late: Duration,
-    chunk: Bytes,
+    chunk: zmux::Chunk,
 }
 
 impl Line {
@@ -625,7 +657,7 @@ impl Line {
             rate: rate_bps / 8.0,
             owd,
             late,
-            chunk: Bytes::from(vec![7u8; 64 * 1024]),
+            chunk: zmux::Chunk::from(vec![7u8; 64 * 1024]),
         };
         l.react();
         l
@@ -801,6 +833,8 @@ fn paced_pipe_of_a_receiving_endpoint_is_not_held_by_its_acknowledgements() {
         // No credit update, which would elicit an acknowledgement, within
         // the test.
         let w = 16 << 30;
+        // Disable admission accounting for the deliberately oversized windows.
+        c.memory_budget = None;
         c.initial_stream_receive_window = w;
         c.max_stream_receive_window = Cap::Fixed(w);
         c.initial_connection_receive_window = w;
@@ -811,9 +845,13 @@ fn paced_pipe_of_a_receiving_endpoint_is_not_held_by_its_acknowledgements() {
     l.run(l.now + Duration::from_secs(4));
     l.ends[1].bulk = false;
     l.run(l.now + Duration::from_millis(100));
+    assert!(
+        l.ends[0].read >= 1 << 28,
+        "the receiver must first sustain bulk traffic"
+    );
     let a = &mut l.ends[0].s;
     let k = a.open(Dir::Uni).unwrap();
-    a.write(k, &[1u8; 4096]).unwrap();
+    assert_eq!(a.write(k, &[1u8; 4096]).unwrap(), 4096);
     a.finish(k).unwrap();
     l.react();
     l.run(l.now + Duration::from_secs(1));
@@ -844,9 +882,18 @@ fn unsent_counts_on_a_single_pipe_are_taken() {
 fn rejected_carrier_early_data_is_sent_again_whole() {
     let mut a_cfg = Config::default();
     a_cfg.early_data = zmux::EarlyData::default().with_carrier_early_data(true);
-    let mut p = Pair::attached(a_cfg, Config::default());
-    // The server's parameters, as remembered from an earlier session.
-    let remembered = p.b.local_parameters();
+    let remembered = zmux::proto::params::TransportParameters {
+        initial_max_data: Some(1 << 20),
+        initial_max_streams_bidi: Some(8),
+        initial_max_streams_uni: Some(8),
+        initial_max_stream_data_bidi_remote: Some(1 << 16),
+        initial_max_stream_data_uni: Some(1 << 16),
+        reset_stream_at: true,
+        ..Default::default()
+    };
+    let mut b_cfg = Config::default();
+    b_cfg.test_hooks().transport_parameters = Some(remembered.clone());
+    let mut p = Pair::attached(a_cfg, b_cfg);
     assert!(p.a.assume_remembered(&remembered));
     let uni = p.a.open(Dir::Uni).unwrap();
     p.a.write(uni, b"uni data").unwrap();
@@ -895,16 +942,13 @@ fn rejected_carrier_early_data_is_sent_again_whole() {
     assert!(got[2].1.contains("Reset"), "{:?}", got[2].1);
 }
 
-/// A preamble is checked when it is set, against the limit known then
-/// (the remembered Maximum Preamble Size during early data), and again
+/// A preamble is checked when it is set, against the local limit, and again
 /// when the stream's identifier is due: once the peer's smaller limit
 /// arrived, only that stream fails, nothing of it is sent, and the
 /// session goes on (N8).
 #[test]
 fn a_preamble_beyond_the_peer_limit_fails_only_its_stream() {
-    let mut a_cfg = Config::default();
-    a_cfg.early_data = zmux::EarlyData::default().with_carrier_early_data(true);
-    // The server remembered with the largest limit now announces 1500.
+    // The peer announces a limit smaller than the local one.
     let remembered = Pair::attached(Config::default(), Config::default())
         .b
         .local_parameters();
@@ -913,30 +957,15 @@ fn a_preamble_beyond_the_peer_limit_fails_only_its_stream() {
     let mut smaller = remembered.clone();
     smaller.zmux_preamble = Some(1500);
     b_cfg.test_hooks().transport_parameters = Some(smaller);
-    let mut p = Pair::attached(a_cfg, b_cfg);
-    assert!(p.a.assume_remembered(&remembered));
+    let mut p = Pair::attached(Config::default(), b_cfg);
     let big = Preamble::new().with_info(vec![b'x'; 2000]);
-    // Beyond the local limit of 4096: refused at once.
     assert_eq!(
-        p.a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![b'x'; 5000]))
-            .err(),
-        Some(OpenError::PreambleTooLarge { max: 4096 })
+        p.a.open_with(Dir::Bidi, &big).err(),
+        Some(OpenError::NotEstablished)
     );
-    let k = p.a.open_with(Dir::Bidi, &big).unwrap();
     // The peer's parameters arrive before the stream's first frame.
     p.send(false);
     assert!(p.a.is_established());
-    if let Err(e) = p.a.write(k, b"data") {
-        assert_eq!(
-            e,
-            zmux::proto::session::StreamError::PreambleTooLarge { max: 1500 }
-        );
-    }
-    p.pump();
-    assert_eq!(
-        p.a.write(k, b"more").err(),
-        Some(zmux::proto::session::StreamError::PreambleTooLarge { max: 1500 })
-    );
     assert!(p.b.accept(Dir::Bidi).unwrap().is_none(), "nothing was sent");
     // Now the peer's limit applies at once.
     assert_eq!(
@@ -950,25 +979,6 @@ fn a_preamble_beyond_the_peer_limit_fails_only_its_stream() {
     p.pump();
     assert_eq!(p.a.state(), State::Active);
     assert!(p.b.accept(Dir::Bidi).unwrap().is_some());
-}
-
-/// During early data without remembered parameters, the limit is the
-/// 1024-byte floor.
-#[test]
-fn early_preambles_are_bounded_by_the_floor() {
-    let mut a_cfg = Config::default();
-    a_cfg.early_data = zmux::EarlyData::for_zmux_peer();
-    let p = Pair::attached(a_cfg, Config::default());
-    let mut a = p.a;
-    assert!(
-        a.open_with(Dir::Bidi, &Preamble::new().with_info("x"))
-            .is_ok()
-    );
-    assert_eq!(
-        a.open_with(Dir::Bidi, &Preamble::new().with_info(vec![b'x'; 1100]))
-            .err(),
-        Some(OpenError::PreambleTooLarge { max: 1024 })
-    );
 }
 
 /// A pinned stream's reset goes even though its opening frame was not sent,
@@ -1045,7 +1055,7 @@ fn without_pipe_ack(bytes: &[u8]) -> Vec<u8> {
                     tp.zmux_max_lanes = None;
                     let mut block = vec![0u8; 4096];
                     let k = tp.encode(None, &mut block).unwrap();
-                    Frame::TransportParameters(QxTransportParameters { block: &block[..k] })
+                    Frame::TransportParameters(QxTransportParameters::from_block(&block[..k]))
                         .encode(&mut buf)
                         .unwrap()
                 }
@@ -1212,7 +1222,7 @@ fn lane_zero_write_failure_waits_for_pending_peer_close() {
     let code = VarInt::from_u32(9);
     p.b.close(code, b"peer close", p.now);
     let close = take(&mut p.b, &mut p.out, p.now);
-    assert_ne!(close, []);
+    assert_ne!(close, b"");
 
     p.a.write_failed(P0, std::io::ErrorKind::BrokenPipe, p.now);
     assert!(p.a.error().is_none(), "{:?}", p.a.error());

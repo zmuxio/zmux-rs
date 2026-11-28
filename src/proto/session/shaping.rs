@@ -26,9 +26,21 @@ pub trait Shaper: Send {
     /// Called once, when the instance is installed.
     fn capabilities(&self) -> Caps;
 
+    /// The longest certified wait for a compiled rate gate, including an
+    /// indivisible STREAM preamble of up to `preamble` bytes.
+    fn required_gate_wait(&self, preamble: u64) -> Duration {
+        let _ = preamble;
+        Duration::ZERO
+    }
+
     /// Called before each outgoing record of the pipe ([`Caps::PLAN`]);
     /// `plan` starts at its default.
     fn plan(&mut self, view: &RecordView, plan: &mut RecordPlan) {
+        let _ = (view, plan);
+    }
+
+    /// Plans the selected native datagram ([`Caps::DATAGRAM_PLAN`]).
+    fn plan_datagram(&mut self, view: &DatagramView, plan: &mut DatagramPlan) {
         let _ = (view, plan);
     }
 
@@ -91,6 +103,13 @@ impl ShapedPipe {
 pub trait Factory: Send + Sync {
     /// The instance for `pipe`.
     fn shaper(&self, pipe: &ShapedPipe) -> Option<Box<dyn Shaper>>;
+
+    /// The longest certified wait for a compiled rate gate, including an
+    /// indivisible STREAM preamble of up to `preamble` bytes.
+    fn required_gate_wait(&self, preamble: u64) -> Duration {
+        let _ = preamble;
+        Duration::ZERO
+    }
 }
 
 impl<F> Factory for F
@@ -111,12 +130,16 @@ impl Caps {
     pub const NONE: Self = Self(0);
     /// [`Shaper::plan`] is called.
     pub const PLAN: Self = Self(1);
-    /// [`EventKind::RecordIn`] is delivered.
-    pub const RECORD_IN: Self = Self(2);
+    /// [`EventKind::Outbound`] is delivered for new application data.
+    pub const OUTBOUND: Self = Self(2);
     /// [`EventKind::StreamOpen`] and [`EventKind::StreamEnd`] are delivered.
     pub const STREAMS: Self = Self(4);
     /// [`RecordView::meters`] and [`Event::meters`] are filled.
     pub const BUDGET: Self = Self(8);
+    /// [`Shaper::plan_datagram`] is called.
+    pub const DATAGRAM_PLAN: Self = Self(16);
+    /// Also deliver control-only [`EventKind::Outbound`] with [`Self::OUTBOUND`].
+    pub const INCLUDE_CONTROL: Self = Self(32);
 
     /// Whether every capability of `other` is in `self`.
     #[must_use]
@@ -225,6 +248,15 @@ impl UnitPlan {
         pad_for(n, self.pad_to, self.pad_multiple, self.pad)
     }
 
+    /// One handshake's structural allowance after choosing its absolute target.
+    #[must_use]
+    pub fn handshake_room(&self, baseline: usize, physical_room: usize) -> usize {
+        let basis = if self.pad_to == 0 { baseline } else { 0 };
+        self.pad_for(basis)
+            .saturating_sub(baseline)
+            .min(physical_room)
+    }
+
     /// Applies `limits`: `no_padding` clears the lengths, `no_pause` the delay, and the
     /// bound on one wait bounds it.
     pub fn apply_limits(&mut self, limits: &Limits) {
@@ -236,9 +268,7 @@ impl UnitPlan {
         if limits.no_pause {
             self.delay = Duration::ZERO;
         }
-        if let Some(m) = limits.max_delay {
-            self.delay = self.delay.min(m);
-        }
+        self.delay = self.delay.min(limits.max_added_delay());
     }
 }
 
@@ -575,6 +605,55 @@ pub const fn reply_room(received: usize, base: usize, want: usize) -> (usize, us
     (limit, room.saturating_sub(used))
 }
 
+/// The native datagram selected by this pipe's writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DatagramView {
+    /// The pipe.
+    pub pipe: PipeId,
+    /// Session time in microseconds.
+    pub now: u64,
+    /// Unpadded encoded bytes, including the channel's pipe ID when present.
+    pub len: usize,
+    /// Structural channel capacity.
+    pub capacity: usize,
+    /// Current channel room.
+    pub room: usize,
+    /// Whether the negotiated format and local limits allow padding.
+    pub padding: bool,
+    /// This is a replica of a previously dispatched original.
+    pub replica: bool,
+    /// The session's readings ([`Caps::BUDGET`]).
+    pub meters: Meters,
+}
+
+impl DatagramView {
+    /// A view with these sizes and time on the owner's clock.
+    #[must_use]
+    pub const fn new(pipe: PipeId, now: u64, len: usize, capacity: usize, room: usize) -> Self {
+        Self {
+            pipe,
+            now,
+            len,
+            capacity,
+            room,
+            padding: false,
+            replica: false,
+            meters: Meters::new(0, 0, 0, 0),
+        }
+    }
+}
+
+/// A native datagram's optional changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DatagramPlan {
+    /// Padding and delay for this datagram.
+    pub unit: UnitPlan,
+    /// Changes to the local policy state.
+    pub effects: Effects,
+}
+
 /// The decision for one record. Lengths are wire lengths; the core converts them,
 /// and values beyond the limits are reduced to them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -608,16 +687,16 @@ pub enum EventKind {
     Start,
     /// The instance was replaced; no further calls.
     Replaced,
-    /// A record arrived on the pipe ([`Caps::RECORD_IN`]).
-    RecordIn,
-    /// A record of PADDING only was sent, or PADDING was added to a record
-    /// for an [`Injection`].
-    Injected,
-    /// The core gave up the pending [`Injection`]: the account, a limit, the protocol or
-    /// the peer. An answer that keeps it is tried again one granularity later.
-    InjectDropped,
-    /// The wake time ([`Effects::wake`]) came.
-    Wake,
+    /// The carrier accepted a complete qualifying outbound unit.
+    Outbound,
+    /// Cover was irreversibly committed with this layout.
+    InjectionAccepted,
+    /// A cover request was rejected before commit.
+    InjectionRejected,
+    /// The carrier returned the result of a committed cover dispatch.
+    InjectionCarrierCompleted,
+    /// A scheduled wake became due.
+    Timer,
     /// Shaping of the pipe ended; no further calls.
     Stopped,
     /// The pipe's outbound direction failed; no further calls.
@@ -628,6 +707,52 @@ pub enum EventKind {
     StreamEnd,
 }
 
+/// The representation of an outbound unit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnitKind {
+    /// A reliable record.
+    #[default]
+    Record,
+    /// An unreliable datagram on a carrier channel.
+    NativeDatagram,
+}
+
+/// A reason an optional shaping decision was limited or a carrier did not accept it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeReason {
+    /// The carrier or negotiated format lacks the optional capability.
+    UnsupportedCapability,
+    /// The profile or local delay cap shortened a plan.
+    PolicyDeadline,
+    /// The application deadline elapsed.
+    ApplicationExpired,
+    /// The policy instance was replaced before dispatch.
+    StaleGeneration,
+    /// The pending unit was cancelled.
+    Cancelled,
+    /// No structural room.
+    ClippedRoom,
+    /// Policy or peer disallows this operation.
+    Disabled,
+    /// The available cover balance is too small.
+    InsufficientCoverCredit,
+    /// The profile's byte ceiling would be exceeded.
+    OverheadLimit,
+    /// The protocol's no-effect limit was reached.
+    RateLimit,
+    /// The carrier accepted no bytes.
+    CarrierRejected,
+    /// The carrier accepted only a prefix.
+    PartialProgress,
+}
+
+impl RuntimeReason {
+    /// Number of defined reasons in the meters.
+    pub const COUNT: usize = Self::PartialProgress as usize + 1;
+}
+
 /// A notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -636,14 +761,24 @@ pub struct Event {
     pub kind: EventKind,
     /// The pipe.
     pub pipe: PipeId,
-    /// The lane ([`EventKind::RecordIn`]).
+    /// The lane, zero for a native datagram.
     pub lane: u64,
     /// The session clock, microseconds.
     pub now: u64,
-    /// Frames length, bytes ([`EventKind::RecordIn`], [`EventKind::Injected`]).
+    /// Encoded unit length or actual cover bytes.
     pub len: usize,
-    /// The record holds PADDING only ([`EventKind::RecordIn`]).
-    pub padding_only: bool,
+    /// The representation of an outbound unit.
+    pub unit: UnitKind,
+    /// This unit contains original application data.
+    pub data: bool,
+    /// This unit contains eligible control frames.
+    pub control: bool,
+    /// The cover request identifier, for injection results.
+    pub request_id: u64,
+    /// Wire overhead charged to the cover request when accepted.
+    pub wire_cost: usize,
+    /// Reason for a refusal or incomplete write.
+    pub reason: Option<RuntimeReason>,
     /// The stream ID ([`EventKind::StreamOpen`], [`EventKind::StreamEnd`]).
     pub stream: u64,
     /// The session's readings ([`Caps::BUDGET`]).
@@ -660,7 +795,12 @@ impl Event {
             lane: 0,
             now,
             len: 0,
-            padding_only: false,
+            unit: UnitKind::Record,
+            data: false,
+            control: false,
+            request_id: 0,
+            wire_cost: 0,
+            reason: None,
             stream: 0,
             meters: Meters::new(0, 0, 0, 0),
         }
@@ -680,11 +820,10 @@ impl Event {
         self
     }
 
-    /// With `len` and `padding_only`.
+    /// With a length in bytes.
     #[must_use]
-    pub const fn with_len(mut self, len: usize, padding_only: bool) -> Self {
+    pub const fn with_len(mut self, len: usize) -> Self {
         self.len = len;
-        self.padding_only = padding_only;
         self
     }
 
@@ -696,17 +835,14 @@ impl Event {
     }
 }
 
-/// What changed with an entrance of a [`Shaper`]. A field that is `None` changes
-/// nothing: the core keeps one injection, one wake time, one gate and one weight
-/// per pipe. An injection or a wake time that has come stays until a later
-/// answer changes it, so an answer to [`EventKind::Injected`],
-/// [`EventKind::InjectDropped`] and [`EventKind::Wake`] says what follows it.
+/// Changes to the pipe's bounded policy slots. A field of `None` keeps its
+/// previous value. The core consumes a cover request or wake once.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Effects {
     /// The pending injection, or none.
     pub inject: Option<Option<Injection>>,
-    /// When to send [`EventKind::Wake`], or never.
+    /// When to send [`EventKind::Timer`], or never.
     pub wake: Option<Option<u64>>,
     /// The gate.
     pub gate: Option<Gate>,
@@ -733,17 +869,19 @@ impl Effects {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Injection {
+    /// Identifies this request in acceptance and completion events.
+    pub id: u64,
     /// When, on the session clock.
     pub at: u64,
-    /// Wire length, bytes.
-    pub len: usize,
+    /// Requested PADDING bytes.
+    pub pad_bytes: usize,
 }
 
 impl Injection {
-    /// `len` bytes at `at`.
+    /// Requests `pad_bytes` at `at` with the supplied nonzero identifier.
     #[must_use]
-    pub const fn new(at: u64, len: usize) -> Self {
-        Self { at, len }
+    pub const fn new(id: u64, at: u64, pad_bytes: usize) -> Self {
+        Self { id, at, pad_bytes }
     }
 }
 
@@ -776,23 +914,21 @@ impl Gate {
 /// counted in [`Stats::clamped`].
 pub const MIN_MAX_LEN: usize = 64;
 
-/// The default of [`Limits::max_delay`], the bound on one wait.
-pub const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(1);
-
 /// The largest [`Account::initial`].
 pub const MAX_ACCOUNT_INITIAL: u64 = 1 << 53;
 
 /// The largest [`Account::per_mb`] and [`Account::per_sec`], and the largest rate of a [`Gate`].
 pub const MAX_ACCOUNT_RATE: u64 = 1 << 43;
 
-/// An allowance for injections, in bytes on the carrier. All fields zero: not set.
-/// Padding that goes with a record is never refused and does not draw on it.
+/// An allowance for injections, in bytes on the carrier.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Account {
-    /// Available from the start.
+    /// Maximum balance. Zero disables the account.
+    pub ceiling: u64,
+    /// Balance the first time a positive ceiling is configured.
     pub initial: u64,
-    /// Added per 10^6 bytes this endpoint sends of its own.
+    /// Added per million carrier-confirmed own bytes.
     pub per_mb: u64,
     /// Added per second.
     pub per_sec: u64,
@@ -801,146 +937,295 @@ pub struct Account {
 impl Account {
     /// An account of the given values.
     #[must_use]
-    pub const fn new(initial: u64, per_mb: u64, per_sec: u64) -> Self {
+    pub const fn new(ceiling: u64, initial: u64, per_mb: u64, per_sec: u64) -> Self {
         Self {
+            ceiling,
             initial,
             per_mb,
             per_sec,
         }
     }
 
-    /// Whether every field is zero.
-    #[must_use]
-    pub const fn is_unset(&self) -> bool {
-        self.initial == 0 && self.per_mb == 0 && self.per_sec == 0
-    }
-
-    const fn clamped(self) -> Self {
-        Self {
-            initial: if self.initial > MAX_ACCOUNT_INITIAL {
-                MAX_ACCOUNT_INITIAL
-            } else {
-                self.initial
-            },
-            per_mb: if self.per_mb > MAX_ACCOUNT_RATE {
-                MAX_ACCOUNT_RATE
-            } else {
-                self.per_mb
-            },
-            per_sec: if self.per_sec > MAX_ACCOUNT_RATE {
-                MAX_ACCOUNT_RATE
-            } else {
-                self.per_sec
-            },
-        }
-    }
-}
-
-/// Local bounds over a session, set by the application and never sent. A configuration
-/// cannot widen them. A session whose limits are not [valid](Self::validate) is not created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Limits {
-    /// What injections may spend.
-    pub wire: Account,
-    /// The bound on one wait, and so on the lowest rate of a gate (default
-    /// [`DEFAULT_MAX_DELAY`]; `None`: no bound). A bound is above zero.
-    pub max_delay: Option<Duration>,
-    /// No padding at all, on handshakes and injections too.
-    pub no_padding: bool,
-    /// No pause or delay.
-    pub no_pause: bool,
-    /// No injection.
-    pub no_injection: bool,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            wire: Account::default(),
-            max_delay: Some(DEFAULT_MAX_DELAY),
-            no_padding: false,
-            no_pause: false,
-            no_injection: false,
-        }
-    }
-}
-
-impl Limits {
-    /// Whether the limits are valid: the account's fields within their maximums and a
-    /// set `max_delay` above zero.
-    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
-        let a = self.wire;
-        if a.initial > MAX_ACCOUNT_INITIAL
-            || a.per_mb > MAX_ACCOUNT_RATE
-            || a.per_sec > MAX_ACCOUNT_RATE
+    fn validate(self) -> Result<(), crate::InvalidConfig> {
+        if self.ceiling > MAX_ACCOUNT_INITIAL
+            || self.initial > self.ceiling
+            || self.per_mb > MAX_ACCOUNT_RATE
+            || self.per_sec > MAX_ACCOUNT_RATE
         {
             return Err(crate::InvalidConfig::new(
-                "shaping_limits",
-                "a wire account field above its maximum",
-            ));
-        }
-        if self.max_delay == Some(Duration::ZERO) {
-            return Err(crate::InvalidConfig::new(
-                "shaping_limits",
-                "max_delay of zero",
+                "shaping wire account",
+                "invalid ceiling, initial, or refill rate",
             ));
         }
         Ok(())
     }
 
-    /// These limits in force under `budget`: the account field by field the smaller where
-    /// both are set, the smaller bound on one wait, and either side's switch. Two set
-    /// accounts whose smaller fields are all zero allow no injection.
+    fn under(self, other: Self) -> Self {
+        Self::new(
+            self.ceiling.min(other.ceiling),
+            self.initial.min(other.initial),
+            self.per_mb.min(other.per_mb),
+            self.per_sec.min(other.per_sec),
+        )
+    }
+}
+
+/// Hard deployment limits at the zmux handoff boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProfileLimits {
+    /// Number of one-second buckets in the sliding window.
+    pub window_seconds: u32,
+    /// Extra bytes per million proved baseline bytes.
+    pub extra_bytes_ppm: u32,
+    /// Absolute allowance per direction and window.
+    pub floor_bytes: u64,
+    /// Maximum additional local wait of a unit.
+    pub max_added_delay: Duration,
+}
+
+impl ProfileLimits {
+    /// The default hard limits of an enabled policy.
+    pub const LIGHTWEIGHT: Self = Self::new(10, 50_000, 540, Duration::from_micros(2000));
+
+    /// Hard limits of the given values.
+    #[must_use]
+    pub const fn new(
+        window_seconds: u32,
+        extra_bytes_ppm: u32,
+        floor_bytes: u64,
+        max_added_delay: Duration,
+    ) -> Self {
+        Self {
+            window_seconds,
+            extra_bytes_ppm,
+            floor_bytes,
+            max_added_delay,
+        }
+    }
+
+    fn validate(self) -> Result<(), crate::InvalidConfig> {
+        if self.window_seconds == 0
+            || self.extra_bytes_ppm > 1_000_000
+            || self.floor_bytes > MAX_ACCOUNT_INITIAL
+            || self.max_added_delay > Duration::from_secs(1_000_000_000)
+            || !self.max_added_delay.subsec_nanos().is_multiple_of(1000)
+        {
+            return Err(crate::InvalidConfig::new(
+                "shaping profile",
+                "invalid window, ratio, floor or delay",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Extra bytes allowed for the proved baseline in this window.
+    #[must_use]
+    pub fn allowance(self, baseline: u64) -> u64 {
+        let ratio = u128::from(baseline) * u128::from(self.extra_bytes_ppm) / 1_000_000;
+        self.floor_bytes
+            .max(u64::try_from(ratio).unwrap_or(u64::MAX))
+    }
+}
+
+/// Local session bounds. The peer never receives them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Limits {
+    /// A cap on a policy's cover grant.
+    pub wire: Option<Account>,
+    /// A local profile cap, or the policy profile on effective limits.
+    pub profile: Option<ProfileLimits>,
+    pub(super) local_profile: Option<ProfileLimits>,
+    /// Disable all padding.
+    pub no_padding: bool,
+    /// Disable shaping delays.
+    pub no_pause: bool,
+    /// Disable cover injection.
+    pub no_injection: bool,
+}
+
+impl Limits {
+    /// Checks all configured bounds before they take effect.
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
+        Budget {
+            wire: self.wire,
+            profile: self.profile,
+            ..Budget::default()
+        }
+        .validate()
+    }
+
+    /// Effective profile windows, with the policy first.
+    pub fn profiles(&self) -> impl Iterator<Item = ProfileLimits> + use<> {
+        [self.profile, self.local_profile].into_iter().flatten()
+    }
+
+    /// Effective per-unit delay limit.
+    #[must_use]
+    pub fn max_added_delay(&self) -> Duration {
+        if self.no_pause {
+            return Duration::ZERO;
+        }
+        self.profiles()
+            .map(|p| p.max_added_delay)
+            .min()
+            .unwrap_or(ProfileLimits::LIGHTWEIGHT.max_added_delay)
+    }
+
+    /// Applies the enabled policy and the independent local cap.
     #[must_use]
     pub fn under(mut self, budget: &Budget) -> Self {
-        let b = budget.wire.clamped();
-        if self.wire.is_unset() {
-            self.wire = b;
-        } else if !b.is_unset() {
-            self.wire = Account {
-                initial: self.wire.initial.min(b.initial),
-                per_mb: self.wire.per_mb.min(b.per_mb),
-                per_sec: self.wire.per_sec.min(b.per_sec),
-            };
-            self.no_injection |= self.wire.is_unset();
-        }
+        self.wire = budget
+            .wire
+            .map(|grant| self.wire.map_or(grant, |cap| grant.under(cap)));
+        self.local_profile = self.profile;
+        self.profile = Some(budget.profile.unwrap_or(ProfileLimits::LIGHTWEIGHT));
         self.no_injection |= budget.no_injection;
-        self.max_delay = match (self.max_delay, budget.max_delay.filter(|d| !d.is_zero())) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, None) => a,
-            (None, b) => b,
-        };
         self
     }
 }
 
-/// What a shaping configuration allows for a session.
+/// What an enabled shaping configuration allows for a session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Budget {
-    /// What injections may spend.
-    pub wire: Account,
-    /// The configuration's bound on one wait; `None`: none.
-    pub max_delay: Option<Duration>,
-    /// The configuration allows no injection.
+    /// Cover grant, if configured.
+    pub wire: Option<Account>,
+    /// Hard deployment limits. Absent selects Lightweight.
+    pub profile: Option<ProfileLimits>,
+    /// Disable cover injection.
     pub no_injection: bool,
 }
 
 impl Budget {
     /// A budget of the given values.
     #[must_use]
-    pub const fn new(wire: Account, max_delay: Option<Duration>, no_injection: bool) -> Self {
+    pub const fn new(
+        wire: Option<Account>,
+        profile: Option<ProfileLimits>,
+        no_injection: bool,
+    ) -> Self {
         Self {
             wire,
-            max_delay,
+            profile,
             no_injection,
         }
     }
+
+    /// Checks all configured bounds before they take effect.
+    pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
+        if let Some(account) = self.wire {
+            account.validate()?;
+        }
+        if let Some(profile) = self.profile {
+            profile.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// One completed outbound Establish unit at the handoff boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct EstablishReceipt {
+    /// Dispatch instant on the carrier's clock.
+    pub at: std::time::Instant,
+    /// Encoded unpadded bytes accepted.
+    pub baseline: u64,
+    /// Structural allowance for this unit alone.
+    pub allowance: u64,
+    /// Encoded padding bytes accepted.
+    pub extra: u64,
+    /// Shaping-induced wait before dispatch.
+    pub delay: Duration,
+}
+
+/// The initiator writes at most two Establish messages.
+pub type EstablishReceipts = [Option<EstablishReceipt>; 2];
+
+/// An immutable outbound Join layout and its settlement identity.
+#[derive(Debug)]
+pub struct JoinUnit {
+    bytes: Vec<u8>,
+    pub(super) dispatch: Option<JoinDispatch>,
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(super) handoffs: Vec<super::splice_handoff::HandoffSpan>,
+}
+
+#[derive(Debug)]
+pub(super) struct JoinDispatch {
+    pub(super) at: u64,
+    pub(super) extra_at: usize,
+    pub(super) extra: usize,
+}
+
+impl JoinUnit {
+    pub(super) fn new(bytes: Vec<u8>, dispatch: JoinDispatch) -> Self {
+        Self {
+            bytes,
+            dispatch: Some(dispatch),
+            #[cfg(all(feature = "tokio", not(loom)))]
+            handoffs: Vec::new(),
+        }
+    }
+
+    /// The immutable encoded unit to hand to the carrier.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::ops::Deref for JoinUnit {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.bytes()
+    }
+}
+
+/// The byte costs observed at the default handoff boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CostPrecision {
+    /// Confirmed progress can be attributed to the final layout.
+    #[default]
+    Exact,
+    /// A live window contains unidentified terminal progress.
+    Unavailable,
+}
+
+/// The boundary used to price baseline and shaped output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ObservationBoundary {
+    /// Encoded zmux units at the adapter handoff.
+    #[default]
+    ZmuxHandoff,
+}
+
+/// Meter readings for one effective admission window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowStats {
+    pub profile: ProfileLimits,
+    pub baseline_bytes: u64,
+    pub allowance_bytes: u64,
+    pub consumed_bytes: u64,
+    pub reserved_bytes: u64,
+    pub history_complete: bool,
+}
+
+/// Send-direction ledger readings at the observation boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LedgerStats {
+    pub boundary: ObservationBoundary,
+    pub precision: CostPrecision,
+    pub policy: Option<WindowStats>,
+    pub local: Option<WindowStats>,
+    pub measured_bytes: u64,
+    pub baseline_bytes: u64,
 }
 
 /// Gives the budget of a session: called once per session, outside every lock; it may be
-/// called concurrently. A panic is no budget.
+/// called concurrently. A panic rejects the installation.
 #[derive(Clone)]
 pub struct ShapingBudget(pub Arc<dyn Fn() -> Budget + Send + Sync>);
 
@@ -950,10 +1235,14 @@ impl ShapingBudget {
         Self(Arc::new(f))
     }
 
-    /// One session's budget.
-    #[must_use]
-    pub fn ask(&self) -> Budget {
-        catch_unwind(AssertUnwindSafe(|| self.0())).unwrap_or_default()
+    /// Resolves one session's budget.
+    ///
+    /// # Errors
+    ///
+    /// The source panicked while sampling the policy.
+    pub fn ask(&self) -> Result<Budget, crate::InvalidConfig> {
+        catch_unwind(AssertUnwindSafe(|| self.0()))
+            .map_err(|_| crate::InvalidConfig::new("shaping budget", "budget source panicked"))
     }
 }
 
@@ -967,7 +1256,7 @@ impl fmt::Debug for ShapingBudget {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Meters {
-    /// What the account allows injections now; `u64::MAX` when it is not set.
+    /// What the account allows injections now.
     pub wire_left: u64,
     /// Reserved; `u64::MAX`.
     pub stall_left: u64,
@@ -976,54 +1265,45 @@ pub struct Meters {
     /// The waits applied, microseconds.
     pub stall_spent: u64,
     /// The bytes this endpoint sent of its own: no padding, injections or copies.
-    pub sent_bytes: u64,
+    pub earned_bytes: u64,
 }
 
 impl Meters {
     /// Readings of the given values, `stall_spent` 0.
     #[must_use]
-    pub const fn new(wire_left: u64, stall_left: u64, wire_spent: u64, sent_bytes: u64) -> Self {
+    pub const fn new(wire_left: u64, stall_left: u64, wire_spent: u64, earned_bytes: u64) -> Self {
         Self {
             wire_left,
             stall_left,
             wire_spent,
             stall_spent: 0,
-            sent_bytes,
+            earned_bytes,
         }
     }
 }
 
-/// `s` bytes in parts per million of `e`; `u64::MAX` when `e` is 0. From 2^44 on both lose
-/// their low 20 bits.
+/// Cover account debits as parts per million of confirmed own bytes.
 #[must_use]
-pub const fn wire_ppm(mut s: u64, mut e: u64) -> u64 {
-    if s >= 1 << 44 || e >= 1 << 44 {
-        s >>= 20;
-        e >>= 20;
+pub fn wire_ppm(spent: u64, earned: u64) -> u64 {
+    if spent == 0 {
+        return 0;
     }
-    if e == 0 {
+    if earned == 0 {
         return u64::MAX;
     }
-    s * 1_000_000 / e
+    let ratio = u128::from(spent) * 1_000_000 / u128::from(earned);
+    u64::try_from(ratio).unwrap_or(u64::MAX)
 }
 
-/// The rate in force for `rate` under a bound of `max_delay` microseconds on one wait
-/// (`None`: no bound, so no lower rate), and whether it was raised. Rate 0 is no gate.
+/// Worst required recovery after draining the bucket or an indivisible prefix.
 #[must_use]
-pub const fn rate_floor(rate: u64, max_delay: Option<u64>) -> (u64, bool) {
-    let Some(md) = max_delay else {
-        return (rate, false);
-    };
+pub fn gate_wait(rate: u64, burst: u64, preamble: u64) -> Duration {
     if rate == 0 {
-        return (0, false);
+        return Duration::ZERO;
     }
-    let md = if md == 0 { 1 } else { md };
-    let floor = (MIN_MAX_LEN as u64 * 1_000_000).div_ceil(md);
-    if rate < floor {
-        (floor, true)
-    } else {
-        (rate, false)
-    }
+    let quantum = (MIN_MAX_LEN as u64).max(burst.min(rate / 1000));
+    let micros = (u128::from(quantum.max(preamble)) * 1_000_000).div_ceil(u128::from(rate));
+    Duration::from_micros(u64::try_from(micros).unwrap_or(u64::MAX))
 }
 
 /// The burst in force for `burst` with records up to `record_max`, and whether it was raised:
@@ -1051,16 +1331,36 @@ pub const fn burst_floor(burst: u64, record_max: u64) -> (u64, bool) {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Stats {
-    /// Wire bytes added: padding, splits, handshakes, injections.
+    /// Current session policy generation.
+    pub generation: u64,
+    /// Cumulative cover account debits.
     pub wire_spent: u64,
     /// Waits applied.
     pub stall_spent: Duration,
+    /// Longest additional local wait applied.
+    pub max_added_delay: Duration,
     /// Decisions reduced by a structural limit, the bound on one wait or a switch.
     pub clamped: u64,
-    /// Records of PADDING only sent.
-    pub injected: u64,
-    /// Injections not sent.
-    pub inject_dropped: u64,
+    /// PADDING bytes committed as cover, merged and independent.
+    pub injection_accepted_bytes: u64,
+    /// Committed cover PADDING bytes confirmed by the carrier.
+    pub injection_sent_bytes: u64,
+    /// Cover requests committed.
+    pub injection_accepted_requests: u64,
+    /// Cover requests rejected before commit.
+    pub injection_rejected: u64,
+    /// Causes of cover rejection.
+    pub injection_rejected_by_reason: [u64; RuntimeReason::COUNT],
+    /// Observed clipping and failure reasons.
+    pub runtime_reasons: [u64; RuntimeReason::COUNT],
+    /// The direction's ongoing overhead.
+    pub ledger: LedgerStats,
+    /// Structural handshake padding proved accepted.
+    pub handshake_measured_bytes: u64,
+    /// Structural handshake padding awaiting a terminal result.
+    pub handshake_reserved_bytes: u64,
+    /// Structural handshake padding of unknown terminal progress.
+    pub handshake_unresolved_bytes: u64,
     /// Calls that panicked, of a handshake shaper on a Join too.
     pub faults: u64,
     /// Messages of a Join a handshake shaper had no plan for.

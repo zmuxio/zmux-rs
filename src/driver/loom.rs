@@ -74,6 +74,46 @@ fn take_wakes(wakes: &mut WakeList) -> Option<WakeList> {
     (!wakes.is_empty()).then(|| std::mem::take(wakes))
 }
 
+#[test]
+fn loom_carrier_slot_release_can_race_admission() {
+    loom::model(|| {
+        let slots = Arc::new(super::sync::Slots::default());
+        assert!(slots.try_acquire(1));
+        let active = slots.clone();
+        let close = thread::spawn(move || active.release());
+        let pending = slots.clone();
+        let take = thread::spawn(move || {
+            if pending.try_acquire(1) {
+                assert_eq!(pending.used(), 1);
+                pending.release();
+            }
+        });
+        close.join().unwrap();
+        take.join().unwrap();
+        assert_eq!(slots.used(), 0);
+    });
+}
+
+#[test]
+fn loom_group_charge_is_all_or_nothing_during_release() {
+    loom::model(|| {
+        let slots = Arc::new(super::sync::Slots::default());
+        assert!(slots.try_acquire_count(2, 2));
+        let closing = slots.clone();
+        let release = thread::spawn(move || closing.release_count(2));
+        let opening = slots.clone();
+        let admit = thread::spawn(move || {
+            if opening.try_acquire_count(2, 2) {
+                assert_eq!(opening.used(), 2);
+                opening.release_count(2);
+            }
+        });
+        release.join().unwrap();
+        admit.join().unwrap();
+        assert_eq!(slots.used(), 0);
+    });
+}
+
 // ---- (b) the deferred-wake guard ----------------------------------------------------
 
 #[derive(Default)]

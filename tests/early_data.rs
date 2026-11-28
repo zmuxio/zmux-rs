@@ -1,174 +1,9 @@
-//! Early data under the zmux floor through the tokio driver:
-//! `connect` returns before the peer's parameters, the
-//! first stream's bytes go out at once, and a peer that cannot take them
-//! processed none of them.
-
-#![allow(
-    clippy::cast_possible_truncation,
-    reason = "test and bench values are small and bounded; checked conversions would only add noise"
-)]
+//! The bootstrap carrier supplies its exporter after its handshake.
 
 mod common;
 
-use std::time::Duration;
-
-use common::{duplex, eventually, multi_thread, watchdog};
-use zmux::{Config, ConnectError, EarlyData, EarlyDataState, Session, SessionError};
-
-/// Waits until the client's early data left: the server, started only
-/// then, cannot get its parameters to the client before it (a client whose
-/// writer runs late would send the stream after the parameters, as no early
-/// data).
-async fn early_sent(client: &Session) {
-    eventually(5, "early data sent", || {
-        client.early_data() == EarlyDataState::Pending
-    })
-    .await;
-}
-
-fn early() -> Config {
-    let mut c = Config::default();
-    c.early_data = EarlyData::for_zmux_peer();
-    c
-}
-
-#[test]
-fn early_streams_carry_data_within_and_beyond_the_floor() {
-    multi_thread(async {
-        let ((a, _), (b, _)) = duplex(1 << 20);
-        // The client's session is usable before the server even reads.
-        let client = watchdog(5, "connect", Session::connect(a, early()))
-            .await
-            .unwrap();
-        let (mut send, _recv) = client.open_bi().await.unwrap();
-        // 10 000 bytes: 4096 of them (preamble included) go as early data,
-        // the rest once the parameters arrive.
-        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
-        send.write_all(&data).await.unwrap();
-        send.finish().unwrap();
-        early_sent(&client).await;
-        let server = watchdog(5, "accept", Session::accept(b, Config::default()))
-            .await
-            .unwrap();
-        let (_s, mut r) = watchdog(5, "accept_bi", server.accept_bi()).await.unwrap();
-        let got = watchdog(5, "read", r.read_to_end(1 << 20)).await.unwrap();
-        assert_eq!(got, data);
-        assert_eq!(client.early_data(), EarlyDataState::Accepted);
-        assert_eq!(server.early_data(), EarlyDataState::NotSent);
-        client.close().await;
-    });
-}
-
-#[test]
-fn a_peer_without_bidirectional_streams_rejects_early_data_unprocessed() {
-    multi_thread(async {
-        let ((a, _), (b, _)) = duplex(1 << 20);
-        let client = Session::connect(a, early()).await.unwrap();
-        let (mut send, _recv) = client.open_bi().await.unwrap();
-        send.write_all(b"GET /").await.unwrap();
-        early_sent(&client).await;
-        let mut server_cfg = Config::default();
-        server_cfg.max_incoming_streams = 0;
-        // The server fails at the first early STREAM frame; either side
-        // may finish establishing first.
-        let server = Session::accept(b, server_cfg).await;
-        let e = watchdog(5, "closed", client.closing()).await;
-        assert!(e.is_early_data_rejected(), "{e:?}");
-        assert_eq!(e, SessionError::EarlyDataRejected);
-        assert_eq!(client.early_data(), EarlyDataState::Rejected);
-        if let Ok(s) = server {
-            assert!(
-                tokio::time::timeout(Duration::from_millis(200), s.accept_bi())
-                    .await
-                    .map_or(true, |r| r.is_err()),
-                "no stream reached the server"
-            );
-        }
-    });
-}
-
-#[test]
-fn role_auto_cannot_send_early_data() {
-    multi_thread(async {
-        let ((a, _), _) = duplex(1 << 20);
-        let e = Session::peer(a, early()).await.unwrap_err();
-        assert!(matches!(e, ConnectError::InvalidConfig(_)), "{e:?}");
-    });
-}
-
-#[test]
-fn early_streams_carry_preamble_and_priority() {
-    multi_thread(async {
-        let ((a, _), (b, _)) = duplex(1 << 20);
-        let client = watchdog(5, "connect", Session::connect(a, early()))
-            .await
-            .unwrap();
-        let pre = zmux::Preamble::new()
-            .with_info("GET /")
-            .with_tlv(0x1000, b"dest");
-        let (mut send, recv) = client.open_bi_with(&pre).await.unwrap();
-        let prio = zmux::Priority::new(1, true).unwrap();
-        recv.set_peer_priority(prio).unwrap();
-        send.write_all(b"early").await.unwrap();
-        send.finish().unwrap();
-        let server = watchdog(5, "accept", Session::accept(b, Config::default()))
-            .await
-            .unwrap();
-        let (_s, mut r) = watchdog(5, "accept_bi", server.accept_bi()).await.unwrap();
-        let got = r.preamble();
-        assert_eq!(got.info().map(|b| &b[..]), Some(&b"GET /"[..]));
-        assert_eq!(got.tlv(0x1000).as_deref(), Some(&b"dest"[..]));
-        assert_eq!(r.preamble_priority(), Some(prio));
-        let data = watchdog(5, "read", r.read_to_end(1 << 10)).await.unwrap();
-        assert_eq!(data, b"early");
-        client.close().await;
-    });
-}
-
-/// Gate the carrier handshake independently of application scheduling.
-#[test]
-fn carrier_streams_are_replayable_until_the_handshake_completes() {
-    multi_thread(watchdog(5, "carrier handshake replayability", async {
-        let (a, b) = tokio::io::duplex(1 << 20);
-        let (done, handshake) = tokio::sync::watch::channel(false);
-        let mut config = Config::default();
-        config.early_data = EarlyData::default().with_carrier_early_data(true);
-        let (client, server) = tokio::join!(
-            Session::connect(zmux::PipeIo::new(a), config.clone()),
-            Session::accept(
-                zmux::PipeIo::new(b).with_early_data_in(move || {
-                    let mut handshake = handshake.clone();
-                    async move {
-                        let _ = handshake.wait_for(|d| *d).await;
-                    }
-                }),
-                config,
-            ),
-        );
-        let (client, server) = (client.unwrap(), server.unwrap());
-        let mut send = client.open_uni().await.unwrap();
-        send.write_all(b"before handshake").await.unwrap();
-        let mut recv = watchdog(5, "accept early stream", server.accept_uni())
-            .await
-            .unwrap();
-        let mut buf = [0; 16];
-        recv.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"before handshake");
-        assert!(recv.is_replayable());
-        done.send_replace(true);
-        // How the stream arrived stays true after the handshake.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(recv.is_replayable());
-        let mut later = client.open_uni().await.unwrap();
-        later.write_all(b"after handshake").await.unwrap();
-        let recv = watchdog(5, "accept settled stream", server.accept_uni())
-            .await
-            .unwrap();
-        assert!(!recv.is_replayable());
-        client.close().await;
-        server.close().await;
-    }));
-}
+use common::{duplex, multi_thread, watchdog};
+use zmux::{Config, Session};
 
 /// A server carrier that accepted early data: its exporter gives no value
 /// until the handshake.
@@ -192,12 +27,6 @@ fn exporter_server(io: zmux::PipeIo) -> zmux::Listener {
             .await;
     });
     l
-}
-
-fn exporter_client_config() -> Config {
-    let mut c = exporter_config();
-    c.early_data = EarlyData::for_zmux_peer();
-    c
 }
 
 /// Parameters that arrive before the handshake gives the exporter wait for
@@ -225,24 +54,22 @@ fn parameters_wait_for_the_handshake_that_gives_the_exporter() {
                 }
             }),
         );
-        let client = Session::connect(a.with_exporter(fixed_exporter), exporter_client_config())
+        let client = Session::connect(a.with_exporter(fixed_exporter), exporter_config())
             .await
             .unwrap();
         let (mut send, _recv) = client.open_bi().await.unwrap();
         send.write_all(b"early").await.unwrap();
         send.finish().unwrap();
-        // The client gets the server's parameters; the server's session
-        // waits, and did not fail.
-        watchdog(5, "the server's parameters", async {
-            while client.stats().bytes_received == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
+        watchdog(20, "the server's parameters", client.established())
+            .await
+            .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), listener.accept())
-                .await
-                .is_err()
+            std::future::poll_fn(|cx| {
+                use std::future::Future;
+                let mut accepting = std::pin::pin!(listener.accept());
+                std::task::Poll::Ready(accepting.as_mut().poll(cx).is_pending())
+            })
+            .await
         );
         complete.store(true, Ordering::SeqCst);
         done.send_replace(true);
@@ -259,21 +86,21 @@ fn parameters_wait_for_the_handshake_that_gives_the_exporter() {
 fn a_failed_handshake_under_the_exporter_wait_is_no_internal_error() {
     multi_thread(async {
         let ((a, _), (b, _)) = duplex(1 << 20);
-        let listener = exporter_server(
-            b.with_exporter(|_, _, _| false)
-                .with_early_data_in(|| tokio::time::sleep(Duration::from_millis(30))),
-        );
-        let client = Session::connect(a.with_exporter(fixed_exporter), exporter_client_config())
+        let (settle, settled) = tokio::sync::watch::channel(false);
+        let listener = exporter_server(b.with_exporter(|_, _, _| false).with_early_data_in(
+            move || {
+                let mut settled = settled.clone();
+                async move {
+                    settled.wait_for(|done| *done).await.unwrap();
+                }
+            },
+        ));
+        let client = Session::connect(a.with_exporter(fixed_exporter), exporter_config())
             .await
             .unwrap();
-        let e = watchdog(5, "closed", client.closing()).await;
+        settle.send_replace(true);
+        let e = watchdog(20, "closed", client.closing()).await;
         assert!(!format!("{e:?}").contains("xporter"), "{e:?}");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), listener.accept())
-                .await
-                .is_err(),
-            "established on a failed handshake"
-        );
         listener.close();
     });
 }

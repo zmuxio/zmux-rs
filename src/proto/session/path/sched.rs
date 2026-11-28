@@ -45,7 +45,7 @@ pub(crate) struct Picks {
     /// The generation: it advances when a decision can no longer be
     /// applied (the pipe set, a pipe's state or eligibility changed), never
     /// with metrics.
-    generation: u64,
+    pub(in crate::proto::session) generation: u64,
     /// Advances with every input (records, timers, writes, pipe changes):
     /// a "wait" answer holds until the next one.
     input_epoch: u64,
@@ -243,7 +243,7 @@ impl Decision {
 /// decision: `Q_p`, `R_p` as divided by (at least 1), `R_p` as estimated, and
 /// the one-way delay in seconds.
 #[derive(Debug, Clone, Copy)]
-struct Eta {
+pub(in crate::proto::session) struct Eta {
     queued: u64,
     rate: u64,
     estimate: u64,
@@ -252,8 +252,8 @@ struct Eta {
 
 impl Eta {
     /// `ETA_p(L)` in seconds.
-    fn of(&self, len: u64) -> f64 {
-        f64_of(self.queued + len) / f64_of(self.rate) + self.owd
+    pub(in crate::proto::session) fn of(&self, len: u64) -> f64 {
+        f64_of(self.queued.saturating_add(len)) / f64_of(self.rate) + self.owd
     }
 }
 
@@ -297,7 +297,16 @@ impl SessionCore {
     }
 
     /// What `ETA_p(L)` needs of a pipe now.
-    fn eta_inputs(&self, a: &Attachment, o: &OutPipe) -> Eta {
+    pub(in crate::proto::session) fn eta_inputs(&self, a: &Attachment, o: &OutPipe) -> Eta {
+        #[cfg(test)]
+        if let Some(replay) = o.est().replay {
+            return Eta {
+                queued: 0,
+                rate: u64::MAX,
+                estimate: u64::MAX,
+                owd: replay.eta.as_secs_f64(),
+            };
+        }
         let rate = self.placement_rate(a, o);
         Eta {
             queued: Self::queued(o),
@@ -357,23 +366,6 @@ impl SessionCore {
                 .min_by(|a, b| min(*a, *b))
         }
         .map(|(_, q)| q)
-    }
-
-    /// The eligible pipe with the smallest ETA for `len` bytes, whatever
-    /// its tier (opportunistic copies).
-    pub(in crate::proto::session) fn fastest_eligible(&self, gate: &Gate, len: u64) -> Option<u64> {
-        let views = self.views();
-        views
-            .tiers()
-            .iter()
-            .take_while(|t| t.priority <= gate.last())
-            .flat_map(|t| views.pipes(t))
-            .filter_map(|&i| {
-                let a = self.atts.at(i);
-                Some((self.eta(a, a.out()?, len), a.id()))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
-            .map(|(_, q)| q)
     }
 
     /// The scheduling policy of a stream direction.
@@ -639,12 +631,16 @@ impl SessionCore {
         {
             return;
         }
+        let previous = send.mp().bound.map(|binding| binding.pipe);
         send.mp_mut().bound = Some(Binding {
             pipe: id,
             provisional: !all_sampled,
             epoch,
             move_to: None,
         });
+        if let Some(previous) = previous {
+            self.mp_mut().acks_mut().invalidate_backlog_pipe(previous);
+        }
         if !all_sampled {
             self.mp_mut().affinity_mut().provisional = true;
         }
@@ -710,7 +706,7 @@ impl SessionCore {
         let sb = self.session_send_buffer();
         for u in 0..self.streams.queue().levels().len() {
             for i in 0..self.streams.queue().level(u).len() {
-                let key = self.streams.queue().level(u)[i];
+                let key = self.streams.queue().level(u)[i].key;
                 if !matches!(self.policy_for(key), Scheduler::Affinity) {
                     continue;
                 }
@@ -742,6 +738,9 @@ impl SessionCore {
                         move_to: target.filter(|&t| t != b.pipe),
                         ..b
                     });
+                    if target.is_some_and(|pipe| pipe != b.pipe) {
+                        self.mp_mut().acks_mut().invalidate_backlog_pipe(b.pipe);
+                    }
                     self.note_credit_blocked(key);
                 }
             }
@@ -869,6 +868,7 @@ impl SessionCore {
                 .and_then(|s| s.mp_mut().bound.as_mut())
             {
                 b.move_to = Some(receiver);
+                self.mp_mut().acks_mut().invalidate_backlog_pipe(donor);
             }
             self.note_credit_blocked(key);
             pipes[d].3 -= 1;
@@ -1175,6 +1175,46 @@ impl SessionCore {
             .map(move |(a, o, w)| (a.id(), Self::rr_weight(&self.atts, a, o, w, by_rate, off)))
     }
 
+    #[cfg(all(
+        feature = "test-hooks",
+        any(feature = "tokio", feature = "blocking"),
+        not(loom)
+    ))]
+    pub(crate) fn sample_fixture_path(
+        &mut self,
+        pipe: PipeId,
+        rtt: Option<Duration>,
+        rate: Option<u64>,
+    ) {
+        let now = self.now;
+        let est = self.out_mut(pipe.get()).expect("fixture pipe").est_mut();
+        if let Some(rtt) = rtt {
+            // This is the fixture's initial path measurement. Discard
+            // the zero-delay samples from the in-memory handshake.
+            *est = crate::proto::session::estimator::Estimator::new(rtt, now);
+            est.rtt_sample(rtt, Duration::ZERO, false, now);
+        }
+        if let Some(rate) = rate {
+            est.rate_sample(rate, false, now);
+        }
+        self.views_changed();
+        self.quality_sample(pipe.get(), now);
+    }
+
+    #[cfg(all(
+        feature = "test-hooks",
+        any(feature = "tokio", feature = "blocking"),
+        not(loom)
+    ))]
+    pub(crate) fn fixture_rate_weights(&self, key: StreamKey) -> Vec<(PipeId, f64)> {
+        let Some(gate) = self.gate() else {
+            return Vec::new();
+        };
+        self.rr_weights(key, &gate, 0)
+            .map(|(id, weight)| (PipeId::new(id), weight))
+            .collect()
+    }
+
     /// A candidate's round-robin weight, as an f64: a weight times a rate
     /// in bytes per second may exceed a u64. Values above 2^53 round to a
     /// relative error of 2^-53, which only perturbs the shares that much;
@@ -1420,9 +1460,11 @@ impl SessionCore {
     /// under way, whole (its answers find nothing to apply to when they
     /// come back); a direction still under a custom policy is asked again.
     pub(in crate::proto::session) fn reset_picks(&mut self, only: Option<StreamKey>) {
-        let Some(mp) = self.mp.as_deref_mut().map(Mp::picks_mut) else {
+        let Some(mp) = self.mp.as_deref_mut() else {
             return;
         };
+        mp.acks_mut().invalidate_backlog();
+        let mp = mp.picks_mut();
         for k in mp.out.drain(..) {
             if let Some(s) = self.streams.get(k) {
                 s.pick_queued.set(false);
@@ -1631,6 +1673,7 @@ impl SessionCore {
             return;
         };
         mp.generation += 1;
+
         let picked = std::mem::take(&mut mp.picked);
         let mut misses = 0;
         for &k in &picked {

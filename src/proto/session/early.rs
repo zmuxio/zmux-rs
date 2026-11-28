@@ -1,41 +1,22 @@
-//! Early data under the zmux floor: stream data an
-//! initiator sends before it has processed the peer's parameters, when the
-//! application declares the peer a zmux endpoint.
-//!
-//! The floor stands for the peer's parameters until they arrive: at most
-//! four bidirectional streams, 4096 bytes each (preamble included) and
-//! 16384 in all, preambles up to 1024 bytes, records up to 16382 bytes. A
-//! `PIPE_ACK` with one entry at Position 0 (the fence) precedes the first
-//! early STREAM frame, so that a peer without `PIPE_ACK` stops before it.
-//! When the parameters arrive, the outcome rules decide: the peer could
-//! not take it (`EarlyDataRejected`), it advertised less than the floor
-//! (`TRANSPORT_PARAMETER_ERROR`), or the session goes on with the peer's
-//! limits, which cover everything sent.
+//! QMux carrier 0-RTT under remembered plain-peer parameters.
 
 use bytes::Bytes;
 
-use super::output::Records;
 use super::pipes::OutPipe;
 use super::stream::SendState;
 use super::tp::TpValues;
-use super::{CloseFrame, SessionCore, SessionError, State};
-use crate::proto::error::{Error, TransportErrorCode};
-use crate::proto::frame::{Frame, PipeAck, PipeAckEntry};
-use crate::proto::params::{Features, Role, RoleParameter, TransportParameters, floor};
+use super::{SessionCore, State};
+use crate::proto::error::Error;
+use crate::proto::params::{Features, Role, RoleParameter, TransportParameters};
 
 /// Early data of a session that may send it.
 #[derive(Debug)]
 pub(super) struct Early {
-    /// The assumed set: the floor, or the remembered parameters.
+    /// The remembered parameters used while sending.
     assumed: TpValues,
     /// The set and its limits, to judge the peer's parameters by.
     set: TransportParameters,
-    /// Under remembered parameters, as carrier early data.
-    remembered: bool,
-    /// The fence goes before the first early STREAM frame: the assumed
-    /// set has zmux parameters.
-    fence: bool,
-    /// Early STREAM data went out (behind the fence, when there is one).
+    /// At least one early STREAM frame went out.
     sent: bool,
 }
 
@@ -50,6 +31,8 @@ pub(super) struct EarlyState {
     carrier_in: bool,
     /// How often the bootstrap pipe started again after a rejection.
     starts: u32,
+    /// Own bytes confirmed while the outgoing carrier verdict is pending.
+    shaping_own: u64,
     /// The peer's parameters stored for a later carrier's early data.
     remember: Option<TransportParameters>,
     /// What became of the early data, as far as the peer's parameters
@@ -78,9 +61,7 @@ pub enum EarlyDataState {
     Accepted,
     /// The peer processed none of it. After a carrier's rejection (TLS 1.3
     /// early data, QUIC 0-RTT) the session wrote the data again once the
-    /// handshake completed and the streams go on; after a zmux peer's
-    /// rejection the session ended with
-    /// [`SessionError::EarlyDataRejected`](SessionError::EarlyDataRejected).
+    /// handshake completed and the streams go on.
     Rejected,
 }
 
@@ -96,7 +77,7 @@ pub(super) enum CarrierEarly {
 }
 
 /// The parameters stored for 0-RTT (RFC 9000 Section 7.4.1): the flow-control limits,
-/// `max_record_size`, `zmux_preamble`, `zmux_pipe_ack` and `reset_stream_at`.
+/// `max_record_size` and `reset_stream_at`.
 fn stored(tp: &TransportParameters) -> TransportParameters {
     TransportParameters {
         initial_max_data: tp.initial_max_data,
@@ -106,71 +87,25 @@ fn stored(tp: &TransportParameters) -> TransportParameters {
         initial_max_streams_bidi: tp.initial_max_streams_bidi,
         initial_max_streams_uni: tp.initial_max_streams_uni,
         max_record_size: tp.max_record_size,
-        zmux_preamble: tp.zmux_preamble,
-        zmux_pipe_ack: tp.zmux_pipe_ack,
         reset_stream_at: tp.reset_stream_at,
         ..TransportParameters::default()
     }
 }
 
-/// The floor as transport parameters.
-fn floor_parameters() -> TransportParameters {
-    TransportParameters {
-        initial_max_data: Some(floor::MAX_DATA),
-        initial_max_streams_bidi: Some(floor::MAX_STREAMS_BIDI),
-        initial_max_stream_data_bidi_remote: Some(floor::MAX_STREAM_DATA),
-        max_record_size: Some(floor::MAX_RECORD_SIZE),
-        zmux_preamble: Some(floor::MAX_PREAMBLE),
-        zmux_pipe_ack: true,
-        reset_stream_at: true,
-        ..TransportParameters::default()
-    }
-}
-
 impl SessionCore {
-    /// Prepares early data when the configuration declares the peer a
-    /// zmux endpoint and the role does not depend on the peer, as early data requires: it
-    /// has a transport role and sends no `zmux_role` auto.
-    pub(super) fn early_setup(&mut self, transport_role: Option<Role>) {
-        let local = self.local_parameters();
-        let independent = match (local.zmux_role, transport_role) {
-            (_, None) | (Some(RoleParameter::Auto { .. }), Some(_)) => false,
-            (None, Some(_)) => true,
-            (Some(RoleParameter::Initiator), Some(t)) => t == Role::Client,
-            (Some(RoleParameter::Responder), Some(t)) => t == Role::Server,
-        };
-        if !self.config.early_data.zmux_peer || !independent {
-            return;
-        }
-        let floor = floor_parameters();
-        self.streams
-            .peer_limits(floor::MAX_DATA, [floor::MAX_STREAMS_BIDI, 0]);
-        self.features = Features {
-            preamble: local.zmux_preamble.is_some(),
-            ..Features::default()
-        };
-        self.early_state().sending = Some(Early {
-            assumed: TpValues::of(&floor),
-            set: floor,
-            remembered: false,
-            fence: true,
-            sent: false,
-        });
-    }
-
     /// Carrier early data (TLS 1.3 early data, QUIC 0-RTT on a resumed
     /// carrier): the first records go out under `remembered`, the server's
-    /// parameters of the session that issued the ticket, instead of the
-    /// floor. Call it before anything is written on the bootstrap pipe,
+    /// parameters of the session that issued the ticket. Call it before
+    /// anything is written on the bootstrap pipe,
     /// with [`super::EarlyData::carrier_early_data`] set; then tell the
     /// outcome with [`SessionCore::carrier_early_data_settled`], before
     /// feeding anything read from that pipe. Returns
     /// whether the session sends carrier early data. Only the parameters
-    /// QUIC stores for 0-RTT are used: the flow-control limits,
-    /// `max_record_size`, `zmux_preamble`, `zmux_pipe_ack` and
-    /// `reset_stream_at`.
+    /// QUIC stores for 0-RTT are used. The caller supplies them from a
+    /// carrier resumption context bound to a plain QMux peer.
     pub fn assume_remembered(&mut self, remembered: &TransportParameters) -> bool {
-        if !self.config.early_data.carrier_early_data
+        if !remembered.is_plain_qmux()
+            || !self.config.early_data.carrier_early_data
             || self.state != State::Establishing
             || self.stats.bytes_sent > 0
         {
@@ -187,7 +122,6 @@ impl SessionCore {
             return false;
         }
         let set = stored(remembered);
-        let zmux = set.zmux_preamble.is_some() || set.zmux_pipe_ack;
         self.streams.peer_limits(
             set.initial_max_data.unwrap_or(0),
             [
@@ -195,15 +129,9 @@ impl SessionCore {
                 set.initial_max_streams_uni.unwrap_or(0),
             ],
         );
-        self.features = Features {
-            preamble: local.zmux_preamble.is_some() && set.zmux_preamble.is_some(),
-            ..Features::default()
-        };
         self.early_state().sending = Some(Early {
             assumed: TpValues::of(&set),
             set,
-            remembered: true,
-            fence: zmux,
             sent: false,
         });
         self.early_state().carrier = CarrierEarly::Pending;
@@ -218,7 +146,7 @@ impl SessionCore {
 
     /// Keeps the stored part of the peer's parameters (on establishment).
     pub(super) fn keep_to_remember(&mut self, tp: &TransportParameters) {
-        if self.config.early_data.carrier_early_data {
+        if self.config.early_data.carrier_early_data && tp.is_plain_qmux() {
             self.early_state().remember = Some(stored(tp));
         }
     }
@@ -240,8 +168,12 @@ impl SessionCore {
         if !self.early_retains() {
             return;
         }
+        self.tick(now);
         self.early_state().carrier = CarrierEarly::Off;
+        self.shape_ledger.early_verdict(accepted);
+        let own = std::mem::take(&mut self.early_state().shaping_own);
         if accepted {
+            self.confirm_provisional_own(self.bootstrap_start(), own);
             // The held bytes are not needed any more, and what was written
             // is final, as on any single pipe.
             let keys: Vec<_> = self.streams.keys().collect();
@@ -326,7 +258,7 @@ impl SessionCore {
         flow.used = 0;
         flow.blocked_reported = None;
         match &self.peer_tp {
-            // No floor: the data waits for the peer's parameters.
+            // The data waits for the peer's current parameters.
             None => {
                 self.streams.peer_limits(0, [0, 0]);
                 self.features = Features::default();
@@ -345,8 +277,18 @@ impl SessionCore {
             }
         }
         self.stats.bytes_sent = 0;
-        // Nothing of it reached the peer; it goes again.
-        self.earn_skip = self.earn_bytes;
+    }
+
+    pub(super) fn confirm_provisional_own(&mut self, start: u32, own: u64) {
+        if start != self.bootstrap_start() {
+            return;
+        }
+        if self.early_retains() {
+            let early = self.early_state();
+            early.shaping_own = early.shaping_own.saturating_add(own);
+        } else {
+            self.shaping_earn(own);
+        }
     }
 
     /// How often the bootstrap pipe started writing again from its first
@@ -418,77 +360,35 @@ impl SessionCore {
     }
 
     /// The parameters the send side works with: the peer's, or before them
-    /// the floor that early data assumes.
+    /// the remembered parameters carrier early data assumes.
     pub(super) fn send_tp(&self) -> Option<&TpValues> {
         self.peer_tp
             .as_ref()
             .or_else(|| Some(&self.early.as_deref()?.sending.as_ref()?.assumed))
     }
 
-    /// Writes the fence that an assumed set with zmux parameters puts before the first early
-    /// STREAM frame; `false` when it does not fit.
-    pub(super) fn write_fence(&mut self, w: &mut Records<'_>) -> bool {
-        let Some(es) = self.early.as_deref_mut() else {
-            return true;
-        };
-        let Some(e) = es.sending.as_mut() else {
-            return true;
-        };
-        if e.sent {
-            return true;
+    pub(super) fn note_early_streams_sent(&mut self) {
+        let state = self.early_state();
+        if let Some(sending) = &mut state.sending {
+            sending.sent = true;
+            state.outcome = EarlyDataState::Pending;
         }
-        if !e.fence {
-            e.sent = true;
-            es.outcome = EarlyDataState::Pending;
-            return true;
-        }
-        let entry = [PipeAckEntry {
-            pipe_id: 0,
-            lane: 0,
-            position: 0,
-            ack_delay: 0,
-        }];
-        if !w.try_frame(&Frame::PipeAck(PipeAck::new(&entry))) {
-            return false;
-        }
-        e.sent = true;
-        es.outcome = EarlyDataState::Pending;
-        true
     }
 
-    /// The peer's parameters arrived after early data: the outcome rules. `Ok(false)` when the
-    /// session closed with "early data rejected"; an error for parameters below
-    /// the floor.
-    pub(super) fn early_outcome(
-        &mut self,
-        tp: &TransportParameters,
-        now: std::time::Instant,
-    ) -> Result<bool, Error> {
+    /// Validates the current family's identity and its limits after QMux 0-RTT.
+    pub(super) fn early_outcome(&mut self, tp: &TransportParameters) -> Result<(), Error> {
         let Some(e) = self.early.as_deref_mut().and_then(|e| e.sending.take()) else {
-            return Ok(true);
+            return Ok(());
         };
         if !e.sent {
-            return Ok(true);
+            return Ok(());
         }
-        let acks = self.features.pipe_ack || self.features.multipath;
-        let no_streams = !e.remembered && tp.initial_max_streams_bidi.unwrap_or(0) == 0;
-        if (e.fence && !acks) || no_streams {
-            // The peer stopped at the fence or at the first early STREAM
-            // frame: it processed none of the early data.
+        if !tp.is_plain_qmux() {
             self.early_state().outcome = EarlyDataState::Rejected;
-            self.set_error(SessionError::EarlyDataRejected);
-            self.enter_closing(
-                Some(CloseFrame::Transport {
-                    code: TransportErrorCode::NO_ERROR.0,
-                    frame_type: 0,
-                    reason: Bytes::new(),
-                }),
-                now,
-            );
-            return Ok(false);
+            return Err(Error::transport_parameter(
+                "QMux early data sent to a zmux peer",
+            ));
         }
-        // Below the assumed set: a limit reduced, a stored zmux parameter
-        // smaller or gone (RFC 9000 Section 7.4.1).
         let a = &e.set;
         let less =
             |peer: Option<u64>, assumed: Option<u64>| peer.unwrap_or(0) < assumed.unwrap_or(0);
@@ -507,17 +407,15 @@ impl SessionCore {
                 tp.initial_max_stream_data_uni,
                 a.initial_max_stream_data_uni,
             )
-            || less(tp.zmux_preamble, a.zmux_preamble)
             || tp.max_record_size_or_default() < a.max_record_size_or_default()
-            || (a.zmux_pipe_ack && !tp.zmux_pipe_ack)
             || (a.reset_stream_at && !tp.reset_stream_at);
         if below {
             self.early_state().outcome = EarlyDataState::Rejected;
             return Err(Error::transport_parameter(
-                "parameters below those early data assumed",
+                "parameters below those remembered for QMux early data",
             ));
         }
         self.early_state().outcome = EarlyDataState::Accepted;
-        Ok(true)
+        Ok(())
     }
 }

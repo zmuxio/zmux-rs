@@ -626,7 +626,14 @@ mod tests {
             let mut source = Source::new(provider, move || counts);
             source.dedicated = true;
             let registration = source.attach(Instant::now).unwrap();
-            let sample = registration.cache.read(Instant::now()).0.unwrap();
+            let (cached, refresh) = registration.cache.read(Instant::now());
+            let sample = if let Some(refresh) = refresh {
+                assert!(cached.is_none());
+                refresh.run();
+                registration.cache.read(Instant::now()).0.unwrap()
+            } else {
+                cached.unwrap()
+            };
             assert_eq!(sample.source, provider);
             assert_eq!(sample.counts, None);
         }

@@ -74,6 +74,12 @@ impl<'a> Cursor<'a> {
         Ok(head)
     }
 
+    /// Borrows the remaining input without moving the cursor.
+    #[inline]
+    pub(crate) const fn remaining_bytes(&self) -> &'a [u8] {
+        self.rest
+    }
+
     /// Takes everything that is left.
     #[inline]
     pub(crate) fn rest(&mut self) -> &'a [u8] {

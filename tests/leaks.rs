@@ -528,7 +528,7 @@ fn session_churn_returns_to_baseline() {
 
 fn mp_config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"leak-test-psk-0123456789abcdef!!").with_end_to_end();
     c.liveness.suspect_floor = Duration::from_millis(100);
     c.resume_timeout = Some(Duration::from_secs(5));
@@ -613,7 +613,7 @@ async fn mp_churn() {
     let mut pipes = Vec::new();
     for _ in 0..3 {
         let (io, _) = dial(&listener, PipeHint::default());
-        pipes.push(client.begin_add_pipe(io, opts.clone()).expect("add"));
+        pipes.push(client.test_begin_join(io, opts.clone()).expect("add"));
     }
     echo(&client, 256 * 1024).await;
     expect_pipes(&client, &server, 4, "joined").await;
@@ -626,9 +626,9 @@ async fn mp_churn() {
     progress("A failed carrier ");
     // A failed carrier and an aborted pipe.
     let (io, ctl) = dial(&listener, PipeHint::default());
-    let failing = client.begin_add_pipe(io, opts.clone()).expect("add");
+    let failing = client.test_begin_join(io, opts.clone()).expect("add");
     let (io, _) = dial(&listener, PipeHint::default());
-    let aborted = client.begin_add_pipe(io, opts.clone()).expect("add");
+    let aborted = client.test_begin_join(io, opts.clone()).expect("add");
     echo(&client, 128 * 1024).await;
     ctl.fail();
     echo(&client, 128 * 1024).await;
@@ -642,11 +642,11 @@ async fn mp_churn() {
     // listener.
     let (stranger, _none) = mp_listener();
     let (io, _) = dial(&stranger, PipeHint::default());
-    let rejected = client.begin_add_pipe(io, opts.clone()).expect("add");
+    let rejected = client.test_begin_join(io, opts.clone()).expect("add");
     let (closed, _none2) = mp_listener();
     closed.close();
     let (io, _) = dial(&closed, PipeHint::default());
-    let refused = client.begin_add_pipe(io, opts.clone()).expect("add");
+    let refused = client.test_begin_join(io, opts.clone()).expect("add");
     echo(&client, 64 * 1024).await;
     stranger.close();
     drop((rejected, refused, stranger, closed));
@@ -655,7 +655,7 @@ async fn mp_churn() {
     progress("Every pipe lost");
     // Every pipe lost: suspended, then resumed on a new pipe.
     let (io, ctl) = dial(&listener, PipeHint::default());
-    let p = client.begin_add_pipe(io, opts.clone()).expect("add");
+    let p = client.test_begin_join(io, opts.clone()).expect("add");
     echo(&client, 16 * 1024).await;
     ctl.fail();
     bootstrap.fail();
@@ -664,7 +664,7 @@ async fn mp_churn() {
     })
     .await;
     let (io, resumed_ctl) = dial(&listener, PipeHint::default());
-    let resumed = client.begin_add_pipe(io, opts.clone()).expect("resume");
+    let resumed = client.test_begin_join(io, opts.clone()).expect("resume");
     eventually(30, "resumed", || {
         client.state() == zmux::SessionState::Active
     })
@@ -676,7 +676,7 @@ async fn mp_churn() {
     progress("Lost again and ne");
     // Lost again and never resumed: the resume timeout ends both ends.
     let (io, ctl) = dial(&listener, PipeHint::default());
-    let extra = client.begin_add_pipe(io, opts.clone()).expect("add");
+    let extra = client.test_begin_join(io, opts.clone()).expect("add");
     echo(&client, 16 * 1024).await;
     ctl.fail();
     resumed_ctl.fail();

@@ -129,6 +129,8 @@ jobs:
       - name: Core, TLS and QUIC adapters
         run: cargo test --locked --all-features
       - name: Std driver only
+        run: cargo check --locked -p zmux --no-default-features --features blocking --lib
+      - name: Std driver unit tests
         run: cargo test --locked -p zmux --no-default-features --features blocking --lib
       - name: Other adapters
         run: cargo test --locked -p zmux-websocket -p zmux-http -p zmux-h3 -p zmux-webtransport
@@ -153,6 +155,7 @@ jobs:
           key: release-checks-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: release-checks-${{ runner.os }}-
       - run: cargo test --locked --release --all-features --test zero_alloc --test footprint --test input_pending
+      - run: cargo test --locked --release --all-features --test session shutdown_after_tcp_echo_drains_with_live_handles
       - name: Build benchmarks
         run: cargo bench --locked --workspace --no-run
 

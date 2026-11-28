@@ -53,17 +53,22 @@ fn records(c: &mut Criterion) {
                 Framing::ByteStream,
                 Opener::new(aes_256_gcm(), key.clone()),
                 Vec::new(),
+                None,
             );
-            let mut out = vec![0; 16 * 1024];
             b.iter(|| {
                 w.seal(black_box(&plain)).unwrap();
                 let unit = w.pending().clone();
                 w.wrote(unit.len()).unwrap();
-                r.space()[..unit.len()].copy_from_slice(&unit);
-                drop(unit);
-                r.filled(size + 18);
-                while let SealedRead::Data(n) = r.read(&mut out).unwrap() {
-                    black_box(n);
+                let (head, body) = unit.split_at(2);
+                r.space().copy_from_slice(head);
+                r.filled(head.len()).unwrap();
+                assert!(matches!(r.read().unwrap(), SealedRead::More));
+                r.space().copy_from_slice(body);
+                r.filled(body.len()).unwrap();
+                if let SealedRead::Record(record) = r.read().unwrap() {
+                    black_box(record);
+                } else {
+                    unreachable!("the reader has a complete record");
                 }
             });
         });

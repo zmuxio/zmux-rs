@@ -74,6 +74,19 @@ impl Value {
         self.low
     }
 
+    pub(crate) fn upper(&self) -> u64 {
+        self.segments.iter().map(|s| s.hi).max().unwrap_or(0)
+    }
+
+    pub(crate) fn reachable(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let mut previous = 0;
+        self.segments.iter().filter_map(move |segment| {
+            let reachable = segment.acc > previous;
+            previous = segment.acc;
+            reachable.then_some((segment.lo, segment.hi))
+        })
+    }
+
     /// Fixes a `shared` value with its one draw, which `out` records.
     pub(crate) fn settle(&mut self, s: &mut Sampler, out: &mut Vec<u64>) {
         if self.scope == Scope::Shared {

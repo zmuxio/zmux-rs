@@ -12,6 +12,9 @@
     reason = "test-local consts and helper fns sit next to their only use"
 )]
 
+#[path = "../adapter/test-support/ticket.rs"]
+mod ticket;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use zmux::adapter::{Admit, JoinPrefix};
 use zmux::{
     Admission, AdmissionStats, AdmissionVerdict, CarrierInfo, Config, Decide, Fallback,
-    HandleError, Listener, ListenerConfig, PipeHint, PipeIo, PrefixAuth, PrefixAuthVerifier,
-    Session, Takeover,
+    HandleError, Listener, ListenerConfig, PipeHint, PipeIo, Session, Takeover,
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -68,11 +70,16 @@ async fn ended(tcp: &mut TcpStream) -> Vec<u8> {
 
 #[tokio::test]
 async fn prefix_auth_token_then_session() {
-    let auth = PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
-    let (listener, addr) = serve(Admission::prefix_auth(verifier), None).await;
+    let (auth, verifier) = ticket::fixture(zmux::PrefixBinding::AllowCleartext);
+    let (listener, addr) = serve(
+        Admission::prefix_auth(verifier, zmux::PrefixRejection::Fallback),
+        None,
+    )
+    .await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
-    tcp.write_all(&auth.token(None).unwrap()).await.unwrap();
+    tcp.write_all(&auth.token(&zmux::CarrierInfo::new()).unwrap())
+        .await
+        .unwrap();
     let session = tokio::time::timeout(
         LIMIT,
         Session::connect(PipeIo::from_tcp(tcp), Config::default()),
@@ -89,6 +96,7 @@ async fn prefix_auth_token_then_session() {
     send.finish().unwrap();
     let (_s, mut recv) = accepted.accept_bi().await.unwrap();
     assert_eq!(recv.read_to_end(16).await.unwrap(), b"ping");
+    assert_eq!(accepted.bound_prefix_principal(), None);
     let st = listener.stats();
     assert_eq!((st.admission.accepted, st.sessions, st.rejected), (1, 1, 0));
     listener.close();
@@ -96,9 +104,7 @@ async fn prefix_auth_token_then_session() {
 
 #[tokio::test]
 async fn fallback_receives_every_byte_read() {
-    let auth = PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let wrong = PrefixAuth::new(b"other", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(PrefixAuthVerifier::new(auth, 1, 1024).unwrap());
+    let (auth, verifier) = ticket::fixture(zmux::PrefixBinding::AllowCleartext);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let fallback = Fallback::new(move |t: Takeover| {
         let tx = tx.clone();
@@ -111,8 +117,13 @@ async fn fallback_receives_every_byte_read() {
             let _ = tx.send((got, source));
         }
     });
-    let (listener, addr) = serve(Admission::prefix_auth(verifier), Some(fallback)).await;
-    let mut sent = wrong.token(None).unwrap().to_vec();
+    let (listener, addr) = serve(
+        Admission::prefix_auth(verifier, zmux::PrefixRejection::Fallback),
+        Some(fallback),
+    )
+    .await;
+    let mut sent = auth.token(&CarrierInfo::new()).unwrap().to_vec();
+    sent[0] ^= 1;
     sent.extend_from_slice(b"and the rest of the stream");
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(&sent).await.unwrap();
@@ -155,7 +166,7 @@ async fn fallback_without_a_target_stalls() {
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"0123").await.unwrap();
-    assert_eq!(ended(&mut tcp).await, Vec::new());
+    assert_eq!(ended(&mut tcp).await, b"");
     let st = listener.stats();
     assert_eq!(
         (st.admission.fallback, st.admission.stalled, st.rejected),
@@ -177,7 +188,7 @@ async fn every_outcome_is_counted_once() {
         let (listener, addr) = serve(Admission::new(4, decide), None).await;
         let mut tcp = TcpStream::connect(&addr).await.unwrap();
         tcp.write_all(b"0123").await.unwrap();
-        assert_eq!(ended(&mut tcp).await, Vec::new());
+        assert_eq!(ended(&mut tcp).await, b"");
         eventually(|| listener.stats().admission.closed == 1).await;
         let st = listener.stats();
         assert_eq!(
@@ -257,7 +268,7 @@ async fn a_late_decision_is_a_peek_timeout() {
     .with_peek_timeout(Duration::from_millis(50));
     let (listener, addr) = serve(admission, None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
-    assert_eq!(ended(&mut tcp).await, Vec::new());
+    assert_eq!(ended(&mut tcp).await, b"");
     eventually(|| listener.stats().admission.peek_timed_out == 1).await;
     assert_eq!(listener.stats().admission.closed, 0);
     listener.close();
@@ -271,7 +282,7 @@ async fn a_late_prefix_is_closed_or_falls_back() {
     let (listener, addr) = serve(late(), None).await;
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"ab").await.unwrap();
-    assert_eq!(ended(&mut tcp).await, Vec::new());
+    assert_eq!(ended(&mut tcp).await, b"");
     let a = listener.stats().admission;
     assert_eq!((a.peek_timed_out, a.fallback, a.closed), (1, 0, 0));
     listener.close();
@@ -304,17 +315,52 @@ async fn a_late_prefix_is_closed_or_falls_back() {
 
 #[tokio::test]
 async fn closing_the_listener_cancels_a_decision() {
-    let admission = Admission::with_decider(
-        0,
-        Slow(Duration::from_secs(3600), AdmissionVerdict::accept(0)),
-    )
-    .with_peek_timeout(Duration::from_secs(3600));
-    let (listener, addr) = serve(admission, None).await;
-    let mut tcp = TcpStream::connect(&addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    struct Pending(tokio::sync::mpsc::UnboundedSender<()>);
+
+    impl Decide for Pending {
+        fn decide(&self, _: CarrierInfo, _: &[u8]) -> zmux::Decision<zmux::AdmissionDecision> {
+            let started = self.0.clone();
+            zmux::Decision::later(async move {
+                started.send(()).unwrap();
+                std::future::pending().await
+            })
+        }
+    }
+
+    let (started, mut pending) = tokio::sync::mpsc::unbounded_channel();
+    let admission =
+        Admission::with_decider(0, Pending(started)).with_peek_timeout(Duration::from_secs(3600));
+    let listener = Listener::new(Config::default(), limits(admission, None)).unwrap();
+    let (mut client, carrier) = tokio::io::duplex(64);
+    let handled = {
+        let listener = listener.clone();
+        tokio::spawn(async move {
+            listener
+                .handle_pipe(PipeIo::new(carrier), PipeHint::default())
+                .await
+        })
+    };
+    tokio::time::timeout(LIMIT, pending.recv())
+        .await
+        .unwrap()
+        .unwrap();
     listener.close();
-    assert_eq!(ended(&mut tcp).await, Vec::new());
-    eventually(|| listener.stats().admission.closed == 1).await;
+    assert!(
+        tokio::time::timeout(LIMIT, handled)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    let mut bytes = Vec::new();
+    assert_eq!(
+        tokio::time::timeout(LIMIT, client.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(listener.stats().admission.closed, 1);
 }
 
 #[tokio::test]
@@ -334,7 +380,7 @@ async fn the_source_slot_is_taken_before_any_handshake() {
     eventually(|| listener.adapter().enter(peer, None).is_none()).await;
     // Beyond the share: closed at once, refused, never decided.
     let mut second = TcpStream::connect(&addr).await.unwrap();
-    assert_eq!(ended(&mut second).await, Vec::new());
+    assert_eq!(ended(&mut second).await, b"");
     eventually(|| listener.stats().refused >= 2).await;
     // Another source has its own share.
     assert!(
@@ -359,7 +405,7 @@ async fn the_source_slot_is_taken_before_any_handshake() {
     );
     drop(held);
     listener.close();
-    assert_eq!(ended(&mut first).await, Vec::new());
+    assert_eq!(ended(&mut first).await, b"");
 }
 
 #[tokio::test(start_paused = true)]
@@ -701,8 +747,10 @@ async fn no_admission_counts_nothing() {
 /// bytes past the accepted ones reach the session.
 #[tokio::test]
 async fn more_reads_on_in_the_serve_loop() {
-    let admission = Admission::new(2, |_, p| {
+    let (asked, mut more) = tokio::sync::mpsc::unbounded_channel();
+    let admission = Admission::new(2, move |_, p| {
         if p.len() < 5 {
+            asked.send(p.to_vec()).unwrap();
             AdmissionVerdict::More { need: 5 }
         } else if p == b"token" {
             AdmissionVerdict::accept(5)
@@ -715,7 +763,13 @@ async fn more_reads_on_in_the_serve_loop() {
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"to").await.unwrap();
     tcp.flush().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        tokio::time::timeout(LIMIT, more.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        b"to"
+    );
     tcp.write_all(b"ken").await.unwrap();
     let session = tokio::time::timeout(
         LIMIT,
@@ -754,7 +808,7 @@ async fn more_past_the_end_of_the_carrier_closes() {
     let mut tcp = TcpStream::connect(&addr).await.unwrap();
     tcp.write_all(b"tok").await.unwrap();
     tcp.shutdown().await.unwrap();
-    assert_eq!(ended(&mut tcp).await, Vec::new());
+    assert_eq!(ended(&mut tcp).await, b"");
     let l = listener.clone();
     eventually(move || l.stats().admission.closed == 1).await;
     assert_eq!(listener.stats().admission.accepted, 0);
@@ -801,32 +855,49 @@ async fn a_bound_token_with_a_later_exporter_is_admitted() {
             *b = u8::try_from(i % 251).unwrap() ^ label.as_bytes()[0];
         }
     };
-    let auth = PrefixAuth::new(b"key", Duration::from_secs(30), true).unwrap();
-    let client = CarrierInfo::new().with_exporter(CarrierExporter::new(move |label, _, out| {
-        secret(label, out);
-        true
-    }));
+    let (auth, verifier) = ticket::fixture(zmux::PrefixBinding::Bound);
+    let client =
+        CarrierInfo::new().with_prefix_binding(CarrierExporter::new(move |label, _, out| {
+            secret(label, out);
+            true
+        }));
     let token = auth.prefix(&client).unwrap();
-    let verifier = Arc::new(PrefixAuthVerifier::new(auth, 1, 1024).unwrap());
     let listener = Listener::new(
         Config::default(),
-        limits(Admission::prefix_auth(verifier), None),
+        limits(
+            Admission::prefix_auth(verifier, zmux::PrefixRejection::Fallback),
+            None,
+        ),
     )
     .expect("valid listener configuration");
-    let server =
-        CarrierInfo::new().with_exporter(CarrierExporter::new_async(move |req| async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let mut out = vec![0; req.length];
-            secret(&req.label, &mut out);
-            Ok(out)
-        }));
+    let (started, mut exporting) = tokio::sync::mpsc::unbounded_channel();
+    let (resume, resumed) = tokio::sync::watch::channel(false);
+    let server = CarrierInfo::new().with_prefix_binding(CarrierExporter::new_async({
+        move |req| {
+            let started = started.clone();
+            let mut resumed = resumed.clone();
+            async move {
+                started.send(()).unwrap();
+                resumed.wait_for(|&ready| ready).await.unwrap();
+                let mut out = vec![0; req.length];
+                secret(&req.label, &mut out);
+                Ok(out)
+            }
+        }
+    }));
     let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
     let mut entry = listener.adapter().enter(peer, None).unwrap();
     let (_a, b) = tokio::io::duplex(64);
     let carrier = PipeIo::new(b).with_prefix(token);
-    let admitted = tokio::time::timeout(LIMIT, entry.admit(server, carrier))
-        .await
-        .unwrap();
+    let admitted = tokio::time::timeout(LIMIT, async {
+        let (result, ()) = tokio::join!(entry.admit(server, carrier), async {
+            exporting.recv().await.unwrap();
+            resume.send(true).unwrap();
+        });
+        result
+    })
+    .await
+    .unwrap();
     assert!(admitted.is_some());
     assert_eq!(listener.stats().admission.accepted, 1);
     listener.close();

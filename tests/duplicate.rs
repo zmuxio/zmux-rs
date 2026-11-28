@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use common::{connect, duplex, eventually, multi_thread, settle, snapshot, watchdog};
 
 use zmux::helpers::{DuplicateError, DuplicateRule, resolve_duplicate};
-use zmux::{Config, OpenError, PipeAuth, Session, SessionError, VarInt};
+use zmux::{Config, OpenError, PipeAuth, PipeOptions, Session, SessionError, VarInt};
 
 use zmux::helpers::DuplicateOptions;
 
@@ -28,30 +28,32 @@ struct End {
 
 /// Two sessions between endpoints 1 and 2, one dialed by each: endpoint
 /// 1's view and endpoint 2's.
-async fn race(c1: Config, c2: Config) -> (End, End) {
-    let ((a, l1), (b, l2)) = duplex(1 << 20);
-    let (dialed_by_1, accepted_by_2) = connect(a, b, c1.clone(), c2.clone()).await;
-    let ((a, l3), (b, l4)) = duplex(1 << 20);
-    let (dialed_by_2, accepted_by_1) = connect(a, b, c2, c1).await;
-    // `connect` returns once one end is established; both must be.
-    let all = [&dialed_by_1, &accepted_by_2, &dialed_by_2, &accepted_by_1];
-    eventually(10, "every end established", || {
-        all.iter()
-            .all(|s| s.state() != zmux::SessionState::Establishing)
+fn race(c1: Config, c2: Config) -> impl Future<Output = (End, End)> {
+    Box::pin(async move {
+        let ((a, l1), (b, l2)) = duplex(1 << 20);
+        let (dialed_by_1, accepted_by_2) = connect(a, b, c1.clone(), c2.clone()).await;
+        let ((a, l3), (b, l4)) = duplex(1 << 20);
+        let (dialed_by_2, accepted_by_1) = connect(a, b, c2, c1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            for session in [&dialed_by_1, &accepted_by_2, &dialed_by_2, &accepted_by_1] {
+                session.established().await.unwrap();
+            }
+        })
+        .await
+        .expect("every end established");
+        (
+            End {
+                mine: dialed_by_1,
+                theirs: accepted_by_1,
+                links: vec![l1, l2, l3, l4],
+            },
+            End {
+                mine: dialed_by_2,
+                theirs: accepted_by_2,
+                links: Vec::new(),
+            },
+        )
     })
-    .await;
-    (
-        End {
-            mine: dialed_by_1,
-            theirs: accepted_by_1,
-            links: vec![l1, l2, l3, l4],
-        },
-        End {
-            mine: dialed_by_2,
-            theirs: accepted_by_2,
-            links: Vec::new(),
-        },
-    )
 }
 
 /// Resolves at both ends and checks that they keep the same session:
@@ -106,7 +108,7 @@ async fn drained(e1: &End, e2: &End, kept_1s: bool) {
 
 fn multipath(nonce: u8) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"duplicate-psk---0123456789abcdef").with_end_to_end();
     c.test_hooks().session_nonce = Some([nonce; 16]);
     c
@@ -165,7 +167,7 @@ fn failing_rejoin() -> (Arc<AtomicUsize>, DuplicateOptions) {
 
 /// `rejoin` is a hint, skipped (and reported as not
 /// started) when the survivor has no room for a pipe of its own: here its
-/// one attachment is all its `max_pipes` allows.
+/// outstanding Join fills its local `max_pipes` allowance.
 #[test]
 fn a_rejoin_without_room_is_not_started() {
     multi_thread(async {
@@ -173,18 +175,28 @@ fn a_rejoin_without_room_is_not_started() {
         {
             let one_pipe = |n| {
                 let mut c = multipath(n);
-                c.max_pipes = 1;
+                c.session_policy.limits.steady_attachments = 1;
+                c.test_hooks().locator = vec![n];
                 c.resume_timeout = Some(std::time::Duration::from_secs(5));
                 c
             };
             let (e1, e2) = race(one_pipe(9), one_pipe(3)).await;
             assert_eq!(e1.mine.multipath(), zmux::Multipath::InUse);
+            assert_eq!(e1.theirs.adapter().join_room(), 1);
+            let ((local, _), (remote, _)) = duplex(1 << 16);
+            let pending = e1
+                .theirs
+                .test_begin_join(local, PipeOptions::new())
+                .unwrap();
+            assert_eq!(e1.theirs.adapter().join_room(), 0);
             let none = DuplicateOptions::default();
             let (dials, o1) = failing_rejoin();
             let (kept, rejoin) = both_ends(&e1, &e2, &o1, &none, DuplicateRule::SessionNonce);
             assert!(!kept, "endpoint 1 dialed the loser");
             assert!(!rejoin, "no room on the survivor");
             assert_eq!(dials.load(Ordering::Relaxed), 0);
+            pending.abort().unwrap();
+            drop(remote);
             drained(&e1, &e2, kept).await;
         }
         settle(base, 10, "rejoin without room").await;

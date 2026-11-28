@@ -11,33 +11,56 @@ use crate::proto::varint::len as vlen;
 /// [`crate::proto::draft`]), carrying an encoded
 /// transport-parameter block.
 ///
-/// Decoding validates the block; parse it with
-/// [`TransportParameters::decode`] to read the values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Decoding retains the validated parameters alongside their wire bytes.
+#[derive(Debug, Clone)]
 pub struct QxTransportParameters<'a> {
     /// The Transport Parameters field, as a sequence of (ID, Length, Value).
     pub block: &'a [u8],
+    parsed: Option<Box<TransportParameters>>,
 }
 
+impl PartialEq for QxTransportParameters<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.block == other.block
+    }
+}
+
+impl Eq for QxTransportParameters<'_> {}
+
 impl<'a> QxTransportParameters<'a> {
+    /// Wraps a parameter block for encoding.
+    #[must_use]
+    pub const fn from_block(block: &'a [u8]) -> Self {
+        Self {
+            block,
+            parsed: None,
+        }
+    }
+
     /// Length of the encoding.
     #[must_use]
     pub const fn encoded_len(&self) -> usize {
         8 + vlen(self.block.len() as u64) + self.block.len()
     }
 
-    /// Parses the parameter block.
-    pub fn parameters(&self) -> Result<TransportParameters, crate::proto::Error> {
-        TransportParameters::decode(self.block)
+    /// Returns the parameters, borrowing the results of frame validation when available.
+    pub fn parameters(
+        &self,
+    ) -> Result<std::borrow::Cow<'_, TransportParameters>, crate::proto::Error> {
+        match self.parsed.as_deref() {
+            Some(parsed) => Ok(std::borrow::Cow::Borrowed(parsed)),
+            None => TransportParameters::decode(self.block).map(std::borrow::Cow::Owned),
+        }
     }
 
     pub(super) fn read(c: &mut Cursor<'a>) -> Result<Self, Fail> {
         let len = c.varint()?;
         let block = c.bytes(len)?;
-        TransportParameters::validate_block(block).map_err(|e| {
-            crate::proto::Error::new(e.code(), FrameType::QX_TRANSPORT_PARAMETERS.0, e.reason())
-        })?;
-        Ok(Self { block })
+        let parsed = Box::new(TransportParameters::decode(block)?);
+        Ok(Self {
+            block,
+            parsed: Some(parsed),
+        })
     }
 
     pub(crate) fn write(&self, w: &mut Writer<'_>) -> Result<(), EncodeError> {

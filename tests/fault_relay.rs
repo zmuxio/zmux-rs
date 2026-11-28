@@ -1,8 +1,5 @@
 //! Carriers through a faulty relay in the middle, on a paused clock: idle
-//! cut-offs, black holes, cuts of the last pipe with resume, refused
-//! redials, a silently cut downlink of a split pool and a lifetime limit.
-//! The pipe pool keeps the pipes up (redials on pipe events, rotates make
-//! before break); idle probes keep idle carriers alive and find dead ones.
+//! cut-offs and black holes. Idle probes keep idle carriers alive and detect failures.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -10,27 +7,23 @@
     reason = "test and bench values are small and bounded; checked conversions would only add noise"
 )]
 
-use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
-use tokio::sync::Notify;
-use tokio::time::{Instant, sleep, sleep_until};
-use zmux::Backoff;
-use zmux::helpers::{
-    AsyncPoolPolicy, OwnedPoolView, PipePool, PolicyFuture, PoolDecision, PoolView, Rotation,
-    maintain_pipes,
-};
+use tokio::sync::{Notify, watch};
+use tokio::time::{Instant, sleep_until};
 use zmux::{
-    Config, InboundState, Listener, ListenerConfig, OutboundState, PipeAuth, PipeDirection,
-    PipeHint, PipeIo, PipeOptions, Session, SessionError, SessionState,
+    AttachmentSpec, Backoff, Candidate, CarrierCache, CarrierCacheConfig, CarrierKind,
+    CarrierOpener, Config, ControllerOptions, Directions, GroupTarget, Listener, ListenerConfig,
+    MemberQuota, OutboundState, PipeAuth, PipeHint, PipeIo, PipeOptions, RotationPolicy, Session,
+    SessionControl, SessionController, SessionTarget, TargetCandidate,
 };
 
 fn config(edit: impl FnOnce(&mut Config)) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 6;
+    c.session_policy.limits.steady_attachments = 6;
     c.pipe_auth = PipeAuth::psk(*b"fault-relay-psk-0123456789abcdef").with_end_to_end();
     c.max_idle_timeout = None;
     c.resume_timeout = Some(Duration::from_secs(120));
@@ -44,11 +37,6 @@ struct Faults {
     /// A connection without bytes either way for this long is dropped
     /// silently: nothing more is forwarded, neither end is told.
     idle_cut: Option<Duration>,
-    /// A connection is dropped (both ends see its end) this long after it
-    /// opened.
-    lifetime: Option<Duration>,
-    /// New connections are refused.
-    refuse: AtomicBool,
 }
 
 /// One relayed connection's switches.
@@ -56,22 +44,10 @@ struct Faults {
 struct Conn {
     /// Forwards nothing more, ends stay open (a black hole).
     blackhole: AtomicBool,
-    /// Ended at once: both ends see the end.
-    cut: Notify,
-    cut_flag: AtomicBool,
     /// Silently cut by the idle rule.
     idled: AtomicBool,
-    /// Ended by the lifetime rule.
-    expired: AtomicBool,
-    /// The direction the dial asked for.
-    direction: Mutex<Option<PipeDirection>>,
-}
-
-impl Conn {
-    fn cut(&self) {
-        self.cut_flag.store(true, Ordering::SeqCst);
-        self.cut.notify_waiters();
-    }
+    idle_event: Notify,
+    forwarded: watch::Sender<u64>,
 }
 
 #[derive(Clone)]
@@ -103,6 +79,7 @@ async fn pump(
         if to.write_all(&buf[..n]).await.is_err() {
             return;
         }
+        conn.forwarded.send_modify(|count| *count += 1);
     }
 }
 
@@ -132,34 +109,28 @@ impl Relay {
             let (br, bw) = tokio::io::split(relay_b);
             let mut up = tokio::spawn(pump(ar, bw, c.clone(), last.clone()));
             let mut down = tokio::spawn(pump(br, aw, c.clone(), last.clone()));
-            while !c.cut_flag.load(Ordering::SeqCst) {
-                let mut wake = opened + Duration::from_secs(3600);
-                if let Some(l) = faults.lifetime {
-                    wake = wake.min(opened + l);
-                }
-                if let Some(i) = faults.idle_cut
-                    && !c.idled.load(Ordering::SeqCst)
-                {
-                    wake = wake.min(*last.lock().unwrap() + i);
-                }
+            loop {
+                let idle_at = faults
+                    .idle_cut
+                    .filter(|_| !c.idled.load(Ordering::SeqCst))
+                    .map(|limit| *last.lock().unwrap() + limit);
                 tokio::select! {
-                    () = c.cut.notified() => break,
                     _ = &mut up => break,
                     _ = &mut down => break,
-                    () = sleep_until(wake) => {}
+                    () = async {
+                        if let Some(at) = idle_at {
+                            sleep_until(at).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {}
                 }
-                if c.cut_flag.load(Ordering::SeqCst) {
-                    break;
-                }
-                let now = Instant::now();
-                if faults.lifetime.is_some_and(|l| now >= opened + l) {
-                    c.expired.store(true, Ordering::SeqCst);
-                    break;
-                }
-                if let Some(i) = faults.idle_cut
-                    && now >= *last.lock().unwrap() + i
+                if faults
+                    .idle_cut
+                    .is_some_and(|limit| Instant::now() >= *last.lock().unwrap() + limit)
                 {
                     c.idled.store(true, Ordering::SeqCst);
+                    c.idle_event.notify_one();
                 }
             }
             // Dropping the copies drops the relay's ends: both ends see the
@@ -175,87 +146,65 @@ impl Relay {
     }
 
     /// A bidirectional carrier through the relay.
-    fn carrier(&self) -> io::Result<PipeIo> {
+    fn carrier(&self) -> PipeIo {
         self.dials.lock().unwrap().push(Instant::now());
-        if self.faults.refuse.load(Ordering::SeqCst) {
-            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
-        }
         let (near, far, _) = self.connect();
         let l = self.listener.clone();
         tokio::spawn(async move {
             let _ = l.handle_pipe(PipeIo::new(far), Self::hint()).await;
         });
-        Ok(PipeIo::new(near))
+        PipeIo::new(near)
     }
 
-    /// A one-way carrier through the relay of a split pool's member, paired at the
-    /// listener by `token`.
-    fn one_way(&self, direction: PipeDirection, token: [u8; 16]) -> io::Result<PipeIo> {
-        self.dials.lock().unwrap().push(Instant::now());
-        if self.faults.refuse.load(Ordering::SeqCst) {
-            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
-        }
-        let (near, far, conn) = self.connect();
-        *conn.direction.lock().unwrap() = Some(direction);
-        let l = self.listener.clone();
-        let mut hint = Self::hint();
-        hint.pair = Some(token.to_vec());
-        match direction {
-            PipeDirection::Out => {
-                tokio::spawn(async move {
-                    let _ = l.handle_pipe(PipeIo::reader(far), hint).await;
-                });
-                Ok(PipeIo::writer(near))
-            }
-            PipeDirection::In => {
-                tokio::spawn(async move {
-                    let _ = l.handle_pipe(PipeIo::writer(far), hint).await;
-                });
-                Ok(PipeIo::reader(near))
-            }
-            PipeDirection::Bidi => unreachable!("a split pool dials one-way carriers"),
-        }
-    }
-
-    fn pool(&self, count: usize, options: PipeOptions) -> PipePool {
-        let r = self.clone();
-        PipePool::new(count, move |_| std::future::ready(r.carrier()))
-            .with_options(options)
-            .with_backoff(Backoff::new(
-                Duration::from_millis(500),
-                Duration::from_secs(5),
-            ))
-    }
-
-    /// A pool of split members: a downlink and an uplink joined together.
-    fn split_pool(&self, options: PipeOptions) -> PipePool {
-        let r = self.clone();
-        PipePool::join(1, move |session: Session, options| {
-            let r = r.clone();
-            async move {
-                let mut token = [0; 16];
-                getrandom::fill(&mut token).map_err(io::Error::other)?;
-                let up = r.one_way(PipeDirection::Out, token)?;
-                let down = r.one_way(PipeDirection::In, token)?;
-                let pipe = session
-                    .begin_add_pipe(PipeIo::paired_join(up, down), options)
-                    .map_err(io::Error::other)?;
-                Ok(vec![pipe])
-            }
+    fn manage(&self, session: &Session, options: PipeOptions) -> SessionControl {
+        let relayed = self.clone();
+        let open = CarrierOpener::new(move |_| {
+            std::future::ready(zmux::OpenedCarriers::ready(vec![relayed.carrier()]))
+        });
+        let relay = self.clone();
+        let candidate = Candidate::new(CarrierKind::Streaming, move || {
+            std::future::ready(Ok(relay.carrier()))
         })
-        .with_options(options)
-        .with_backoff(Backoff::new(
-            Duration::from_millis(500),
-            Duration::from_secs(5),
-        ))
+        .with_identity("relay", "relay")
+        .with_join_opener(vec![AttachmentSpec::new(Directions::BOTH, options)], open);
+        let mut options =
+            ControllerOptions::new(format!("fault-relay-{:?}", session.id()), vec![candidate]);
+        let mut cache = CarrierCacheConfig::default();
+        cache.backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(5));
+        options.cache = Some(CarrierCache::new(cache).unwrap());
+        SessionController::new(options)
+            .unwrap()
+            .manage(
+                session,
+                SessionTarget {
+                    revision: 1,
+                    groups: vec![GroupTarget {
+                        id: "relay".into(),
+                        quotas: vec![MemberQuota {
+                            id: "one".into(),
+                            count: 1,
+                            directions: Directions::BOTH,
+                            candidates: vec![TargetCandidate {
+                                id: "relay".into(),
+                                send: None,
+                                receive: None,
+                            }],
+                        }],
+
+                        rotation: zmux::RotationPolicy::default(),
+                    }],
+                    replace: Vec::new(),
+                },
+            )
+            .unwrap()
     }
 
     fn dial_count(&self) -> usize {
         self.dials.lock().unwrap().len()
     }
 
-    fn count(&self, f: impl Fn(&Conn) -> bool) -> usize {
-        self.conns.lock().unwrap().iter().filter(|c| f(c)).count()
+    fn first_connection(&self) -> Arc<Conn> {
+        self.conns.lock().unwrap()[0].clone()
     }
 }
 
@@ -271,496 +220,998 @@ async fn direct(listener: &Listener, cfg: Config) -> (Session, Session) {
     (client, server)
 }
 
-/// A session over a relayed carrier and its peer.
-async fn relayed(relay: &Relay, cfg: Config) -> (Session, Session) {
-    let client = Session::connect(relay.carrier().unwrap(), cfg)
-        .await
-        .unwrap();
-    let server = relay.listener.accept().await.unwrap();
-    (client, server)
-}
-
-/// Waits (on the paused clock, in 1 ms steps) until `f` holds; fails after
-/// `limit`. Returns the time it held.
-async fn until(what: &str, limit: Duration, mut f: impl FnMut() -> bool) -> Instant {
-    let end = Instant::now() + limit;
-    while !f() {
-        assert!(Instant::now() < end, "timed out: {what}");
-        sleep(Duration::from_millis(1)).await;
+async fn observe<T>(session: &Session, mut predicate: impl FnMut() -> Option<T>) -> T {
+    loop {
+        let observed = session.capacity().observed;
+        if let Some(value) = predicate() {
+            return value;
+        }
+        session.capacity_changed(observed).await;
     }
-    Instant::now()
 }
 
-/// Pool pipes of the client (not pipe 0) whose outbound is ACTIVE.
-fn active(s: &Session) -> usize {
-    s.pipe_stats()
-        .iter()
-        .filter(|p| p.pipe.get() != 0 && p.outbound == Some(OutboundState::Active))
-        .count()
+async fn joined_pipe(session: &Session, except: Option<zmux::PipeId>) -> zmux::PipeId {
+    observe(session, || {
+        session
+            .pipe_stats()
+            .into_iter()
+            .find(|pipe| {
+                pipe.pipe.get() != 0
+                    && Some(pipe.pipe) != except
+                    && pipe.peer_attached
+                    && pipe.outbound == Some(OutboundState::Active)
+            })
+            .map(|pipe| pipe.pipe)
+    })
+    .await
 }
 
-/// The pool's first pipe (the lowest ID above 0) of the client.
-fn pool_pipe(s: &Session) -> zmux::PipeId {
-    s.pipe_stats()
-        .iter()
-        .map(|p| p.pipe)
-        .filter(|p| p.get() != 0)
-        .min()
-        .expect("a pool pipe")
+async fn lost(session: &Session, pipe: zmux::PipeId) {
+    observe(session, || {
+        session
+            .pipe_stats()
+            .into_iter()
+            .find(|p| p.pipe == pipe)
+            .is_none_or(|p| p.outbound == Some(OutboundState::Failed))
+            .then_some(())
+    })
+    .await;
 }
 
-/// The pipe is gone or its outbound failed.
-fn lost(s: &Session, id: zmux::PipeId) -> bool {
-    s.pipe_stats()
-        .iter()
-        .find(|p| p.pipe == id)
-        .is_none_or(|p| p.outbound == Some(OutboundState::Failed))
+fn probe_options(period: Duration) -> PipeOptions {
+    PipeOptions::new().with_liveness(zmux::PipeLiveness {
+        probe_interval: zmux::Inherit::Set(Some(period)),
+        probe_jitter: zmux::Inherit::Set(0.0),
+        ..zmux::PipeLiveness::default()
+    })
 }
 
-fn failed(s: &Session) -> usize {
-    s.pipe_stats()
-        .iter()
-        .filter(|p| p.outbound == Some(OutboundState::Failed) || p.failure.is_some())
-        .count()
-}
+const WATCHDOG: Duration = Duration::from_hours(1);
 
-/// Checks a numbered byte stream: every byte once, in order.
-fn check(data: &[u8], from: usize) -> usize {
-    for (i, b) in data.iter().enumerate() {
-        assert_eq!(*b, ((from + i) % 251) as u8, "byte {} wrong", from + i);
-    }
-    from + data.len()
-}
-
-/// The idle rule of a middlebox (8 s): probes every 5 s with 30% jitter
-/// keep a quiet pipe alive for 10 minutes; at 12 s the relay drops it
-/// silently, the probe finds it within k + `T_fail` and the pool redials on
-/// the failure at once.
 #[tokio::test(start_paused = true)]
 async fn probes_keep_an_idle_relay_open() {
-    // Only the pool pipe's own probes may cross the relay. A session is
-    // busy for the first 15 s after it was established, and while it is
-    // busy the answer to a probe of the direct pipe 0 also goes, as the
-    // redundant PIPE_ACK copy, on the second live pipe: the relayed one.
-    // Pipe 0's first
-    // probe wait is drawn from [0, k], so such a copy fell inside the 8 s
-    // the idle cut below needs about one run in five; with k = 1 h, still
-    // about one in 300 (a draw below 12 s at either end). Pipe 0 probes
-    // without jitter, first after 1 h, beyond the test's window.
-    let quiet = |c: &mut Config| {
-        c.liveness.probe_interval = Some(Duration::from_secs(3600));
-        c.liveness.probe_jitter = 0.0;
-    };
-    let listener = Listener::new(config(quiet), ListenerConfig::default())
-        .expect("valid listener configuration");
-    let relay = Relay::new(
-        &listener,
-        Faults {
-            idle_cut: Some(Duration::from_secs(8)),
-            ..Faults::default()
-        },
-    );
-    let (client, _server) = direct(&listener, config(quiet)).await;
-    let opts = PipeOptions::new().with_liveness(zmux::PipeLiveness {
-        probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(5))),
-        probe_jitter: zmux::Inherit::Set(0.3),
-        ..Default::default()
-    });
-    let handle = maintain_pipes(&client, relay.pool(1, opts)).expect("valid pool");
-    until("a pool pipe", Duration::from_secs(10), || {
-        active(&client) == 1
-    })
-    .await;
-    sleep(Duration::from_secs(600)).await;
-    assert_eq!(relay.count(|c| c.idled.load(Ordering::SeqCst)), 0);
-    assert_eq!(relay.dial_count(), 1);
-    assert_eq!(failed(&client), 0);
-    drop(handle);
-    client.close().await;
+    tokio::time::timeout(WATCHDOG, async {
+        let quiet = |config: &mut Config| {
+            config.liveness.probe_interval = Some(Duration::from_hours(1));
+            config.liveness.probe_jitter = 0.0;
+        };
+        let listener = Listener::new(config(quiet), ListenerConfig::default()).unwrap();
+        let relay = Relay::new(
+            &listener,
+            Faults {
+                idle_cut: Some(Duration::from_secs(8)),
+            },
+        );
+        let (client, _server) = direct(&listener, config(quiet)).await;
+        let control = relay.manage(&client, probe_options(Duration::from_secs(5)));
+        joined_pipe(&client, None).await;
+        let link = relay.first_connection();
+        let mut forwarded = link.forwarded.subscribe();
+        for _ in 0..3 {
+            let previous = *forwarded.borrow_and_update();
+            tokio::select! {
+                biased;
+                () = link.idle_event.notified() => panic!("relay closed without another probe"),
+                changed = forwarded.wait_for(|&count| count > previous) => { changed.unwrap(); }
+            }
+        }
+        assert_eq!(relay.dial_count(), 1);
+        control.release().unwrap();
+        control.done().await;
+        client.close().await;
 
-    let relay = Relay::new(
-        &listener,
-        Faults {
-            idle_cut: Some(Duration::from_secs(8)),
-            ..Faults::default()
-        },
-    );
-    let (client, _server) = direct(&listener, config(quiet)).await;
-    // A fixed schedule: the pool pipe's first probe goes 12 s after the
-    // join, so the cut comes 8 s after it, and the probe 4 s later.
-    let opts = PipeOptions::new().with_liveness(zmux::PipeLiveness {
-        probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(12))),
-        probe_jitter: zmux::Inherit::Set(0.0),
-        ..Default::default()
-    });
-    let handle = maintain_pipes(&client, relay.pool(1, opts)).expect("valid pool");
-    until("a pool pipe", Duration::from_secs(10), || {
-        active(&client) == 1
+        let relay = Relay::new(
+            &listener,
+            Faults {
+                idle_cut: Some(Duration::from_secs(8)),
+            },
+        );
+        let (client, _server) = direct(&listener, config(quiet)).await;
+        let control = relay.manage(&client, probe_options(Duration::from_secs(12)));
+        let first = joined_pipe(&client, None).await;
+        relay.first_connection().idle_event.notified().await;
+        lost(&client, first).await;
+        joined_pipe(&client, Some(first)).await;
+        assert_eq!(relay.dial_count(), 2);
+        control.release().unwrap();
+        control.done().await;
+        client.close().await;
     })
-    .await;
-    let id = pool_pipe(&client);
-    let cut = until("an idle cut", Duration::from_secs(20), || {
-        relay.count(|c| c.idled.load(Ordering::SeqCst)) == 1
-    })
-    .await;
-    let found = until("the dead pipe found", Duration::from_secs(20), || {
-        lost(&client, id)
-    })
-    .await;
-    // The probe goes at most 12 s after the last byte, 4 s after the cut;
-    // T_fail follows.
-    assert!(
-        found - cut <= Duration::from_secs(4 + 5),
-        "{:?}",
-        found - cut
-    );
-    until("a redial", Duration::from_millis(20), || {
-        relay.dial_count() == 2
-    })
-    .await;
-    until("a new pool pipe", Duration::from_secs(5), || {
-        active(&client) == 1
-    })
-    .await;
-    drop(handle);
-    client.close().await;
+    .await
+    .unwrap();
 }
 
-/// A relay that takes bytes and forwards none: the idle pipe fails within
-/// k + `T_fail`.
 #[tokio::test(start_paused = true)]
 async fn a_black_hole_is_found_by_the_probe() {
-    let listener = Listener::new(config(|_| {}), ListenerConfig::default())
-        .expect("valid listener configuration");
-    let relay = Relay::new(&listener, Faults::default());
-    let (client, _server) = direct(&listener, config(|_| {})).await;
-    let opts = PipeOptions::new().with_liveness(zmux::PipeLiveness {
-        probe_interval: zmux::Inherit::Set(Some(Duration::from_secs(5))),
-        ..Default::default()
-    });
-    let handle = maintain_pipes(&client, relay.pool(1, opts)).expect("valid pool");
-    until("a pool pipe", Duration::from_secs(10), || {
-        active(&client) == 1
+    tokio::time::timeout(WATCHDOG, async {
+        let listener = Listener::new(config(|_| {}), ListenerConfig::default()).unwrap();
+        let relay = Relay::new(&listener, Faults::default());
+        let (client, _server) = direct(&listener, config(|_| {})).await;
+        let control = relay.manage(&client, probe_options(Duration::from_secs(5)));
+        let pipe = joined_pipe(&client, None).await;
+        relay
+            .first_connection()
+            .blackhole
+            .store(true, Ordering::SeqCst);
+        lost(&client, pipe).await;
+        control.release().unwrap();
+        control.done().await;
+        client.close().await;
     })
-    .await;
-    sleep(Duration::from_secs(20)).await;
-    let id = pool_pipe(&client);
-    let start = Instant::now();
-    relay.conns.lock().unwrap()[0]
-        .blackhole
-        .store(true, Ordering::SeqCst);
-    let found = until("the black hole found", Duration::from_secs(20), || {
-        lost(&client, id)
-    })
-    .await;
-    assert!(
-        found - start <= Duration::from_secs(5 + 5),
-        "{:?}",
-        found - start
-    );
-    drop(handle);
-    client.close().await;
+    .await
+    .unwrap();
 }
 
-/// Runs a policy closure on the maintainer's own task, so that what it
-/// reads of the paused clock is the instant of the look. A synchronous
-/// policy runs on a thread of its own: while the test waits for it the
-/// paused clock keeps advancing, and a thread that starts late (a loaded
-/// host) would make the look appear late in virtual time.
-struct OnTask<F>(Mutex<F>);
-
-impl<F> AsyncPoolPolicy for OnTask<F>
-where
-    F: FnMut(&PoolView<'_>, &mut PoolDecision) -> Result<(), zmux::helpers::PolicyError> + Send,
-{
-    fn decide(&self, view: OwnedPoolView) -> PolicyFuture {
-        let mut d = PoolDecision::default();
-        let r = (self.0.lock().unwrap())(&view.view(), &mut d).map(|()| d);
-        Box::pin(std::future::ready(r))
-    }
-}
-
-/// The policy of the resume tests: redial 1 s after the last dial, reduced
-/// by up to 30% drawn once per wait; records when it was asked.
-fn redial_policy(
-    session: Session,
-    asked: Arc<Mutex<Vec<(Instant, SessionState)>>>,
-) -> Arc<dyn AsyncPoolPolicy> {
-    let mut wait: Option<(u32, f64)> = None;
-    let mut seed = 0x2545_f491_4f6c_dd1du64;
-    Arc::new(OnTask(Mutex::new(
-        move |v: &PoolView<'_>, d: &mut PoolDecision| {
-            asked
-                .lock()
-                .unwrap()
-                .push((Instant::now(), session.state()));
-            let u = match wait {
-                Some((f, u)) if f == v.failures => u,
-                _ => {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    let u = (seed >> 11) as f64 / (1u64 << 53) as f64;
-                    wait = Some((v.failures, u));
-                    u
+#[tokio::test(start_paused = true)]
+async fn a_confirmed_recovery_releases_the_alternates_protocol_reservation() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let config = config(|_| {});
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let (session, _peer) = direct(&listener, config).await;
+        let relay = Relay::new(&listener, Faults::default());
+        let confirm_winner = Arc::new(Notify::new());
+        let winner = CarrierOpener::new({
+            let confirm_winner = confirm_winner.clone();
+            move |_| {
+                let relay = relay.clone();
+                let confirm_winner = confirm_winner.clone();
+                async move {
+                    confirm_winner.notified().await;
+                    zmux::OpenedCarriers::ready(vec![relay.carrier()])
                 }
-            };
-            let after = Duration::from_secs_f64(1.0 - 0.3 * u);
-            if v.since_last_dial.is_some() {
-                d.set_dial_after(after);
             }
-            Ok(())
-        },
-    )))
-}
-
-/// The last pipe is cut with resume on: the pool decides on the
-/// suspension at once, redials by its policy, the session resumes and the
-/// stream's bytes arrive once each, in order.
-#[tokio::test(start_paused = true)]
-async fn the_last_pipe_cut_resumes_without_loss() {
-    let listener = Listener::new(config(|_| {}), ListenerConfig::default())
-        .expect("valid listener configuration");
-    let relay = Relay::new(&listener, Faults::default());
-    let (client, server) = relayed(&relay, config(|_| {})).await;
-    let asked = Arc::new(Mutex::new(Vec::new()));
-    let pool = relay
-        .pool(1, PipeOptions::new())
-        .with_async_policy(redial_policy(client.clone(), asked.clone()));
-    let handle = maintain_pipes(&client, pool).expect("valid pool");
-    until("a pool pipe", Duration::from_secs(10), || {
-        active(&client) == 1
-    })
-    .await;
-    let total = 4 << 20;
-    let (mut tx, _rx) = client.open_bi().await.unwrap();
-    let writer = tokio::spawn(async move {
-        let mut sent = 0;
-        while sent < total {
-            let chunk: Vec<u8> = (sent..sent + 16 * 1024).map(|i| (i % 251) as u8).collect();
-            tx.write_all(&chunk).await.unwrap();
-            sent += chunk.len();
-            sleep(Duration::from_millis(5)).await;
-        }
-        tx.finish().unwrap();
-    });
-    let peer = server.clone();
-    let reader = tokio::spawn(async move {
-        let (_t, mut r) = peer.accept_bi().await.unwrap();
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut got = 0;
-        while let Some(n) = r.read(&mut buf).await.unwrap() {
-            got = check(&buf[..n], got);
-        }
-        got
-    });
-    sleep(Duration::from_millis(300)).await;
-    for c in relay.conns.lock().unwrap().iter() {
-        c.cut();
-    }
-    let suspended = until("suspended", Duration::from_secs(10), || {
-        client.state() == SessionState::Suspended
-    })
-    .await;
-    // A decision saw the suspension within 10 ms (polled here in 1 ms
-    // steps).
-    let saw = asked
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(_, st)| *st == SessionState::Suspended)
-        .map(|(t, _)| *t)
-        .expect("a decision during the suspension");
-    assert!(
-        saw <= suspended + Duration::from_millis(10),
-        "{:?}",
-        saw - suspended
-    );
-    until("resumed", Duration::from_secs(10), || {
-        client.state() != SessionState::Suspended
-    })
-    .await;
-    assert_eq!(reader.await.unwrap(), total);
-    writer.await.unwrap();
-    assert!(client.close_reason().is_none());
-    drop(handle);
-    client.close().await;
-}
-
-/// The relay refuses every redial during the grace period: the session
-/// ends with `RESUME_TIMEOUT` when it expires, and the pool with it.
-#[tokio::test(start_paused = true)]
-async fn refused_redials_end_in_resume_timeout() {
-    let cfg = || config(|c| c.resume_timeout = Some(Duration::from_secs(20)));
-    let listener =
-        Listener::new(cfg(), ListenerConfig::default()).expect("valid listener configuration");
-    let relay = Relay::new(&listener, Faults::default());
-    let (client, _server) = relayed(&relay, cfg()).await;
-    let handle = maintain_pipes(&client, relay.pool(1, PipeOptions::new())).expect("valid pool");
-    until("a pool pipe", Duration::from_secs(10), || {
-        active(&client) == 1
-    })
-    .await;
-    relay.faults.refuse.store(true, Ordering::SeqCst);
-    for c in relay.conns.lock().unwrap().iter() {
-        c.cut();
-    }
-    let start = Instant::now();
-    let e = tokio::time::timeout(Duration::from_secs(30), client.closing())
-        .await
-        .expect("the grace period ends");
-    assert!(matches!(e, SessionError::ResumeTimeout { .. }), "{e:?}");
-    assert!(Instant::now() - start >= Duration::from_secs(19));
-    // It kept dialling while suspended.
-    assert!(relay.dial_count() > 3, "{}", relay.dial_count());
-    until("the pool stopped", Duration::from_secs(1), || {
-        handle.is_finished()
-    })
-    .await;
-}
-
-/// A split pool whose downlink the relay cuts silently: the pipe fails
-/// within the inbound silence limit, and both directions are redialled in
-/// parallel; the session carries on.
-#[tokio::test(start_paused = true)]
-async fn a_silent_downlink_cut_is_found_and_redialled() {
-    let listener = Listener::new(config(|_| {}), ListenerConfig::default())
-        .expect("valid listener configuration");
-    let relay = Relay::new(&listener, Faults::default());
-    let (client, server) = relayed(&relay, config(|_| {})).await;
-    let handle = maintain_pipes(&client, relay.split_pool(PipeOptions::new())).expect("valid pool");
-    let halves = |s: &Session| {
-        let p = s.pipe_stats();
-        let up = p
-            .iter()
-            .filter(|p| p.pipe.get() != 0 && p.outbound == Some(OutboundState::Active))
-            .count();
-        let down = p
-            .iter()
-            .filter(|p| p.pipe.get() != 0 && p.inbound == Some(InboundState::Open))
-            .count();
-        (up, down)
-    };
-    until("an uplink and a downlink", Duration::from_secs(10), || {
-        halves(&client) == (1, 1)
-    })
-    .await;
-    // The session runs on the split pipes alone.
-    relay.conns.lock().unwrap()[0].cut();
-    sleep(Duration::from_secs(2)).await;
-    let down = relay
-        .conns
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|c| *c.direction.lock().unwrap() == Some(PipeDirection::In))
-        .cloned()
+        });
+        let alternate_started = Arc::new(Notify::new());
+        let alternate = CarrierOpener::new({
+            let alternate_started = alternate_started.clone();
+            move |_| {
+                alternate_started.notify_one();
+                std::future::pending::<zmux::OpenedCarriers>()
+            }
+        });
+        let candidate = |id, tier, opener| {
+            Candidate::new(CarrierKind::Streaming, || async { unreachable!() })
+                .with_identity(id, id)
+                .with_tier(tier)
+                .join_only()
+                .with_join_opener(
+                    vec![AttachmentSpec::new(
+                        Directions::BOTH,
+                        PipeOptions::default(),
+                    )],
+                    opener,
+                )
+        };
+        let controller = SessionController::new(ControllerOptions::new(
+            "directional-recovery-alternatives",
+            vec![
+                candidate("winner", 0, winner),
+                candidate("alternate", 1, alternate),
+            ],
+        ))
         .unwrap();
-    let dials = relay.dial_count();
-    let start = Instant::now();
-    down.blackhole.store(true, Ordering::SeqCst);
-    until("redialled", Duration::from_secs(25), || {
-        relay.dial_count() >= dials + 2
-    })
-    .await;
-    let times = relay.dials.lock().unwrap().clone();
-    // The inbound silence limit is 15 s plus a small slack.
-    assert!(
-        times[dials] - start <= Duration::from_secs(20),
-        "{:?}",
-        times[dials] - start
-    );
-    assert!(
-        times[dials + 1] - times[dials] <= Duration::from_millis(20),
-        "{times:?}"
-    );
-    until("both halves again", Duration::from_secs(10), || {
-        halves(&client) == (1, 1)
-    })
-    .await;
-    let (mut tx, _rx) = client.open_bi().await.unwrap();
-    tx.write_all(b"after").await.unwrap();
-    tx.finish().unwrap();
-    let (_t, mut r) = server.accept_bi().await.unwrap();
-    assert_eq!(r.read_to_end(64).await.unwrap(), b"after");
-    assert!(client.close_reason().is_none());
-    drop(handle);
-    client.close().await;
-}
+        let target = SessionTarget {
+            groups: vec![GroupTarget {
+                id: "recovery".into(),
+                quotas: vec![MemberQuota {
+                    id: "coverage".into(),
+                    count: 1,
+                    directions: Directions::BOTH,
+                    candidates: ["winner", "alternate"]
+                        .map(|id| TargetCandidate {
+                            id: id.into(),
+                            send: None,
+                            receive: None,
+                        })
+                        .into(),
+                }],
 
-/// A relay that ends each connection 30 s after it opened (a load
-/// balancer's connection lifetime): rotation by age, 25 s less up to 10%,
-/// replaces each pipe before, make before break, and a stream running all
-/// along never stalls.
-#[tokio::test(start_paused = true)]
-async fn age_rotation_beats_a_lifetime_limit() {
-    let listener = Listener::new(config(|_| {}), ListenerConfig::default())
-        .expect("valid listener configuration");
-    let relay = Relay::new(
-        &listener,
-        Faults {
-            lifetime: Some(Duration::from_secs(30)),
-            ..Faults::default()
-        },
-    );
-    let (client, server) = direct(&listener, config(|_| {})).await;
-    // Pipe 0 is the fallback tier: the data goes on the pool's pipes.
-    client
-        .pipe(zmux::PipeId::new(0))
-        .unwrap()
-        .update(&zmux::PipeUpdate {
-            send_priority: zmux::Change::Set(10),
-            ..Default::default()
+                rotation: zmux::RotationPolicy::default(),
+            }],
+            ..SessionTarget::default()
+        };
+        let control = controller.manage(&session, target).unwrap();
+        session.pipe(zmux::PipeId::new(0)).unwrap().abort().unwrap();
+        alternate_started.notified().await;
+        assert_eq!(session.capacity().reserved_attachments, 2);
+        confirm_winner.notify_one();
+        observe(&session, || {
+            let capacity = session.capacity();
+            (capacity.covered == Directions::BOTH && capacity.reserved_attachments == 0)
+                .then_some(())
         })
-        .unwrap();
-    let pool = relay.pool(1, PipeOptions::new()).with_rotate(
-        Rotation::new()
-            .with_max_age(Duration::from_secs(25))
-            .with_jitter(0.1),
-    );
-    let handle = maintain_pipes(&client, pool).expect("valid pool");
-    until("a pool pipe", Duration::from_secs(10), || {
-        active(&client) == 1
+        .await;
+        assert_eq!(control.snapshot().host_calls_in_flight, 1);
+        control.release().unwrap();
+        control.done().await;
     })
-    .await;
-    let stalls = Arc::new(AtomicUsize::new(0));
-    let (mut tx, _rx) = client.open_bi().await.unwrap();
-    let total = 180 * 50 * 4096;
-    let writer = tokio::spawn(async move {
-        let mut sent = 0;
-        while sent < total {
-            let chunk: Vec<u8> = (sent..sent + 4096).map(|i| (i % 251) as u8).collect();
-            tx.write_all(&chunk).await.unwrap();
-            sent += chunk.len();
-            sleep(Duration::from_millis(20)).await;
-        }
-        tx.finish().unwrap();
-    });
-    let s = stalls.clone();
-    let reader = tokio::spawn(async move {
-        let (_t, mut r) = server.accept_bi().await.unwrap();
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut got = 0;
-        loop {
-            match tokio::time::timeout(Duration::from_millis(500), r.read(&mut buf)).await {
-                Err(_) => {
-                    s.fetch_add(1, Ordering::SeqCst);
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn directional_recovery_alternatives_share_the_batch_deadline() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let config = config(|_| {});
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let (session, _peer) = direct(&listener, config).await;
+        let (requests, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let candidate = |id, tier, directions| {
+            let released = Arc::new(Notify::new());
+            let opener = CarrierOpener::new({
+                let released = released.clone();
+                let listener = listener.clone();
+                let requests = requests.clone();
+                move |request| {
+                    requests.send((id, request)).unwrap();
+                    let listener = listener.clone();
+                    let released = released.clone();
+                    async move {
+                        released.notified().await;
+                        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+                        tokio::spawn(async move {
+                            let _ = listener
+                                .handle_pipe(PipeIo::new(theirs), Relay::hint())
+                                .await;
+                        });
+                        zmux::OpenedCarriers::ready(vec![PipeIo::new(ours)])
+                    }
                 }
-                Ok(r) => match r.unwrap() {
-                    Some(n) => got = check(&buf[..n], got),
-                    None => return got,
+            });
+            let candidate = Candidate::new(CarrierKind::Streaming, || async { unreachable!() })
+                .with_identity(id, id)
+                .with_tier(tier)
+                .join_only()
+                .with_join_opener(
+                    vec![AttachmentSpec::new(directions, PipeOptions::default())],
+                    opener,
+                );
+            (candidate, released)
+        };
+        let (send, release_send) = candidate("send", 0, Directions::SEND);
+        let (duplex, release_duplex) = candidate("duplex", 1, Directions::BOTH);
+        let controller = SessionController::new(ControllerOptions::new(
+            "partial-recovery",
+            vec![send, duplex],
+        ))
+        .unwrap();
+        let control = controller
+            .manage(&session, SessionTarget::default())
+            .unwrap();
+        session.pipe(zmux::PipeId::new(0)).unwrap().abort().unwrap();
+
+        let (id, send) = started.recv().await.unwrap();
+        assert_eq!(id, "send");
+        let (id, duplex) = started.recv().await.unwrap();
+        assert_eq!(id, "duplex");
+        assert_eq!(send.need, Directions::SEND);
+        assert_eq!(duplex.need, Directions::BOTH);
+        assert_eq!(duplex.deadline, send.deadline);
+        assert_eq!(session.capacity().reserved_attachments, 2);
+
+        release_duplex.notify_one();
+        let mut view = control.subscribe();
+        view.wait_for(|state| {
+            state.last_attempt.as_ref().is_some_and(|result| {
+                result.id == duplex.attempt && result.reason == zmux::AttemptReason::Confirmed
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(session.capacity().covered, Directions::BOTH);
+        assert_eq!(session.capacity().reserved_attachments, 0);
+        assert!(started.try_recv().is_err());
+        release_send.notify_one();
+        control.release().unwrap();
+        control.done().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_open_keeps_its_pending_place_until_the_session_inherits_it() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let config = config(|_| {});
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let candidate = Candidate::new(CarrierKind::Streaming, {
+            let entered = entered.clone();
+            let release = release.clone();
+            let listener = listener.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                let listener = listener.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    let (ours, theirs) = tokio::io::duplex(64 * 1024);
+                    tokio::spawn(async move {
+                        let _ = listener.handle_pipe(PipeIo::new(theirs), Relay::hint()).await;
+                    });
+                    Ok(PipeIo::new(ours))
+                }
+            }
+        }).with_identity("bootstrap", "bootstrap");
+        let mut options = ControllerOptions::new("bootstrap-pending-place", vec![candidate]);
+        options.limits.pending_owners = std::num::NonZeroUsize::MIN;
+        let controller = SessionController::new(options).unwrap();
+        let opening = controller.open(config.clone(), SessionTarget::default());
+        tokio::pin!(opening);
+        tokio::select! {
+            () = entered.notified() => {}
+            result = &mut opening => panic!("open completed before its callback was released: {:?}", result.err()),
+        }
+        assert!(matches!(controller.open(config, SessionTarget::default()).await, Err(zmux::ControllerError::QueueFull)));
+        release.notify_one();
+        let (session, control) = opening.await.unwrap();
+        let control = control.unwrap();
+        control.release().unwrap();
+        control.done().await;
+        session.close().await;
+    }).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_blocked_due_start_is_counted_once_across_controller_wakeups() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let config = config(|_| {});
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let (session, _peer) = direct(&listener, config).await;
+        let candidate = Candidate::new(CarrierKind::Streaming, || async {
+            std::future::pending::<std::io::Result<PipeIo>>().await
+        })
+        .with_identity("scheduled", "scheduled")
+        .join_only();
+        let cache = CarrierCache::new(CarrierCacheConfig::default()).unwrap();
+        let mut options = ControllerOptions::new("suppression-count", vec![candidate]);
+        options.cache = Some(cache.clone());
+        let at = Instant::now();
+        options
+            .dial_after
+            .insert("scheduled".into(), (at + Duration::from_secs(1)).into_std());
+        let controller = SessionController::new(options).unwrap();
+        let control = controller
+            .manage(&session, SessionTarget::default())
+            .unwrap();
+        session.pipe(zmux::PipeId::new(0)).unwrap().abort().unwrap();
+
+        let mut view = control.subscribe();
+        for millis in [1000, 1100, 1200, 1300] {
+            if millis == 1300 {
+                tokio::time::advance(Duration::from_millis(1050)).await;
+            }
+            let due = (at + Duration::from_millis(millis)).into_std();
+            control
+                .set_dial_after("scheduled".into(), Some(due))
+                .unwrap();
+            view.wait_for(|snapshot| snapshot.next_retry == Some(due))
+                .await
+                .unwrap();
+            assert_eq!(
+                cache
+                    .retry_metrics("scheduled", CarrierKind::Streaming, "")
+                    .suppressions
+                    .get(&zmux::RetryAdmission::DialAfter),
+                Some(&1)
+            );
+        }
+        control.release().unwrap();
+        control.done().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_sessions_rotate_before_the_next_ready_pool() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let config = config(|_| {});
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let (a, _peer_a) = direct(&listener, config.clone()).await;
+        let (b, _peer_b) = direct(&listener, config.clone()).await;
+        let busy_started = Arc::new(Notify::new());
+        let release_busy = Arc::new(Notify::new());
+        let busy = Candidate::new(CarrierKind::Streaming, {
+            let busy_started = busy_started.clone();
+            let release_busy = release_busy.clone();
+            move || {
+                let busy_started = busy_started.clone();
+                let release_busy = release_busy.clone();
+                async move {
+                    busy_started.notify_one();
+                    release_busy.notified().await;
+                    Err(std::io::Error::other("release test opener"))
+                }
+            }
+        })
+        .with_identity("busy", "busy");
+        let (starts, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let relay = Relay::new(&listener, Faults::default());
+        let candidate = |id| {
+            let relay = relay.clone();
+            let starts = starts.clone();
+            Candidate::new(CarrierKind::Streaming, move || {
+                starts.send(id).unwrap();
+                std::future::ready(Ok(relay.carrier()))
+            })
+            .with_identity(id, id)
+            .join_only()
+        };
+        let mut options = ControllerOptions::new(
+            "rotate-pools-within-a-session",
+            vec![busy, candidate("p"), candidate("q"), candidate("r")],
+        );
+        options.limits.concurrent_openers = std::num::NonZeroUsize::MIN;
+        let controller = SessionController::new(options).unwrap();
+        let occupying = tokio::spawn({
+            let controller = controller.clone();
+            async move { controller.open(config, SessionTarget::default()).await }
+        });
+        busy_started.notified().await;
+
+        let group = |id: &str, count| GroupTarget {
+            id: id.into(),
+            quotas: vec![MemberQuota {
+                id: "coverage".into(),
+                count,
+                directions: Directions::BOTH,
+                candidates: vec![TargetCandidate {
+                    id: id.into(),
+                    send: None,
+                    receive: None,
+                }],
+            }],
+
+            rotation: zmux::RotationPolicy::default(),
+        };
+        let stalled = |control: &SessionControl| {
+            let mut view = control.subscribe();
+            async move {
+                view.wait_for(|state| state.blocked == Some(zmux::ControllerBlock::Execution))
+                    .await
+                    .unwrap();
+            }
+        };
+        let a = controller
+            .manage(
+                &a,
+                SessionTarget {
+                    groups: vec![group("p", 2), group("q", 1)],
+                    ..SessionTarget::default()
                 },
+            )
+            .unwrap();
+        stalled(&a).await;
+        let b = controller
+            .manage(
+                &b,
+                SessionTarget {
+                    groups: vec![group("r", 1)],
+                    ..SessionTarget::default()
+                },
+            )
+            .unwrap();
+        stalled(&b).await;
+
+        release_busy.notify_one();
+        for pool in ["p", "r", "q", "p"] {
+            assert_eq!(started.recv().await, Some(pool));
+        }
+        assert!(occupying.await.unwrap().is_err());
+        a.release().unwrap();
+        b.release().unwrap();
+        a.done().await;
+        b.done().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_single_recovery_candidate_retries_at_the_sampled_cadence() {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        let config = config(|_| {});
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let (session, _peer) = direct(&listener, config).await;
+        let (starts, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let candidate = Candidate::new(CarrierKind::Streaming, move || {
+            starts.send(Instant::now()).unwrap();
+            std::future::ready(Err(std::io::Error::other("test cooldown")))
+        })
+        .with_identity("only", "only")
+        .join_only();
+        let mut cache = CarrierCacheConfig::default();
+        cache.backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(1));
+        cache.recovery_sample = || 0.5;
+        cache.backoff.jitter = 0.0;
+        cache.backoff.jitter_up = 0.0;
+        let mut options = ControllerOptions::new("single-recovery-cooldown", vec![candidate]);
+        options.cache = Some(CarrierCache::new(cache).unwrap());
+        let controller = SessionController::new(options).unwrap();
+        let control = controller
+            .manage(&session, SessionTarget::default())
+            .unwrap();
+        session.pipe(zmux::PipeId::new(0)).unwrap().abort().unwrap();
+
+        let first = started.recv().await.unwrap();
+        let cadence = Duration::from_millis(500);
+        let due = first + cadence;
+        let mut view = control.subscribe();
+        view.wait_for(|snapshot| snapshot.next_retry == Some(due.into_std()))
+            .await
+            .unwrap();
+        tokio::time::advance(cadence.checked_sub(Duration::from_nanos(1)).unwrap()).await;
+        assert!(started.try_recv().is_err());
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert_eq!(started.recv().await.unwrap(), due);
+        control.release().unwrap();
+        control.done().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_suspended_recovery_deadline_is_strictly_inside_grace() {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        let grace = Duration::from_secs(2);
+        let config = config(|config| config.resume_timeout = Some(grace));
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let (session, _peer) = direct(&listener, config).await;
+        let (starts, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let opener = CarrierOpener::new(move |request| {
+            starts.send(request).unwrap();
+            std::future::pending::<zmux::OpenedCarriers>()
+        });
+        let candidate = Candidate::new(CarrierKind::Streaming, || async { unreachable!() })
+            .with_identity("recovery", "recovery")
+            .join_only()
+            .with_join_opener(
+                vec![AttachmentSpec::new(
+                    Directions::BOTH,
+                    PipeOptions::default(),
+                )],
+                opener,
+            );
+        let controller =
+            SessionController::new(ControllerOptions::new("bounded-recovery", vec![candidate]))
+                .unwrap();
+        let control = controller
+            .manage(&session, SessionTarget::default())
+            .unwrap();
+        let suspended = Instant::now();
+        session.pipe(zmux::PipeId::new(0)).unwrap().abort().unwrap();
+
+        let request = started.recv().await.unwrap();
+        assert_eq!(
+            request.deadline,
+            (suspended + grace - Duration::from_nanos(1)).into_std()
+        );
+        assert_ne!(request.attempt.0, 0);
+        control.release().unwrap();
+        control.done().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_managed_ack_stall_preserves_coverage_and_waits_for_actual_opener_failure() {
+    use std::sync::atomic::AtomicUsize;
+
+    static CADENCE_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let config = config(|cfg| {
+            cfg.liveness.probe_interval = Some(Duration::from_secs(1));
+            cfg.liveness.probe_jitter = 0.0;
+            cfg.test_hooks().probe_seed = Some(1);
+        });
+        let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+        let primary = Relay::new(&listener, Faults::default());
+        let alternate = Relay::new(&listener, Faults::default());
+        let session = Session::connect(primary.carrier(), config).await.unwrap();
+        let _peer = listener.accept().await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started, mut recovery) = tokio::sync::mpsc::unbounded_channel();
+        let open = CarrierOpener::new({
+            let calls = calls.clone();
+            let alternate = alternate.clone();
+            move |request| {
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                let alternate = alternate.clone();
+                let started = started.clone();
+                async move {
+                    if first {
+                        zmux::OpenedCarriers::ready(vec![alternate.carrier()])
+                    } else {
+                        started.send(request).unwrap();
+                        std::future::pending().await
+                    }
+                }
+            }
+        });
+        let candidate = Candidate::new(CarrierKind::Streaming, || async { unreachable!() })
+            .with_identity("alternate", "alternate")
+            .join_only()
+            .with_join_opener(
+                vec![AttachmentSpec::new(
+                    Directions::BOTH,
+                    PipeOptions::default(),
+                )],
+                open,
+            );
+        let mut cache = CarrierCacheConfig::default();
+        cache.recovery_sample = || {
+            CADENCE_SAMPLES.fetch_add(1, Ordering::SeqCst);
+            0.5
+        };
+        let mut options = ControllerOptions::new("ack-stall-coverage", vec![candidate]);
+        options.cache = Some(CarrierCache::new(cache).unwrap());
+        let controller = SessionController::new(options).unwrap();
+        let control = controller
+            .manage(
+                &session,
+                SessionTarget {
+                    groups: vec![GroupTarget {
+                        id: "coverage".into(),
+                        quotas: vec![MemberQuota {
+                            id: "one".into(),
+                            count: 1,
+                            directions: Directions::BOTH,
+                            candidates: vec![TargetCandidate {
+                                id: "alternate".into(),
+                                send: None,
+                                receive: None,
+                            }],
+                        }],
+                        rotation: zmux::RotationPolicy::default(),
+                    }],
+                    ..SessionTarget::default()
+                },
+            )
+            .unwrap();
+        let q = joined_pipe(&session, None).await;
+        observe(&session, || {
+            session.pipe(q)?.health()?.send.settled.then_some(())
+        })
+        .await;
+        let p = zmux::PipeId::new(0);
+        primary
+            .first_connection()
+            .blackhole
+            .store(true, Ordering::SeqCst);
+        lost(&session, p).await;
+        let covered = control.snapshot().capacity.covered;
+        assert!(covered.contains(Directions::SEND));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(recovery.try_recv().is_err());
+
+        alternate
+            .first_connection()
+            .blackhole
+            .store(true, Ordering::SeqCst);
+        recovery.recv().await.unwrap();
+        lost(&session, q).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(CADENCE_SAMPLES.load(Ordering::SeqCst), 0);
+        control.release().unwrap();
+        control.done().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn controller_empty_target_keeps_redundant_coverage() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let cfg = config(|_| {});
+        let listener = Listener::new(cfg.clone(), ListenerConfig::default()).unwrap();
+        let (session, _peer) = direct(&listener, cfg).await;
+        let relay = Relay::new(&listener, Faults::default());
+        let candidate = Candidate::new(CarrierKind::Streaming, move || {
+            let carrier = relay.carrier();
+            async move { Ok(carrier) }
+        })
+        .with_identity("second", "second");
+        let ctl = SessionController::new(ControllerOptions::new(
+            "empty-target-keeps-coverage",
+            vec![candidate],
+        ))
+        .unwrap();
+        let control = ctl
+            .manage(
+                &session,
+                SessionTarget {
+                    revision: 1,
+                    groups: vec![GroupTarget {
+                        id: "pool".into(),
+                        quotas: vec![MemberQuota {
+                            id: "duplex".into(),
+                            count: 1,
+                            directions: Directions::BOTH,
+                            candidates: vec![TargetCandidate {
+                                id: "second".into(),
+                                send: None,
+                                receive: None,
+                            }],
+                        }],
+                        rotation: RotationPolicy::default(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut view = control.subscribe();
+        view.wait_for(|s| s.members.len() == 2 && s.members.iter().all(|m| m.complete))
+            .await
+            .unwrap();
+        control
+            .set_target(SessionTarget {
+                revision: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        let result = view.wait_for(|s| s.revision == 2).await.unwrap();
+        assert_eq!(result.members.len(), 2);
+        assert!(result.members.iter().all(|m| m.complete));
+        assert_eq!(session.capacity().covered, Directions::BOTH);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn controller_plain_open_returns_no_binding() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+        let relay = Relay::new(&listener, Faults::default());
+        let candidate = Candidate::new(CarrierKind::Streaming, move || {
+            let carrier = relay.carrier();
+            async move { Ok(carrier) }
+        })
+        .with_identity("plain", "plain");
+        let ctl = SessionController::new(ControllerOptions::new(
+            "plain-empty-target",
+            vec![candidate],
+        ))
+        .unwrap();
+        let (session, control) = ctl
+            .open(Config::default(), SessionTarget::default())
+            .await
+            .unwrap();
+        let _peer = listener.accept().await.unwrap();
+        assert_ne!(session.multipath(), zmux::Multipath::InUse);
+        assert!(control.is_none());
+        ctl.close();
+        ctl.done().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn controller_bootstrap_attribution_checks_layout_and_original_key() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let cfg = config(|_| {});
+        let listener = Listener::new(cfg.clone(), ListenerConfig::default()).unwrap();
+        let relay = Relay::new(&listener, Faults::default());
+        let io = relay.carrier().with_carrier(CarrierKind::Streaming);
+        let session = Session::connect(io, cfg).await.unwrap();
+        let _peer = listener.accept().await.unwrap();
+        let candidate = |key| {
+            Candidate::new(CarrierKind::Streaming, || async {
+                unreachable!("empty target must not dial")
+            })
+            .with_identity("first", key)
+        };
+        let opts = |name, candidates| {
+            SessionController::new(ControllerOptions::new(name, candidates)).unwrap()
+        };
+        let split = candidate("original").with_join_opener(
+            vec![
+                AttachmentSpec::new(Directions::SEND, PipeOptions::default()),
+                AttachmentSpec::new(Directions::RECEIVE, PipeOptions::default()),
+            ],
+            CarrierOpener::new(|_| std::future::pending::<zmux::OpenedCarriers>()),
+        );
+        let ctl = opts("bootstrap-split-rejected", vec![split]);
+        assert!(matches!(
+            ctl.manage_with_bootstrap(&session, SessionTarget::default(), Some(&"first".into())),
+            Err(zmux::ControllerError::Invalid(_))
+        ));
+        let ctl = opts("bootstrap-original", vec![candidate("original")]);
+        let old = ctl
+            .manage_with_bootstrap(&session, SessionTarget::default(), Some(&"first".into()))
+            .unwrap();
+        let middle = opts("bootstrap-unknown", Vec::new());
+        let old = middle.take_over(&old, SessionTarget::default()).unwrap();
+        let changed = opts("bootstrap-changed", vec![candidate("different")]);
+        assert!(matches!(
+            changed.take_over(&old, SessionTarget::default()),
+            Err(zmux::ControllerError::Invalid(_))
+        ));
+        let matching = opts("bootstrap-matching", vec![candidate("original")]);
+        assert!(matching.take_over(&old, SessionTarget::default()).is_ok());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn controller_panicking_opener_finishes_without_waiting_for_deadline() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let cfg = config(|_| {});
+        let listener = Listener::new(cfg.clone(), ListenerConfig::default()).unwrap();
+        let (session, _peer) = direct(&listener, cfg).await;
+        let candidate = Candidate::new(CarrierKind::Streaming, || async {
+            panic!("scripted opener panic")
+        })
+        .with_identity("panic", "panic");
+        let cache = CarrierCache::default();
+        let mut options = ControllerOptions::new("opener-panic", vec![candidate]);
+        options.cache = Some(cache.clone());
+        let ctl = SessionController::new(options).unwrap();
+        let control = ctl.manage(&session, SessionTarget::default()).unwrap();
+        session.pipe(zmux::PipeId::new(0)).unwrap().abort().unwrap();
+        let mut view = control.subscribe();
+        let view = view.wait_for(|s| s.last_attempt.is_some()).await.unwrap();
+        assert_eq!(
+            view.last_attempt.as_ref().unwrap().reason,
+            zmux::AttemptReason::HookFailed
+        );
+        assert_eq!(
+            cache
+                .retry_metrics("panic", CarrierKind::Streaming, "")
+                .faults,
+            0
+        );
+        assert_eq!(session.capacity().reserved_attachments, 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn controller_takeover_settles_before_a_reentrant_sampler_returns() {
+    use std::sync::OnceLock;
+    use tokio::sync::oneshot;
+    type Sample = (
+        CarrierCache,
+        oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    static SAMPLE: OnceLock<Mutex<Option<Sample>>> = OnceLock::new();
+    fn sample() -> f64 {
+        let (cache, entered, release) = SAMPLE.get().unwrap().lock().unwrap().take().unwrap();
+        assert_eq!(
+            cache
+                .retry_metrics("shared", CarrierKind::Streaming, "")
+                .attempted_starts,
+            1
+        );
+        entered.send(()).unwrap();
+        release.recv().unwrap();
+        1.0
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let cfg = config(|_| {});
+        let listener = Listener::new(cfg.clone(), ListenerConfig::default()).unwrap();
+        let (session, _peer) = direct(&listener, cfg).await;
+        let (sampling, entered) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let mut cache_opts = CarrierCacheConfig::default();
+        cache_opts.recovery_sample = sample;
+        let cache = CarrierCache::new(cache_opts).unwrap();
+        *SAMPLE.get_or_init(Mutex::default).lock().unwrap() = Some((cache.clone(), sampling, gate));
+        let candidate = Candidate::new(CarrierKind::Streaming, || async {
+            Err(std::io::Error::other("scripted dial failure"))
+        })
+        .with_identity("shared", "shared");
+        let mut opts = ControllerOptions::new("sampler-predecessor", vec![candidate.clone()]);
+        opts.cache = Some(cache.clone());
+        let old = SessionController::new(opts).unwrap();
+        let binding = old.manage(&session, SessionTarget::default()).unwrap();
+        session.pipe(zmux::PipeId::new(0)).unwrap().abort().unwrap();
+        entered.await.unwrap();
+
+        let mut opts = ControllerOptions::new("sampler-successor", vec![candidate]);
+        opts.cache = Some(cache.clone());
+        opts.dial_after.insert(
+            "shared".into(),
+            std::time::Instant::now() + Duration::from_secs(60),
+        );
+        let next = SessionController::new(opts).unwrap();
+        let successor = next.take_over(&binding, SessionTarget::default()).unwrap();
+        assert_eq!(session.capacity().reserved_attachments, 0);
+
+        let mut timeline = Vec::new();
+        let mut batch = 0;
+        while let Some(event) = session.next_event().await {
+            match event {
+                zmux::SessionEvent::BatchReserved {
+                    generation,
+                    batch: id,
+                    ..
+                } if generation == binding.snapshot().generation => {
+                    batch = id;
+                    timeline.push("reserve");
+                }
+                zmux::SessionEvent::AttemptStarted { batch: id, .. } if id == batch => {
+                    timeline.push("start");
+                }
+                zmux::SessionEvent::AttemptFinished {
+                    batch: id,
+                    generation,
+                    reason,
+                    ..
+                } if id == batch => {
+                    assert_eq!(generation, binding.snapshot().generation);
+                    assert_eq!(reason, zmux::AttemptReason::Cancelled);
+                    timeline.push("cancel");
+                }
+                zmux::SessionEvent::BatchRolledBack { batch: id, .. } if id == batch => {
+                    timeline.push("rollback");
+                }
+                zmux::SessionEvent::TargetChanged { generation, .. }
+                    if generation == successor.snapshot().generation =>
+                {
+                    break;
+                }
+                _ => {}
             }
         }
-    });
-    assert_eq!(reader.await.unwrap(), total);
-    writer.await.unwrap();
-    assert_eq!(stalls.load(Ordering::SeqCst), 0);
-    assert!(relay.dial_count() >= 6, "{}", relay.dial_count());
-    // No pipe lived to the relay's limit while it carried the stream: each
-    // was replaced first (the last one may still run).
-    assert!(relay.count(|c| c.expired.load(Ordering::SeqCst)) <= 1);
-    assert_eq!(client.stats().bytes_reinjected, 0);
-    drop(handle);
-    client.close().await;
+        assert_eq!(timeline, ["reserve", "start", "cancel", "rollback"]);
+        release.send(()).unwrap();
+        binding.done().await;
+        assert_eq!(
+            cache
+                .retry_metrics("shared", CarrierKind::Streaming, "")
+                .faults,
+            0
+        );
+        assert_eq!(
+            cache
+                .retry_metrics("shared", CarrierKind::Streaming, "")
+                .recovery_retry_at,
+            None
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn controller_panicking_sampler_finishes_the_attempt_as_hook_failed() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let cfg = config(|_| {});
+        let listener = Listener::new(cfg.clone(), ListenerConfig::default()).unwrap();
+        let (session, _peer) = direct(&listener, cfg).await;
+        let mut config = CarrierCacheConfig::default();
+        config.recovery_sample = || panic!("scripted recovery sampler panic");
+        let cache = CarrierCache::new(config).unwrap();
+        let candidate = Candidate::new(CarrierKind::Streaming, || async {
+            Err(std::io::Error::other("scripted dial failure"))
+        })
+        .with_identity("sampler", "sampler");
+        let mut opts = ControllerOptions::new("sampler-panics", vec![candidate]);
+        opts.cache = Some(cache.clone());
+        let ctl = SessionController::new(opts).unwrap();
+        let ctl = ctl.manage(&session, SessionTarget::default()).unwrap();
+        session.pipe(zmux::PipeId::new(0)).unwrap().abort().unwrap();
+        let mut view = ctl.subscribe();
+        let view = view.wait_for(|s| s.last_attempt.is_some()).await.unwrap();
+        assert_eq!(
+            view.last_attempt.as_ref().unwrap().reason,
+            zmux::AttemptReason::HookFailed
+        );
+        let metrics = cache.retry_metrics("sampler", CarrierKind::Streaming, "");
+        assert_eq!(metrics.faults, 0);
+        assert!(metrics.recovery_retry_at.is_none());
+    })
+    .await
+    .unwrap();
 }

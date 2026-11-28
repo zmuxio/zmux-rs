@@ -258,12 +258,10 @@ pub(crate) struct Limiter {
     /// The bytes in flight at the last event: from the acknowledged
     /// position to the end of the last ack-eliciting byte (RFC 9002 Section 2).
     in_flight: u64,
-    /// Held back now; when the bucket lets it go again (`None`: when an
-    /// acknowledgement makes room under the cap).
+    /// Whether the limiter currently holds the pipe back.
     held: bool,
     /// When the current hold began.
     held_at: Instant,
-    release: Option<Instant>,
 }
 
 impl Limiter {
@@ -283,7 +281,6 @@ impl Limiter {
             in_flight: 0,
             held: false,
             held_at: now,
-            release: None,
         }
     }
 
@@ -291,11 +288,6 @@ impl Limiter {
     /// scheduler).
     pub(crate) fn held(&self) -> bool {
         self.held
-    }
-
-    /// When a held pipe may send again without an acknowledgement.
-    pub(crate) fn release(&self) -> Option<Instant> {
-        self.release.filter(|_| self.held)
     }
 
     /// Holds the pipe back, with no release time (tests).
@@ -464,11 +456,16 @@ impl Limiter {
     /// of it at quantum = `R_p` x G with wake-ups 1 to 2 ms apart), more than
     /// the cycle's probing gain makes up, and `R_p` would fall round by round
     /// while the RTT stays at the base.
-    pub(crate) fn refresh(&mut self, now: Instant, in_flight: u64, est: &Estimator, p: &Params) {
+    pub(crate) fn refresh(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        est: &Estimator,
+        p: &Params,
+    ) -> Option<Instant> {
         self.advance(now, in_flight, est, p);
         let was = self.held;
         self.held = self.room(now, in_flight, est, p) == 0;
-        self.release = None;
         if self.held && !was {
             self.held_at = now;
         }
@@ -480,11 +477,12 @@ impl Limiter {
             // An absolute time, no earlier than G after the hold began and
             // kept until the next decision: taken as G from the current
             // time whenever it is read, it would move on with every event.
-            self.release = Duration::try_from_secs_f64(wait)
-                .ok()
-                .and_then(|w| now.checked_add(w))
-                .map(|r| r.max(self.held_at + GRANULARITY));
+            let minimum = self.held_at.checked_add(GRANULARITY)?;
+            return now
+                .checked_add(Duration::try_from_secs_f64(wait).ok()?)
+                .map(|at| at.max(minimum));
         }
+        None
     }
 
     /// A batch of `bytes` was handed to the carrier. The bucket pays for
@@ -510,7 +508,7 @@ impl Limiter {
         ev: &AckEvent<'_>,
         est: &mut Estimator,
         p: &Params,
-    ) {
+    ) -> Option<Instant> {
         // The bucket and the cycle are settled at the gain, mode and bytes
         // in flight that applied so far.
         self.advance(now, self.in_flight, est, p);
@@ -587,7 +585,7 @@ impl Limiter {
                 }
             }
         }
-        self.refresh(now, in_flight, est, p);
+        self.refresh(now, in_flight, est, p)
     }
 
     /// A round trip of the pipe measured outside `PIPE_ACK`: the response to
@@ -754,6 +752,7 @@ mod tests {
         arrivals: std::collections::VecDeque<(Instant, u64)>,
         round_end: u64,
         last_ack: (Instant, u64),
+        release: Option<Instant>,
     }
 
     impl Path {
@@ -772,6 +771,7 @@ mod tests {
                 arrivals: std::collections::VecDeque::default(),
                 round_end: 0,
                 last_ack: (now, 0),
+                release: None,
             }
         }
 
@@ -817,6 +817,7 @@ mod tests {
                     self.flight.pop_front();
                 }
                 let sample = AckSample {
+                    delivery: false,
                     rtt: Some(RttSample {
                         latest: rtt,
                         adjusted: rtt,
@@ -833,10 +834,10 @@ mod tests {
                     sent: self.sent,
                     held: Held::default(),
                 };
-                self.lim.on_ack(now, &ev, &mut self.est, &p);
+                self.release = self.lim.on_ack(now, &ev, &mut self.est, &p);
             }
-            if self.lim.release().is_some_and(|t| t <= now) {
-                self.lim.refresh(now, self.sent - self.acked, &self.est, &p);
+            if self.release.is_some_and(|t| t <= now) {
+                self.release = self.lim.refresh(now, self.sent - self.acked, &self.est, &p);
             }
             let room = self.lim.room(now, self.sent - self.acked, &self.est, &p);
             if room > 0 && !self.lim.held() {
@@ -850,7 +851,7 @@ mod tests {
                 self.busy_until = done;
                 self.arrivals.push_back((done + self.rtt / 2, self.sent));
                 self.lim.on_sent(now, n, &self.est, &p);
-                self.lim.refresh(now, self.sent - self.acked, &self.est, &p);
+                self.release = self.lim.refresh(now, self.sent - self.acked, &self.est, &p);
             }
         }
 
@@ -999,9 +1000,8 @@ mod tests {
         let room = lim.room(t, 0, &est, &p);
         assert!((1_200_000..=1_300_000).contains(&room), "{room}");
         lim.on_sent(t, room, &est, &p);
-        lim.refresh(t, 0, &est, &p);
+        let release = lim.refresh(t, 0, &est, &p).unwrap();
         assert!(lim.held());
-        let release = lim.release().unwrap();
         assert_eq!(release, t + GRANULARITY, "{:?}", release - t);
         // A slow pipe with room under its cap: the quantum is two chunks.
         let mut est = Estimator::new(10 * MS, now);
@@ -1087,9 +1087,8 @@ mod tests {
         });
         let quantum = f64_of(2 * p.chunk);
         lim.on_sent(t0, 2 * p.chunk, &est, &p);
-        lim.refresh(t0, 0, &est, &p);
+        let release = lim.refresh(t0, 0, &est, &p).unwrap();
         assert!(lim.held());
-        let release = lim.release().unwrap();
         // Woken 3 ms late: what accrued since is sent, not cut at the
         // quantum; whole chunks.
         let late = release + 3 * MS;

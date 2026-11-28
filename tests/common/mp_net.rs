@@ -74,6 +74,8 @@ pub(crate) struct Flow {
     pub(crate) write_err_reported: bool,
     /// The writer shut its half down or closed it.
     pub(crate) writer_closed: bool,
+    pub(crate) hold_shutdown: bool,
+    pub(crate) shutdown_pending: bool,
     /// The reader closed its half; bytes pile up unread.
     pub(crate) reader_closed: bool,
     /// Writable, as the writer's core was last told.
@@ -95,6 +97,8 @@ impl Flow {
             write_err: false,
             write_err_reported: false,
             writer_closed: false,
+            hold_shutdown: false,
+            shutdown_pending: false,
             reader_closed: false,
             writable: true,
         }
@@ -308,6 +312,17 @@ impl<X: Observe, S> MpNet<X, S> {
         }
         let cap = l.cap;
         let core = &mut self.ends[w];
+        let flow = &mut l.flows[w];
+        if flow.shutdown_pending {
+            if !flow.hold_shutdown {
+                flow.shutdown_pending = false;
+                flow.writer_closed = true;
+                flow.fin = true;
+                l.socket_closed(w);
+                core.write_shutdown_complete(pipe, now);
+            }
+            return;
+        }
         if w == A && l.joining != Joining::Records {
             if l.joining == Joining::Hello && l.flows[A].takes && !l.flows[A].writer_closed {
                 if l.flows[A].write_err {
@@ -323,7 +338,9 @@ impl<X: Observe, S> MpNet<X, S> {
                         &zmux::shaping::UnitPlan::default(),
                         now,
                     ) {
-                        Ok(hello) => {
+                        Ok(mut hello) => {
+                            let len = hello.len();
+                            core.complete_join_write(&mut hello, len, false, now);
                             l.flows[A].push(now, &hello);
                             l.joining = Joining::Reply;
                         }
@@ -380,9 +397,14 @@ impl<X: Observe, S> MpNet<X, S> {
                 let f = &mut l.flows[w];
                 f.push(now, &self.wire);
                 if t == Transmit::Shutdown {
-                    f.writer_closed = true;
-                    f.fin = true;
-                    l.socket_closed(w);
+                    if f.hold_shutdown {
+                        f.shutdown_pending = true;
+                    } else {
+                        f.writer_closed = true;
+                        f.fin = true;
+                        l.socket_closed(w);
+                        core.write_shutdown_complete(pipe, now);
+                    }
                     break;
                 }
                 if self.wire.is_empty() {

@@ -60,10 +60,14 @@ pub mod id {
     pub const ZMUX_PREAMBLE: u64 = 0x0439_e07a;
     /// `zmux_priority`.
     pub const ZMUX_PRIORITY: u64 = 0x31e7_139d;
-    /// `zmux_datagram_flows`.
-    pub const ZMUX_DATAGRAM_FLOWS: u64 = 0x0af3_91ed;
+    /// Retired `zmux_datagram_flows` parameter.
+    pub const RETIRED_ZMUX_DATAGRAM_FLOWS: u64 = 0x0af3_91ed;
+    /// `zmux_datagram_family`.
+    pub const ZMUX_DATAGRAM_FAMILY: u64 = 0x27e7_a042;
     /// `zmux_carrier_datagrams`.
     pub const ZMUX_CARRIER_DATAGRAMS: u64 = 0x3d27_4c5f;
+    /// `zmux_carrier_datagram_padding`.
+    pub const ZMUX_CARRIER_DATAGRAM_PADDING: u64 = 0x2071_d4ee;
     /// `zmux_multipath`.
     pub const ZMUX_MULTIPATH: u64 = 0x30dc_2978;
     /// `zmux_session_crypto`.
@@ -128,7 +132,7 @@ pub const DEFAULT_MAX_ACK_DELAY_MS: u64 = 25;
 pub const MAX_PREAMBLE_TP_OVERHEAD: u64 = 32;
 /// The most a `zmux_preamble` may say (EXTENSIONS Section 4.1): the carrier record floor
 /// (8192) less [`MAX_PREAMBLE_TP_OVERHEAD`].
-pub const MAX_PREAMBLE_FIELD: u64 = 8192 - MAX_PREAMBLE_TP_OVERHEAD;
+pub const MAX_PREAMBLE_FIELD: u64 = super::record::RECORD_FLOOR as u64 - MAX_PREAMBLE_TP_OVERHEAD;
 
 /// The GREASE parameter ID 31 * `n` + 27 (RFC 9000 Section 18.1), or `None`
 /// if it does not fit in a varint.
@@ -304,26 +308,6 @@ impl MultipathParameter {
     }
 }
 
-/// The zmux floor: what every zmux endpoint
-/// advertises at least, and so what early data may use before the peer's
-/// parameters arrive: 4 bidirectional streams, 4096 bytes of each
-/// (preamble included), 16384 bytes in all, preambles of up to 1024
-/// bytes. The values are in the units of the [`crate::Config`] fields
-/// they bound (`u64` bytes or streams).
-pub mod floor {
-    /// `initial_max_data`.
-    pub const MAX_DATA: u64 = 16384;
-    /// `initial_max_streams_bidi`: 4, or 0 for an endpoint that accepts
-    /// no bidirectional streams.
-    pub const MAX_STREAMS_BIDI: u64 = 4;
-    /// `initial_max_stream_data_bidi_remote`.
-    pub const MAX_STREAM_DATA: u64 = 4096;
-    /// `zmux_preamble` (Maximum Preamble Size).
-    pub const MAX_PREAMBLE: u64 = 1024;
-    /// `max_record_size` under the floor.
-    pub const MAX_RECORD_SIZE: u64 = super::DEFAULT_MAX_RECORD_SIZE;
-}
-
 /// The `max_lanes` zmux endpoints announce by default: the default
 /// stream concurrency of 256, lane 0 and the copy lane.
 pub const DEFAULT_MAX_LANES: NonZeroU64 = NonZeroU64::new(258).expect("not 0");
@@ -433,11 +417,13 @@ pub struct TransportParameters {
     pub zmux_preamble: Option<u64>,
     /// `zmux_priority`.
     pub zmux_priority: bool,
-    /// `zmux_datagram_flows`.
-    pub zmux_datagram_flows: bool,
+    /// `zmux_datagram_family`.
+    pub zmux_datagram_family: bool,
     /// `zmux_carrier_datagrams`: the sender accepts DATAGRAM frames on the
     /// datagram channels of its pipes' carriers.
     pub zmux_carrier_datagrams: bool,
+    /// Accepts leading PADDING on the carrier datagram channel.
+    pub zmux_carrier_datagram_padding: bool,
     /// `zmux_multipath`.
     pub zmux_multipath: Option<MultipathParameter>,
     /// `zmux_session_crypto`: the Join Suites and Groups the endpoint declares.
@@ -540,8 +526,9 @@ impl TransportParameters {
             && !self.zmux_goaway
             && self.zmux_preamble.is_none()
             && !self.zmux_priority
-            && !self.zmux_datagram_flows
+            && !self.zmux_datagram_family
             && !self.zmux_carrier_datagrams
+            && !self.zmux_carrier_datagram_padding
             && self.zmux_multipath.is_none()
             && self.zmux_session_crypto.is_none()
             && !self.zmux_pipe_ack
@@ -591,6 +578,9 @@ impl TransportParameters {
         if let Some(v) = self.max_datagram_frame_size {
             f(id::MAX_DATAGRAM_FRAME_SIZE, Value::Varint(v))?;
         }
+        if self.zmux_datagram_family {
+            f(id::ZMUX_DATAGRAM_FAMILY, Value::Empty)?;
+        }
         if let Some(r) = self.zmux_role {
             f(id::ZMUX_ROLE, Value::Role(r))?;
         }
@@ -603,11 +593,11 @@ impl TransportParameters {
         if self.zmux_priority {
             f(id::ZMUX_PRIORITY, Value::Empty)?;
         }
-        if self.zmux_datagram_flows {
-            f(id::ZMUX_DATAGRAM_FLOWS, Value::Empty)?;
-        }
         if self.zmux_carrier_datagrams {
             f(id::ZMUX_CARRIER_DATAGRAMS, Value::Empty)?;
+        }
+        if self.zmux_carrier_datagram_padding {
+            f(id::ZMUX_CARRIER_DATAGRAM_PADDING, Value::Empty)?;
         }
         if self.zmux_pipe_ack {
             f(id::ZMUX_PIPE_ACK, Value::Empty)?;
@@ -702,6 +692,11 @@ impl TransportParameters {
     /// Parses and validates a parameter block: every violation is a
     /// `TRANSPORT_PARAMETER_ERROR`.
     pub fn decode(block: &[u8]) -> Result<Self, Error> {
+        Self::decode_block(block)
+            .map_err(|e| Error::new(e.code(), FrameType::QX_TRANSPORT_PARAMETERS.0, e.reason()))
+    }
+
+    fn decode_block(block: &[u8]) -> Result<Self, Error> {
         let mut tp = Self::default();
         for p in RawParameters::new(block) {
             let (pid, value) = p?;
@@ -711,11 +706,10 @@ impl TransportParameters {
             return Err(Error::transport_parameter("duplicate transport parameter"));
         }
         tp.validate()?;
+        if !tp.zmux_datagram_family && !tp.is_plain_qmux() {
+            return Err(Error::transport_parameter("missing zmux_datagram_family"));
+        }
         Ok(tp)
-    }
-
-    pub(crate) fn validate_block(block: &[u8]) -> Result<(), Error> {
-        Self::decode(block).map(drop)
     }
 
     fn set(&mut self, pid: u64, value: &[u8]) -> Result<(), Error> {
@@ -756,8 +750,16 @@ impl TransportParameters {
             id::ZMUX_GOAWAY => self.zmux_goaway = empty()?,
             id::ZMUX_PREAMBLE => self.zmux_preamble = Some(varint()?),
             id::ZMUX_PRIORITY => self.zmux_priority = empty()?,
-            id::ZMUX_DATAGRAM_FLOWS => self.zmux_datagram_flows = empty()?,
+            id::ZMUX_DATAGRAM_FAMILY => self.zmux_datagram_family = empty()?,
+            id::RETIRED_ZMUX_DATAGRAM_FLOWS => {
+                return Err(Error::transport_parameter(
+                    "retired zmux_datagram_flows parameter",
+                ));
+            }
             id::ZMUX_CARRIER_DATAGRAMS => self.zmux_carrier_datagrams = empty()?,
+            id::ZMUX_CARRIER_DATAGRAM_PADDING => {
+                self.zmux_carrier_datagram_padding = empty()?;
+            }
             id::ZMUX_MULTIPATH => self.zmux_multipath = Some(MultipathParameter::parse(value)?),
             id::ZMUX_SESSION_CRYPTO => {
                 self.zmux_session_crypto =
@@ -783,6 +785,13 @@ impl TransportParameters {
     /// Checks value ranges and dependencies between parameters.
     pub fn validate(&self) -> Result<(), Error> {
         let err = Error::transport_parameter;
+        if self.zmux_carrier_datagram_padding
+            && (!self.zmux_carrier_datagrams || self.max_datagram_frame_size.unwrap_or(0) == 0)
+        {
+            return Err(err(
+                "zmux_carrier_datagram_padding requires carrier datagram support",
+            ));
+        }
         if self
             .max_record_size
             .is_some_and(|v| v < DEFAULT_MAX_RECORD_SIZE)
@@ -949,12 +958,14 @@ pub struct Features {
     pub preamble: bool,
     /// `PRIORITY_UPDATE`.
     pub priority: bool,
-    /// Datagram flows.
-    pub datagram_flows: bool,
+    /// Both endpoints advertised the current zmux family.
+    pub same_family: bool,
     /// DATAGRAM frames may go on the datagram channels of pipe carriers:
     /// both endpoints sent `zmux_carrier_datagrams` and this one
     /// announced datagram support.
     pub carrier_datagrams: bool,
+    /// Both endpoints declared support for leading PADDING on the channel.
+    pub carrier_datagram_padding: bool,
     /// Multipath.
     pub multipath: bool,
     /// Pipe acknowledgement without multipath.
@@ -973,6 +984,9 @@ impl Features {
     /// Computes the features in use from both endpoints' parameters.
     #[must_use]
     pub fn negotiate(local: &TransportParameters, peer: &TransportParameters) -> Self {
+        if !local.zmux_datagram_family || !peer.zmux_datagram_family {
+            return Self::default();
+        }
         let multipath = match (&local.zmux_multipath, &peer.zmux_multipath) {
             (Some(l), Some(p)) => !matches!(
                 keys::select_secret_source(l.secret_flags, p.secret_flags),
@@ -992,15 +1006,20 @@ impl Features {
         // while multipath or pipe acknowledgement is in use.
         let lanes =
             |tp: &TransportParameters| (multipath || pipe_ack) && tp.max_lanes_or_default() > 1;
+        let carrier_datagrams = local.zmux_carrier_datagrams
+            && peer.zmux_carrier_datagrams
+            && local.max_datagram_frame_size.is_some_and(|m| m > 0);
         Self {
             role: local.zmux_role.is_some() && peer.zmux_role.is_some(),
             goaway: local.zmux_goaway && peer.zmux_goaway,
             preamble: local.zmux_preamble.is_some() && peer.zmux_preamble.is_some(),
             priority: local.zmux_priority && peer.zmux_priority,
-            datagram_flows: local.zmux_datagram_flows && peer.zmux_datagram_flows,
-            carrier_datagrams: local.zmux_carrier_datagrams
-                && peer.zmux_carrier_datagrams
-                && local.max_datagram_frame_size.is_some_and(|m| m > 0),
+            same_family: true,
+            carrier_datagrams,
+            carrier_datagram_padding: carrier_datagrams
+                && local.zmux_carrier_datagram_padding
+                && peer.zmux_carrier_datagram_padding
+                && peer.max_datagram_frame_size.is_some_and(|m| m > 0),
             multipath,
             pipe_ack,
             resume,
@@ -1017,6 +1036,7 @@ impl Features {
         Gates {
             reset_stream_at,
             max_datagram_frame_size,
+            datagram_ack: false,
             goaway: self.goaway,
             priority: self.priority,
             multipath: self.multipath,
@@ -1040,6 +1060,7 @@ mod tests {
             initial_max_streams_bidi: Some(256),
             initial_max_streams_uni: Some(256),
             reset_stream_at: true,
+            zmux_datagram_family: true,
             zmux_goaway: true,
             zmux_preamble: Some(4096),
             zmux_priority: true,
@@ -1079,8 +1100,8 @@ mod tests {
         let mut buf = [0u8; 160];
         let n = tp.encode_frame(Some(grease), &mut buf).unwrap();
         assert_eq!(n, tp.frame_len(Some(grease)));
-        let expected = "ff5153300d0a0d0a40670104800075300404801000000504800400000604\
-                        8004000007048004000008024100090241001d0084528a5f008439e07a025000\
+        let expected = "ff5153300d0a0d0a406c0104800075300404801000000504800400000604\
+                        8004000007048004000008024100090241001d00a7e7a0420084528a5f008439e07a025000\
                         b1e7139d00b4b4762100a7856ef01241028d2f6a01c7e4b35a90f1d26e4b7c0a\
                         39c571c59429cd0845048000ffff4078029a7b";
         let hex = buf[..n].iter().fold(String::new(), |mut s, b| {
@@ -1126,6 +1147,7 @@ mod tests {
         let tp = TransportParameters {
             max_datagram_frame_size: Some(65535),
             zmux_carrier_datagrams: true,
+            zmux_datagram_family: true,
             ..Default::default()
         };
         let mut buf = [0u8; 64];
@@ -1135,7 +1157,7 @@ mod tests {
         // An empty flag: a value is an error.
         assert!(TransportParameters::decode(&[0xbd, 0x27, 0x4c, 0x5f, 0x01, 0x00]).is_err());
         assert!(
-            TransportParameters::decode(&[0xbd, 0x27, 0x4c, 0x5f, 0x00])
+            TransportParameters::decode(&[0xa7, 0xe7, 0xa0, 0x42, 0, 0xbd, 0x27, 0x4c, 0x5f, 0])
                 .unwrap()
                 .zmux_carrier_datagrams
         );
@@ -1145,9 +1167,45 @@ mod tests {
         assert!(!Features::negotiate(&tp, &none).carrier_datagrams);
         let no_dgram = TransportParameters {
             zmux_carrier_datagrams: true,
+            zmux_datagram_family: true,
             ..Default::default()
         };
         assert!(!Features::negotiate(&no_dgram, &tp).carrier_datagrams);
+    }
+
+    #[test]
+    fn carrier_datagram_padding_requires_both_declarations_and_companions() {
+        let mut legacy = TransportParameters {
+            max_datagram_frame_size: Some(65535),
+            zmux_datagram_family: true,
+            zmux_carrier_datagrams: true,
+            ..TransportParameters::default()
+        };
+        let padded = TransportParameters {
+            zmux_carrier_datagram_padding: true,
+            ..legacy.clone()
+        };
+        let mut buf = [0; 64];
+        let len = padded.encode(None, &mut buf).unwrap();
+        assert!(
+            buf[..len]
+                .windows(5)
+                .any(|b| b == [0xa0, 0x71, 0xd4, 0xee, 0])
+        );
+        let received = TransportParameters::decode(&buf[..len]).unwrap();
+        assert!(Features::negotiate(&padded, &received).carrier_datagram_padding);
+        for (local, peer) in [(&padded, &legacy), (&legacy, &padded)] {
+            let features = Features::negotiate(local, peer);
+            assert!(features.carrier_datagrams);
+            assert!(!features.carrier_datagram_padding);
+        }
+        legacy.zmux_carrier_datagram_padding = true;
+        legacy.max_datagram_frame_size = Some(0);
+        assert!(legacy.validate().is_err());
+        legacy.max_datagram_frame_size = Some(1);
+        legacy.zmux_carrier_datagrams = false;
+        assert!(legacy.validate().is_err());
+        assert!(TransportParameters::decode(&[0xa0, 0x71, 0xd4, 0xee, 1, 0]).is_err());
     }
 
     #[test]

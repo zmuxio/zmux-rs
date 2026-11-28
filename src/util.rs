@@ -7,10 +7,65 @@
     expect(unreachable_pub, reason = "re-exported only with the tokio driver")
 )]
 
-use std::time::Duration;
+use std::hash::Hasher;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+
+/// A multiplicative hasher for integer identifiers.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (n ^ (n >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+/// Bounded storage for empty containers, indexed by their capacity.
+pub(crate) struct CapacityPool<T> {
+    entries: Vec<(usize, T)>,
+    weight: usize,
+    limit: usize,
+}
+
+impl<T> CapacityPool<T> {
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            weight: 0,
+            limit,
+        }
+    }
+
+    pub(crate) fn take(&mut self, range: std::ops::RangeInclusive<usize>) -> Option<T> {
+        let at = self
+            .entries
+            .iter()
+            .rposition(|(weight, _)| range.contains(weight))?;
+        let (weight, value) = self.entries.swap_remove(at);
+        self.weight -= weight;
+        Some(value)
+    }
+
+    pub(crate) fn give(&mut self, weight: usize, value: T) {
+        if weight != 0 && weight <= self.limit - self.weight {
+            self.weight += weight;
+            self.entries.push((weight, value));
+        }
+    }
+}
 
 /// HMAC-SHA256 under one key, prepared once: each MAC starts from the
 /// keyed state. Cheap to clone.
@@ -51,6 +106,7 @@ impl HmacSha256 {
     /// Whether `tag` is the MAC of the concatenation of `parts`, or its
     /// first `tag.len()` bytes (1 to 32), compared in constant time.
     #[must_use]
+    #[cfg(all(feature = "tokio", not(loom)))]
     pub fn verify(&self, parts: &[&[u8]], tag: &[u8]) -> bool {
         self.update(parts).verify_truncated_left(tag).is_ok()
     }
@@ -64,6 +120,15 @@ pub(crate) fn saturating_secs(secs: f64) -> Duration {
         return Duration::ZERO;
     }
     Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
+}
+
+pub(crate) fn checked_clock_deadline(
+    now: Instant,
+    duration: Duration,
+    field: &'static str,
+) -> Result<Instant, crate::InvalidConfig> {
+    now.checked_add(duration)
+        .ok_or_else(|| crate::InvalidConfig::new(field, "exceeds the configured clock"))
 }
 
 /// The time `bytes` take at `rate` bytes per second (a rate of 0 counts

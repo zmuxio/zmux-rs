@@ -3,7 +3,49 @@
 use std::sync::{Arc, Weak};
 
 use super::attachment::Attachment;
-use crate::proto::listener::{CarrierId, Slot};
+use crate::proto::listener::{
+    AdmissionStats, CarrierId, ListenerCore, ListenerLimits, ListenerStats, Slot,
+};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// Outcome counters common to all listener runtimes.
+#[derive(Default)]
+pub(super) struct ListenerCounts {
+    pub(super) sessions: AtomicU64,
+    pub(super) joins: AtomicU64,
+    pub(super) setup_failures: AtomicU64,
+    pub(super) rejected: AtomicU64,
+    pub(super) refused: AtomicU64,
+    pub(super) timed_out: AtomicU64,
+}
+
+impl ListenerCounts {
+    pub(super) fn snapshot(&self, admission: AdmissionStats) -> ListenerStats {
+        ListenerStats {
+            sessions: self.sessions.load(Relaxed),
+            joins: self.joins.load(Relaxed),
+            setup_failures: self.setup_failures.load(Relaxed),
+            rejected: self.rejected.load(Relaxed),
+            refused: self.refused.load(Relaxed),
+            timed_out: self.timed_out.load(Relaxed),
+            admission,
+        }
+    }
+}
+
+/// Updates the core and account while the listener lock is held, returning
+/// the suspended sessions to close after the lock is released.
+pub(super) fn update_listener_limits<S>(
+    core: &mut ListenerCore,
+    account: &super::account::Account<S>,
+    limits: ListenerLimits,
+) -> Result<Vec<Arc<S>>, crate::InvalidConfig> {
+    limits.validate()?;
+    let mut excess = account.set_memory_limits(limits)?;
+    core.set_limits(limits)?;
+    excess.extend(account.trim_to(limits.max_suspended));
+    Ok(excess)
+}
 
 /// A native listener critical section. Like the session lock, this marks the
 /// lock scope until the underlying guard has been released.
@@ -57,7 +99,29 @@ impl From<CommitError> for crate::HandleError {
     }
 }
 
+/// Checks a handoff while the caller holds the listener lock. The return
+/// value identifies which carrier to deregister before releasing that lock.
+pub(super) fn check_handoff(
+    closed: bool,
+    evicted: bool,
+    remove: bool,
+    id: Option<CarrierId>,
+    willing: impl FnOnce() -> bool,
+) -> Result<Option<CarrierId>, CommitError> {
+    if closed {
+        return Err(CommitError::ListenerClosed);
+    }
+    if evicted {
+        return Err(CommitError::Evicted);
+    }
+    if !willing() {
+        return Err(CommitError::Withdrawn);
+    }
+    Ok(id.filter(|_| remove))
+}
+
 pub(super) trait SlotTable: Send + Sync + 'static {
+    fn deregister(&self, id: CarrierId);
     fn release(&self, slot: Slot);
     /// Holds the listener lock through the final withdrawal check and deregistration.
     fn commit(
@@ -69,9 +133,25 @@ pub(super) trait SlotTable: Send + Sync + 'static {
     ) -> Result<(), CommitError>;
 }
 
+/// A pending carrier registration, released on every exit from setup.
+pub(super) struct Registration<T: SlotTable> {
+    pub(super) table: Arc<T>,
+    pub(super) id: CarrierId,
+}
+
+impl<T: SlotTable> Drop for Registration<T> {
+    fn drop(&mut self) {
+        self.table.deregister(self.id);
+    }
+}
+
 // Endpoints without a listener cannot construct a reservation.
 #[cfg(feature = "tokio")]
 impl SlotTable for std::convert::Infallible {
+    fn deregister(&self, _: CarrierId) {
+        match *self {}
+    }
+
     fn release(&self, _: Slot) {
         match *self {}
     }
@@ -762,6 +842,44 @@ impl<D: super::handle::Driver> Sessions<D> {
     }
 }
 
+/// A refusal before a session could be charged: announce no usable credit.
+/// A message carrier supplies its own record delimiter.
+pub(super) fn bootstrap_refusal_record(
+    framing: crate::proto::record::Framing,
+    out: &mut [u8; 128],
+) -> &[u8] {
+    use crate::proto::frame::{ConnectionClose, Frame, QxTransportParameters};
+    use crate::proto::params::{RoleParameter, TransportParameters};
+    use crate::proto::record::{Framing, RecordBuilder};
+
+    let mut block = [0; 16];
+    let parameters = TransportParameters {
+        zmux_role: Some(RoleParameter::Responder),
+        zmux_datagram_family: true,
+        ..TransportParameters::default()
+    };
+    let n = parameters
+        .encode(None, &mut block)
+        .expect("refusal parameters fit");
+    let mut record = RecordBuilder::new(out, 126).expect("refusal record fits");
+    let parameters = Frame::TransportParameters(QxTransportParameters::from_block(&block[..n]));
+    let refusal = Frame::ConnectionClose(ConnectionClose {
+        application: false,
+        error_code: crate::proto::TransportErrorCode::CONNECTION_REFUSED.0,
+        frame_type: 0,
+        reason: b"memory budget",
+    });
+    record.push(&parameters).expect("refusal parameters fit");
+    record.push(&refusal).expect("refusal close fits");
+    let len = record.finish().expect("valid refusal record");
+    let start = if framing == Framing::Records {
+        len - parameters.encoded_len() - refusal.encoded_len()
+    } else {
+        0
+    };
+    &out[start..len]
+}
+
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
@@ -774,6 +892,7 @@ mod tests {
     }
 
     impl SlotTable for Table {
+        fn deregister(&self, _: CarrierId) {}
         fn release(&self, _: Slot) {
             self.releases.fetch_add(1, SeqCst);
         }

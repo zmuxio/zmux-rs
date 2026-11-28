@@ -3,6 +3,9 @@
 //! on the wire, a connection lost without a Close frame is a failure,
 //! never a clean end, and the source trusted intermediaries report.
 
+#[path = "../../test-support/ticket.rs"]
+mod ticket;
+
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -332,10 +335,12 @@ async fn connect_over_tls() {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
 
-    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
+    let (auth, verifier) = ticket::fixture(zmux::PrefixBinding::Bound);
     let mut limits = ListenerConfig::default();
-    limits.admission = Some(zmux::Admission::prefix_auth(verifier));
+    limits.admission = Some(zmux::Admission::prefix_auth(
+        verifier,
+        zmux::PrefixRejection::Fallback,
+    ));
     let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = tcp.local_addr().unwrap().port();
@@ -355,7 +360,7 @@ async fn connect_over_tls() {
     .await;
     assert!(refused.is_err());
     // Unbound tokens do not verify where bound ones are configured.
-    let unbound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
+    let unbound = ticket::fixture(zmux::PrefixBinding::AllowCleartext).0;
     let options = zmux_websocket::Options::default().with_carrier_credential(Arc::new(unbound));
     assert!(
         zmux_websocket::dial_tls(url.as_str(), &connector, &options)
@@ -369,9 +374,128 @@ async fn connect_over_tls() {
     let server = listener.accept().await.unwrap();
     assert_eq!(client.protocol().as_deref(), Some("qmux-02"));
     round_trip(&client, &server).await;
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = zmux_rustls::TlsConnection::client(
+        connector.connect(name, tcp).await.unwrap(),
+        "localhost",
+    );
+    let info = tls.info();
+    let pipe = zmux_websocket::dial_over(tls, url.as_str(), &options, &info)
+        .await
+        .unwrap();
+    let hosted = Session::connect(pipe, Config::default()).await.unwrap();
+    let accepted = listener.accept().await.unwrap();
+    assert_eq!(accepted.bound_prefix_principal(), Some(ticket::ID));
+    round_trip(&hosted, &accepted).await;
+    hosted.close().await;
     client.close().await;
     listener.close();
     serving.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn ticket_record_refusal_replays_complete_messages_and_closes_failed_reads() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::{
+        WebSocketStream,
+        tungstenite::{
+            Message,
+            protocol::{Role, WebSocketConfig},
+        },
+    };
+    use zmux::{
+        Admission, CarrierInfo, Fallback, MAX_ADMISSION_MESSAGE, PrefixBinding, PrefixRejection,
+    };
+
+    let max = MAX_ADMISSION_MESSAGE;
+    for (reject, message, fallback, stalled, closed) in [
+        (
+            PrefixRejection::Fallback,
+            Message::binary(vec![1; max + 1]),
+            true,
+            false,
+            false,
+        ),
+        (
+            PrefixRejection::Fallback,
+            Message::binary(vec![2; max + 2]),
+            false,
+            true,
+            false,
+        ),
+        (
+            PrefixRejection::Stall,
+            Message::binary(vec![3; max + 1]),
+            false,
+            true,
+            false,
+        ),
+        (
+            PrefixRejection::Stall,
+            Message::binary(vec![4; max + 2]),
+            false,
+            true,
+            false,
+        ),
+        (
+            PrefixRejection::Fallback,
+            Message::text("text"),
+            false,
+            false,
+            true,
+        ),
+        (
+            PrefixRejection::Fallback,
+            Message::binary(Vec::new()),
+            false,
+            false,
+            true,
+        ),
+    ] {
+        let (report, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let (_, verifier) = ticket::fixture(PrefixBinding::AllowCleartext);
+        let mut limits = ListenerConfig::default();
+        limits.admission = Some(
+            Admission::prefix_auth(verifier, reject)
+                .with_stall_interval(Duration::from_secs(2), Duration::from_secs(2)),
+        );
+        limits.fallback = Some(Fallback::new(move |carrier| {
+            let report = report.clone();
+            async move {
+                report.send(carrier.replayed().to_vec()).unwrap();
+            }
+        }));
+        let listener = Listener::new(Config::default(), limits).unwrap();
+        let (client, server) = tokio::io::duplex(max + 32);
+        let cfg = WebSocketConfig::default()
+            .max_message_size(Some(max + 1))
+            .max_frame_size(Some(max + 1));
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, Some(cfg)).await;
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        client.send(message).await.unwrap();
+        let mut entry = listener
+            .adapter()
+            .enter("127.0.0.1:0".parse().unwrap(), None)
+            .unwrap();
+        assert!(
+            entry
+                .admit(CarrierInfo::new(), zmux_websocket::pipe(server, None))
+                .await
+                .is_none()
+        );
+        let stats = listener.stats().admission;
+        assert_eq!(stats.fallback, u64::from(fallback));
+        assert_eq!(stats.stalled, u64::from(stalled));
+        assert_eq!(stats.closed, u64::from(closed));
+        if fallback {
+            assert_eq!(reports.try_recv().unwrap(), vec![1; max + 1]);
+        } else {
+            assert!(reports.try_recv().is_err());
+        }
+    }
 }
 
 /// A join over a second WebSocket connection.
@@ -379,7 +503,7 @@ async fn connect_over_tls() {
 async fn a_second_connection_joins() {
     let mut config = Config::default();
     config.pipe_auth = zmux::PipeAuth::psk(vec![7u8; 32]).with_end_to_end();
-    config.max_pipes = 8;
+    config.session_policy.limits.steady_attachments = 8;
     let listener = Listener::new(config.clone(), ListenerConfig::default())
         .expect("valid listener configuration");
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -401,7 +525,9 @@ async fn a_second_connection_joins() {
     let io = zmux_websocket::dial(req, &zmux_websocket::Options::default())
         .await
         .unwrap();
-    let pipe = client.begin_add_pipe(io, zmux::PipeOptions::new()).unwrap();
+    let pipe = client
+        .test_begin_join(io, zmux::PipeOptions::new())
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), pipe.joined())
         .await
         .unwrap()
@@ -520,7 +646,7 @@ async fn a_refused_request_reaches_the_fallback_with_every_byte() {
 async fn an_admission_decides_on_the_request_head() {
     use zmux::{Admission, AdmissionVerdict};
     let admission = Admission::new(0, |info, prefix| {
-        assert_eq!(prefix, []);
+        assert_eq!(prefix, b"");
         assert!(info.source.is_some());
         assert!(info.is_head() && info.upgrade);
         let mut upgrade = false;
@@ -567,18 +693,17 @@ async fn an_admission_decides_on_the_request_head() {
     serving.await.unwrap();
 }
 
-/// A `ws://` client with a prefix authentication credential sends its
-/// token in the `Zmux-Prefix-Auth` field, which the server's admission
-/// verifies once; without it, or with the token replayed, the request is
-/// refused. A bound credential has no exporter on `ws://` and fails.
+/// Even a bearer ticket enabled for cleartext binary presentation may
+/// travel in a request field only on an encrypted connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prefix_auth_in_the_request_header() {
-    use std::sync::Arc;
-    let auth = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), false).unwrap();
-    let verifier = Arc::new(zmux::PrefixAuthVerifier::new(auth.clone(), 1, 1024).unwrap());
+async fn prefix_auth_in_a_cleartext_request_header_is_refused() {
+    let (auth, verifier) = ticket::fixture(zmux::PrefixBinding::AllowCleartext);
     let mut limits = ListenerConfig::default();
-    limits.admission = Some(zmux::Admission::prefix_auth(verifier));
-    let listener = Listener::new(Config::default(), limits).expect("valid listener configuration");
+    limits.admission = Some(zmux::Admission::prefix_auth(
+        verifier,
+        zmux::PrefixRejection::Fallback,
+    ));
+    let listener = Listener::new(Config::default(), limits).unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     let serving = tokio::spawn(zmux_websocket::serve(
@@ -586,41 +711,26 @@ async fn prefix_auth_in_the_request_header() {
         tcp,
         zmux_websocket::Options::default(),
     ));
-    let url = format!("ws://{addr}/zmux");
-    let refused = raw_request(addr, &upgrade_request(Some("qmux-02"))).await;
-    assert!(refused.starts_with(b"HTTP/1.1 404"));
-
-    let options =
-        zmux_websocket::Options::default().with_carrier_credential(Arc::new(auth.clone()));
-    let client = zmux_websocket::connect(url.as_str(), &options, Config::default())
-        .await
-        .unwrap();
-    let server = listener.accept().await.unwrap();
-    round_trip(&client, &server).await;
-    client.close().await;
-
-    let (name, value) = zmux::CarrierCredential::header(&auth, &zmux::CarrierInfo::new()).unwrap();
-    assert_eq!(name, zmux::PREFIX_AUTH_HEADER);
+    let raw = auth.token(&zmux::CarrierInfo::new()).unwrap();
+    let value = zmux::PrefixAuth::header_value(&raw);
     let mut request = format!("ws://{addr}/zmux").into_client_request().unwrap();
     request
         .headers_mut()
         .insert(zmux::PREFIX_AUTH_HEADER, value.parse().unwrap());
-    zmux_websocket::dial(request.clone(), &zmux_websocket::Options::default())
-        .await
-        .unwrap();
     assert!(
         zmux_websocket::dial(request, &zmux_websocket::Options::default())
             .await
-            .is_err(),
-        "a replayed token"
+            .is_err()
     );
-
-    let bound = zmux::PrefixAuth::new(b"psk", Duration::from_secs(30), true).unwrap();
-    let options = zmux_websocket::Options::default().with_carrier_credential(Arc::new(bound));
-    let e = zmux_websocket::dial(url.as_str(), &options)
-        .await
-        .unwrap_err();
-    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    let options =
+        zmux_websocket::Options::default().with_carrier_credential(std::sync::Arc::new(auth));
+    assert_eq!(
+        zmux_websocket::dial(format!("ws://{addr}/zmux").as_str(), &options)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput,
+    );
     listener.close();
     serving.await.unwrap();
 }
@@ -769,81 +879,9 @@ async fn wss_without_the_feature_is_invalid_input() {
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
 }
 
-// ---- N16: close delivery ---------------------------------------------------------------
-
-/// N16 on one carrier class: the client writes 1 MiB on a stream it
-/// finishes and a few bytes on a second one it leaves open, then closes
-/// with `code` and `reason` (code 0 and no reason: the plain close) and
-/// waits for the whole end. The server reads the whole 1 MiB in order and
-/// ends with the client's code and reason; the close returned within its
-/// guard; the wait, under a client linger of an hour, returned once the
-/// server read the close and ended its side; the open
-/// stream failed locally with the session's error. `slow`: the server starts
-/// reading only after a pause, so the close arrives before it read everything.
-/// `c` with a linger of an hour: a session that ends ended at the peer's end
-/// of its side.
-fn lingering(mut c: Config) -> Config {
-    c.test_hooks().linger_timeout = Some(Duration::from_secs(3600));
-    c
-}
-
-async fn close_delivery(client: &Session, server: &Session, code: u32, reason: &[u8], slow: bool) {
-    let data: Vec<u8> = (0..(1 << 20))
-        .map(|i| u8::try_from(i % 251).unwrap())
-        .collect();
-    let reader = {
-        let (server, data) = (server.clone(), data.clone());
-        tokio::spawn(async move {
-            let (_s, mut r) = server.accept_bi().await.unwrap();
-            if slow {
-                // A slow reader: the close arrives while data waits unread.
-                tokio::time::sleep(Duration::from_millis(300)).await;
-            }
-            assert_eq!(r.read_to_end(2 << 20).await.unwrap(), data);
-            server.closing().await
-        })
-    };
-    let (mut w, _r) = client.open_bi().await.unwrap();
-    w.write_all(&data).await.unwrap();
-    w.finish().unwrap();
-    let (mut open, _r2) = client.open_bi().await.unwrap();
-    open.write_all(b"left open").await.unwrap();
-    let start = std::time::Instant::now();
-    let code = zmux::VarInt::from_u32(code);
-    if code == zmux::VarInt::ZERO && reason.is_empty() {
-        client.close().await;
-    } else {
-        client.close_with_error(code, reason).await;
-    }
-    // A guard only: the server's delivery below shows the close completed
-    // normally.
-    let closed = start.elapsed();
-    assert!(closed < Duration::from_secs(3), "{closed:?}");
-    // The client lingers an hour (`lingering`): a wait that returns within
-    // its guard returned at the server's end of its side, after it read the
-    // close.
-    let end = tokio::time::timeout(Duration::from_secs(5), client.closed())
-        .await
-        .expect("the server ended its side after the close");
-    assert!(
-        matches!(&end, SessionError::ApplicationClosed { code: c, remote: false, .. } if *c == code),
-        "{end:?}"
-    );
-    let seen = tokio::time::timeout(Duration::from_secs(5), reader)
-        .await
-        .expect("the server read everything")
-        .unwrap();
-    assert!(
-        matches!(&seen, SessionError::ApplicationClosed { code: c, reason: r, remote: true }
-            if *c == code && r.as_ref() == reason),
-        "{seen:?}"
-    );
-    let e = open.write_all(b"more").await.unwrap_err();
-    assert!(
-        matches!(&e, zmux::StreamError::SessionLost(SessionError::ApplicationClosed { code: c, remote: false, .. }) if *c == code),
-        "{e:?}"
-    );
-}
+#[path = "../../test-support/close_delivery.rs"]
+mod close_delivery;
+use close_delivery::{close_delivery, lingering};
 
 /// N16 over WebSocket, through the adapter's `connect` and `serve`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -999,14 +1037,17 @@ async fn a_detached_websocket_is_served_after_the_fallback() {
     .with_peek_timeout(Duration::from_secs(10));
     let (returned_tx, returned) = tokio::sync::oneshot::channel::<()>();
     let returned_tx = std::sync::Mutex::new(Some(returned_tx));
+    let (resume, resume_after_return) = tokio::sync::oneshot::channel::<()>();
+    let resume_after_return = std::sync::Mutex::new(Some(resume_after_return));
     let fallback = Fallback::new(move |t: Takeover| {
         let returned_tx = returned_tx.lock().unwrap().take();
+        let resume_after_return = resume_after_return.lock().unwrap().take().unwrap();
         async move {
             t.detach().unwrap();
             let mut m = t.into_messages().expect("message-framed");
             tokio::spawn(async move {
                 // Served once the fallback's future completed.
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                resume_after_return.await.unwrap();
                 while let Some(msg) = m.read_message(1024).await.unwrap() {
                     let mut echo = b"echo ".to_vec();
                     echo.extend_from_slice(&msg);
@@ -1041,6 +1082,7 @@ async fn a_detached_websocket_is_served_after_the_fallback() {
         .await
         .unwrap()
         .unwrap();
+    resume.send(()).unwrap();
     for msg in [&b"first"[..], b"second", b"bye"] {
         if msg != b"first" {
             ws.send(Message::binary(msg.to_vec())).await.unwrap();

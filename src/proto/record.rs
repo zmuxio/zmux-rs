@@ -20,6 +20,13 @@ use super::varint;
 
 pub use super::params::{DEFAULT_MAX_RECORD_SIZE, ZMUX_MAX_RECORD_SIZE};
 
+/// Minimum Frames size supported by every carrier of a pipe.
+pub(crate) const RECORD_FLOOR: usize = 8192;
+
+pub(crate) const fn supports_record_floor(limit: usize) -> bool {
+    limit >= RECORD_FLOOR
+}
+
 /// Length of the shortest Size field for a record of `body_len` bytes.
 #[must_use]
 pub const fn size_len(body_len: u64) -> usize {
@@ -31,6 +38,17 @@ pub const fn size_len(body_len: u64) -> usize {
 #[must_use]
 pub const fn wire_len(body_len: u64) -> u64 {
     body_len + varint::len(body_len) as u64
+}
+
+/// The message body length corresponding to a shortest byte-stream record.
+pub(crate) fn message_len(wire: u64) -> u64 {
+    [1, 2, 4, 8]
+        .into_iter()
+        .find_map(|width| {
+            let len = wire.checked_sub(width)?;
+            (wire_len(len) == wire).then_some(len)
+        })
+        .unwrap_or_default()
 }
 
 /// Writes the shortest Size field for a record of `body_len` bytes.
@@ -50,7 +68,7 @@ pub enum Framing {
 }
 
 /// An item produced by [`RecordReader::read`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event<'a> {
     /// A frame of a complete record, in record order.
     Frame(Frame<'a>),
@@ -147,6 +165,23 @@ impl RecordReader {
     #[must_use]
     pub const fn at_record_boundary(&self) -> bool {
         matches!(self.state, State::Size { have: 0, .. })
+    }
+
+    pub(crate) const fn complete_record_len(&self) -> Option<u64> {
+        match self.state {
+            State::Direct { wire_len, .. } | State::Scratch { wire_len, .. } => Some(wire_len),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pending_record_bytes(&self) -> u64 {
+        match self.state {
+            State::Size { have, .. } => u64::from(have),
+            State::Buffer { need, wire_len } => wire_len - need + self.scratch.len() as u64,
+            State::Direct { rest, wire_len } => wire_len - rest,
+            State::Scratch { wire_len, .. } => wire_len,
+            State::Failed(_) => 0,
+        }
     }
 
     /// Frees the buffer used for records that span reads, if the reader

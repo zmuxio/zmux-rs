@@ -1,322 +1,349 @@
-//! A pipe whose peer `CONNECTION_CLOSE` was read and whose input then ended, before the local
-//! `CONNECTION_CLOSE` finished being written, still gets its own `CONNECTION_CLOSE` written
-//! whole and its write side shut down gracefully (SPEC.md Section 6.5), not an abort. Every
-//! wait is bounded, and the scenario runs repeatedly under CPU load.
+//! When the peer's `CONNECTION_CLOSE` and then EOF arrive during the local
+//! `CONNECTION_CLOSE` write, the local close is still handed off and the
+//! carrier's write side is shut down gracefully.
 
-#![allow(
-    clippy::many_single_char_names,
-    reason = "short conventional names in scenario code"
-)]
-
-use std::io;
+use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{mpsc, oneshot};
+use zmux::proto::frame::{ConnectionClose, Frame, Frames, Gates};
 use zmux::{Config, VarInt};
 
-const REPEAT: usize = 200;
-/// How long the local carrier takes for each write: the local `CONNECTION_CLOSE` is still
-/// being written when the peer's close and the carrier's end have been read.
-const SLOW_WRITE: Duration = Duration::from_millis(40);
-const BOUND: Duration = Duration::from_secs(10);
+const WATCHDOG: Duration = Duration::from_secs(30);
+const LOCAL_CLOSE: (VarInt, &[u8]) = (VarInt::from_u32(7), b"client");
+const PEER_CLOSE: (VarInt, &[u8]) = (VarInt::from_u32(8), b"server");
+
+fn close_frame(record: &[u8]) -> Option<ConnectionClose<'_>> {
+    Frames::new(
+        record,
+        Gates {
+            pipe_ack: true,
+            ..Gates::NONE
+        },
+    )
+    .find_map(|frame| {
+        if let Ok(Frame::ConnectionClose(close)) = frame {
+            Some(close)
+        } else {
+            None
+        }
+    })
+}
+
+fn is_close(record: &[u8], (code, reason): (VarInt, &[u8])) -> bool {
+    close_frame(record).is_some_and(|close| {
+        close.application && close.error_code == code.into_inner() && close.reason == reason
+    })
+}
+
+fn config() -> Config {
+    let mut config = Config::default();
+    // Only the test watchdog can end a stalled scenario. The driver's
+    // close timer must not advance the sequence under test.
+    config.test_hooks().close_handoff_limit = Some(WATCHDOG * 2);
+    config.test_hooks().no_first_ping = true;
+    config
+}
+
+/// One complete carrier record per channel message. Closing the sender
+/// delivers EOF after every record already handed off.
+struct Reader {
+    wire: mpsc::UnboundedReceiver<Vec<u8>>,
+    ended: Option<oneshot::Sender<ReadEnd>>,
+    read_end: ReadEnd,
+}
 
 #[derive(Default)]
-struct Seen {
-    /// The input ends: the carrier's end of input, as if the peer closed it.
-    eof: AtomicBool,
-    /// Writes that completed their delay (and were handed on).
-    writes_done: AtomicUsize,
-    /// The write side was shut down.
-    shutdown: AtomicBool,
-    /// The carrier was dropped.
-    dropped: AtomicBool,
+struct ReadEnd {
+    peer_close: bool,
+    eof: bool,
 }
 
-/// A carrier whose writes take [`SLOW_WRITE`] and whose input can be ended on demand.
-struct Slow {
-    io: tokio::io::DuplexStream,
-    seen: Arc<Seen>,
-    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
-}
-
-impl Drop for Slow {
-    fn drop(&mut self) {
-        self.seen.dropped.store(true, Ordering::SeqCst);
+impl Reader {
+    fn copy_record(&mut self, record: Option<Vec<u8>>, buf: &mut [u8]) -> usize {
+        let Some(record) = record else {
+            self.read_end.eof = true;
+            return 0;
+        };
+        if self.ended.is_some() && is_close(&record, PEER_CLOSE) {
+            self.read_end.peer_close = true;
+        }
+        buf[..record.len()].copy_from_slice(&record);
+        record.len()
     }
 }
 
-impl AsyncRead for Slow {
+impl Drop for Reader {
+    fn drop(&mut self) {
+        if let Some(ended) = self.ended.take() {
+            let _ = ended.send(std::mem::take(&mut self.read_end));
+        }
+    }
+}
+
+impl AsyncRead for Reader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        match Pin::new(&mut self.io).poll_read(cx, buf) {
-            Poll::Ready(Ok(())) if buf.filled().len() > before => Poll::Ready(Ok(())),
-            Poll::Ready(r) => Poll::Ready(r),
-            Poll::Pending if self.seen.eof.load(Ordering::SeqCst) => Poll::Ready(Ok(())),
-            Poll::Pending => {
-                // Poll again soon to see the end of input.
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                    waker.wake();
-                });
-                Poll::Pending
-            }
-        }
+        let record = ready!(self.wire.poll_recv(cx));
+        let n = self.copy_record(record, buf.initialize_unfilled());
+        buf.advance(n);
+        Poll::Ready(Ok(()))
     }
 }
 
-impl AsyncWrite for Slow {
+impl Read for Reader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let record = self.wire.blocking_recv();
+        Ok(self.copy_record(record, buf))
+    }
+}
+
+struct CloseGate {
+    started: Option<oneshot::Sender<()>>,
+    release: Option<oneshot::Receiver<()>>,
+    finished: oneshot::Sender<Vec<u8>>,
+}
+
+struct Writer {
+    wire: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    gate: Option<CloseGate>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Writer {
+    fn gate(&mut self, record: &[u8]) -> Option<&mut CloseGate> {
+        let gate = self.gate.as_mut()?;
+        if !is_close(record, LOCAL_CLOSE) {
+            return None;
+        }
+        if let Some(started) = gate.started.take() {
+            let _ = started.send(());
+        }
+        Some(gate)
+    }
+
+    fn write_record(&mut self, record: &[u8], close: bool) -> usize {
+        if close {
+            let gate = self.gate.take().unwrap();
+            let _ = gate.finished.send(record.to_vec());
+        }
+        if let Some(wire) = &self.wire {
+            // A carrier can accept writes after its peer stops reading.
+            let _ = wire.send(record.to_vec());
+        }
+        record.len()
+    }
+}
+
+impl AsyncWrite for Writer {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &[u8],
+        record: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let sleep = self
-            .sleep
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep(SLOW_WRITE)));
-        if sleep.as_mut().poll(cx).is_pending() {
-            return Poll::Pending;
-        }
-        self.sleep = None;
-        self.seen.writes_done.fetch_add(1, Ordering::SeqCst);
-        // The peer may be gone: the bytes were handed to the carrier all the same.
-        match Pin::new(&mut self.io).poll_write(cx, buf) {
-            Poll::Ready(Err(_)) => Poll::Ready(Ok(buf.len())),
-            r => r,
-        }
+        let close = if let Some(gate) = self.gate(record) {
+            ready!(Pin::new(gate.release.as_mut().unwrap()).poll(cx)).map_err(io::Error::other)?;
+            true
+        } else {
+            false
+        };
+        Poll::Ready(Ok(self.write_record(record, close)))
     }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_flush(cx)
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.seen.shutdown.store(true, Ordering::SeqCst);
-        Pin::new(&mut self.io).poll_shutdown(cx)
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.shutdown.store(true, Relaxed);
+        self.wire = None;
+        Poll::Ready(Ok(()))
     }
 }
 
-fn config() -> Config {
-    let mut c = Config::default();
-    c.test_hooks().linger_timeout = Some(Duration::from_secs(5));
-    c
+impl Write for Writer {
+    fn write(&mut self, record: &[u8]) -> io::Result<usize> {
+        let close = if let Some(gate) = self.gate(record) {
+            gate.release
+                .take()
+                .unwrap()
+                .blocking_recv()
+                .map_err(io::Error::other)?;
+            true
+        } else {
+            false
+        };
+        Ok(self.write_record(record, close))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
-async fn one() {
-    let seen = Arc::new(Seen::default());
-    let (a, b) = tokio::io::duplex(1 << 16);
-    let listener = zmux::Listener::new(config(), zmux::ListenerConfig::default()).unwrap();
-    let l = listener.clone();
-    tokio::spawn(async move {
-        let _ = l
-            .handle_pipe(
-                zmux::PipeIo::new(b),
-                zmux::PipeHint::from_peer(([127, 0, 0, 1], 0).into()),
-            )
-            .await;
-    });
-    let slow = Slow {
-        io: a,
-        seen: seen.clone(),
-        sleep: None,
-    };
-    let client = zmux::Session::connect(zmux::PipeIo::new(slow), config())
-        .await
-        .unwrap();
-    let server = listener.accept().await.unwrap();
-    // Both ends close at once; the server's CONNECTION_CLOSE arrives while the client's is
-    // still being written, then the carrier's input ends.
-    let before = seen.writes_done.load(Ordering::SeqCst);
-    let c = client.clone();
-    let closing = tokio::spawn(async move {
-        c.close_with_error(VarInt::from_u32(7), b"client").await;
-    });
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    let s = server.clone();
-    tokio::spawn(async move {
-        s.close_with_error(VarInt::from_u32(8), b"server").await;
-    });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    seen.eof.store(true, Ordering::SeqCst);
-    tokio::time::timeout(BOUND, closing)
-        .await
-        .expect("close bounded")
-        .unwrap();
-    tokio::time::timeout(BOUND, client.closed())
-        .await
-        .expect("closed bounded");
-    // The write of CONNECTION_CLOSE ran to its end, and the carrier was ended after it by a
-    // shutdown, not abandoned.
-    let began = Instant::now();
-    while !seen.dropped.load(Ordering::SeqCst) && began.elapsed() < BOUND {
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    assert!(
-        seen.dropped.load(Ordering::SeqCst),
-        "the carrier was released"
-    );
-    assert!(
-        seen.writes_done.load(Ordering::SeqCst) > before,
-        "the local CONNECTION_CLOSE was written"
-    );
-    assert!(
-        seen.shutdown.load(Ordering::SeqCst),
-        "the write side was shut down"
-    );
-    listener.close();
+struct Scenario {
+    started: oneshot::Receiver<()>,
+    reader_ended: oneshot::Receiver<ReadEnd>,
+    release: oneshot::Sender<()>,
+    finished: oneshot::Receiver<Vec<u8>>,
+    shutdown: Arc<AtomicBool>,
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_peer_close_and_the_carrier_end_do_not_abort_the_local_close() {
-    // CPU load: busy threads for the whole run.
-    let stop = Arc::new(AtomicBool::new(false));
-    let load: Vec<_> = (0..std::thread::available_parallelism().map_or(4, std::num::NonZero::get))
-        .map(|_| {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                let mut x = 1u64;
-                while !stop.load(Ordering::Relaxed) {
-                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                    std::hint::black_box(x);
-                }
-            })
-        })
-        .collect();
-    let r = tokio::time::timeout(Duration::from_secs(180), async {
-        for _ in 0..REPEAT {
-            one().await;
-        }
-    })
-    .await;
-    stop.store(true, Ordering::Relaxed);
-    for t in load {
-        t.join().unwrap();
-    }
-    r.expect("every round ends in time");
-}
+type Carrier = (Reader, Writer);
 
-// ---- blocking driver ---------------------------------------------------------------------
-
-mod blocking {
-    use std::io::{self, Write};
-    use std::net::{Shutdown, TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, mpsc};
-    use std::time::{Duration, Instant};
-
-    use zmux::VarInt;
-
-    use super::{BOUND, REPEAT, SLOW_WRITE, config};
-
-    #[derive(Default)]
-    struct Seen {
-        writes_done: AtomicUsize,
-        shutdown_write: AtomicBool,
-    }
-
-    struct SlowWrite {
-        io: TcpStream,
-        seen: Arc<Seen>,
-    }
-
-    impl Write for SlowWrite {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            std::thread::sleep(SLOW_WRITE);
-            self.seen.writes_done.fetch_add(1, Ordering::SeqCst);
-            // The peer may be gone: the bytes were handed to the carrier all the same.
-            Ok(self.io.write(buf).unwrap_or(buf.len()))
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            self.io.flush()
-        }
-    }
-
-    fn one() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
-        let (b, _) = l.accept().unwrap();
-        let seen = Arc::new(Seen::default());
-        let closer = zmux::blocking::PipeIo::tcp_closer(a.try_clone().unwrap());
-        let seen_c = seen.clone();
-        let slow = zmux::blocking::PipeIo::from_halves(
-            a.try_clone().unwrap(),
-            SlowWrite {
-                io: a.try_clone().unwrap(),
-                seen: seen.clone(),
+impl Scenario {
+    fn new() -> (Self, Carrier, Carrier) {
+        let (to_client, client_records) = mpsc::unbounded_channel();
+        let (to_server, server_records) = mpsc::unbounded_channel();
+        let (reader_ended, ended) = oneshot::channel();
+        let (start, started) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        let (finish, finished) = oneshot::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                started,
+                reader_ended: ended,
+                release,
+                finished,
+                shutdown: shutdown.clone(),
             },
+            (
+                Reader {
+                    wire: client_records,
+                    ended: Some(reader_ended),
+                    read_end: ReadEnd::default(),
+                },
+                Writer {
+                    wire: Some(to_server),
+                    gate: Some(CloseGate {
+                        started: Some(start),
+                        release: Some(resume),
+                        finished: finish,
+                    }),
+                    shutdown,
+                },
+            ),
+            (
+                Reader {
+                    wire: server_records,
+                    ended: None,
+                    read_end: ReadEnd::default(),
+                },
+                Writer {
+                    wire: Some(to_client),
+                    gate: None,
+                    shutdown: Arc::default(),
+                },
+            ),
         )
-        .with_closer(move |how| {
-            if how == Shutdown::Write {
-                seen_c.shutdown_write.store(true, Ordering::SeqCst);
-            }
-            closer(how);
-        });
-        let listener =
-            zmux::blocking::Listener::new(config(), zmux::ListenerConfig::default(), None).unwrap();
-        let ll = listener.clone();
-        let t = std::thread::spawn(move || {
-            ll.handle_pipe(
-                zmux::blocking::PipeIo::from_tcp(b),
-                zmux::blocking::PipeHint::default(),
-            )
-        });
-        let client = zmux::blocking::Session::connect(slow, config()).unwrap();
-        t.join().unwrap().ok();
-        let server = listener
-            .accept_timeout(Duration::from_secs(5))
-            .ok()
-            .flatten()
-            .expect("a session");
-        let before = seen.writes_done.load(Ordering::SeqCst);
-        let c = client.clone();
-        let closing = std::thread::spawn(move || {
-            c.close_with_error(VarInt::from_u32(7), b"client");
-        });
-        std::thread::sleep(Duration::from_millis(5));
-        let s = server.clone();
-        std::thread::spawn(move || {
-            s.close_with_error(VarInt::from_u32(8), b"server");
-        });
-        std::thread::sleep(Duration::from_millis(10));
-        // The carrier's input ends while the local CONNECTION_CLOSE is being written.
-        let _ = a.shutdown(Shutdown::Read);
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            closing.join().unwrap();
-            let _ = tx.send(());
-        });
-        rx.recv_timeout(BOUND).expect("close bounded");
-        let began = Instant::now();
-        while !seen.shutdown_write.load(Ordering::SeqCst) && began.elapsed() < BOUND {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(
-            seen.writes_done.load(Ordering::SeqCst) > before,
-            "the local CONNECTION_CLOSE was written"
-        );
-        assert!(
-            seen.shutdown_write.load(Ordering::SeqCst),
-            "the write side was shut down"
-        );
-        listener.close();
     }
 
-    #[test]
-    fn the_peer_close_and_the_carrier_end_do_not_abort_the_local_close() {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for _ in 0..REPEAT {
-                one();
-            }
-            let _ = tx.send(());
-        });
-        rx.recv_timeout(std::time::Duration::from_secs(240))
-            .expect("every round ends in time");
+    async fn check(self, close_peer: impl FnOnce(), closed: impl Future<Output = ()>) {
+        self.started.await.expect("the local close write started");
+        close_peer();
+        let end = self.reader_ended.await.expect("the local reader ended");
+        assert!(end.peer_close, "the local reader received the peer close");
+        assert!(
+            end.eof,
+            "the driver consumed EOF before releasing the reader"
+        );
+        self.release
+            .send(())
+            .expect("the local close is still being written");
+        let record = self.finished.await.expect("the local close was handed off");
+        assert!(is_close(&record, LOCAL_CLOSE));
+        closed.await;
+        assert!(
+            self.shutdown.load(Relaxed),
+            "the writer was shut down gracefully"
+        );
     }
+}
+
+#[tokio::test]
+async fn the_peer_close_and_the_carrier_end_do_not_abort_the_local_close() {
+    tokio::time::timeout(WATCHDOG, async {
+        let (scenario, (client_read, client_write), (server_read, server_write)) = Scenario::new();
+        let (client, server) = tokio::try_join!(
+            zmux::Session::connect(
+                zmux::PipeIo::from_halves(client_read, client_write).records(),
+                config()
+            ),
+            zmux::Session::accept(
+                zmux::PipeIo::from_halves(server_read, server_write).records(),
+                config()
+            ),
+        )
+        .unwrap();
+
+        let local = tokio::spawn(async move {
+            client.close_with_error(LOCAL_CLOSE.0, LOCAL_CLOSE.1).await;
+            client.closed().await;
+        });
+        let (close, should_close) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            should_close.await.unwrap();
+            server.close_with_error(PEER_CLOSE.0, PEER_CLOSE.1).await;
+        });
+        scenario
+            .check(|| close.send(()).unwrap(), async { local.await.unwrap() })
+            .await;
+        peer.await.unwrap();
+    })
+    .await
+    .expect("close scenario timed out");
+}
+
+#[tokio::test]
+async fn blocking_peer_close_and_carrier_end_do_not_abort_the_local_close() {
+    tokio::time::timeout(WATCHDOG, async {
+        use zmux::blocking::{PipeIo, Session};
+
+        let (scenario, (client_read, client_write), (server_read, server_write)) = Scenario::new();
+        let shutdown = scenario.shutdown.clone();
+        let (close, should_close) = oneshot::channel();
+        let (done, closed) = oneshot::channel();
+        let (peer_done, peer_closed) = oneshot::channel();
+        let peer = std::thread::spawn(move || {
+            let server = Session::accept(
+                PipeIo::from_halves(server_read, server_write).records(),
+                config(),
+            )
+            .unwrap();
+            should_close.blocking_recv().unwrap();
+            server.close_with_error(PEER_CLOSE.0, PEER_CLOSE.1);
+            let _ = peer_done.send(());
+        });
+        let local = std::thread::spawn(move || {
+            let pipe = PipeIo::from_halves(client_read, client_write)
+                .records()
+                .with_closer(move |how| {
+                    if how == Shutdown::Write {
+                        shutdown.store(true, Relaxed);
+                    }
+                });
+            let client = Session::connect(pipe, config()).unwrap();
+            client.close_with_error(LOCAL_CLOSE.0, LOCAL_CLOSE.1);
+            client.closed().unwrap();
+            let _ = done.send(());
+        });
+        scenario
+            .check(|| close.send(()).unwrap(), async { closed.await.unwrap() })
+            .await;
+        peer_closed.await.unwrap();
+        local.join().unwrap();
+        peer.join().unwrap();
+    })
+    .await
+    .expect("close scenario timed out");
 }

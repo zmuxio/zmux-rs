@@ -22,7 +22,6 @@
 //! terminates TLS reads the carrier.
 
 mod client;
-mod record;
 mod server;
 mod wire;
 
@@ -85,6 +84,7 @@ pub struct ExchangeOptions {
     /// Client: the credential whose header ([`zmux::CarrierCredential::header`])
     /// accompanies the request that creates the exchange, for server admission
     /// ([`zmux::ListenerConfig::admission`]; none by default).
+    /// Exchange uses its own request envelope and rejects `zmux::PrefixAuth`.
     pub carrier_credential: Option<std::sync::Arc<dyn zmux::CarrierCredential>>,
     /// Runs without a PSK, explicitly (false by default): the MACs then
     /// only bind responses to requests, and the carrier ID is a bearer
@@ -189,9 +189,10 @@ pub struct ExchangeOptions {
     /// authenticated. A window of 2^31 s or more takes every Time.
     pub time_window: Duration,
     /// Server: the (Carrier ID, Nonce) pairs recorded at most (default
-    /// 262144). A pair stays recorded while its request's Time is within
-    /// the window, and up to one window longer; a request that finds the
-    /// record full is not authenticated.
+    /// 262144). A pair can be accepted once across all active timestamps.
+    /// It stays recorded until its Time expires, rounded up to the end of
+    /// its expiry bucket. A request that finds the record full is not
+    /// authenticated.
     pub max_recorded: usize,
 }
 

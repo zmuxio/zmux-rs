@@ -10,8 +10,8 @@ zmux-shaping-peer server            # prints LISTEN <addr>, serves one session
 zmux-shaping-peer client <addr>
 ```
 
-`SHAPE_DEF` names a definition file (`defs/records.json`, `defs/delayed.json`);
-unset or empty, the side runs unshaped. The client opens eight bidirectional
+`SHAPE_DEF` points to a JSON definition in the `zmux-shaping` machine format.
+With the variable unset or empty, the side runs unshaped. The client opens eight bidirectional
 streams, stream `i` carrying `200000 + i * 7919` bytes of xorshift64 output
 seeded with `i + 1`; the server echoes them and the client compares. Each side
 prints `STATS wire_spent=<n> injected=<n> dropped=<n> clamped=<n> faults=<n>`

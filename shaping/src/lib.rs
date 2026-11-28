@@ -12,12 +12,13 @@ mod limits;
 mod machine;
 mod pool;
 mod random;
+mod segment;
 mod value;
 
 pub use bundle::{Bundle, Compiled};
 pub use error::Error;
 pub use limits::parse_limits;
 pub use machine::{DEFAULT_MAX_SLOTS, MachineFactory, MachineShaper, Options, SizeLimits};
-pub use pool::{MachinePoolPolicy, MemberDecision, PoolMember, pool_policy};
 pub use random::Source;
+pub use segment::{Segment, SegmentProfile};
 pub use value::{Sampler, Value};

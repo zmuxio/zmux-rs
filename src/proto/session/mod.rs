@@ -30,20 +30,33 @@
 //! lane ([`LaneId`]; a [`PipeId`] is the pipe's lane 0), and everything
 //! else sees one pipe.
 
+pub(crate) mod accounting;
 mod api;
 mod app_event;
+mod capacity;
 mod channel;
+mod chunk;
+mod clock;
 mod codel;
 mod config;
 mod credit;
+mod datagram;
+mod datagram_feedback;
+mod deadline;
 mod early;
 mod error;
 mod estimator;
 mod event;
 mod filter;
+mod health;
 mod input;
 mod lanes;
 mod limiter;
+mod memory;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub(crate) use memory::JoinWork;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub(crate) use memory::minimum_listener_admission;
 mod output;
 mod pacing;
 mod path;
@@ -57,18 +70,22 @@ mod quality;
 mod ranges;
 mod reasm;
 mod recv_buf;
+mod recv_store;
 mod rtt;
 mod shape;
 mod shape_account;
+mod shape_ledger;
 pub mod shaping;
 mod share;
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) mod splice_handoff;
 mod stream;
 mod streams;
 mod tp;
 mod transmit;
 mod tuner;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -83,24 +100,59 @@ use crate::proto::record::Framing;
 use crate::proto::{ApplicationErrorCode, Error, TransportErrorCode, VarInt};
 
 pub use crate::proto::seal::RecordMode;
+pub use accounting::{
+    AccountingPolicy, CarrierHalfSource, CarrierHalfSources, HalfTotals, PipeAccounting,
+};
 pub use api::{SendCapacity, SendOutcomeKind};
 pub use app_event::{
     CandidateOutcome, CandidateResult, CarrierKind, GoAway, SessionEvent, SessionId, Support,
     TraceRecord, Tracer,
 };
+pub use capacity::{
+    CandidateId, CapacityLimits, CapacitySnapshot, Directions, MemberId, MemberSnapshot,
+    PathPreference, SessionPolicy, SessionPolicyError,
+};
+pub use channel::{NativeDatagram, NativeDatagramOutcome, NativeDatagramResult};
+pub use chunk::{Chunk, ChunkBuffer};
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub(crate) use clock::ClockWait;
+pub use clock::{ClockDomain, MonotonicClock};
+#[cfg(all(feature = "blocking", not(loom)))]
+pub(crate) use config::RedialCompletion;
 #[cfg(feature = "test-hooks")]
 pub use config::TestHooks;
-pub use config::{AllowRecordMode, AuthorizeJoin, RecordPolicy, RecordPolicyInput};
+pub use config::{
+    AllowRecordMode, AuthorizeJoin, JoinAuthorization, JoinFirstBatch, RecordPolicy,
+    RecordPolicyInput,
+};
 pub use config::{
     Cap, Change, Config, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_JOIN_TIMEOUT,
     DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF,
     DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_MEMORY_BUDGET, DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY,
-    DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER, DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE,
-    DEFAULT_SUSPECT_FLOOR, DeadTimeout, EarlyData, Inherit, Liveness, LogFn, LogLevel, Logger,
-    MAX_STREAM_CREDIT, PipeAuth, Redial, Redundancy, SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR,
-    UniCredit, WindowIncrease,
+    DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER, DEFAULT_STANDBY_PROBE, DEFAULT_SUSPECT_FLOOR,
+    DeadTimeout, EarlyData, Inherit, Liveness, LogFn, LogLevel, Logger, MAX_STREAM_CREDIT,
+    PipeAuth, Redial, RedialAttempt, RedialCause, RedialOutcome, RedialResult, Redundancy,
+    STREAM_WINDOW_FLOOR, UniCredit, WindowIncrease,
 };
 pub(crate) use config::{Period, STAGED_UNI_STREAMS};
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) use datagram::ResolvedDatagramOptions;
+pub use datagram::{
+    DatagramCarrier, DatagramConfig, DatagramCopyPolicy, DatagramDeadline, DatagramDispatchStats,
+    DatagramDrop, DatagramDrops, DatagramPath, DatagramReplicaDegradation, DatagramSendOptions,
+    DatagramStats, SendPolicy,
+};
+pub(crate) use datagram::{PacketAdmission, PacketRepresentation};
+#[cfg(all(
+    feature = "test-hooks",
+    any(feature = "tokio", feature = "blocking"),
+    not(loom)
+))]
+pub(crate) use datagram::{datagram_replica_credit, datagram_send_state};
+pub use datagram_feedback::{
+    DatagramArrivals, DatagramEvidenceSource, DatagramFeedback, DatagramLossSample,
+    DatagramLossSourceExpired,
+};
 pub use early::EarlyDataState;
 pub use epoch::{
     DEFAULT_EPOCH_JOINS, DEFAULT_EPOCH_PERIOD, EPOCH_RETENTION, EpochPolicy, MAX_JOIN_DEADLINE,
@@ -110,20 +162,28 @@ pub use error::{
     StreamError,
 };
 pub use event::CoreEvent;
+pub use health::{
+    CarrierFailureEvent, CarrierFailureReport, DirectionEvidence, DirectionExclusion,
+    DirectionHealth, PipeHealth, PipeHealthChange, PipeHealthReason, PipeHealthState,
+    PipeProofKind, StabilityPolicy,
+};
 pub use join::{
     ClaimedHello, ConfirmedJoin, JOIN_READ_BOUND, JoinFinished, JoinRecords, JoinStep, OpenedHello,
     PeerCarrier, PeerJoin,
 };
 pub use lanes::LaneAccept;
+pub(crate) use mpath::CapacityObserver;
 pub use mpath::{
-    CarrierConnId, CarrierCounts, CarrierSample, CarrierSource, LaneStats, Multipath,
-    PipeDirection, PipeFinal, PipeLiveness, PipeOptions, PipeStats, PipeWrite, RttSource,
+    AckDelivery, CarrierConnId, CarrierCounts, CarrierLoss, CarrierLossUnit, CarrierSample,
+    CarrierSource, DeliveryLoad, LaneStats, Multipath, PipeDirection, PipeFinal, PipeLiveness,
+    PipeOptions, PipeStats, PipeWrite, RttSource,
 };
 pub use pipes::{DirectionState, InboundState, OutboundState, PipeHalf, PrioritySource};
 pub use policy::{FrameInfo, Pick, PickAnswer, PickRequest, PipeSnapshot, Scheduler};
 pub use preamble::Preamble;
 pub use quality::{CapacityFloor, QualityBand};
-pub use recv_buf::Backing;
+pub(crate) use recv_buf::Backing;
+pub(crate) use recv_buf::Segment;
 pub(crate) use rtt::WRITE_CALL_MIN;
 pub use stream::StreamKey;
 pub(crate) use transmit::DEFAULT_BATCH;
@@ -136,7 +196,7 @@ use streams::Streams;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum JoinDeadline {
     Protocol(Instant),
-    #[cfg(feature = "blocking")]
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
     Caller(Instant),
 }
 
@@ -144,7 +204,7 @@ impl JoinDeadline {
     pub(crate) fn at(self) -> Instant {
         match self {
             Self::Protocol(t) => t,
-            #[cfg(feature = "blocking")]
+            #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
             Self::Caller(t) => t,
         }
     }
@@ -152,16 +212,8 @@ impl JoinDeadline {
     pub(crate) fn cause(self) -> PipeFailure {
         match self {
             Self::Protocol(_) => PipeFailure::JoinTimedOut,
-            #[cfg(feature = "blocking")]
+            #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
             Self::Caller(_) => PipeFailure::CallerDeadline,
-        }
-    }
-
-    #[cfg(feature = "blocking")]
-    pub(crate) fn with_caller(own: Option<Self>, caller: Option<Instant>) -> Option<Self> {
-        match caller {
-            Some(t) if own.is_none_or(|d| t <= d.at()) => Some(Self::Caller(t)),
-            _ => own,
         }
     }
 }
@@ -306,7 +358,8 @@ pub enum Transmit {
     /// Nothing to send now.
     Idle,
     /// Write the batch, then shut down the write side gracefully. Nothing
-    /// more will be sent on this pipe.
+    /// more will be sent on this lane. Call
+    /// [`SessionCore::write_shutdown_complete`] once the carrier shuts down.
     Shutdown,
 }
 
@@ -372,8 +425,7 @@ pub struct SessionStats {
     pub datagrams_sent: u64,
     /// Datagrams received.
     pub datagrams_received: u64,
-    /// Datagrams dropped from the send queue: the oldest when it was full,
-    /// or one that no carrier could take when its turn came.
+    /// Outgoing original datagrams dropped locally, excluding the application limiter.
     pub datagrams_dropped_send: u64,
     /// Received datagrams dropped from full queues or for closed streams.
     pub datagrams_dropped_recv: u64,
@@ -459,6 +511,50 @@ pub struct SessionStats {
     pub suspended_time: Duration,
 }
 
+/// Cumulative core counters. Gauges, driver-owned fields and derived
+/// statistics are projected into a snapshot only when requested.
+#[derive(Debug, Default)]
+struct SessionCounters {
+    bytes_sent: u64,
+    bytes_received: u64,
+    records_sent: u64,
+    records_received: u64,
+    streams_opened_local: u64,
+    streams_opened_remote: u64,
+    bytes_duplicate_received: u64,
+    stream_credit_waits: u64,
+    pipes_added: u64,
+    join_auth_failures: u64,
+    first_flight_timeouts: u64,
+}
+
+#[derive(Debug, Default)]
+struct DatagramCounters {
+    sent: u64,
+    received: u64,
+    dropped_recv: u64,
+    dropped_limit: u64,
+    sent_channel: u64,
+    received_channel: u64,
+}
+
+#[derive(Debug, Default)]
+struct MultipathCounters {
+    bytes_reinjected: u64,
+    bytes_opportunistic: u64,
+    bytes_redundant: u64,
+    penalties: u64,
+    reinjections: u64,
+    pipe_failures: u64,
+    join_pending: u64,
+    join_batch_dropped: u64,
+    join_failures: u64,
+    join_replays: u64,
+    join_refusals: u64,
+    suspensions: u64,
+    suspended_time: Duration,
+}
+
 /// A stream's runtime settings, the ones its sending and receiving parts
 /// read back: what a part the stream does not
 /// have reads as is the field's default.
@@ -530,6 +626,8 @@ pub struct StreamStats {
     pub datagrams_received: u64,
     /// The stream's datagrams dropped from its full queue.
     pub datagrams_dropped_recv: u64,
+    /// Datagrams whose local receive lifetime expired while queued.
+    pub datagrams_expired_recv: u64,
     /// Payload bytes of the stream's datagrams handed to a carrier.
     pub datagram_bytes_sent: u64,
     /// Payload bytes of the stream's datagrams returned to the
@@ -580,6 +678,9 @@ struct GoAwayState {
     shutdown: Option<u64>,
     /// The reason phrase of the final `CONNECTION_CLOSE`.
     reason: Bytes,
+    /// Streams with unfinished directions or stream controls to send.
+    /// Only populated during a local drain, independently of the handles.
+    draining: BTreeSet<StreamKey>,
     /// GOAWAY frame to send: watermarks and code.
     pending: Option<(u64, u64, u64)>,
     /// Watermarks last sent.
@@ -601,6 +702,7 @@ struct GoAwayState {
 static NO_GOAWAY: GoAwayState = GoAwayState {
     shutdown: None,
     reason: Bytes::new(),
+    draining: BTreeSet::new(),
     pending: None,
     sent: None,
     fence: None,
@@ -630,13 +732,7 @@ impl SessionCore {
 #[derive(Debug, Default)]
 pub(super) struct DatagramState {
     /// Outgoing datagrams.
-    send: VecDeque<OutDatagram>,
-    /// The send queue's delay bound ([`Config::datagram_queue_delay`]).
-    send_codel: codel::Codel,
-    /// Datagrams sent before establishment: the stream
-    /// (`None` for the session) and context, and the payload. Sent, or
-    /// dropped and counted, once the peer's parameters arrive.
-    early: VecDeque<(Option<(StreamKey, u64)>, Bytes)>,
+    send: datagram::SendDatagrams,
     /// Received session datagrams and when each was queued.
     recv: VecDeque<(Bytes, Instant)>,
     /// The session queue's delay bound ([`Config::datagram_queue_delay`]).
@@ -648,6 +744,7 @@ pub(super) struct DatagramState {
     /// Bytes held in every stream's queue together, each bounded by its own
     /// limits: for the memory accounting only.
     stream_bytes: usize,
+    stream_expiry: BTreeSet<(Instant, StreamKey)>,
     /// Received datagrams held for the receive limiter, which the driver
     /// asks outside the lock.
     held: VecDeque<ReceivedDatagram>,
@@ -658,12 +755,19 @@ pub(super) struct DatagramState {
     /// Received datagrams of peer streams within the limit that have not
     /// been opened yet, in arrival order, until the stream opens or their deadline. Their bytes,
     /// with an entry cost each, are in `recv_bytes`.
-    waiting: VecDeque<WaitingDatagram>,
+    waiting: datagram::WaitingDatagrams,
     /// [`SessionCore::channel_generation`].
     channel_gen: u64,
+    native_plans: Option<Box<channel::NativePlans>>,
     /// The last [`SessionCore::path_datagram_size`] reported
     /// ([`CoreEvent::DatagramPathChanged`]).
-    path: Option<usize>,
+    path: DatagramPath,
+    next_sequence: u64,
+    window: Option<datagram::ReceiveWindow>,
+    feedback: Option<Box<datagram_feedback::Feedback>>,
+    copies: Option<Box<datagram::PendingCopies>>,
+    stats: DatagramStats,
+    counters: DatagramCounters,
 }
 
 /// A datagram in the send queue.
@@ -674,17 +778,42 @@ struct OutDatagram {
     data: Bytes,
     /// When it was queued ([`Config::datagram_queue_delay`]).
     at: Instant,
+    deadline: Option<Instant>,
+    require_native: bool,
+    copy_policy: DatagramCopyPolicy,
+    urgent: Option<bool>,
+    independent_fate: bool,
+    tag: u64,
+    shape_held: Duration,
+    #[cfg(all(feature = "tokio", not(loom)))]
+    handoff: Option<splice_handoff::HandoffSpan>,
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+#[derive(Default)]
+pub(crate) struct SpliceChunk {
+    pub(crate) data: Chunk,
+    pub(crate) copied: bool,
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) enum SpliceDatagram {
+    Data {
+        context: u64,
+        data: Chunk,
+        remaining: Option<Duration>,
+        copied: bool,
+    },
+    TooLarge,
 }
 
 /// A received datagram held for a peer stream not opened yet.
 #[derive(Debug)]
 struct WaitingDatagram {
+    sequence: Option<u64>,
     stream_id: u64,
     context: u64,
-    data: Bytes,
-    /// Dropped at this time: one smoothed RTT after its arrival, or the
-    /// deadline of the one held before it when that is later.
-    until: Instant,
+    data: Chunk,
     /// It arrived on a carrier's datagram channel.
     channel: bool,
 }
@@ -705,37 +834,69 @@ impl WaitingDatagram {
 }
 
 impl DatagramState {
+    fn release_waiting_slot(&mut self, old: &WaitingDatagram) {
+        debit(&mut self.recv_bytes, old.cost());
+        datagram::occupy_window(&mut self.window, old.sequence, false);
+    }
+
     /// Heap bytes held: the state, its queues and the datagrams queued.
     fn heap_bytes(&self) -> usize {
         use std::mem::size_of;
         size_of::<Self>()
-            + self.send.capacity() * size_of::<OutDatagram>()
-            + self.early.capacity() * size_of::<(Option<(StreamKey, u64)>, Bytes)>()
+            + self.send.heap_bytes()
+            + self
+                .native_plans
+                .as_deref()
+                .map_or(0, channel::NativePlans::heap_bytes)
+            + self
+                .copies
+                .as_deref()
+                .map_or(0, datagram::PendingCopies::heap_bytes)
             + self.recv.capacity() * size_of::<(Bytes, Instant)>()
             + self.held.capacity() * size_of::<ReceivedDatagram>()
-            + self.waiting.capacity() * size_of::<WaitingDatagram>()
-            + self.send.iter().map(|o| o.data.len()).sum::<usize>()
-            + self.early.iter().map(|(_, b)| b.len()).sum::<usize>()
+            + self.waiting.heap_bytes()
             + self.recv_bytes
             + self.stream_bytes
+            + self.stream_expiry.len() * 2 * size_of::<(Instant, StreamKey)>()
             + self.held_bytes
+            + self
+                .window
+                .as_ref()
+                .map_or(0, datagram::ReceiveWindow::heap_bytes)
     }
 }
 
 /// The datagram state of a session that never had one.
 static NO_DGRAM: DatagramState = DatagramState {
-    send: VecDeque::new(),
-    send_codel: codel::Codel::new(),
-    early: VecDeque::new(),
+    send: datagram::SendDatagrams::new(),
     recv: VecDeque::new(),
     recv_codel: codel::Codel::new(),
     recv_bytes: 0,
     stream_bytes: 0,
+    stream_expiry: BTreeSet::new(),
     held: VecDeque::new(),
     held_bytes: 0,
-    waiting: VecDeque::new(),
+    waiting: datagram::WaitingDatagrams::new(),
     channel_gen: 0,
-    path: None,
+    native_plans: None,
+    path: DatagramPath {
+        payload: None,
+        native_payload: None,
+        native_room: None,
+    },
+    next_sequence: 0,
+    window: None,
+    feedback: None,
+    copies: None,
+    stats: DatagramStats::EMPTY,
+    counters: DatagramCounters {
+        sent: 0,
+        received: 0,
+        dropped_recv: 0,
+        dropped_limit: 0,
+        sent_channel: 0,
+        received_channel: 0,
+    },
 };
 
 impl SessionCore {
@@ -757,9 +918,10 @@ impl SessionCore {
 /// with [`SessionCore::admit_datagrams`].
 #[derive(Debug)]
 pub struct ReceivedDatagram {
+    sequence: Option<u64>,
     /// The stream and context, `None` for the session.
     stream: Option<(StreamKey, u64)>,
-    data: Bytes,
+    data: Chunk,
     /// The receive limiter's grant; `None`: refused (the default).
     granted: Option<u64>,
 }
@@ -831,11 +993,9 @@ struct RecvRefs {
     /// buffers before its current one are retired: the driver never reads
     /// into them again.
     current: Vec<(LaneId, Backing)>,
-    /// The streams whose received data references read buffers.
-    holders: Vec<StreamKey>,
     /// Scratch of the bound: each buffer referenced, its size and the
     /// bytes referenced in it.
-    tally: Vec<(u64, usize, usize)>,
+    tally: std::cell::RefCell<Vec<(u64, usize, usize)>>,
     /// Since the bound was last checked: at most this many bytes of
     /// retired buffers are referenced (each retirement adds its buffer),
     /// and at least this many bytes are referenced in all (each byte that
@@ -847,6 +1007,11 @@ struct RecvRefs {
 }
 
 impl RecvRefs {
+    fn heap_bytes(&self) -> usize {
+        self.current.capacity() * size_of::<(LaneId, Backing)>()
+            + self.tally.borrow().capacity() * size_of::<(u64, usize, usize)>()
+    }
+
     /// `n` more bytes of received data reference read buffers.
     fn referenced(&mut self, n: usize) {
         self.referenced_at_least = self.referenced_at_least.saturating_add(n);
@@ -978,11 +1143,13 @@ pub struct SessionCore {
     /// The datagram being processed arrived on a carrier's datagram
     /// channel.
     rx_channel: bool,
-    /// The read buffer the bytes being processed came in, when the driver
-    /// handed it over ([`SessionCore::receive_shared`]), and the streams whose
-    /// received data references read buffers.
-    rx_src: Option<(Bytes, Backing)>,
     recv_refs: RecvRefs,
+    receive: recv_store::ReceiveStore,
+    write_blocked_at: Option<u64>,
+    memory_writers: Vec<StreamKey>,
+    receive_credit: Option<memory::ReceiveCredit>,
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    read_loans: std::sync::OnceLock<Arc<recv_buf::ReadLoans>>,
     /// The outbound pipe whose batch is being built.
     tx: u64,
     /// The lane of `tx` the batch is for, and whether `tx` has lanes.
@@ -997,6 +1164,8 @@ pub struct SessionCore {
     /// reinjection and copies the carrier queue limiter still lets it take;
     /// `None` when the pipe is not paced.
     pace_left: Option<u64>,
+    pacing_timers: Option<Box<deadline::Deadlines<u64>>>,
+    lane_open_timers: Option<Box<deadline::Deadlines<LaneId>>>,
 
     /// Present once the host announced an exporter on the bootstrap carrier:
     /// its value, passed by the host, which goes when the peer's parameters
@@ -1029,14 +1198,6 @@ pub struct SessionCore {
     carrier_rtt: Option<Duration>,
     /// The credit-loop minimum RTT over 300 s, `QX_PING` samples included.
     loop_min: filter::MinFilter,
-    /// Memory the session's carriers hold for it, charged by their
-    /// adapters without a listener (a QUIC connection's receive window).
-    carrier_memory: u64,
-    /// What a listener's memory budget has left for the session to grow
-    /// by, and what the session held when it said so
-    /// ([`SessionCore::set_memory_allowance`]); `None`: the session's own
-    /// `memory_budget` applies.
-    memory_allowance: Option<(Option<u64>, u64)>,
     /// `allow_connection_window_increase` proposals.
     window_increase: credit::IncreaseState,
     /// The rate bytes are handed to the carrier (single pipe).
@@ -1079,7 +1240,7 @@ pub struct SessionCore {
     close_flush: Option<Box<(VarInt, Bytes)>>,
     /// An abort was called: a close returns at once.
     close_aborted: bool,
-    stats: SessionStats,
+    stats: SessionCounters,
     /// The linger deadline was extended once because the close was not
     /// written yet.
     linger_extended: bool,
@@ -1108,13 +1269,11 @@ pub struct SessionCore {
     /// Time 0 of the session clock shapers see.
     started: Instant,
     /// The shaping configuration's budget of this session.
-    shape_budget: shaping::Budget,
+    shape_budget: Option<Box<shaping::Budget>>,
     /// The bytes this endpoint sent of its own: no padding, injections or copies.
     earn_bytes: u64,
-    /// Bytes earned on a discarded first flight, not earned twice.
-    earn_skip: u64,
-    /// Padding, injections and copies of the batch just closed.
-    batch_not_earned: u64,
+    /// Send-direction shaping byte ledger.
+    shape_ledger: shape_ledger::Ledger,
 }
 
 const BIDI: usize = 0;
@@ -1157,12 +1316,39 @@ impl SessionCore {
         transport_role: Option<Role>,
         now: Instant,
     ) -> Result<Self, InvalidConfig> {
-        let config: Arc<Config> = config.into();
+        Self::new_in(config.into(), role, transport_role, now, None, 0).map_err(|error| match error
+        {
+            crate::ConnectError::InvalidConfig(error) => error,
+            crate::ConnectError::MemoryBudget => InvalidConfig::new(
+                "memory_budget",
+                "cannot reserve initial receive credit and carrier working space",
+            ),
+            _ => unreachable!("core bootstrap performs no carrier I/O"),
+        })
+    }
+
+    pub(crate) fn new_in(
+        mut config: Arc<Config>,
+        role: Role,
+        transport_role: Option<Role>,
+        now: Instant,
+        ledger: Option<Arc<crate::proto::memory::Ledger>>,
+        carrier_memory: u64,
+    ) -> Result<Self, crate::ConnectError> {
+        if config.initial_capacity.is_some() {
+            Arc::make_mut(&mut config).initial_capacity = None;
+        }
         let keep_alive_rng = config
             .hooks
             .probe_seed
             .map_or_else(random_u64, |s| s ^ 0x6b65_6570_616c_6976);
         config.validate()?;
+        crate::util::checked_clock_deadline(
+            now,
+            config.redial_backoff.wait_upper(),
+            "redial_backoff",
+        )?;
+        config.datagram_config().defaults.deadline_at(now)?;
         let role_nonce =
             (role == Role::Auto).then(|| config.hooks.role_nonce.unwrap_or_else(random_u64));
         let session_nonce = config.hooks.session_nonce.unwrap_or_else(|| {
@@ -1172,7 +1358,63 @@ impl SessionCore {
             n
         });
         let lane_key = config.hooks.lane_key.unwrap_or_else(random_key);
-        let local_tp = config.transport_parameters(role_nonce, session_nonce, lane_key);
+        let shared_budget = ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.snapshot().limit.is_some());
+        let ledger = ledger.or_else(|| {
+            config
+                .memory_budget()
+                .map(|limit| crate::proto::memory::Ledger::new(Some(limit), None))
+        });
+        let mut local_tp = config.transport_parameters(role_nonce, session_nonce, lane_key);
+        if let Some(value) = local_tp.initial_max_data.as_mut() {
+            *value = (*value).min(recv_store::ReceiveStore::MAX_POSITIONS);
+        }
+        let requested_streams = [
+            local_tp.initial_max_streams_bidi.unwrap_or(0),
+            local_tp.initial_max_streams_uni.unwrap_or(0),
+        ];
+        let stream_limits = if shared_budget {
+            let [bidi, uni] = memory::listener_stream_limits(
+                requested_streams,
+                config.max_incoming_uni_streams == UniCredit::Staged,
+            );
+            if local_tp.initial_max_streams_bidi.is_some() {
+                local_tp.initial_max_streams_bidi = Some(bidi);
+            }
+            if local_tp.initial_max_streams_uni.is_some() {
+                local_tp.initial_max_streams_uni = Some(uni);
+            }
+            [bidi, uni]
+        } else {
+            requested_streams
+        };
+        let staged_uni = config.max_incoming_uni_streams == UniCredit::Staged
+            && stream_limits[UNI] < STAGED_UNI_STREAMS.1;
+        let remote_uni = if staged_uni {
+            STAGED_UNI_STREAMS.1
+        } else {
+            stream_limits[UNI]
+        };
+        let peer_directions = [
+            stream_limits[BIDI],
+            if shared_budget {
+                stream_limits[UNI]
+            } else {
+                remote_uni
+            },
+        ];
+        let receive_credit = if let Some(ledger) = &ledger {
+            let requested = local_tp.initial_max_data.unwrap_or(0);
+            let (credit, admitted) =
+                memory::ReceiveCredit::admit(ledger, requested, carrier_memory, peer_directions)?;
+            if admitted < requested {
+                local_tp.initial_max_data = Some(admitted);
+            }
+            Some(credit)
+        } else {
+            None
+        };
         local_tp.validate().map_err(|_| {
             InvalidConfig::new("Config", "gives transport parameters that are not valid")
         })?;
@@ -1184,26 +1426,20 @@ impl SessionCore {
             Role::Auto => None,
         });
         let window = local_tp.initial_max_data.unwrap_or(0);
-        let stream_limits = [
-            local_tp.initial_max_streams_bidi.unwrap_or(0),
-            local_tp.initial_max_streams_uni.unwrap_or(0),
-        ];
-        // Unidirectional credit grows on the first accept unless the
-        // application configured it (or the test parameters set more).
-        let staged_uni = config.max_incoming_uni_streams == UniCredit::Staged
-            && stream_limits[UNI] < STAGED_UNI_STREAMS.1;
-        let streams = Streams::new(config.send_buffer, stream_limits, staged_uni, window);
+        let mut streams = Streams::new(config.send_buffer, stream_limits, staged_uni, window);
+        streams.set_write_domain(ledger);
+        if shared_budget {
+            streams.fund_peer_streams_in_batches([requested_streams[BIDI], remote_uni]);
+        }
         let ping_start = config.hooks.ping_seq_start.unwrap_or(0);
         let srtt = config.hooks.rtt;
         let hold = config.early_data.hold_first_flight;
-        if hold
-            && (role != Role::Client
-                || !config.early_data.zmux_peer && !config.early_data.carrier_early_data)
-        {
+        if hold && role != Role::Client {
             return Err(InvalidConfig::new(
                 "early_data",
-                "hold_first_flight without client early data",
-            ));
+                "hold_first_flight requires the initiating endpoint",
+            )
+            .into());
         }
         let start_timeout = now.checked_add(config.handshake_wait());
         let mut session = Self {
@@ -1225,14 +1461,21 @@ impl SessionCore {
             rx: 0,
             rx_lane: 0,
             rx_channel: false,
-            rx_src: None,
             recv_refs: RecvRefs::default(),
+            receive: recv_store::ReceiveStore::default(),
+            receive_credit,
+            write_blocked_at: None,
+            memory_writers: Vec::new(),
+            #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+            read_loans: std::sync::OnceLock::new(),
             tx: 0,
             tx_lane: 0,
             tx_lanes: false,
             batch_stream_bytes: 0,
             exchange_at: None,
             pace_left: None,
+            pacing_timers: None,
+            lane_open_timers: None,
 
             exporter: None,
             first_pipe_mode: None,
@@ -1253,8 +1496,6 @@ impl SessionCore {
             srtt,
             carrier_rtt: None,
             loop_min: filter::MinFilter::default(),
-            memory_allowance: None,
-            carrier_memory: 0,
             window_increase: credit::IncreaseState::default(),
             send_rate: filter::IntervalRate::default(),
             requests: pipes::TokenBucket::default(),
@@ -1272,7 +1513,7 @@ impl SessionCore {
             untimed_shutdown_close: false,
             close_flush: None,
             close_aborted: false,
-            stats: SessionStats::default(),
+            stats: SessionCounters::default(),
             linger_extended: false,
             peer_close_processed: false,
             established: false,
@@ -1284,17 +1525,19 @@ impl SessionCore {
             shape_pending: None,
             join_shaping: JoinShaping::default(),
             started: now,
-            shape_budget: shaping::Budget::default(),
+            shape_budget: None,
             earn_bytes: 0,
-            earn_skip: 0,
-            batch_not_earned: 0,
+            shape_ledger: shape_ledger::Ledger::default(),
         };
-        session.early_setup(transport_role);
-        if let Some(b) = &session.config.shaping_budget {
-            session.shape_budget = b.ask();
-        }
-        if let Some(f) = session.config.shaper.clone() {
-            session.install_shaper(Some(f));
+        if let Some(factory) = session.config.shaper.clone() {
+            let budget = session
+                .config
+                .shaping_budget
+                .as_ref()
+                .map(shaping::ShapingBudget::ask)
+                .transpose()?
+                .unwrap_or_default();
+            session.set_shaper_budgeted(Some(factory), budget)?;
         }
         Ok(session)
     }
@@ -1304,6 +1547,7 @@ impl SessionCore {
     /// durations since an event are current.
     pub(crate) fn tick(&mut self, now: Instant) {
         if now > self.now {
+            self.advance_shaping_waits(now);
             self.now = now;
         }
     }
@@ -1343,7 +1587,20 @@ impl SessionCore {
             .config
             .transport_parameters(l.role_nonce, nonce, l.lane_key);
         tp.zmux_multipath.clone_from(&l.multipath);
-        tp.zmux_carrier_datagrams |= l.carrier_datagrams && tp.max_datagram_frame_size.is_some();
+        if let Some(credit) = &mut tp.initial_max_data {
+            *credit = l.receive_data;
+        }
+        if let Some(credit) = &mut tp.initial_max_streams_bidi {
+            *credit = l.receive_streams[BIDI];
+        }
+        if let Some(credit) = &mut tp.initial_max_streams_uni {
+            *credit = l.receive_streams[UNI];
+        }
+        if self.config.hooks.transport_parameters.is_none() {
+            tp.zmux_carrier_datagrams |=
+                l.carrier_datagrams && tp.max_datagram_frame_size.is_some();
+            tp.zmux_carrier_datagram_padding = tp.zmux_carrier_datagrams;
+        }
         tp
     }
 
@@ -1447,7 +1704,14 @@ impl SessionCore {
         if !self.streams.set_memory_pressure(on) {
             return;
         }
-        if !on {
+        if on {
+            self.window_increase.proposal = None;
+            self.window_increase.offered = false;
+            self.window_increase.wanted = 0;
+            let floor = self.streams.recv_flow().initial_window;
+            self.streams.set_session_window(floor);
+            self.reclaim_receive_space(false);
+        } else {
             // Held bytes are released at once below the cap.
             self.credit_consumed(0);
         }
@@ -1468,6 +1732,7 @@ impl SessionCore {
             datagrams_sent: d.sent,
             datagrams_received: d.received,
             datagrams_dropped_recv: d.dropped_recv,
+            datagrams_expired_recv: d.expired_recv,
             datagram_bytes_sent: d.bytes_sent,
             datagram_bytes_received: d.bytes_received,
             ..StreamStats::default()
@@ -1488,7 +1753,7 @@ impl SessionCore {
         }
         if let Some(r) = &s.recv {
             // Application bytes: none before a peer stream's preamble.
-            st.bytes_received = match r.preamble_size {
+            st.bytes_received = match r.preamble_size() {
                 Some(base) => r.arrived_from(base),
                 None if self.features.preamble && !s.local => 0,
                 None => r.arrived_from(0),
@@ -1542,15 +1807,17 @@ impl SessionCore {
         )
     }
 
-    /// Heap bytes of received stream data held for the application, with
-    /// the bookkeeping of out-of-order data.
+    /// Receive storage held for the application, including reassembly
+    /// bookkeeping and the full capacity of every shared carrier root once.
     #[doc(hidden)]
     pub fn received_data_memory(&self) -> usize {
         self.streams
             .keys()
             .filter_map(|k| self.streams.get(k)?.recv.as_ref())
             .map(stream::RecvPart::memory)
-            .sum()
+            .sum::<usize>()
+            + self.receive.heap_bytes()
+            + self.receive_root_capacity()
     }
 
     // ---- pipes ---------------------------------------------------------
@@ -1633,6 +1900,62 @@ impl SessionCore {
         self.att(id).and_then(Attachment::out)
     }
 
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn set_pipe_connection(&mut self, id: PipeId, connection: CarrierConnId) {
+        if self.config.offers_multipath()
+            && let Some(attachment) = self.att_mut(id.0)
+        {
+            let replaced = attachment
+                .physical_connection()
+                .is_some_and(|old| *old != connection);
+            attachment.set_physical_connection(connection);
+            if replaced {
+                attachment.set_replica_domain(None);
+                self.reset_datagram_outbound((
+                    id.0,
+                    crate::proto::frame::DatagramChannelKind::Record,
+                ));
+                self.reset_datagram_outbound((
+                    id.0,
+                    crate::proto::frame::DatagramChannelKind::Native,
+                ));
+            }
+        }
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn pipe_ledger(&self, id: PipeId) -> Option<&Arc<accounting::Ledger>> {
+        if !self.config.accounting.enabled {
+            return None;
+        }
+        self.att(id.0)?.accounting()
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn set_pipe_ledger(&mut self, id: PipeId, ledger: Arc<accounting::Ledger>) {
+        if let Some(att) = self.att_mut(id.0) {
+            att.set_accounting(ledger);
+        }
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn switch_pipe_accounting(
+        &mut self,
+        id: PipeId,
+        sources: CarrierHalfSources,
+    ) -> Result<(), std::io::ErrorKind> {
+        let connection = sources.send.connection.clone();
+        if let Some(ledger) = self.pipe_ledger(id)
+            && !ledger.switch(sources)
+        {
+            return Err(std::io::ErrorKind::PermissionDenied);
+        }
+        if let Some(connection) = connection {
+            self.set_pipe_connection(id, connection);
+        }
+        Ok(())
+    }
+
     /// The inbound side of a pipe ended, or of one of its lanes. Complete
     /// records already received were processed; an end inside a record is
     /// a pipe failure. A pipe with lanes ends gracefully once every lane
@@ -1642,6 +1965,9 @@ impl SessionCore {
         self.tick(now);
         self.pick_input();
         let pipe = at.pipe.0;
+        if let Some(ledger) = self.att(pipe).and_then(|a| a.accounting()) {
+            ledger.finish_read(at.lane.0);
+        }
         let Some(p) = self.inp_mut(pipe) else {
             return;
         };
@@ -1715,11 +2041,42 @@ impl SessionCore {
     pub fn write_failed(&mut self, at: impl Into<LaneId>, kind: std::io::ErrorKind, now: Instant) {
         let at = at.into();
         self.tick(now);
+        if let Some(ledger) = self.att(at.pipe.0).and_then(|a| a.accounting()) {
+            ledger.write_imprecise();
+        }
         if at.lane.0 != 0 {
             self.outbound_lane_failed(at.pipe.0, at.lane.0, kind, now);
             return;
         }
         self.outbound_failed(at, PipeFailure::Carrier(kind), now);
+    }
+
+    /// Reports completion of the sending half's carrier shutdown.
+    pub fn write_shutdown_complete(&mut self, at: impl Into<LaneId>, now: Instant) {
+        let at = at.into();
+        self.tick(now);
+        let Some(out) = self.out_mut(at.pipe.0) else {
+            return;
+        };
+        let was_pending = out.graceful_shutdown_pending();
+        if at.lane.0 == 0 {
+            out.shutdown_complete();
+        } else if let Some(lanes) = out.lanes_mut() {
+            lanes.lane_closed(at.lane.0);
+        }
+        if was_pending && !out.graceful_shutdown_pending() {
+            self.pipe_event(at.pipe.0, PipeHalf::Outbound);
+            self.try_retire(now);
+        }
+        if at.lane.0 == 0 {
+            self.cancel_pipe_lane_open(at.pipe.0);
+        } else {
+            self.cancel_lane_open(at);
+        }
+        if self.state == State::Closing {
+            self.settle_pipe(at.pipe.0, now);
+            self.maybe_closed(now);
+        }
     }
 
     // ---- events and timers ---------------------------------------------
@@ -1731,6 +2088,8 @@ impl SessionCore {
         if self.events.is_empty() {
             self.events = VecDeque::new();
         }
+        self.reclaim_receive_space(true);
+        self.streams.release_idle_write_roots();
         for o in self.atts.outs_mut() {
             o.release_idle();
         }
@@ -1742,6 +2101,7 @@ impl SessionCore {
     /// taken here), so an event left queued holds back the next one of its
     /// stream.
     pub fn poll_event(&mut self) -> Option<CoreEvent> {
+        self.wake_memory_writers();
         let e = self.events.pop_front()?;
         match &e {
             CoreEvent::StreamReadable(k) => {
@@ -1794,7 +2154,11 @@ impl SessionCore {
             self.pacing_deadline(),
             self.quality_deadline(),
             self.shape_deadline(),
+            self.native_shape_deadline(),
             self.waiting_deadline(),
+            self.dgram().stream_expiry.first().map(|(at, _)| *at),
+            self.datagram_send_deadline(),
+            self.datagram_feedback_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -1804,12 +2168,14 @@ impl SessionCore {
     /// Fires every timer due at `now`.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.fire_timers(now);
+        self.native_shape_timeout();
         if self.shape.is_some() && self.state != State::Closed {
             self.shape_timeout(now);
         }
         // Last: the quality reports read the estimates and pipe views as
         // the other timers left them.
         self.quality_timeout(now);
+        self.health_timeouts();
     }
 
     fn fire_timers(&mut self, now: Instant) {
@@ -1829,6 +2195,9 @@ impl SessionCore {
             return;
         }
         self.expire_waiting(now);
+        self.expire_stream_datagrams(now);
+        self.expire_send_datagrams();
+        self.expire_datagram_feedback();
         if self
             .close
             .as_ref()
@@ -1989,6 +2358,7 @@ impl SessionCore {
         if let CoreEvent::PipeRetired { pipe, .. } = e {
             self.quality_retired(pipe.0);
             self.shape_retired(pipe.0);
+            self.retire_datagram_feedback(pipe);
         }
         if matches!(
             e,
@@ -2031,8 +2401,9 @@ impl SessionCore {
     /// wins).
     fn set_error(&mut self, e: SessionError) {
         if self.error.is_none() {
-            self.events.push_back(CoreEvent::Closed(e.clone()));
-            self.error = Some(Box::new(e));
+            self.error = Some(Box::new(e.clone()));
+            self.sync_all_pipe_health();
+            self.events.push_back(CoreEvent::Closed(e));
         }
     }
 
@@ -2124,6 +2495,7 @@ impl SessionCore {
             return;
         }
         self.state = State::Closing;
+        self.sync_all_pipe_health();
         self.write_failure = None;
         self.wipe_exporter();
         self.close = frame.map(|frame| Box::new(ClosingFrame { frame, wait: None }));
@@ -2132,6 +2504,7 @@ impl SessionCore {
         self.keep_alive_deadline = None;
         self.ping.outstanding = None;
         self.linger_deadline = Some(now + self.linger_timeout());
+        self.lane_open_timers = None;
         self.start_close_wait(now + self.linger_timeout());
         // Deferred joins never went: their carriers are closed now.
         while let Some(i) = self.atts.iter().position(Attachment::deferred) {
@@ -2144,6 +2517,9 @@ impl SessionCore {
         }
         if let Some(mp) = &mut self.mp {
             mp.closing(now);
+        }
+        if let Some(goaway) = &mut self.goaway {
+            goaway.draining.clear();
         }
         self.wake_all_streams();
         self.maybe_closed(now);
@@ -2287,7 +2663,10 @@ impl SessionCore {
             self.set_error(SessionError::PipesLost { last: None });
         }
         self.state = State::Closed;
+        self.sync_all_pipe_health();
         self.write_failure = None;
+        self.pacing_timers = None;
+        self.lane_open_timers = None;
         self.events.push_back(CoreEvent::Released);
         self.wipe_exporter();
         self.handshake_deadline = None;
@@ -2513,10 +2892,8 @@ impl SessionCore {
             crate::proto::params::resolve_role(local.zmux_role, tp.zmux_role, self.transport_role)?;
         self.role = role;
         self.features = Features::negotiate(&local, tp);
+        self.early_outcome(tp)?;
         self.keep_to_remember(tp);
-        if !self.early_outcome(tp, now)? {
-            return Ok(());
-        }
         let protocol = match (&self.config.protocols, &tp.application_protocols) {
             (Some(ours), Some(theirs)) => select_protocol(ours, theirs, self.role == Role::Server),
             _ => None,
@@ -2548,6 +2925,7 @@ impl SessionCore {
             features: self.features,
             protocol,
         });
+        self.sync_pipe_health(0);
         self.note_datagram_path();
         // Streams opened before establishment may send now.
         for d in 0..2 {
@@ -2563,7 +2941,6 @@ impl SessionCore {
         }
         // The peer's credit is known: waiting parts may send.
         self.wake_capacity_waiters();
-        self.release_early_datagrams();
         // A shutdown requested before establishment starts now.
         if let Some(code) = self.goaway().shutdown {
             self.start_drain(code);
@@ -2618,7 +2995,7 @@ impl SessionCore {
     // ---- shutdown --------------------------------------------------------
 
     /// Graceful close: the two-phase GOAWAY when it is in use, then an
-    /// application `CONNECTION_CLOSE` once no stream remains.
+    /// application `CONNECTION_CLOSE` once the streams have drained.
     pub fn shutdown(&mut self, code: VarInt, reason: &[u8], now: Instant) {
         self.tick(now);
         if self.state >= State::Closing || self.goaway().shutdown.is_some() {
@@ -2636,6 +3013,15 @@ impl SessionCore {
     /// Enters DRAINING for a shutdown; with GOAWAY in use, phase 1: the
     /// limits currently granted, then the fence.
     fn start_drain(&mut self, code: u64) {
+        self.goaway_mut().draining = self
+            .streams
+            .keys()
+            .filter(|&key| {
+                self.streams
+                    .get(key)
+                    .is_some_and(stream::Stream::shutdown_pending)
+            })
+            .collect();
         if self.state == State::Suspended {
             // Draining after resumption.
             self.drain_after_suspension();
@@ -2651,13 +3037,22 @@ impl SessionCore {
         }
     }
 
-    /// After a shutdown, closes once no stream remains.
+    /// After a shutdown, closes once the stream directions and their
+    /// queued frames have drained. Finished handles can outlive the drain.
     fn check_shutdown_done(&mut self, now: Option<Instant>) {
-        if let Some(code) = self.goaway().shutdown
-            && self.state < State::Closing
-            && self.streams.len() == 0
-            && (self.goaway().final_sent || !self.features.goaway || !self.is_established())
-        {
+        let Some(code) = self.goaway().shutdown else {
+            return;
+        };
+        if self.state >= State::Closing {
+            return;
+        }
+        let drained = if self.state == State::Establishing {
+            // Early data may still be rejected and sent again.
+            self.streams.len() == 0
+        } else {
+            self.goaway().draining.is_empty() && (self.goaway().final_sent || !self.features.goaway)
+        };
+        if drained {
             let reason = std::mem::take(&mut self.goaway_mut().reason);
             self.untimed_shutdown_close = now.is_none();
             let now = now.unwrap_or(self.now);
@@ -2730,15 +3125,12 @@ impl SessionCore {
     }
 }
 
-/// The carrier record floor (zmux-spec SPEC.md Section 3.2): every carrier of a pipe, each
-/// lane included, takes records (messages) of 8192 bytes, so every frame that cannot be
-/// split fits one, and a record limit is never below it.
-pub(crate) const RECORD_FLOOR: usize = 8192;
+pub(crate) use crate::proto::record::RECORD_FLOOR;
 
 /// The one check of a pipe's record limit (the plaintext of a record, a transform's
 /// overhead already taken off): at least [`RECORD_FLOOR`].
 pub(crate) fn check_record_limit(limit: usize) -> Result<(), InvalidConfig> {
-    if limit < RECORD_FLOOR {
+    if !crate::proto::record::supports_record_floor(limit) {
         return Err(InvalidConfig::new(
             "PipeIo::with_max_record",
             "the record limit, its transform overhead taken off, is below 8192",
@@ -2757,7 +3149,7 @@ pub(crate) fn check_record_limit(limit: usize) -> Result<(), InvalidConfig> {
 ///
 /// [`InvalidConfig`] for a value from 1 to 8191.
 pub const fn check_max_record(max: usize) -> Result<(), InvalidConfig> {
-    if max != 0 && max < RECORD_FLOOR {
+    if max != 0 && !crate::proto::record::supports_record_floor(max) {
         return Err(InvalidConfig::new(
             "PipeIo::with_max_record",
             "below 8192 (0 is the carrier's default)",

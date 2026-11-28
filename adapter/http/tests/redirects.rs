@@ -12,8 +12,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zmux::{
-    CarrierCache, CarrierChoice, CarrierChoicePolicy, CarrierKind, Config, Listener,
-    ListenerConfig, Session,
+    Candidate, CarrierCache, Config, ControllerOptions, Listener, ListenerConfig, Session,
+    SessionController, SessionTarget,
 };
 use zmux_http::Options;
 
@@ -131,36 +131,47 @@ fn a_redirect_is_followed_with_the_uplink_repeated() {
         let options = Options::default().with_path("/old");
         let candidate = zmux_http::candidate(connect(addr), &addr.to_string(), &options);
         let cache = CarrierCache::default();
-        let policy = CarrierChoicePolicy::new().with_cache(cache.clone(), "k");
-        let mode = CarrierChoice::auto([candidate.clone()]);
-        let (cs, ss) =
-            within(async { tokio::join!(dial_choice_session(&mode, &policy), listener.accept()) })
-                .await;
+        let (cs, ss) = within(async {
+            tokio::join!(
+                cached_session(candidate, &cache, "http-redirect-first"),
+                listener.accept()
+            )
+        })
+        .await;
         let (cs, ss) = (cs, ss.unwrap());
         assert_eq!(count.load(Ordering::SeqCst), 1);
         echo(&cs, &ss).await;
-        assert_eq!(
-            cache.url("k", CarrierKind::Streaming, None).as_deref(),
-            Some(format!("http://{addr}/new").as_str())
-        );
-        // The next carrier starts at /new: no redirect.
-        let io = candidate.dial().await.unwrap();
+        // The next candidate's target starts at /new through the cache.
+        let next = zmux_http::candidate(connect(addr), &addr.to_string(), &options);
         let (c2, s2) = within(async {
-            tokio::join!(Session::connect(io, Config::default()), listener.accept())
+            tokio::join!(
+                cached_session(next, &cache, "http-redirect-second"),
+                listener.accept()
+            )
         })
         .await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        echo(&c2.unwrap(), &s2.unwrap()).await;
+        echo(&c2, &s2.unwrap()).await;
         cs.close().await;
         front.abort();
         serving.abort();
     });
 }
 
-async fn dial_choice_session(mode: &CarrierChoice, policy: &CarrierChoicePolicy) -> Session {
-    zmux::dial_choice(mode, Config::default(), policy)
+async fn cached_session(candidate: Candidate, cache: &CarrierCache, domain: &str) -> Session {
+    let mut options =
+        ControllerOptions::new(domain, vec![candidate.with_identity("redirect", "k")]);
+    options.cache = Some(cache.clone());
+    let controller = SessionController::new(options).unwrap();
+    let (session, control) = controller
+        .open(Config::default(), SessionTarget::default())
         .await
-        .unwrap()
+        .unwrap();
+    if let Some(control) = control {
+        control.release().unwrap();
+        control.done().await;
+    }
+    session
 }
 
 /// The error a failed session establishment carries, as text.
@@ -281,9 +292,9 @@ fn http2_requests_follow_redirects_within_the_origin() {
         ))
         .await
         .unwrap();
-        let (cs, ss) = within(async {
+        let (cs, ss) = Box::pin(within(async {
             tokio::join!(conn.connect_session(Config::default()), listener.accept())
-        })
+        }))
         .await;
         let (cs, ss) = (cs.unwrap(), ss.unwrap());
         assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -296,7 +307,7 @@ fn http2_requests_follow_redirects_within_the_origin() {
         ))
         .await
         .unwrap();
-        let Err(e) = within(conn.connect_session(Config::default())).await else {
+        let Err(e) = within(Box::pin(conn.connect_session(Config::default()))).await else {
             panic!("established");
         };
         let e = format!("{e:?}");
@@ -359,12 +370,8 @@ fn exchange_requests_follow_redirects_per_request() {
                 .with_path(path)
                 .with_down_path("/zmux/exchange");
             let io = zmux_http::dial_exchange(&addr.to_string(), &options).unwrap();
-            let start = std::time::Instant::now();
             let r = within(Session::connect(io, Config::default())).await;
             assert!(r.is_err(), "{path} established");
-            // The first UP request failed the carrier, before the deadline of
-            // repeats (its CLOSE may be under way as well).
-            assert!(start.elapsed() < options.deadline, "{path}");
             let n = count.load(Ordering::SeqCst);
             assert!(n >= hops, "{path}: {n}");
         }

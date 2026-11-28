@@ -625,6 +625,9 @@ async fn closing_a_pending_handshake_counts_as_cancellation() {
     l.close();
     drop(cancelled);
     assert_eq!(counts(&l), [0, 0, 0, 1, 0, 0, 0, 1]);
-    assert_eq!(*calls.lock().unwrap(), []);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [] as [(AdmissionStage, Framing, bool, Option<SocketAddr>, Vec<u8>); 0]
+    );
     assert_eq!(l.stats().setup_failures, 0);
 }

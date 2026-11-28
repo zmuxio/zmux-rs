@@ -108,6 +108,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::{
     Request as ClientRequest, Response as ClientResponse,
@@ -115,10 +116,9 @@ use tokio_tungstenite::tungstenite::handshake::client::{
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::http::{self, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
-use tokio_tungstenite::tungstenite::{Bytes, Message};
 use zmux::Prefixed;
 use zmux::adapter::ChunkWrite;
-use zmux::adapter::{Admit, Entry};
+use zmux::adapter::{Admit, Entry, MemoryCharge};
 use zmux::{CarrierCredential, CarrierInfo, ConnectError, Listener, PipeHint, PipeIo, Session};
 use zmux_rustls::{TlsBinding, TlsConnection};
 
@@ -132,12 +132,28 @@ pub fn pipe<S>(ws: WebSocketStream<S>, protocol: Option<String>) -> PipeIo
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    pipe_with_reservation(ws, protocol, None)
+}
+
+fn pipe_with_reservation<S>(
+    ws: WebSocketStream<S>,
+    protocol: Option<String>,
+    memory: Option<MemoryCharge>,
+) -> PipeIo
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (sink, stream) = ws.split();
+    let memory = memory.map(Arc::new);
     let io = PipeIo::from_chunk_halves(
-        Reader { stream },
+        Reader {
+            stream,
+            _memory: memory.clone(),
+        },
         Writer {
             sink,
             started: (0, 0),
+            _memory: memory,
         },
     )
     .records()
@@ -359,11 +375,11 @@ async fn dial_once(
 /// A carrier over a new WebSocket on `io`, an established byte stream such
 /// as a TLS stream: the client handshake for `request` (a `ws://` or
 /// `wss://` URL, or a request with headers), the subprotocols and the
-/// credential's header field as in [`dial`] (the credential is given no
-/// exporter: a bound one needs [`dial_tls`]). A redirect is not followed
-/// (it is a refusal: the connection is the caller's). The carrier has no
-/// exporter and is not declared secure: the adapter does not see the TLS
-/// layer of `io`. Give the carrier the TCP socket underneath
+/// credential's header field as in [`dial`]. Supply the outer connection's
+/// metadata in `info`: [`CarrierInfo::with_encrypted`] for bearer tickets,
+/// or [`CarrierInfo::with_prefix_binding`] with the completed TLS 1.3
+/// connection's exporter for bound tickets. A redirect is a refusal.
+/// Give the carrier the TCP socket underneath
 /// ([`PipeIo::with_tcp_socket`]) so that a failed pipe is aborted without a
 /// Close frame, as [`dial_tls`] does.
 ///
@@ -372,7 +388,8 @@ async fn dial_once(
 /// #     name: tokio_rustls::rustls::pki_types::ServerName<'static>) -> std::io::Result<()> {
 /// let tcp = tokio::net::TcpStream::connect("example.com:443").await?;
 /// let conn = tls.connect(name, tcp).await?;
-/// let pipe = zmux_websocket::dial_over(conn, "wss://example.com/zmux", &Default::default()).await?;
+/// let info = zmux::CarrierInfo::new().with_encrypted();
+/// let pipe = zmux_websocket::dial_over(conn, "wss://example.com/zmux", &Default::default(), &info).await?;
 /// # drop(pipe);
 /// # Ok(())
 /// # }
@@ -387,11 +404,12 @@ pub async fn dial_over<S>(
     io: S,
     request: impl IntoClientRequest + Unpin,
     options: &Options,
+    info: &CarrierInfo,
 ) -> io::Result<PipeIo>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let request = offer(request, options, &CarrierInfo::new())?;
+    let request = offer(request, options, info)?;
     bounded(options, async { Ok(upgrade_over(io, request).await?) }).await
 }
 
@@ -716,17 +734,20 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     I: FnOnce(&S) -> CarrierInfo,
 {
-    accept_with_fallback(io, entry, info, listener, options, None).await
+    let (upgrade, outcome) = accept_routed(io, entry, info, listener, options).await?;
+    if let Some(outcome) = outcome {
+        outcome.complete(true);
+    }
+    Ok(upgrade)
 }
 
-async fn accept_with_fallback<S, I>(
+async fn accept_routed<S, I>(
     mut io: S,
     mut entry: Entry,
     info: I,
     listener: &Listener,
     options: &Options,
-    outcome: Option<&mut Option<zmux::adapter::RequestFallback>>,
-) -> io::Result<Upgrade<S>>
+) -> io::Result<(Upgrade<S>, Option<zmux::adapter::RequestFallback>)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     I: FnOnce(&S) -> CarrierInfo,
@@ -735,16 +756,16 @@ where
         .setup_step(read_head(&mut io, options.max_request_head))
         .await
     else {
-        return Ok(Upgrade::Ended);
+        return Ok((Upgrade::Ended, None));
     };
     let (buf, head_len) = head?;
     // Not an upgrade this server takes: a failed upgrade (the entry
     // dropped counts it).
     let Some(head_len) = head_len else {
-        return Ok(Upgrade::Refused(Prefixed::new(io, buf)));
+        return Ok((Upgrade::Refused(Prefixed::new(io, buf)), None));
     };
     let Some(upgrade) = parse_upgrade(&buf[..head_len], options) else {
-        return Ok(Upgrade::Refused(Prefixed::new(io, buf)));
+        return Ok((Upgrade::Refused(Prefixed::new(io, buf)), None));
     };
     let fields = || &upgrade.parts.headers;
     if zmux::adapter::forwarded_early_data(fields()) {
@@ -753,7 +774,7 @@ where
         io.write_all(b"HTTP/1.1 425 Too Early\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await?;
         let _ = io.shutdown().await;
-        return Ok(Upgrade::Ended);
+        return Ok((Upgrade::Ended, None));
     }
     // Behind a PROXY protocol header, the client it reported is the hop
     // whose forwarding header field counts.
@@ -762,11 +783,11 @@ where
         .trusted_proxies()
         .source(entry.source(), fields());
     if !entry.set_source(source) {
-        return Ok(Upgrade::Ended);
+        return Ok((Upgrade::Ended, None));
     }
     let admit = {
         let Some(info) = entry.host(|| info(&io)) else {
-            return Ok(Upgrade::Ended);
+            return Ok((Upgrade::Ended, None));
         };
         entry
             .decide_upgrade(info.with_request_head(Arc::new(upgrade.parts.clone()), header_fields))
@@ -775,12 +796,8 @@ where
     match admit {
         Admit::Accept(_) | Admit::Defer | Admit::TakeOver(_) => {}
         Admit::Fallback(_) => {
-            if let Some(outcome) = outcome {
-                *outcome = entry.request_fallback();
-            } else {
-                entry.complete_request_fallback(true);
-            }
-            return Ok(Upgrade::Refused(Prefixed::new(io, buf)));
+            let fallback = entry.request_fallback();
+            return Ok((Upgrade::Refused(Prefixed::new(io, buf)), fallback));
         }
         Admit::Stall => {
             entry
@@ -790,10 +807,11 @@ where
                     }
                 })
                 .await;
-            return Ok(Upgrade::Ended);
+            return Ok((Upgrade::Ended, None));
         }
-        _ => return Ok(Upgrade::Ended),
+        _ => return Ok((Upgrade::Ended, None)),
     }
+    let memory = listener.adapter().reserve_memory(WS_WORKSPACE)?;
     let selected = upgrade
         .protocol
         .as_ref()
@@ -811,15 +829,18 @@ where
         })
         .await
     else {
-        return Ok(Upgrade::Ended);
+        return Ok((Upgrade::Ended, None));
     };
     flushed?;
     let rest = buf[head_len..].to_vec();
     let ws = WebSocketStream::from_partially_read(io, rest, Role::Server, Some(ws_config())).await;
-    Ok(Upgrade::Upgraded(Upgraded {
-        pipe: pipe(ws, upgrade.protocol),
-        entry,
-    }))
+    Ok((
+        Upgrade::Upgraded(Upgraded {
+            pipe: pipe_with_reservation(ws, upgrade.protocol, Some(memory)),
+            entry,
+        }),
+        None,
+    ))
 }
 
 /// Answers a refused request with `404 Not Found` and ends the
@@ -908,31 +929,16 @@ fn parse_upgrade(head: &[u8], options: &Options) -> Option<UpgradeRequest> {
     }
     let (parts, ()) = builder.body(()).ok()?.into_parts();
     let headers = &parts.headers;
-    let tokens = |name: &str| {
-        headers
-            .get_all(name)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .map(str::trim)
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    };
-    let upgrade = parts.method == http::Method::GET
-        && tokens("Connection")
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case("upgrade"))
-        && tokens("Upgrade")
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case("websocket"))
-        && headers
-            .get("Sec-WebSocket-Version")
-            .is_some_and(|v| v.as_bytes() == b"13");
-    if !upgrade {
+    if zmux_http_head::websocket(&parts.method, parts.version, headers, None)
+        != zmux_http_head::WebSocket::Opening
+    {
         return None;
     }
-    let key = headers.get("Sec-WebSocket-Key")?;
-    let protocol = options.accept(&tokens(PROTOCOL_HEADER))?;
+    let key = headers.get("sec-websocket-key")?;
+    let offered = zmux_http_head::tokens(headers, PROTOCOL_HEADER)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let protocol = options.accept(&offered)?;
     Some(UpgradeRequest {
         accept_key: derive_accept_key(key.as_bytes()),
         protocol,
@@ -1030,11 +1036,9 @@ async fn serve_over<C, S, SF>(
                 // A failed handshake or upgrade counts with the entry.
                 let conn = setup(conn).await.map_err(drop)?;
                 let binding = binding(&conn);
-                let mut outcome = None;
-                let upgraded =
-                    accept_with_fallback(conn, entry, info, &listener, options, Some(&mut outcome))
-                        .await
-                        .map_err(drop)?;
+                let (upgraded, outcome) = accept_routed(conn, entry, info, &listener, options)
+                    .await
+                    .map_err(drop)?;
                 Ok((upgraded, socket, source, binding, outcome))
             }
         }
@@ -1281,12 +1285,28 @@ impl Options {
 /// (`FRAME_ENCODING_ERROR`) rather than as a carrier failure. The session's
 /// read buffer holds every message this lets through.
 pub(crate) fn ws_config() -> WebSocketConfig {
-    let max = usize::try_from(zmux::proto::params::ZMUX_MAX_RECORD_SIZE)
-        .map_or(usize::MAX, |m| m.saturating_add(1));
     WebSocketConfig::default()
-        .max_message_size(Some(max))
-        .max_frame_size(Some(max))
+        .read_buffer_size(WS_READ_BUFFER)
+        .write_buffer_size(WS_READ_BUFFER)
+        .max_write_buffer_size(WS_MAX_WRITE)
+        .max_message_size(Some(WS_MESSAGE))
+        .max_frame_size(Some(WS_MESSAGE))
 }
+
+const WS_MESSAGE: usize = {
+    let size = zmux::proto::params::ZMUX_MAX_RECORD_SIZE + 1;
+    assert!(size <= usize::MAX as u64);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the constant assertion checks the conversion"
+    )]
+    let size = size as usize;
+    size
+};
+const WS_READ_BUFFER: usize = 2 * WS_MESSAGE;
+const WS_MAX_WRITE: usize = 3 * WS_MESSAGE + 256;
+// Space for buffer growth and the frame being decoded, assembled or written.
+const WS_WORKSPACE: u64 = (2 * WS_READ_BUFFER + 4 * WS_MESSAGE + 2 * WS_MAX_WRITE) as u64;
 
 /// A duplicate of the TCP socket, for the carrier's queries and abort.
 fn tcp_dup(tcp: &TcpStream) -> Option<SocketDup> {
@@ -1313,6 +1333,7 @@ type SocketDup = ();
 /// The receiving half: one binary message per read.
 struct Reader<S> {
     stream: SplitStream<WebSocketStream<S>>,
+    _memory: Option<Arc<MemoryCharge>>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Reader<S> {
@@ -1326,6 +1347,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Reader<S> {
                 // The end of the stream without a Close frame is reported
                 // as an error by tungstenite; a Close frame is the end.
                 None | Some(Ok(Message::Close(_))) => return Poll::Ready(Ok(())),
+                Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(
+                    tokio_tungstenite::tungstenite::error::CapacityError::MessageTooLong { .. },
+                ))) => return Poll::Ready(Err(zmux::adapter::message_too_large())),
                 Some(Err(e)) => {
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
                 }
@@ -1368,6 +1392,7 @@ struct Writer<S> {
     /// The messages handed to the sink and not yet flushed: their count and
     /// bytes.
     started: (usize, usize),
+    _memory: Option<Arc<MemoryCharge>>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Writer<S> {
@@ -1376,20 +1401,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Writer<S> {
     fn write_batch(
         &mut self,
         cx: &mut Context<'_>,
-        messages: &mut [Bytes],
+        messages: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
         while let Some(msg) = messages.get(self.started.0) {
             ready!(Pin::new(&mut self.sink).poll_ready(cx)).map_err(ws_error)?;
             // Shared with the sink; taken from `messages` once flushed.
             Pin::new(&mut self.sink)
-                .start_send(Message::Binary(msg.clone()))
+                .start_send(Message::Binary(msg.clone().into_bytes()))
                 .map_err(ws_error)?;
             self.started.0 += 1;
             self.started.1 += msg.len();
         }
         ready!(Pin::new(&mut self.sink).poll_flush(cx)).map_err(ws_error)?;
         let bytes = self.started.1;
-        messages.fill(Bytes::new());
+        messages.fill(zmux::Chunk::new());
         Poll::Ready(Ok(bytes))
     }
 }
@@ -1403,9 +1428,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> ChunkWrite for Writer<S> {
     fn poll_write_chunks(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        chunks: &mut [Bytes],
+        chunks: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
         self.poll_write_message_batch(cx, chunks)
+    }
+
+    fn has_submitted_write(&self) -> bool {
+        self.started.0 != 0
     }
 
     fn takes_message_batches(&self) -> bool {
@@ -1416,7 +1445,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> ChunkWrite for Writer<S> {
     fn poll_write_message_batch(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        messages: &mut [Bytes],
+        messages: &mut [zmux::Chunk],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let r = this.write_batch(cx, messages);

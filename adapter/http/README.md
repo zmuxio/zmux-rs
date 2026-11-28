@@ -91,16 +91,23 @@ error at the other end, never a clean end.
   period and probe interval below the shortest idle limit on the path.
 - Split carriers: `join_http1_split_with` (or `Http2Connection::join_split`)
   joins a paired uplink and downlink as one further pipe of a session; a split
-  bootstrap's carrier makes pipe pair 0 only, and `Session::add_pipe`
-  refuses it. A `zmux::helpers::PipePool::join` keeps such pairs up.
-- Candidates for a `zmux::Dial` with several carrier modes: `candidate`
+  bootstrap's carrier makes pipe pair 0 only, and `Session::begin_change`
+  refuses it. A `zmux::SessionController` can maintain those pairs.
+- Candidates for a `zmux::SessionController` with several carrier modes: `candidate`
   (bidirectional), `candidate_split` (split bootstrap and split joins) and
   `candidate_exchange` (exchange) over HTTP/1.1 connections the caller
   makes, and `Http2Connection::candidate` and
   `Http2Connection::candidate_split` on one HTTP/2 connection.
 - Client: `Options::carrier_credential` presents a `zmux::CarrierCredential`, such as an
-  unbound `zmux::PrefixAuth` token: its prefix first on every request body
-  that carries a pipe or a lane, its header form on a downlink `GET`.
+  `zmux::PrefixAuth` ticket, as a binary prefix on each independently
+  admitted request body or as a header on an encrypted downlink `GET`.
+  HTTP exchange uses its request envelope for authentication. When an
+  endpoint serves carriers protected by prefix tickets, configure exchange
+  with a PSK and a separate listener for the authenticated envelope.
+  `Endpoint::new` and `Options::validate_server` reject unauthenticated
+  exchange in that configuration with `InvalidInput`. Exchange client
+  options accept application credentials for the creating request and
+  reject `PrefixAuth`.
 - Redirects: a carrier request follows a redirect within its origin (the
   connections are the caller's): another path or query on the same scheme
   (`Options::https`), host and port, at most `Options::max_redirects` (5)

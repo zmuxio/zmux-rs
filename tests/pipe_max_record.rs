@@ -135,7 +135,7 @@ async fn a_sealed_join_keeps_the_carrier_record_limit() {
             .await
         });
         let pipe = client
-            .begin_add_pipe(
+            .test_begin_join(
                 PipeIo::new(near).with_max_record(SEALED_CAP).unwrap(),
                 PipeOptions::new(),
             )
@@ -215,7 +215,7 @@ async fn a_pipe_the_sealed_overhead_takes_below_the_floor_is_refused() {
         let _server = listener.accept().await.unwrap();
         client.established().await.unwrap();
         let (near, _far) = tokio::io::duplex(1 << 16);
-        let r = client.begin_add_pipe(
+        let r = client.test_begin_join(
             PipeIo::new(near).with_max_record(CAP).unwrap(),
             PipeOptions::new(),
         );
@@ -265,7 +265,7 @@ async fn the_epoch_exchange_completes_with_every_pipe_at_the_floor() {
             .await
         });
         let pipe = client
-            .begin_add_pipe(
+            .test_begin_join(
                 PipeIo::new(near)
                     .with_max_record(FLOOR_UNDER_SEALED)
                     .unwrap(),

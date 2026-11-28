@@ -1,7 +1,7 @@
 //! WebSocket peer for the Java HTTP interop test: `server|client|bad ADDR`.
 //!
-//! Prefix authentication key `ws-interop`, 30 s slots, skew 1, token in the
-//! upgrade request's header field. `server` prints `READY <address>` (the bound one; port 0 picks a free port), echoes one stream
+//! Ticket fixture `ws-interop`, 30 s slots, skew 1, presented in the
+//! secure upgrade request's header field. `server` prints `READY <address>` (the bound one; port 0 picks a free port), echoes one stream
 //! per session (`SESSION <content>`) and answers refused requests 418, printing
 //! `FALLBACK <target>`. `client` prints `OK ping`; `bad` (no token) prints
 //! `REFUSED <error>`.
@@ -53,9 +53,10 @@ async fn server(addr: &str) {
     let listener = common::listener(KEY, Some(fallback));
     let tcp = TcpListener::bind(addr).await.expect("bind");
     let local = tcp.local_addr().expect("local address");
-    tokio::spawn(zmux_websocket::serve(
+    tokio::spawn(zmux_websocket::serve_tls(
         listener.clone(),
         tcp,
+        common::tls_acceptor(),
         zmux_websocket::Options::default(),
     ));
     println!("READY {local}");
@@ -67,9 +68,12 @@ async fn client(addr: &str, authed: bool) {
     if authed {
         options = options.with_carrier_credential(Arc::new(common::auth(KEY)));
     }
-    let url = format!("ws://{addr}/zmux");
+    let url = format!("wss://{addr}/zmux");
+    let tls = common::tls_connector(b"http/1.1");
     let session =
-        match zmux_websocket::connect(url.as_str(), &options, zmux::Config::default()).await {
+        match zmux_websocket::connect_tls(url.as_str(), &tls, &options, zmux::Config::default())
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 println!("REFUSED {e}");

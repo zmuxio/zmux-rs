@@ -311,6 +311,8 @@ impl TlsBinding {
         tls_info(
             self.state.alpn.as_deref(),
             self.state.server_name.as_deref(),
+            self.terminated_tls().is_some(),
+            self.is_bound(),
             zmux::CarrierExporter::new(move |label, context, out| {
                 binding.export(label, context, out)
             }),
@@ -341,12 +343,20 @@ impl TlsBinding {
 pub(crate) fn tls_info(
     alpn: Option<&[u8]>,
     server_name: Option<&str>,
+    complete: bool,
+    bound: bool,
     exporter: zmux::CarrierExporter,
 ) -> CarrierInfo {
-    CarrierInfo::new()
+    let info = CarrierInfo::new()
         .with_alpn(alpn)
-        .with_server_name(server_name)
-        .with_exporter(exporter)
+        .with_server_name(server_name);
+    if bound {
+        info.with_prefix_binding(exporter)
+    } else if complete {
+        info.with_encrypted().with_exporter(exporter)
+    } else {
+        info.with_early_data()
+    }
 }
 
 /// The exporter values zmux reads from `conn` now

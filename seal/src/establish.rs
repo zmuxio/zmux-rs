@@ -5,8 +5,8 @@ use std::{fmt, io};
 
 use zmux::proto::seal::{Framing, RecordMode, cut_unit};
 use zmux::shaping::{
-    HandshakeShaper, HandshakeView, Limits, PlanAnswer, UnitPlan, ask_handshake,
-    establish_hello_len, item_size, message_len, pad_item,
+    EstablishReceipt, HandshakeShaper, HandshakeView, Limits, PlanAnswer, ProfileLimits, UnitPlan,
+    ask_handshake, establish_hello_len, fit_item, item_size, message_len,
 };
 use zmux::{CarrierKind, PipeIo};
 use zmux_seal_proto::{Error, Initiator, InitiatorConfig, Profile};
@@ -46,32 +46,54 @@ pub(crate) async fn plan_of<C: Carrier>(
     plan
 }
 
-/// The payload of message `seq` under `plan`. `head` gives the wire length of a unit of so
-/// many Noise bytes, `over` of them the carrier's own framing. A message sent without a key has random padding. `padded` counts the
-/// bytes the padding took.
+pub(crate) fn session_shaping_limits(
+    session: &mut zmux::Config,
+    local: Option<Limits>,
+) -> Result<Limits, zmux::InvalidConfig> {
+    if let Some(local) = local {
+        local.validate()?;
+    }
+    let mut limits = session.prepare_establish_shaping()?;
+    if let Some(local) = local {
+        limits.no_padding |= local.no_padding;
+        limits.no_pause |= local.no_pause;
+        if let Some(bound) = local
+            .profiles()
+            .map(|profile| profile.max_added_delay)
+            .min()
+        {
+            let mut profile = limits.profile.unwrap_or(ProfileLimits::LIGHTWEIGHT);
+            profile.max_added_delay = limits.max_added_delay().min(bound);
+            limits.profile = Some(profile);
+        }
+    }
+    Ok(limits)
+}
+
+/// The outgoing payload and the receipt for this unit's chosen layout.
 pub(crate) fn shaped_payload(
     plan: &UnitPlan,
     (seq, profile): (usize, Profile),
     items: &[(u64, &[u8])],
     (head, over): (impl Fn(usize) -> usize, usize),
-    padded: &mut u64,
-) -> Result<Vec<u8>, Error> {
-    let psk = has_psk(profile);
-    // The plaintext of the items, whatever their types.
+) -> Result<(Vec<u8>, EstablishReceipt), Error> {
     let noise = profile.empty_message_len(seq) + zmux::proto::seal::encode_payload(items).len();
-    let w = head(noise);
+    let baseline = head(noise).saturating_sub(over);
     let room = zmux::proto::seal::MAX_UNIT
         .saturating_sub(noise)
-        // The floor counts the message as written, without the carrier's own framing.
-        .min(zmux::proto::seal::HANDSHAKE_MESSAGE_FLOOR.saturating_sub(w.saturating_sub(over)));
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "both sizes are bounded by a handshake unit, far below isize::MAX"
-    )]
-    let value = pad_item(plan.pad_for(w) as isize - w as isize, room);
-    *padded += value.map_or(0, |v| item_size(v) as u64);
-    let random = seq == 0 && !psk;
-    handshake_payload(value, items, random)
+        .min(zmux::proto::seal::HANDSHAKE_MESSAGE_FLOOR.saturating_sub(baseline));
+    let allowance = plan.handshake_room(baseline + over, room);
+    let value = fit_item(allowance);
+    let random = seq == 0 && !has_psk(profile);
+    let payload = handshake_payload(value, items, random)?;
+    let receipt = EstablishReceipt {
+        at: std::time::Instant::now(),
+        baseline: baseline as u64,
+        allowance: allowance as u64,
+        extra: value.map_or(0, |v| item_size(v) as u64),
+        delay: plan.delay,
+    };
+    Ok((payload, receipt))
 }
 
 /// What an Establish learned of the other end.
@@ -258,7 +280,7 @@ pub struct ClientConfig {
     pub signer: Option<Arc<dyn Signer>>,
     /// Plans the handshake's messages; unset: none.
     pub shaper: Option<HandshakeShaper>,
-    /// Applied to the plans, and not counted: there is no session yet.
+    /// Bounds each outbound handshake plan before it is written.
     pub shaping_limits: Option<Limits>,
     /// How long the client waits for message 2 before it fails with [`NoReply`] (default
     /// [`DEFAULT_REPLY_TIMEOUT`], 10 s; `None`: no limit). A server that stalls a refused
@@ -286,6 +308,22 @@ impl Default for ClientConfig {
             shaping_limits: None,
             reply_timeout: Some(DEFAULT_REPLY_TIMEOUT),
         }
+    }
+}
+
+impl ClientConfig {
+    /// Uses the selected session's shaping limits for Hello and Finish.
+    /// Use the same session configuration when attaching the established carrier.
+    ///
+    /// # Errors
+    ///
+    /// The local limits or session budget cannot be resolved.
+    pub fn use_session_shaping(
+        &mut self,
+        session: &mut zmux::Config,
+    ) -> Result<(), zmux::InvalidConfig> {
+        self.shaping_limits = Some(session_shaping_limits(session, self.shaping_limits)?);
+        Ok(())
     }
 }
 
@@ -467,10 +505,10 @@ pub(crate) async fn run_client<C: Carrier>(
     let limits = cfg.shaping_limits.as_ref();
     let stream = framing == Framing::ByteStream;
     let over = usize::from(p.overhead());
-    let mut padded = 0;
-    let plan = plan_of::<C>(&p.wait(), p.kind(), shaper, limits, "hello").await;
+    let clock = zmux::ClockDomain::default();
+    let plan = plan_of::<C>(&p.wait(&clock), p.kind(), shaper, limits, "hello").await;
     let handle = psk;
-    let payload = shaped_payload(
+    let (payload, mut hello_receipt) = shaped_payload(
         &plan,
         (0, profile),
         &message_items(&[], &early, &[]),
@@ -478,16 +516,20 @@ pub(crate) async fn run_client<C: Carrier>(
             |noise| establish_hello_len(profile.value(), handle, stream, noise, over),
             over,
         ),
-        &mut padded,
     )
     .map_err(invalid)?;
     let (hello, wait) = init.write_hello(&payload).map_err(invalid)?;
+    hello_receipt.at = clock.now();
+    debug_assert_eq!(
+        hello.len() as u64,
+        hello_receipt.baseline + hello_receipt.extra
+    );
     p.write(&hello).await?;
     let mut buf = Vec::new();
     let reply = {
         let r = match cfg.reply_timeout {
             None => read_frame(&mut p, framing, &mut buf).await,
-            Some(t) => p.read_unit_within(framing, &mut buf, t).await,
+            Some(t) => p.read_unit_within(&clock, framing, &mut buf, t).await,
         };
         // The server's silence: an end, a failure or a timeout before message 2.
         r.map_err(|e| match e.kind() {
@@ -523,29 +565,21 @@ pub(crate) async fn run_client<C: Carrier>(
         };
         io::Error::new(kind, CredentialFailure::new(Reason::Verifier).with_cause(e))
     })?;
-    // The core checks the proof the verdict names.
-    let pq_authenticated = match &verdict {
-        Some(v) => verify
-            .check_proof(v.proof_key.as_ref(), false)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    CredentialFailure::new(Reason::Proof).with_cause(e),
-                )
-            })?,
-        None => false,
-    };
-    if cfg.require_pq_auth && !pq_authenticated {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            CredentialFailure::new(Reason::PqAuthRequired).with_cause(Error::CredentialsFailed),
-        ));
-    }
-    // The data is the verified server's only once its verifier passed.
     let mut judged = app_data.clone();
-    if verdict.is_some() {
-        AppData::mark_authenticated(&mut judged);
-    }
+    let pq_authenticated = crate::trust::verify_application_data(
+        verdict.as_ref(),
+        cfg.require_pq_auth,
+        |key| verify.check_proof(key, false),
+        &mut judged,
+    )
+    .map_err(|error| {
+        let error = if matches!(error.reason, Reason::PqAuthRequired) {
+            error.with_cause(Error::CredentialsFailed)
+        } else {
+            error
+        };
+        io::Error::new(io::ErrorKind::PermissionDenied, error)
+    })?;
     let late = ask_app_data(
         cfg.app_data.as_ref(),
         AppDataRequest {
@@ -558,13 +592,12 @@ pub(crate) async fn run_client<C: Carrier>(
     .map_err(refused)?;
     let value = credential_value(cfg.credential.as_ref());
     let proof = proof_placeholder(cfg.signer.as_ref());
-    let plan = plan_of::<C>(&p.wait(), p.kind(), shaper, limits, "finish").await;
-    let payload = shaped_payload(
+    let plan = plan_of::<C>(&p.wait(&clock), p.kind(), shaper, limits, "finish").await;
+    let (payload, mut finish_receipt) = shaped_payload(
         &plan,
         (2, profile),
         &message_items(&value, &late, &proof),
         (|noise| message_len(stream, noise, over), over),
-        &mut padded,
     )
     .map_err(invalid)?;
     let finish = verify.accept();
@@ -580,6 +613,11 @@ pub(crate) async fn run_client<C: Carrier>(
             pending.finish(&sig).map_err(invalid)?
         }
     };
+    finish_receipt.at = clock.now();
+    debug_assert_eq!(
+        finish.len() as u64,
+        finish_receipt.baseline + finish_receipt.extra
+    );
     p.write(&finish).await?;
     let peer = Peer {
         static_key: peer_key,
@@ -591,5 +629,8 @@ pub(crate) async fn run_client<C: Carrier>(
         pq_confidential: profile.pq_confidentiality(),
         pq_authenticated,
     };
-    Ok((p.finish(buf, complete, mode).padded(padded), peer))
+    let pipe = p
+        .finish(buf, complete, mode)
+        .with_establish_receipts([Some(hello_receipt), Some(finish_receipt)]);
+    Ok((pipe, peer))
 }

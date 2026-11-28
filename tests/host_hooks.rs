@@ -1,11 +1,19 @@
 //! Host hooks that answer later, and the observing hooks' subscription.
 
+#[path = "common/clock.rs"]
+mod clock;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use clock::ManualClock;
 use tokio::net::{TcpListener, TcpStream};
-use zmux::{Config, HostEvent, Listener, ListenerConfig, PipeIo, SessionConfigFn, TraceRecord};
+use zmux::{ClockDomain, MonotonicClock};
+use zmux::{
+    Config, HandleError, HostEvent, Listener, ListenerConfig, PipeHint, PipeIo, SessionConfigFn,
+    TraceRecord,
+};
 
 const LIMIT: Duration = Duration::from_secs(10);
 
@@ -26,7 +34,7 @@ async fn a_later_session_config_is_awaited() {
         a.fetch_add(1, Ordering::Relaxed);
         async move {
             assert!(c.peer.is_some());
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
             Ok(None)
         }
     }));
@@ -52,27 +60,38 @@ async fn a_later_session_config_is_awaited() {
 
 #[tokio::test]
 async fn a_session_config_past_the_handshake_deadline_rejects() {
-    let mut limits = ListenerConfig::default();
-    limits.handshake_timeout = Duration::from_millis(100);
-    limits.session_config = Some(SessionConfigFn::new_async(|_| std::future::pending()));
-    let mut server = Config::default();
-    server.handshake_timeout = Some(Duration::from_millis(100));
-    let (listener, addr) = serve(server, limits).await;
-    let tcp = TcpStream::connect(&addr).await.unwrap();
-    let mut client = Config::default();
-    client.handshake_timeout = Some(Duration::from_secs(5));
-    let r = tokio::time::timeout(LIMIT, zmux::Session::connect(PipeIo::from_tcp(tcp), client))
-        .await
-        .unwrap();
-    assert!(r.is_err());
     tokio::time::timeout(LIMIT, async {
-        while listener.stats().rejected == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let wait = Duration::from_secs(90);
+        let (clock, domain) = ManualClock::domain(Duration::from_secs(120));
+        let mut timers = clock.registrations();
+        let deadline = domain.now() + wait;
+        let mut limits = ListenerConfig::default();
+        limits.handshake_timeout = wait;
+        limits.session_config = Some(SessionConfigFn::new_async(|_| std::future::pending()));
+        let mut config = Config::default();
+        config.clock_domain = domain;
+        let listener = Listener::new(config, limits).unwrap();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let client = tokio::spawn(zmux::Session::connect(
+            PipeIo::new(client),
+            Config::default(),
+        ));
+        let accepting = listener.clone();
+        let handled = tokio::spawn(async move {
+            accepting
+                .handle_pipe(PipeIo::new(server), PipeHint::default())
+                .await
+        });
+        // The first-record read can also register before the client writes.
+        while timers.recv().await.unwrap() != deadline {}
+        clock.advance(wait);
+        assert_eq!(handled.await.unwrap(), Err(HandleError::Rejected));
+        assert!(client.await.unwrap().is_err());
+        assert_eq!(listener.stats().rejected, 1);
+        listener.close();
     })
     .await
-    .unwrap();
-    listener.close();
+    .expect("session-config timeout test watchdog");
 }
 
 #[tokio::test]
@@ -161,36 +180,40 @@ async fn an_exporter_answering_later_gives_the_session_secret_input() {
     assert!(calls.load(Ordering::Relaxed) >= 1, "asked off the lock");
 }
 
-/// A later `on_reject` is dropped when the listener closes: the carrier's
-/// handler ends with the close, not at the handshake timeout.
+/// A pending reject callback ends with the listener or its clock deadline.
 #[tokio::test]
-async fn a_later_reject_policy_ends_with_the_listener() {
-    let mut limits = ListenerConfig::default();
-    limits.handshake_timeout = Duration::from_secs(30);
-    limits.on_reject = Some(zmux::OnReject::new_async(|_| std::future::pending()));
-    let listener = Listener::new(Config::default(), limits).unwrap();
-    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = tcp.local_addr().unwrap();
-    let (client, server) = tokio::join!(TcpStream::connect(addr), tcp.accept());
-    let mut client = client.unwrap();
-    tokio::io::AsyncWriteExt::write_all(&mut client, &[0xff; 64])
-        .await
-        .unwrap();
-    let l = listener.clone();
-    let handled = tokio::spawn(async move {
-        l.handle_pipe(
-            PipeIo::from_tcp(server.unwrap().0),
-            zmux::PipeHint::default(),
-        )
-        .await
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let started = tokio::time::Instant::now();
-    listener.close();
-    let r = tokio::time::timeout(Duration::from_secs(5), handled)
-        .await
-        .expect("ended with the close")
-        .unwrap();
-    assert!(r.is_err());
-    assert!(started.elapsed() < Duration::from_secs(2));
+async fn a_later_reject_policy_ends_with_close_or_timeout() {
+    tokio::time::timeout(LIMIT, async {
+        for close in [false, true] {
+            let wait = Duration::from_secs(90);
+            let (clock, domain) = ManualClock::domain(Duration::from_secs(120));
+            let mut timers = clock.registrations();
+            let deadline = domain.now() + wait;
+            let mut config = Config::default();
+            config.clock_domain = domain;
+            let mut limits = ListenerConfig::default();
+            limits.handshake_timeout = wait;
+            limits.on_reject = Some(zmux::OnReject::new_async(|_| std::future::pending()));
+            let listener = Listener::new(config, limits).unwrap();
+            let (mut client, server) = tokio::io::duplex(64);
+            tokio::io::AsyncWriteExt::write_all(&mut client, &[0xff; 64])
+                .await
+                .unwrap();
+            let accepting = listener.clone();
+            let handled = tokio::spawn(async move {
+                accepting
+                    .handle_pipe(PipeIo::new(server), PipeHint::default())
+                    .await
+            });
+            assert_eq!(timers.recv().await.unwrap(), deadline);
+            if close {
+                listener.close();
+            } else {
+                clock.advance(wait);
+            }
+            assert_eq!(handled.await.unwrap(), Err(HandleError::Rejected));
+        }
+    })
+    .await
+    .expect("reject policy test watchdog");
 }

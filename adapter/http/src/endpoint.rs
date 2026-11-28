@@ -53,13 +53,19 @@ impl std::fmt::Debug for Endpoint {
 impl Endpoint {
     /// The endpoint of `listener`'s carriers, with the request carriers'
     /// and the exchange's `options`.
-    pub fn new(listener: Listener, options: Options) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when a ticket-protected endpoint serves unauthenticated
+    /// exchange or its ticket and pairing fields conflict.
+    pub fn new(listener: Listener, options: Options) -> io::Result<Self> {
+        options.validate_server(&listener)?;
+        Ok(Self {
             listener,
             options: Arc::new(options),
             #[cfg(feature = "websocket")]
             websocket: None,
-        }
+        })
     }
 
     /// Also serves WebSocket upgrades with `options` (its subprotocols and
@@ -115,10 +121,6 @@ impl Endpoint {
         peer: Option<SocketAddr>,
     ) -> Result<Response<PipeBody>, Unhandled<Incoming>> {
         use zmux_websocket::RequestUpgrade;
-        if crate::forwarded_early_data(req.headers()) {
-            self.listener.adapter().count_setup_failure();
-            return Ok(crate::too_early());
-        }
         let peer = peer.unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
         let info = remote_info(|i| i);
         match zmux_websocket::accept_request(req, peer, info, &self.listener, ws).await {

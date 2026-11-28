@@ -339,7 +339,7 @@ fn peer_parameters(preamble: bool, datagrams: bool) -> Vec<u8> {
         zmux_goaway: preamble,
         zmux_preamble: preamble.then_some(512),
         zmux_priority: preamble,
-        zmux_datagram_flows: datagrams && preamble,
+        zmux_datagram_family: true,
         ..TransportParameters::default()
     };
     let mut buf = vec![0u8; tp.frame_len(None)];

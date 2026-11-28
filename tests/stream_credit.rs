@@ -32,6 +32,8 @@ fn frames(bytes: &[u8], mut each: impl FnMut(Frame<'_>)) {
 
 fn granting_all() -> Config {
     let mut c = Config::default();
+    // This checks the encoding limit independently of physical admission.
+    c.memory_budget = None;
     c.max_incoming_streams = MAX_STREAM_CREDIT;
     c.max_incoming_uni_streams = UniCredit::Limit(MAX_STREAM_CREDIT);
     c
@@ -69,6 +71,7 @@ fn the_maximum_is_advertised_and_one_above_it_is_refused() {
 fn raising_to_the_maximum_sends_max_streams_of_it() {
     // Unidirectional credit set, not staged: a raise of it is sent at once.
     let mut b = Config::default();
+    b.memory_budget = None;
     b.max_incoming_uni_streams = UniCredit::Limit(16);
     let mut p = CorePair::new(Config::default(), b);
     assert!(

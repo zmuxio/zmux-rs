@@ -103,6 +103,8 @@ pub enum CandidateOutcome {
     Refused,
     /// It failed otherwise: the network, TLS, a carrier error.
     Failed,
+    /// Another candidate satisfied the race before this attempt completed.
+    Cancelled,
 }
 
 impl CandidateOutcome {
@@ -114,6 +116,7 @@ impl CandidateOutcome {
             Self::TimedOut => "timed_out",
             Self::Refused => "refused",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -162,10 +165,72 @@ pub struct CandidateResult {
 /// [`SessionEvent::SessionResumed`] removes an unread
 /// [`SessionEvent::ResumeUnattended`]. After the session ended nothing more
 /// is queued; the queued events are still delivered before the end of the
-/// stream.
+/// stream. The queue retains the most recent 256 controller events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionEvent {
+    /// The session owner installed a controller or updated its target.
+    TargetChanged {
+        /// Current binding generation.
+        generation: u64,
+        /// Installed target revision.
+        revision: u64,
+        /// This commit installed a new binding.
+        initial: bool,
+        /// Previous binding generation for an atomic takeover.
+        predecessor: Option<u64>,
+    },
+    /// A controller reserved a capacity batch.
+    BatchReserved {
+        /// Originating binding generation.
+        generation: u64,
+        /// Target revision of the batch.
+        revision: u64,
+        /// Session-local batch identity.
+        batch: u64,
+    },
+    /// A controller batch rolled back its outstanding work.
+    BatchRolledBack {
+        /// Originating binding generation.
+        generation: u64,
+        /// Session-local batch identity.
+        batch: u64,
+    },
+    /// A controller committed the member's retirement.
+    DrainCommitted {
+        /// Originating binding generation.
+        generation: u64,
+        /// Session-local batch identity.
+        batch: u64,
+        /// Retiring member.
+        member: super::MemberId,
+    },
+    /// A controller started a host opener.
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    AttemptStarted {
+        /// Originating binding generation.
+        generation: u64,
+        /// Session-local batch identity.
+        batch: u64,
+        /// Attempt assigned at opener entry.
+        attempt: crate::AttemptId,
+    },
+    /// A controller settled an attempt.
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    AttemptFinished {
+        /// Originating binding generation.
+        generation: u64,
+        /// Session-local batch identity.
+        batch: u64,
+        /// Attempt identity, or zero for a refusal before opener entry.
+        attempt: crate::AttemptId,
+        /// Immutable terminal reason.
+        reason: crate::AttemptReason,
+    },
+    /// Cover acceptance, rejection or carrier completion.
+    Shaping(Box<super::shaping::Event>),
+    /// A committed directional health transition. Sequence gaps indicate coalescing.
+    PipeHealthChanged(Box<super::PipeHealthChange>),
     /// A local outbound pipe direction appeared (a join began, or pipe 0).
     PipeAdded {
         /// The pipe.
@@ -316,8 +381,8 @@ pub enum SessionEvent {
     /// datagrams and records. It is noticed when the session sends or its
     /// pipes change. The latest when several were not read.
     DatagramPathChanged {
-        /// The new value; `None` when the peer accepts no datagram.
-        size: Option<usize>,
+        /// Updated original-copy payload capacities.
+        path: super::DatagramPath,
     },
     /// Pipes were retired since the last such event was read (at least
     /// one): their unread events left the queue (only unretired pipes hold
@@ -370,6 +435,13 @@ pub enum SessionEvent {
 pub struct SessionId(u64);
 
 impl SessionId {
+    /// Restores a process-local identity previously obtained from [`Self::get`].
+    /// Returns `None` for zero. A nonzero value need not name an existing session.
+    #[must_use]
+    pub const fn from_raw(id: u64) -> Option<Self> {
+        if id == 0 { None } else { Some(Self(id)) }
+    }
+
     /// A new identity, distinct from every other of the process.
     #[cfg(any(all(any(feature = "tokio", feature = "blocking"), not(loom)), test))]
     pub(crate) fn next() -> Self {
@@ -447,6 +519,7 @@ impl SessionEvent {
             | Self::PipeClosed { pipe, .. }
             | Self::PipePriorityChanged { pipe, .. }
             | Self::PipeQualityChanged { pipe, .. } => Some(*pipe),
+            Self::Shaping(event) => Some(event.pipe),
             _ => None,
         }
     }

@@ -9,9 +9,8 @@
 //! nothing leaks. (b) A relay's downstream stalls: the relay holds at most
 //! the upstream window, what the downstream holds unsent within its peer's
 //! credit, and one chunk; the nested pipe fails; every hop releases its
-//! session credit. (c) Splices cancelled at random points with limiters
-//! that wait: nothing survives, and the bytes charged are the bytes
-//! forwarded.
+//! session credit. (c) Cancellation while a splice waits for quota:
+//! completed handoffs stay charged and finally unsent bytes are refunded.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -27,19 +26,20 @@ mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use common::{
-    Ctl, Rng, connect, duplex, eventually, multi_thread, settle, snapshot, soak, watchdog,
+    Ctl, Rng, connect, duplex, eventually, multi_thread, paused, settle, snapshot, soak, watchdog,
 };
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use zmux::helpers::{SpliceEnd, SpliceError, SpliceOptions, SpliceResult, splice};
+use zmux::helpers::{SpliceAbort, SpliceEnd, SpliceError, SpliceOptions, SpliceResult, splice};
 use zmux::proto::ApplicationErrorCode;
 use zmux::sched::Scheduler;
 use zmux::{
-    Cap, Config, Limiter, Listener, ListenerConfig, OutboundState, Pipe, PipeAuth, PipeHint,
-    PipeIo, PipeOptions, Session, VarInt,
+    Cap, Change, Config, Limiter, Listener, ListenerConfig, OutboundState, Pipe, PipeAuth,
+    PipeHint, PipeId, PipeIo, PipeOptions, PipeUpdate, Session, VarInt,
 };
 
 fn carrier_failed() -> VarInt {
@@ -48,7 +48,7 @@ fn carrier_failed() -> VarInt {
 
 fn nested_config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 8;
+    c.session_policy.limits.steady_attachments = 8;
     c.pipe_auth = PipeAuth::psk(*b"relay-psk-------0123456789abcdef").with_end_to_end();
     // Every pipe carries data: a relayed pipe fails with data in flight.
     c.scheduler = Scheduler::SpreadRoundRobin;
@@ -86,47 +86,47 @@ impl Nested {
     }
 }
 
-/// A limiter that waits whenever the test says so, counting its charges.
+/// A counting limiter that can switch from unlimited credit to a finite grant.
+/// Once the grant is exhausted it waits until the splice is cancelled.
 #[derive(Default)]
 struct Gate {
-    shut: AtomicBool,
-    waker: Mutex<Option<Waker>>,
+    remaining: Mutex<Option<u64>>,
+    waiting: Notify,
     charged: AtomicU64,
 }
 
-impl Gate {
-    fn set(&self, shut: bool) {
-        self.shut.store(shut, Ordering::SeqCst);
-        let waker = self.waker.lock().unwrap().take();
-        if let Some(w) = waker {
-            w.wake();
-        }
-    }
-}
-
 impl Limiter for Gate {
+    fn max_burst_bytes(&self) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
     fn poll_acquire(
         &self,
-        cx: &mut Context<'_>,
-        _: u64,
+        _: &mut Context<'_>,
+        min: u64,
         max: u64,
     ) -> Poll<Result<u64, zmux::LimitError>> {
-        let mut w = self.waker.lock().unwrap();
-        if self.shut.load(Ordering::SeqCst) {
-            *w = Some(cx.waker().clone());
+        let granted = self.try_acquire(min, max);
+        if granted < min {
+            self.waiting.notify_one();
             return Poll::Pending;
         }
-        self.charged.fetch_add(max, Ordering::Relaxed);
-        Poll::Ready(Ok(max))
+        Poll::Ready(Ok(granted))
     }
-    fn try_acquire(&self, _: u64, max: u64) -> u64 {
-        if self.shut.load(Ordering::SeqCst) {
-            0
-        } else {
-            self.charged.fetch_add(max, Ordering::Relaxed);
-            max
+
+    fn try_acquire(&self, min: u64, max: u64) -> u64 {
+        let mut remaining = self.remaining.lock().unwrap();
+        let granted = remaining.map_or(max, |left| left.min(max));
+        if granted < min {
+            return 0;
         }
+        if let Some(left) = remaining.as_mut() {
+            *left -= granted;
+        }
+        self.charged.fetch_add(granted, Ordering::Relaxed);
+        granted
     }
+
     fn refund(&self, n: u64) {
         self.charged.fetch_sub(n, Ordering::Relaxed);
     }
@@ -150,6 +150,7 @@ struct Relay {
     /// The splices running, with their results.
     splices: Arc<Mutex<Vec<Splicing>>>,
     gate: Arc<Gate>,
+    abort: SpliceAbort,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -161,8 +162,10 @@ impl Relay {
         let (ry, yr) = connect(a, b, hop_config(), hop_config()).await;
         let splices = Arc::new(Mutex::new(Vec::new()));
         let gate = Arc::new(Gate::default());
+        let abort = SpliceAbort::new();
         let relay = {
             let (rx, ry, splices, gate) = (rx.clone(), ry.clone(), splices.clone(), gate.clone());
+            let abort = abort.clone();
             tokio::spawn(async move {
                 while let Ok((s_in, r_in)) = rx.accept_bi().await {
                     // The whole preamble goes on: PIPE_CARRIER, TLVs.
@@ -171,6 +174,7 @@ impl Relay {
                     };
                     let mut opts = SpliceOptions::default();
                     opts.a_to_b = Some(gate.clone());
+                    opts.abort = Some(abort.clone());
                     let h = tokio::spawn(splice((s_in, r_in), (s_out, r_out), opts));
                     splices.lock().unwrap().push(h);
                 }
@@ -199,6 +203,7 @@ impl Relay {
             ry_ctl: [c0, c1],
             splices,
             gate,
+            abort,
             tasks: vec![relay, joiner],
         }
     }
@@ -210,18 +215,22 @@ impl Relay {
 
     /// [`Relay::join`] with the pipe's options.
     async fn join_with(&self, x: &Session, opts: PipeOptions) -> Pipe {
-        let pipe = self
-            .xr
-            .open_pipe_stream(&zmux::Preamble::new().with_tlv(0x1002, [8]))
-            .await
-            .unwrap();
-        let p = x.begin_add_pipe(pipe, opts).unwrap();
+        let p = self.begin_join(x, opts).await;
         eventually(10, "relayed pipe active", || {
             p.stats()
                 .is_some_and(|i| i.outbound == Some(OutboundState::Active) && !i.in_probation)
         })
         .await;
         p
+    }
+
+    async fn begin_join(&self, x: &Session, opts: PipeOptions) -> Pipe {
+        let pipe = self
+            .xr
+            .open_pipe_stream(&zmux::Preamble::new().with_tlv(0x1002, [8]))
+            .await
+            .unwrap();
+        x.test_begin_join(pipe, opts).unwrap()
     }
 
     /// The last splice's result.
@@ -469,43 +478,90 @@ fn a_stalled_downstream_fails_the_relayed_pipe_and_every_hop_releases_its_credit
 }
 
 #[test]
-fn splices_cancelled_in_limiter_waits_leave_nothing_and_charge_what_they_forwarded() {
-    multi_thread(async {
+fn cancelling_a_splice_in_a_limiter_wait_refunds_its_unsent_bytes() {
+    const PREFIX: &[u8] = b"prefix";
+    const QUOTA: usize = 4096;
+
+    paused(async {
         let base = snapshot();
         {
             let n = Nested::new().await;
-            let stop = Arc::new(AtomicBool::new(false));
-            let transfer = bulk(&n.x, &n.y, stop.clone());
-            let mut rng = Rng::new(0x5eed_0011);
-            for _ in 0..soak(6) {
-                let relay = Relay::new(&n).await;
-                let pipe = relay.join(&n.x).await;
-                // The limiter waits now and then; the splice is cancelled
-                // at a random point, waiting or not.
-                for _ in 0..rng.below(4) {
-                    relay.gate.set(true);
-                    tokio::time::sleep(Duration::from_millis(rng.below(30))).await;
-                    relay.gate.set(false);
-                    tokio::time::sleep(Duration::from_millis(rng.below(30))).await;
-                }
-                relay.gate.set(rng.below(2) == 0);
-                let h = relay.splices.lock().unwrap().pop().unwrap();
-                h.abort();
-                let _ = h.await;
-                // Charged exactly what went from X towards Y: the relay's
-                // session towards Y carries nothing else.
-                assert_eq!(
-                    relay.gate.charged.load(Ordering::Relaxed),
-                    relay.ry.meter().bytes_written()
-                );
-                eventually(20, "the relayed pipe failed", || failed(&pipe)).await;
-                relay.close().await;
-            }
-            stop.store(true, Ordering::SeqCst);
-            watchdog(60, "bulk transfer", transfer).await.unwrap();
+            let relay = Relay::new(&n).await;
+            let pipe = relay
+                .begin_join(&n.x, PipeOptions::default().with_probation(None))
+                .await;
+            watchdog(10, "relay attached", pipe.attached())
+                .await
+                .unwrap();
+            n.x.pipe(PipeId::new(0))
+                .unwrap()
+                .update(&PipeUpdate {
+                    send_standby: Change::Set(true),
+                    ..PipeUpdate::default()
+                })
+                .unwrap();
+
+            let mut send = n.x.open_uni().await.unwrap();
+            send.write_all(PREFIX).await.unwrap();
+            let mut recv = watchdog(10, "accept relayed stream", n.y.accept_uni())
+                .await
+                .unwrap();
+            let prefix = watchdog(10, "prefix received", recv.read_chunk(PREFIX.len()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&prefix[..], PREFIX);
+
+            // Queue a suffix on the downstream hop, then stop again in the
+            // limiter before the stalled carrier can hand any of it off.
+            relay.ry_ctl[0].stall(true);
+            *relay.gate.remaining.lock().unwrap() = Some(QUOTA as u64);
+            let before = relay.ry.meter().bytes_written();
+            send.write_all(&[b'x'; QUOTA + 1024]).await.unwrap();
+            watchdog(
+                10,
+                "relay exhausted the quota",
+                relay.gate.waiting.notified(),
+            )
+            .await;
+
+            let code = VarInt::from_u32(1);
+            relay.abort.abort(code);
+            let result = relay.last().await.expect("cancelled splice result").a_to_b;
+            assert_eq!(result.end, SpliceEnd::Cancelled(code));
+            assert_eq!(result.accepted_bytes, before + QUOTA as u64);
+            let tally = result.handoffs.unwrap();
+            let gate = relay.gate.clone();
+            let meter = relay.ry.meter().clone();
+
+            // The last carrier opportunity may outlive the splice.
+            relay.ry_ctl[0].fail();
+            assert!(
+                watchdog(10, "relayed pipe failed", pipe.closed())
+                    .await
+                    .is_err()
+            );
+            watchdog(10, "downstream settled", relay.ry.closed()).await;
+            relay.close().await;
+
+            let settled = tally.get();
+            assert_eq!(settled.accepted_bytes, meter.bytes_written());
+            assert_eq!(settled.pending_bytes, 0);
+            assert_eq!(
+                settled.accepted_bytes,
+                settled.first_carrier_bytes + settled.unsent_bytes
+            );
+            assert!(settled.first_carrier_bytes >= PREFIX.len() as u64);
+            assert!(settled.unsent_bytes >= QUOTA as u64);
+            assert_eq!(settled.unsent_refunded_bytes, settled.unsent_bytes);
+            assert_eq!(
+                gate.charged.load(Ordering::Relaxed),
+                settled.first_carrier_bytes
+            );
+            watchdog(10, "direct pipe still works", echo(&n.x, &n.y, 32, 0)).await;
             n.x.close().await;
             n.listener.close();
         }
-        settle(base, 20, "cancelled splices").await;
+        settle(base, 20, "cancelled splice").await;
     });
 }

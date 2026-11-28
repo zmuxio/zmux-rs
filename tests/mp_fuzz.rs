@@ -41,10 +41,10 @@ mod basics;
 mod mp_net;
 
 use basics::small_windows;
-use bytes::Bytes;
 use mp_net::{A, B, Joined, MpNet, Observe};
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
+use zmux::Chunk;
 use zmux::proto::frame::{Dir, Frame, Frames, Gates};
 use zmux::proto::session::{
     Config, CoreEvent, FrameInfo, InboundState, OutboundState, Pick, PickAnswer, PipeAuth, PipeId,
@@ -79,15 +79,7 @@ fn pattern(tag: usize, half: usize, from: u64, len: usize) -> Vec<u8> {
 }
 
 /// Admits every frame the cores send.
-const ALL_FRAMES: Gates = Gates {
-    reset_stream_at: true,
-    max_datagram_frame_size: u64::MAX,
-    goaway: true,
-    priority: true,
-    multipath: true,
-    pipe_ack: true,
-    lanes: true,
-};
+const ALL_FRAMES: Gates = Gates::ALL;
 
 /// A batch is whole records whose frames decode. `Err(true)` when what
 /// breaks the framing is a STREAM frame with only a FIN, written outside a
@@ -282,7 +274,7 @@ struct Setup {
 impl Setup {
     fn config(&self, side: usize) -> Config {
         let mut c = Config::default();
-        c.max_pipes = self.max_pipes;
+        c.session_policy.limits.steady_attachments = self.max_pipes;
         c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
         c.scheduler = self.policies[side].clone();
         c.max_idle_timeout = Some(Duration::from_secs(60));
@@ -558,7 +550,7 @@ impl Net {
         };
         let data = pattern(tag, h, s.halves[h].sent, len);
         let r = if chunk {
-            self.ends[w].write_chunk(key, Bytes::from(data))
+            self.ends[w].write_chunk(key, Chunk::from(data))
         } else {
             self.ends[w].write(key, &data)
         };

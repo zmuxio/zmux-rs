@@ -10,7 +10,7 @@
 use std::time::Instant;
 
 use zmux::proto::record::Framing;
-use zmux::proto::session::{Config, CoreEvent, PipeId, Role, SessionCore, TransmitBuf};
+use zmux::proto::session::{Config, CoreEvent, PipeId, Role, SessionCore, Transmit, TransmitBuf};
 
 pub const P0: PipeId = PipeId::new(0);
 
@@ -82,17 +82,25 @@ impl CorePair {
         };
         let mut moved = 0;
         while from.wants_write(P0) {
-            from.poll_transmit(P0, self.now, &mut self.out);
+            let result = from.poll_transmit(P0, self.now, &mut self.out);
             if self.out.is_empty() {
+                if result == Transmit::Shutdown {
+                    from.write_shutdown_complete(P0, self.now);
+                }
                 break;
             }
             self.wire.clear();
             self.out.copy_to_vec(&mut self.wire);
-            from.pipe_written(P0, self.wire.len() as u64, self.now);
+            let len = self.out.stream_len();
+            from.transmit_progress(P0.into(), &mut self.out, len, true, self.now);
+            from.pipe_written(P0, len, self.now);
             inspect(&self.wire);
             let used = to.receive_in_place(P0, &self.wire, self.now);
             assert_eq!(used, self.wire.len(), "a batch is whole records");
             moved += self.wire.len();
+            if result == Transmit::Shutdown {
+                from.write_shutdown_complete(P0, self.now);
+            }
         }
         moved
     }

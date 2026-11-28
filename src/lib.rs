@@ -7,7 +7,7 @@
 //! zmux endpoints, transport parameters negotiate multipath (many
 //! unidirectional pipes with per-frame spreading, failover and reinjection),
 //! resumption after all pipes are lost, and the base extensions (roles,
-//! GOAWAY, stream preambles, priorities and datagram flows).
+//! GOAWAY, stream preambles, priorities and sequenced datagrams).
 //!
 //! The crate is built around a sans-IO core:
 //!
@@ -120,30 +120,8 @@
     not(feature = "tokio"),
     doc = " sessions (`Listener::accept`) and routes joins to existing ones; the"
 )]
-#![cfg_attr(
-    feature = "tokio",
-    doc = " client adds pipes with [`Session::add_pipe`](Session#method.add_pipe), or keeps a"
-)]
-#![cfg_attr(
-    not(feature = "tokio"),
-    doc = " client adds pipes with `Session::add_pipe`, or keeps a"
-)]
-#![cfg_attr(
-    feature = "tokio",
-    doc = " pool of them up with [`helpers::maintain_pipes`] and a"
-)]
-#![cfg_attr(
-    not(feature = "tokio"),
-    doc = " pool of them up with `helpers::maintain_pipes` and a"
-)]
-#![cfg_attr(
-    feature = "tokio",
-    doc = " [`helpers::PipePool`] whose dial function is a carrier crate's `dial`."
-)]
-#![cfg_attr(
-    not(feature = "tokio"),
-    doc = " `helpers::PipePool` whose dial function is a carrier crate's `dial`."
-)]
+//! client makes explicit capacity changes or uses a session controller to maintain a
+//! target of carrier members.
 //! The session spreads frames over its pipes and fails over and reinjects
 //! when one is lost; with `resume_timeout` set ([`Config`]) it also
 //! survives losing all of them, resuming on the next pipe that joins in
@@ -207,7 +185,7 @@
 mod backoff;
 mod driver;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
-pub use driver::handle::{JoinError, JoinOutcome, JoinSession};
+pub use driver::handle::JoinError;
 mod error;
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub mod helpers;
@@ -224,6 +202,8 @@ pub(crate) mod util;
 pub use backoff::{Backoff, DEFAULT_BACKOFF_JITTER};
 pub use driver::{DialRequest, PipeDirection, StreamId};
 pub use error::{ConnectError, ReadExactError, ReadToEndError};
+#[cfg(all(feature = "tokio", not(loom)))]
+pub use proto::admission::PrefixRejection;
 pub use proto::admission::{
     Admission, AdmissionDecision, AdmissionStage, AdmissionVerdict, AdmittedValue,
     CarrierCredential, CarrierInfo, Decide, MAX_ADMISSION_MESSAGE, PEEK_TIMEOUT_DRAWN,
@@ -231,7 +211,7 @@ pub use proto::admission::{
 };
 pub use proto::error::{ApplicationErrorCode, TransportErrorCode};
 pub use proto::exporter::{CarrierExporter, ExportError, ExportFuture, ExportRequest, TlsState};
-pub use proto::frame::{Dir, Priority};
+pub use proto::frame::{DatagramChannelKind, Dir, Priority};
 pub use proto::host_events::{HostEvent, HostEvents};
 pub use proto::ident::{alpn_protocols, default_alpn};
 pub use proto::limit::{DatagramLimiter, LimitError, Limiter, Permit};
@@ -243,30 +223,44 @@ pub use proto::listener::{SessionCarrier, SessionConfigAnswer, SessionConfigFn};
 pub use proto::meter::{AppBytes, Meter};
 pub use proto::params::{DEFAULT_MAX_LANES, DEFAULT_MAX_RECORD_SIZE};
 pub use proto::params::{Role, TransportParameters};
+#[cfg(all(feature = "tokio", not(loom)))]
+pub use proto::prefix_auth::PrefixAuthVerifier;
 pub use proto::prefix_auth::{
-    InvalidPrefixAuth, PREFIX_AUTH_BINDING_LEN, PREFIX_AUTH_EXPORTER_LABEL, PREFIX_AUTH_HEADER,
-    PREFIX_TOKEN_LEN, PrefixAuth, PrefixAuthVerifier,
+    InvalidPrefixAuth, MemoryPrefixStore, PREFIX_AUTH_BINDING_LEN, PREFIX_AUTH_EXPORTER_LABEL,
+    PREFIX_AUTH_HEADER, PREFIX_TOKEN_LEN, PrefixAuth, PrefixBinding, PrefixClaim, PrefixDeadline,
+    PrefixGeneration, PrefixSchedule, PrefixStore, PrefixStoreFuture, PrefixTicket, PrefixWindow,
 };
 pub use proto::replay::{InvalidReplayConfig, ReplayFilter, ReplayVerdict};
 pub use proto::seal::SessionCrypto;
 pub use proto::session::shaping;
 pub use proto::session::{
-    AllowRecordMode, AuthorizeJoin, RecordMode, RecordPolicy, RecordPolicyInput,
+    AccountingPolicy, AckDelivery, CandidateOutcome, CandidateResult, Cap, CapacityFloor,
+    CarrierConnId, CarrierCounts, CarrierFailureEvent, CarrierFailureReport, CarrierHalfSource,
+    CarrierHalfSources, CarrierKind, CarrierLoss, CarrierLossUnit, CarrierSample, CarrierSource,
+    Change, Config, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_JOIN_TIMEOUT, DEFAULT_KEEP_ALIVE_PERIOD,
+    DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF, DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_MEMORY_BUDGET,
+    DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER,
+    DEFAULT_STANDBY_PROBE, DEFAULT_SUSPECT_FLOOR, DatagramArrivals, DatagramCarrier,
+    DatagramConfig, DatagramCopyPolicy, DatagramDeadline, DatagramDispatchStats, DatagramDrop,
+    DatagramDrops, DatagramError, DatagramEvidenceSource, DatagramFeedback, DatagramLossSample,
+    DatagramLossSourceExpired, DatagramPath, DatagramReplicaDegradation, DatagramSendOptions,
+    DatagramStats, DeadTimeout, DeliveryLoad, DirectionEvidence, DirectionExclusion,
+    DirectionHealth, DirectionState, EarlyData, EarlyDataState, EpochPolicy, GoAway, HalfTotals,
+    InboundState, Inherit, JoinMissing, LaneStats, Liveness, LogLevel, Logger, MAX_STREAM_CREDIT,
+    Multipath, OpenError, OutboundState, PipeAccounting, PipeAuth, PipeError, PipeFailure,
+    PipeHalf, PipeHealth, PipeHealthChange, PipeHealthReason, PipeHealthState, PipeId,
+    PipeLiveness, PipeOptions, PipeProofKind, PipeStats, PipeUpdate, Preamble, PrioritySource,
+    QualityBand, Redial, RedialAttempt, RedialCause, RedialOutcome, RedialResult, Redundancy,
+    RttSource, STREAM_WINDOW_FLOOR, SessionError, SessionEvent, SessionId, SessionStats,
+    StabilityPolicy, State as SessionState, StreamError, StreamStats, Support, TraceRecord, Tracer,
+    UniCredit, WindowIncrease,
 };
 pub use proto::session::{
-    CandidateOutcome, CandidateResult, Cap, CapacityFloor, CarrierConnId, CarrierCounts,
-    CarrierKind, CarrierSample, CarrierSource, Change, Config, DEFAULT_HANDSHAKE_TIMEOUT,
-    DEFAULT_JOIN_TIMEOUT, DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_LATENCY_BUDGET, DEFAULT_MAX_BACKOFF,
-    DEFAULT_MAX_IDLE_TIMEOUT, DEFAULT_MEMORY_BUDGET, DEFAULT_MIN_BACKOFF, DEFAULT_OVERFLOW_DELAY,
-    DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_JITTER, DEFAULT_SEND_BUFFER_MAX, DEFAULT_STANDBY_PROBE,
-    DEFAULT_SUSPECT_FLOOR, DatagramError, DeadTimeout, DirectionState, EarlyData, EarlyDataState,
-    EpochPolicy, GoAway, InboundState, Inherit, JoinMissing, LaneStats, Liveness, LogLevel, Logger,
-    MAX_STREAM_CREDIT, Multipath, OpenError, OutboundState, PipeAuth, PipeError, PipeFailure,
-    PipeHalf, PipeId, PipeLiveness, PipeOptions, PipeStats, PipeUpdate, Preamble, PrioritySource,
-    QualityBand, Redial, Redundancy, RttSource, SESSION_WINDOW_FLOOR, STREAM_WINDOW_FLOOR,
-    SessionError, SessionEvent, SessionId, SessionStats, State as SessionState, StreamError,
-    StreamStats, Support, TraceRecord, Tracer, UniCredit, WindowIncrease,
+    AllowRecordMode, AuthorizeJoin, CandidateId, CapacityLimits, CapacitySnapshot, ClockDomain,
+    Directions, JoinAuthorization, JoinFirstBatch, MemberId, MemberSnapshot, MonotonicClock,
+    PathPreference, RecordMode, RecordPolicy, RecordPolicyInput, SessionPolicy, SessionPolicyError,
 };
+pub use proto::session::{Chunk, ChunkBuffer};
 pub use proto::session::{InvalidConfig, check_max_record};
 pub use proto::{Decision, LaterFuture};
 
@@ -283,26 +277,56 @@ pub use proto::{DetailKey, VarInt};
 
 // The drivers are left out of loom builds, which check their
 // synchronization units only (src/driver/loom.rs).
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub use driver::accounting::{AccountingTicket, AccountingTickets};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::admission::{
     Fallback, MessageReader, MessageWriter, Messages, Prefixed, Takeover, TakeoverReturned,
     TakeoverStream,
 };
-#[cfg(all(feature = "tokio", not(loom)))]
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
 pub use driver::cache::{
-    CacheOutcome, CacheSnapshot, CacheSnapshotEntry, CarrierCache, SnapshotError, WallTime,
-};
-#[cfg(all(feature = "tokio", not(loom)))]
-pub use driver::choice::{
-    Candidate, CarrierChoice, CarrierChoiceError, CarrierChoicePolicy, HttpTarget, dial_choice,
+    CacheOutcome, CarrierCache, CarrierCacheConfig, CarrierCacheError, CarrierCacheKey,
+    CarrierMeasurement, CarrierMeasurementSource, CarrierObservation, CarrierReportSource,
+    CarrierRetryAfter, CarrierScore, Cooldown, CooldownEvent, RetryMetrics,
 };
 #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
-pub use driver::handle::{StreamDatagram, Written};
+pub use driver::capacity_change::{
+    AttachmentSpec, Attempt, AttemptCause, AttemptId, AttemptReason, AttemptResult,
+    AttemptSnapshot, ChangeError, ChangeRequest, ChangeResult, MemberSpec, OpenRequest, OpenStage,
+    RetryAdmission,
+};
+#[cfg(all(feature = "tokio", not(loom)))]
+pub use driver::capacity_change::{CapacityChange, CarrierOpener, ChangeAdmission, OpenedCarriers};
+#[cfg(all(feature = "tokio", not(loom)))]
+/// Configuration for the session controller.
+pub type ControllerOptions = driver::controller::ControllerOptions<driver::tokio::Tokio>;
+#[cfg(all(feature = "tokio", not(loom)))]
+/// Controls sessions and candidate admission in one host domain.
+pub type SessionController = driver::controller::SessionController<driver::tokio::Tokio>;
+#[cfg(all(feature = "tokio", not(loom)))]
+/// The current generation of control over a session.
+pub type SessionControl = driver::controller::SessionControl<driver::tokio::Tokio>;
+#[cfg(all(feature = "tokio", not(loom)))]
+/// An asynchronous carrier candidate.
+pub type Candidate = driver::choice::Candidate<driver::tokio::Tokio>;
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub use driver::choice::{BootstrapError, HttpTarget};
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub use driver::controller::{
+    ChoicePolicy, ControllerBlock, ControllerError, ControllerLimits, ControllerSnapshot,
+    GroupTarget, MemberQuota, QualityInput, QualityMeasurement, QuotaDeficit, ReplaceIntent,
+    RotationPolicy, SessionTarget, TargetCandidate,
+};
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub use driver::handle::{PreparedRead, StreamDatagram, Written};
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::listen::{
     AdmissionStats, AdmissionVariants, Listener, ListenerStats, MAX_ADMISSION_VARIANTS, PipeHint,
     VariantStats,
 };
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+pub use driver::retry::CooldownReason;
 #[cfg(all(feature = "tokio", not(loom)))]
 pub use driver::tokio::{
     Dial, Pipe, PipeIo, RecvStream, SendStream, Session, StreamHandle, TryRead,
@@ -333,12 +357,14 @@ pub mod sched {
 /// `with_datagram_channel` and `with_protocol`.
 #[cfg(all(feature = "tokio", not(loom)))]
 pub mod adapter {
+    pub use crate::Chunk;
+    pub use crate::proto::frame::channel::Prefix as DatagramChannelPrefix;
+
     pub use crate::driver::admission::{AdmitIo, ConnectionValue, proxied_source};
     pub use crate::driver::channel::{
         ChannelDemux, ChannelReceiver, ChannelRegistration, DatagramChannel,
     };
     #[doc(hidden)]
-    pub use crate::driver::handle::JoinCancellation;
     pub use crate::driver::lanes::{CarrierConnId, Lane, handle_lane};
     pub use crate::driver::listen::{
         Admit, Admitted, Entry, JoinPrefix, ListenerAdapter, MemoryCharge, ResponseHead,
@@ -397,6 +423,116 @@ pub mod adapter {
 pub mod test_hooks {
     pub use crate::driver::resources::{Resources, Tables, resources, take_write_call_bytes};
 
+    /// Subscribes to completed session owner turns, including dropped datagrams.
+    #[cfg(feature = "tokio")]
+    #[must_use]
+    pub fn session_revisions(session: &crate::Session) -> tokio::sync::watch::Receiver<()> {
+        session.revisions()
+    }
+
+    /// Sets the borrow slot limit before the first read lease on a fixture session.
+    #[cfg(feature = "tokio")]
+    #[must_use]
+    pub fn limit_read_leases(session: &crate::Session, slots: usize) -> bool {
+        session.test_read_loan_slots(slots)
+    }
+
+    /// Schedules an owned receive root with a controlled expiry for splice fixtures.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub fn splice_receive_datagram(
+        session: &crate::Session,
+        stream: u64,
+        context: u64,
+        data: crate::Chunk,
+        expires: Option<std::time::Instant>,
+    ) -> bool {
+        session.fixture_splice_receive_datagram(stream, context, data, expires)
+    }
+
+    /// Observes queued items, receive root capacity, and expiry for splice fixtures.
+    #[cfg(all(feature = "tokio", not(loom)))]
+    #[must_use]
+    pub fn splice_receive_state(
+        session: &crate::Session,
+        stream: u64,
+    ) -> Option<(usize, usize, u64)> {
+        session.fixture_splice_receive_state(stream)
+    }
+
+    /// Subscribes to committed listener counts.
+    #[cfg(feature = "tokio")]
+    #[must_use]
+    pub fn listener_revisions(listener: &crate::Listener) -> tokio::sync::watch::Receiver<()> {
+        listener.revisions()
+    }
+
+    /// Reads the queued packet count and next sequence at a fixture barrier.
+    #[must_use]
+    pub fn datagram_send_state(core: &crate::proto::session::SessionCore) -> (usize, u64) {
+        crate::proto::session::datagram_send_state(core)
+    }
+
+    /// Accounts original bytes for a fixture with an existing replica budget.
+    pub fn datagram_replica_credit(core: &mut crate::proto::session::SessionCore, bytes: u64) {
+        crate::proto::session::datagram_replica_credit(core, bytes);
+    }
+
+    /// Injects accepted path samples into the production estimators.
+    pub fn sample_scheduler_path(
+        core: &mut crate::proto::session::SessionCore,
+        pipe: crate::PipeId,
+        rtt: Option<std::time::Duration>,
+        rate: Option<u64>,
+    ) {
+        core.sample_fixture_path(pipe, rtt, rate);
+    }
+
+    /// Reads the scheduler's effective weights for the fixture's active tier.
+    #[must_use]
+    pub fn scheduler_rate_weights(
+        core: &crate::proto::session::SessionCore,
+        key: crate::proto::session::StreamKey,
+    ) -> Vec<(crate::PipeId, f64)> {
+        core.fixture_rate_weights(key)
+    }
+
+    /// Uses the supplied sample for a synchronous retry observation.
+    #[cfg(feature = "tokio")]
+    pub fn with_backoff_jitter<T>(sample: f64, observe: impl FnOnce() -> T) -> (T, u64) {
+        crate::backoff::with_fixture_sample(sample, observe)
+    }
+
+    /// Builds one cache observation from a committed carrier failure.
+    #[cfg(feature = "tokio")]
+    #[must_use]
+    pub fn carrier_failure_observation(
+        at: std::time::Instant,
+        report: crate::CarrierFailureReport,
+    ) -> crate::CarrierObservation {
+        let retry_at = report.retry_after.and_then(|delay| at.checked_add(delay));
+        crate::CarrierObservation {
+            at: Some(at),
+            physical_failure: Some(std::sync::Arc::new(crate::CarrierFailureEvent {
+                report,
+                at,
+                retry_at,
+            })),
+            ..crate::CarrierObservation::default()
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    pub use crate::driver::accounting::probe::AccountingProbe;
+
+    /// Reads the same reliable setup cut from a directly driven core.
+    #[must_use]
+    pub fn core_reliable_setup_end(
+        core: &crate::proto::session::SessionCore,
+        pipes: &[crate::PipeId],
+    ) -> Option<Vec<u64>> {
+        core.reliable_setup_end(pipes)
+    }
+
     /// The carrier contract every adapter's carriers keep, as a suite an
     /// adapter runs on pairs of its carriers (tokio driver).
     #[cfg(feature = "tokio")]
@@ -425,7 +561,10 @@ pub mod test_hooks {
     }
 
     #[cfg(feature = "tokio")]
-    pub use crate::driver::tokio::measure_session_polls;
+    pub use crate::driver::tokio::{
+        expire_blocked_datagram, fire_session_timers, inject_stall_evidence, measure_session_polls,
+        reliable_setup_end, seed_datagram_sequence, tap_datagram_channel,
+    };
 
     /// Pipe observations without triggering a carrier refresh.
     #[cfg(feature = "tokio")]
@@ -434,10 +573,10 @@ pub mod test_hooks {
         session.pipe_signals()
     }
 
-    /// Read buffers in the process-wide pool of idle pipes' buffers.
+    /// Backing capacity in the process-wide idle receive pool.
     #[must_use]
-    pub fn read_pool_buffers() -> usize {
-        crate::driver::read_pool::len()
+    pub fn read_pool_idle_bytes() -> usize {
+        crate::proto::receive::idle_bytes()
     }
 
     /// How often an outbound pipe of `session` became suspect, a DRAINING
@@ -497,14 +636,13 @@ pub mod test_hooks {
 /// |---|---|---|---|
 /// | sessions, streams, datagrams, pipes, events, tracer, close and abort | yes | yes | |
 /// | `resolve_duplicate` | yes | yes | |
-/// | early data under the zmux floor (`EarlyData::zmux_peer`) | yes | yes | |
 /// | carrier early data (`PipeIo::with_early_data`, QUIC 0-RTT) | yes | no | only the QUIC and TLS adapters, all async, produce it |
 /// | `Listener`: sessions, joins, resumption, `adapter().count_setup_failure()` | yes | yes | |
 /// | `Listener`: split carriers, lanes, admission (`Fallback`, `Takeover`), memory budget | yes | no | they serve the HTTP and QUIC adapters, all async |
-/// | `CarrierChoice`, `dial_choice`, `CarrierCache` | yes | no | its candidates are the async adapters' carriers |
+/// | `SessionController`, `CarrierCache` | yes | yes | shares candidate choices and retry admission across sessions |
 /// | streams as pipes (`open_pipe_stream`, `PipeIo::from_stream`) | yes | no | a nested session's pipe threads would block on the outer stream, which a thread that drives sessions may not do |
 /// | lanes, `handle_lane` | yes | no | only multi-stream carriers (QUIC, HTTP/2 and 3) have lanes, all async |
-/// | `helpers::splice`, `helpers::maintain_pipes` | yes | no | each runs as a task beside the sessions; a thread per relay or pool would be the application's choice |
+/// | `helpers::splice` | yes | no | relays streams using async I/O |
 /// | adapter crates (TLS, QUIC, WebSocket, HTTP) | yes | no | they build on tokio-based libraries |
 ///
 /// ```no_run
@@ -524,7 +662,9 @@ pub mod test_hooks {
 #[cfg(all(feature = "blocking", not(loom)))]
 pub mod blocking {
     pub use crate::driver::blocking::{
-        Dial, HandshakeWait, Pipe, PipeIo, RecvStream, SendStream, Session, WaitError, Watchdog,
+        Candidate, CapacityChange, CarrierOpener, ChangeAdmission, ControllerOptions, Dial,
+        HandshakeWait, OpenedCarriers, Pipe, PipeIo, RecvStream, SendStream, Session,
+        SessionControl, SessionController, WaitError, Watchdog,
     };
     pub use crate::driver::blocking_listen::{InboundTransform, Listener, PipeHint};
     pub use crate::proto::listener::{HandleError, ListenerStats};

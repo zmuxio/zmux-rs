@@ -1,1192 +1,1872 @@
-//! The carrier cache of carrier modes and its interchange form: which
-//! carrier kinds worked, per server and local network, exported and
-//! imported as versioned JSON with wall-clock times.
+//! Shared scoring, retry admission and versioned carrier history.
 
-use std::collections::HashMap;
-use std::fmt::{self, Write as _};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::proto::session::CarrierKind;
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
-/// Which carrier kinds worked, per server and local network
-/// ([`CarrierChoicePolicy::key`](crate::CarrierChoicePolicy::key)): a usable kind is
-/// remembered for its success TTL (6 h), a failed one is skipped for a
-/// backoff that doubles with every failure in a row, from 1 min to 6 h. A
-/// kind that fails soon after it was chosen
-/// ([`CarrierChoicePolicy::drop_window`](crate::CarrierChoicePolicy::drop_window)) counts as
-/// failed, so that a path that lets a kind through only briefly is not
-/// tried again at once. Cheap to clone: clones share the cache, which is
-/// safe for concurrent use, [`snapshot`](Self::snapshot) and
-/// [`restore`](Self::restore) included.
+use crate::util::checked_clock_deadline;
+use crate::{Backoff, CarrierKind, InvalidConfig};
+
+use super::capacity_change::{OpenerAdmission, RetryAdmission};
+use super::choice::Candidate;
+use super::handle::Driver;
+use super::retry::{
+    CooldownReason, Cooling, DROP_WINDOW, HEALTH_RESET, LocalCooldown, RecoveryCadence, millis,
+};
+
+const VERSION: i64 = 2;
+
+pub(super) type Key = (String, CarrierKind, String);
+
+/// Settings shared by every user of a carrier cache.
 #[derive(Debug, Clone)]
-pub struct CarrierCache(Arc<CacheInner>);
+#[non_exhaustive]
+pub struct CarrierCacheConfig {
+    /// Clock domain shared by the owners of these observations.
+    pub clock_domain: crate::ClockDomain,
+    wall_clock: Option<WallClock>,
+    /// Uniform fraction in [0, 1] for each recovery advance.
+    pub recovery_sample: fn() -> f64,
+    /// Half-life of the scoring history.
+    pub half_life: Duration,
+    /// A failure before this age counts as an early drop.
+    pub drop_window: Duration,
+    /// Maximum age of performance evidence.
+    pub performance_window: Duration,
+    /// Required continuous healthy time to reset backoff.
+    pub health_reset: Duration,
+    /// Retry settings, shared by all users of the cache.
+    pub backoff: Backoff,
+    short_drop_resilient: bool,
+    /// Optional positive multiplicative priors by carrier kind.
+    pub kind_priors: HashMap<CarrierKind, f64>,
+    /// Maximum number of rows accepted per imported snapshot.
+    pub import_limit: Option<usize>,
+    /// Maximum age of history kept without fresh evidence or active cooling.
+    pub max_age: Option<Duration>,
+    /// Evict history below this effective weight when no other evidence remains.
+    pub min_weight: f64,
+}
 
-/// A server and local network, a carrier kind and a variant.
-type CacheKey = (String, CarrierKind, Option<Arc<str>>);
+#[derive(Clone)]
+struct WallClock(Arc<dyn Fn() -> SystemTime + Send + Sync>);
+
+impl fmt::Debug for WallClock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WallClock(..)")
+    }
+}
+
+impl CarrierCacheConfig {
+    /// Selects the deployment profile for repeated short drops.
+    ///
+    /// Its backoff and ten-minute floor are resolved together.
+    #[must_use]
+    pub fn with_short_drop_resilience(mut self) -> Self {
+        self.backoff = Self::short_drop_backoff();
+        self.short_drop_resilient = true;
+        self
+    }
+
+    fn short_drop_backoff() -> Backoff {
+        let mut backoff = Backoff::new(Duration::from_secs(30), Duration::from_mins(30));
+        backoff.jitter_up = crate::DEFAULT_BACKOFF_JITTER;
+        backoff
+    }
+
+    /// Supplies the wall source for cache creation, explicit reports and snapshots.
+    /// Internal observations follow the resulting wall anchor using [`Self::clock_domain`].
+    #[must_use]
+    pub fn with_wall_clock(mut self, now: impl Fn() -> SystemTime + Send + Sync + 'static) -> Self {
+        self.wall_clock = Some(WallClock(Arc::new(now)));
+        self
+    }
+}
+
+/// Authority to report observations for one cache key, kind and variant.
+///
+/// Each registration has its own sequence space. Clones share replay state.
+#[derive(Debug, Clone)]
+pub struct CarrierReportSource(Arc<ReportSource>);
 
 #[derive(Debug)]
-struct CacheInner {
-    success_ttl: Duration,
-    backoff: (Duration, Duration),
-    entries: Mutex<HashMap<CacheKey, CacheEntry>>,
+struct ReportSource {
+    cache: std::sync::Weak<Inner>,
+    key: Key,
+    replay: Mutex<ReportWindow>,
 }
 
-#[derive(Debug, Default, Clone)]
-struct CacheEntry {
-    good_until: Option<Instant>,
-    fail_until: Option<Instant>,
-    backoff: Duration,
-    url: String,
+#[derive(Debug, Default)]
+struct ReportWindow {
+    high: u64,
+    seen: u64,
 }
 
-impl CacheEntry {
-    /// The later of its two times: entries recorded later are newer.
-    fn latest(&self) -> Option<Instant> {
-        self.good_until.max(self.fail_until)
+impl ReportWindow {
+    fn claim(&mut self, sequence: u64) -> Result<bool, CarrierCacheError> {
+        if sequence == 0 {
+            return Err(CarrierCacheError::Value);
+        }
+        if sequence > self.high {
+            let shift = sequence - self.high;
+            self.seen = if shift < u64::from(u64::BITS) {
+                self.seen << shift
+            } else {
+                0
+            };
+            self.high = sequence;
+        }
+        let offset = self.high - sequence;
+        if offset >= u64::from(u64::BITS) {
+            return Err(CarrierCacheError::StaleReport);
+        }
+        let mask = 1 << offset;
+        let fresh = self.seen & mask == 0;
+        self.seen |= mask;
+        Ok(fresh)
     }
+}
 
-    /// It tells nothing any more at `now`: neither usable nor failed, and
-    /// its backoff history older than the longest backoff.
-    fn expired(&self, now: Instant, backoff_max: Duration) -> bool {
-        let past = |t: Option<Instant>| t.is_none_or(|t| t <= now);
-        past(self.good_until)
-            && past(self.fail_until)
-            && past(self.fail_until.and_then(|t| t.checked_add(backoff_max)))
+impl Default for CarrierCacheConfig {
+    fn default() -> Self {
+        Self {
+            clock_domain: crate::ClockDomain::default(),
+            wall_clock: None,
+            recovery_sample: crate::backoff::random_fraction,
+            half_life: Duration::from_hours(6),
+            drop_window: DROP_WINDOW,
+            performance_window: Duration::from_mins(1),
+            health_reset: HEALTH_RESET,
+            backoff: Backoff::new(Duration::from_mins(1), Duration::from_hours(6)),
+            short_drop_resilient: false,
+            kind_priors: HashMap::new(),
+            import_limit: None,
+            max_age: None,
+            min_weight: 0.0,
+        }
     }
 }
 
-/// What a host learnt of a candidate after dialling it
-/// ([`CarrierCache::report`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The carrier score and evidence used by automatic selection.
+#[derive(Debug, Clone, Copy)]
+pub struct CarrierScore {
+    /// The score including the carrier kind prior.
+    pub score: f64,
+    /// Smoothed handshake success times stability squared, before ranking factors.
+    pub reliability: f64,
+    /// All settled handshake attempts for this candidate.
+    pub attempts: u64,
+    /// Effective handshake sample weight.
+    pub weight: f64,
+    /// Effective weight of successful handshakes.
+    pub success_weight: f64,
+    /// Effective weight of completed initial survival windows.
+    pub window_survived: f64,
+    /// Effective weight of faults before the initial window ended.
+    pub short_drops: f64,
+    /// Effective weight of faults at or after the window boundary.
+    pub post_window_faults: f64,
+    /// Age of the scoring history, when history exists.
+    pub age: Option<Duration>,
+    /// Effective observed post-window exposure, in seconds.
+    pub post_window_seconds: f64,
+    /// Latest protocol RTT measurement, in seconds.
+    pub rtt: Option<CarrierMeasurement>,
+    /// Latest ACK delivery rate measurement, in bytes per second.
+    pub rate: Option<CarrierMeasurement>,
+    /// Committed cooldown rounds since the last health reset, including after expiry.
+    pub cooldown_level: u64,
+    /// Current retry cooldown.
+    pub cooldown: Option<Cooldown>,
+}
+
+/// The latest measurement for one cache field, including an expired measurement.
+#[derive(Debug, Clone, Copy)]
+pub struct CarrierMeasurement {
+    /// The measured value, in the units of its score field.
+    pub value: f64,
+    /// Elapsed time since the original sample.
+    pub age: Duration,
+    /// Effective lifetime including the cache's maximum age.
+    pub valid_for: Duration,
+    /// How this sample reached the cache, if known.
+    pub source: Option<CarrierMeasurementSource>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+/// Where a cache measurement was observed.
+pub enum CarrierMeasurementSource {
+    /// Observed by the protocol on an attached member.
+    #[default]
+    Protocol,
+    /// Reported through a registered host source.
+    HostReport,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CarrierRank {
+    pub(super) score: f64,
+    pub(super) reliability: f64,
+    pub(super) attempts: u64,
+    pub(super) retry_at: Option<Instant>,
+}
+
+/// The active cooling decision for one candidate key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cooldown {
+    /// Cause of the current decision, if observed locally.
+    pub reason: Option<CooldownReason>,
+    /// Monotonic local commit of this decision, if observed locally.
+    pub started_at: Option<Instant>,
+    /// Wait before jitter was applied.
+    pub nominal_wait: Duration,
+    /// Wait after the original draw, if observed locally.
+    pub sampled_wait: Option<Duration>,
+    /// Monotonic end of this decision's wait.
+    pub retry_at: Instant,
+    /// Time remaining to the scheduled retry.
+    pub remaining: Duration,
+}
+
+/// Candidate identity shared by all users of a carrier cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarrierCacheKey {
+    /// Opaque host key.
+    pub key: String,
+    /// Carrier transport.
+    pub kind: CarrierKind,
+    /// Carrier variant.
+    pub variant: String,
+}
+
+impl From<&Key> for CarrierCacheKey {
+    fn from((key, kind, variant): &Key) -> Self {
+        Self {
+            key: key.clone(),
+            kind: *kind,
+            variant: variant.clone(),
+        }
+    }
+}
+
+/// A committed change to the candidate's local cooldown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CooldownEvent {
+    /// A new fault episode committed its retry schedule.
+    Started {
+        /// Shared candidate key.
+        key: CarrierCacheKey,
+        /// Monotonically increasing local fault episode.
+        episode: u64,
+        /// Committed cooldown level.
+        level: u64,
+        /// Cause of the cooldown.
+        reason: CooldownReason,
+        /// Monotonic fault commit time.
+        started_at: Instant,
+        /// Wait before applying jitter.
+        nominal_wait: Duration,
+        /// Wait after the single jitter draw.
+        sampled_wait: Duration,
+        /// Ordinary local retry deadline.
+        retry_at: Instant,
+    },
+    /// Continuous health cleared the cooldown sequence.
+    Reset {
+        /// Shared candidate key.
+        key: CarrierCacheKey,
+        /// Most recent local fault episode, if observed on this cache.
+        episode: Option<u64>,
+        /// Monotonic reset commit time.
+        reset_at: Instant,
+    },
+}
+
+/// Process-local retry counters for a candidate key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RetryMetrics {
+    /// Actual opener invocations.
+    pub attempted_starts: u64,
+    /// Most recent nominal missing-direction retry interval.
+    pub recovery_nominal: Duration,
+    /// Interval drawn at the last recovery failure.
+    pub recovery_sampled: Duration,
+    /// Shared opportunity for a live missing direction.
+    pub recovery_retry_at: Option<Instant>,
+    /// Unique episodes that committed a local cooldown.
+    pub faults: u64,
+    /// Blocked start opportunities by reason.
+    pub suppressions: BTreeMap<RetryAdmission, u64>,
+    /// Elapsed time since the current fault, when anchored.
+    pub elapsed: Option<Duration>,
+    /// Remaining ordinary local cooldown, excluding hard restrictions.
+    pub remaining: Duration,
+}
+
+impl RetryMetrics {
+    fn suppress(&mut self, reason: RetryAdmission) {
+        let count = self.suppressions.entry(reason).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+/// A completed dial attempt or observation from an attached member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CacheOutcome {
-    /// Usable, as a chosen candidate.
+    /// Successful zmux handshake.
     Usable,
-    /// An ordinary failure: the backoff doubles.
+    /// Failed carrier opening or handshake.
     Failed,
-    /// A definite verdict of the host (a binding check that proves the path
-    /// unsuitable): skipped for the longest backoff.
+    /// Definitive path rejection.
     Rejected,
+    /// Completed the initial observation window.
+    Survived,
+    /// First service failure inside the observation window.
+    ShortDrop,
+    /// First service failure after the observation window.
+    LateDrop,
+    /// New observed lifetime after the initial window.
+    Lifetime,
+    /// New protocol RTT or ACK delivery rate.
+    Performance,
+    /// Continuous healthy interval that may clear cooling.
+    Recovered,
 }
+
+/// The timestamp and measurements accompanying a cache observation.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct CarrierObservation {
+    /// Original sample time, or the current cache clock if absent.
+    pub at: Option<Instant>,
+    /// Newly observed lifetime or continuous recovery interval.
+    pub duration: Duration,
+    /// Protocol RTT, zero when absent.
+    pub rtt: Duration,
+    /// ACK delivery rate in bytes per second, zero when absent.
+    pub rate: u64,
+    /// Optional stricter expiry from the estimator, zero when absent.
+    pub valid_for: Duration,
+    pub(crate) physical_failure: Option<Arc<crate::CarrierFailureEvent>>,
+    pub(crate) source: CarrierMeasurementSource,
+}
+
+impl CarrierObservation {
+    /// Creates an observation with the sample time, protocol RTT and delivery rate.
+    #[must_use]
+    pub fn measured(at: Option<Instant>, rtt: Duration, rate: u64) -> Self {
+        Self {
+            at,
+            rtt,
+            rate,
+            ..Self::default()
+        }
+    }
+}
+
+/// An unsuccessful cache interchange or report.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CarrierCacheError {
+    /// Unsupported snapshot version.
+    Version,
+    /// Malformed JSON or a value of the wrong JSON type.
+    Format,
+    /// Invalid sample or snapshot value.
+    Value,
+    /// The source belongs to a different carrier cache.
+    UnknownSource,
+    /// The sequence predates the source's replay window.
+    StaleReport,
+}
+
+impl fmt::Display for CarrierCacheError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Version => "unsupported carrier cache version",
+            Self::Format => "malformed carrier cache",
+            Self::Value => "invalid carrier cache value",
+            Self::UnknownSource => "unknown carrier report source",
+            Self::StaleReport => "carrier report fell outside the replay window",
+        })
+    }
+}
+
+impl std::error::Error for CarrierCacheError {}
+
+#[derive(Debug, Clone, Copy)]
+struct Clock {
+    mono: Instant,
+    wall: OffsetDateTime,
+}
+
+impl Clock {
+    fn now(config: &CarrierCacheConfig) -> Self {
+        Self {
+            mono: config.clock_domain.now(),
+            wall: config
+                .wall_clock
+                .as_ref()
+                .map_or_else(SystemTime::now, |clock| (clock.0)())
+                .into(),
+        }
+    }
+
+    fn age(self, earlier: OffsetDateTime) -> Duration {
+        Duration::try_from(self.wall - earlier).unwrap_or_default()
+    }
+}
+
+fn zero_time() -> OffsetDateTime {
+    time::Date::MIN
+        .midnight()
+        .assume_utc()
+        .replace_year(1)
+        .expect("year one")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct Point {
+    #[serde(with = "time::serde::rfc3339")]
+    at: OffsetDateTime,
+    age_ns: i64,
+    #[serde(skip)]
+    observed: Option<(Instant, Duration)>,
+}
+
+impl Default for Point {
+    fn default() -> Self {
+        Self {
+            at: zero_time(),
+            age_ns: 0,
+            observed: None,
+        }
+    }
+}
+
+impl Point {
+    fn new(clock: Clock, at: Instant) -> Self {
+        let age = clock.mono.saturating_duration_since(at);
+        Self {
+            at: clock
+                .wall
+                .saturating_sub(time::Duration::try_from(age).unwrap_or(time::Duration::MAX)),
+            age_ns: 0,
+            observed: Some((at, Duration::ZERO)),
+        }
+    }
+
+    fn age(&self, now: Instant) -> Duration {
+        self.known_age(now).unwrap_or_default()
+    }
+
+    fn known_age(&self, now: Instant) -> Option<Duration> {
+        self.observed
+            .map(|(at, age)| age.saturating_add(now.saturating_duration_since(at)))
+    }
+
+    fn export(&mut self, now: Instant) {
+        self.age_ns = i64::try_from(self.age(now).as_nanos()).unwrap_or(i64::MAX);
+    }
+
+    fn import(&mut self, now: Instant, elapsed: Duration) {
+        if self.at != zero_time() {
+            let age = Duration::from_nanos(self.age_ns.unsigned_abs()).saturating_add(elapsed);
+            self.observed = Some((now, age.min(Duration::from_nanos(i64::MAX.unsigned_abs()))));
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.age_ns >= 0 && (self.at != zero_time() || self.age_ns == 0)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct History {
+    #[serde(flatten)]
+    point: Point,
+    attempts: u64,
+    success: f64,
+    failure: f64,
+    survived: f64,
+    short_drop: f64,
+    late_drop: f64,
+    late_seconds: f64,
+}
+
+impl History {
+    fn decay(&mut self, factor: f64) {
+        self.success *= factor;
+        self.failure *= factor;
+        self.survived *= factor;
+        self.short_drop *= factor;
+        self.late_drop *= factor;
+        self.late_seconds *= factor;
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Performance {
+    #[serde(flatten)]
+    point: Point,
+    value: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_for_ns: Option<i64>,
+    #[serde(skip)]
+    source: Option<CarrierMeasurementSource>,
+}
+
+impl Performance {
+    fn valid_for(&self, window: Duration) -> Duration {
+        self.valid_for_ns
+            .filter(|&v| v > 0)
+            .map_or(window, |valid| {
+                window.min(Duration::from_nanos(valid.unsigned_abs()))
+            })
+    }
+
+    fn fresh(&self, now: Instant, window: Duration) -> bool {
+        self.value > 0.0 && self.point.age(now) < self.valid_for(window)
+    }
+
+    fn measurement(&self, now: Instant, window: Duration) -> Option<CarrierMeasurement> {
+        (self.value > 0.0).then_some(())?;
+        Some(CarrierMeasurement {
+            value: self.value,
+            age: self.point.known_age(now)?,
+            valid_for: self.valid_for(window),
+            source: self.source,
+        })
+    }
+
+    fn update(
+        &mut self,
+        point: &Point,
+        value: f64,
+        valid_for: Duration,
+        source: CarrierMeasurementSource,
+    ) {
+        if value > 0.0 && point.at > self.point.at {
+            self.point = point.clone();
+            self.value = value;
+            self.source = Some(source);
+            self.valid_for_ns = (!valid_for.is_zero())
+                .then(|| i64::try_from(valid_for.as_nanos()).unwrap_or(i64::MAX));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Entry {
+    history: History,
+    cooling: Cooling<Point>,
+    #[serde(rename = "rtt_seconds")]
+    rtt: Performance,
+    #[serde(rename = "rate_bytes_per_second")]
+    rate: Performance,
+    #[serde(skip)]
+    url: Option<String>,
+    #[serde(skip)]
+    in_flight: Option<Arc<AttemptTicket>>,
+    #[serde(skip)]
+    demand: usize,
+    #[serde(skip)]
+    recovery: RecoveryCadence,
+    #[serde(skip)]
+    physical_failures: HashMap<crate::CarrierConnId, std::num::NonZeroU64>,
+    #[serde(skip)]
+    hard_retry: Option<Instant>,
+    #[serde(skip)]
+    metrics: RetryMetrics,
+}
+
+impl Entry {
+    fn has_snapshot_data(&self) -> bool {
+        [
+            &self.history.point,
+            &self.cooling.point,
+            &self.rtt.point,
+            &self.rate.point,
+        ]
+        .iter()
+        .any(|point| point.at != zero_time())
+    }
+
+    fn export(mut self, now: Instant) -> Self {
+        for point in self.points() {
+            point.export(now);
+        }
+        self.cooling.remaining_ms = self.cooling.active(now).map_or(0, |end| millis(end - now));
+        self
+    }
+
+    fn points(&mut self) -> impl Iterator<Item = &mut Point> {
+        [
+            &mut self.history.point,
+            &mut self.cooling.point,
+            &mut self.rtt.point,
+            &mut self.rate.point,
+        ]
+        .into_iter()
+        .chain(&mut self.cooling.short)
+    }
+
+    fn validate(&mut self, backoff: Backoff) -> bool {
+        let h = &self.history;
+        [
+            h.success,
+            h.failure,
+            h.survived,
+            h.short_drop,
+            h.late_drop,
+            h.late_seconds,
+            self.rtt.value,
+            self.rate.value,
+        ]
+        .into_iter()
+        .all(|v| v.is_finite() && v >= 0.0)
+            && (0..=millis(backoff.max)).contains(&self.cooling.nominal_ms)
+            && (0..=millis(backoff.wait_upper())).contains(&self.cooling.remaining_ms)
+            && self.cooling.level >= 0
+            && (self.cooling.level == 0 || self.cooling.point.at != zero_time())
+            && self.cooling.short.len() <= 3
+            && self.rtt.valid_for_ns.is_none_or(|v| v >= 0)
+            && self.rate.valid_for_ns.is_none_or(|v| v >= 0)
+            && self.points().all(|point| point.valid())
+    }
+
+    fn merge(&mut self, mut entry: Self, now: Clock, elapsed: Duration) {
+        for point in entry.points() {
+            point.import(now.mono, elapsed);
+        }
+        if entry.history.point.at > self.history.point.at {
+            self.history = entry.history;
+        }
+        if entry.cooling.point.at > self.cooling.point.at {
+            let left = Duration::from_millis(entry.cooling.remaining_ms.unsigned_abs());
+            entry.cooling.until = now.mono.checked_add(left.saturating_sub(elapsed));
+            self.cooling = entry.cooling;
+        }
+        if entry.rtt.point.at > self.rtt.point.at {
+            self.rtt = entry.rtt;
+        }
+        if entry.rate.point.at > self.rate.point.at {
+            self.rate = entry.rate;
+        }
+    }
+
+    fn scored_history(
+        &self,
+        config: &CarrierCacheConfig,
+        now: Instant,
+        prior: f64,
+    ) -> (f64, f64, History) {
+        let mut h = self.history.clone();
+        let age = h.point.age(now);
+        h.decay(decay(age, config.half_life));
+        let weight = h.success + h.failure;
+        let success = (1.0 + h.success) / (2.0 + weight);
+        let survival = (1.0 + h.survived) / (2.0 + h.survived + h.short_drop);
+        let window = config.drop_window.as_secs_f64();
+        let stability = survival / (1.0 + h.late_drop * window / (window + h.late_seconds));
+        let rtt = if self.rtt.fresh(now, config.performance_window) {
+            (0.1 / self.rtt.value).clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
+        let rate = if self.rate.fresh(now, config.performance_window) {
+            (self.rate.value / 1_250_000.0).clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
+        let reliability = success * stability * stability;
+        (reliability * (rate * rtt).sqrt() * prior, reliability, h)
+    }
+
+    fn rank(&self, config: &CarrierCacheConfig, now: Instant, prior: f64) -> CarrierRank {
+        let (score, reliability, h) = self.scored_history(config, now, prior);
+        CarrierRank {
+            score,
+            reliability,
+            attempts: h.attempts,
+            retry_at: self.retry_at(now),
+        }
+    }
+
+    fn score(&self, config: &CarrierCacheConfig, now: Instant, prior: f64) -> CarrierScore {
+        let (score, reliability, h) = self.scored_history(config, now, prior);
+        let cooldown_level = self.cooling.level.unsigned_abs();
+        CarrierScore {
+            score,
+            reliability,
+            attempts: h.attempts,
+            weight: h.success + h.failure,
+            success_weight: h.success,
+            window_survived: h.survived,
+            short_drops: h.short_drop,
+            post_window_faults: h.late_drop,
+            age: h.point.known_age(now),
+            post_window_seconds: h.late_seconds,
+            rtt: self.rtt.measurement(now, config.performance_window),
+            rate: self.rate.measurement(now, config.performance_window),
+            cooldown_level,
+            cooldown: self.cooling.active(now).map(|retry_at| Cooldown {
+                reason: self.cooling.local.map(|local| local.reason),
+                started_at: self.cooling.local.map(|local| local.at),
+                nominal_wait: self.cooling.nominal(),
+                sampled_wait: self.cooling.local.map(|local| local.sampled_wait),
+                retry_at,
+                remaining: retry_at - now,
+            }),
+        }
+    }
+
+    fn keep(&self, config: &CarrierCacheConfig, now: Instant) -> bool {
+        if self.demand != 0 || self.in_flight.is_some() || self.retry_at(now).is_some() {
+            return true;
+        }
+        let age = [
+            &self.history.point,
+            &self.cooling.point,
+            &self.rtt.point,
+            &self.rate.point,
+        ]
+        .into_iter()
+        .filter(|point| point.observed.is_some())
+        .map(|point| point.age(now))
+        .min();
+        let history_weight = self.history.success
+            + self.history.failure
+            + self.history.survived
+            + self.history.short_drop
+            + self.history.late_drop;
+        config
+            .max_age
+            .is_none_or(|max| age.is_some_and(|age| age < max))
+            && (history_weight * decay(self.history.point.age(now), config.half_life)
+                >= config.min_weight
+                || self.rtt.fresh(now, config.performance_window)
+                || self.rate.fresh(now, config.performance_window))
+    }
+
+    fn retry_at(&self, now: Instant) -> Option<Instant> {
+        self.cooling
+            .active(now)
+            .max(self.hard_retry.filter(|&retry_at| retry_at > now))
+    }
+
+    fn defer_until(&mut self, retry_at: Instant) {
+        self.hard_retry = self.hard_retry.max(Some(retry_at));
+    }
+
+    fn physical_failure(&mut self, event: &crate::CarrierFailureEvent) -> bool {
+        let report = &event.report;
+        self.physical_failures
+            .retain(|id, _| id == &report.connection || id.is_live());
+        if self
+            .physical_failures
+            .get(&report.connection)
+            .is_some_and(|&round| round >= report.round)
+        {
+            return false;
+        }
+        self.physical_failures
+            .insert(report.connection.clone(), report.round);
+        if let Some(retry_at) = event.retry_at {
+            self.defer_until(retry_at);
+        }
+        true
+    }
+}
+
+fn decay(age: Duration, half_life: Duration) -> f64 {
+    (-age.as_secs_f64() / half_life.as_secs_f64()).exp2()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Snapshot {
+    version: i64,
+    #[serde(default = "zero_time", with = "time::serde::rfc3339")]
+    exported_at: OffsetDateTime,
+    #[serde(default)]
+    entries: Vec<Row>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Row {
+    key: String,
+    kind: String,
+    #[serde(default)]
+    variant: String,
+    #[serde(flatten)]
+    entry: Entry,
+}
+
+#[derive(Debug)]
+struct Inner {
+    anchor: Clock,
+    config: CarrierCacheConfig,
+    entries: Mutex<HashMap<Key, Entry>>,
+    episodes: AtomicU64,
+    changed: tokio::sync::watch::Sender<u64>,
+    cooldown_events: tokio::sync::broadcast::Sender<CooldownEvent>,
+}
+
+/// Shared carrier scores, cooldowns and in-process redirect hints.
+#[derive(Debug, Clone)]
+pub struct CarrierCache(Arc<Inner>);
 
 impl Default for CarrierCache {
     fn default() -> Self {
-        Self::new(
-            Duration::from_hours(6),
-            Duration::from_secs(60),
-            Duration::from_hours(6),
-        )
+        Self::from_config(CarrierCacheConfig::default())
     }
-}
-
-/// What a cache knows of a kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Known {
-    Unknown,
-    Usable,
-    /// Failed: skipped until then.
-    Failed(Instant),
 }
 
 impl CarrierCache {
-    /// A cache that remembers a usable kind for `success_ttl` and backs a
-    /// failed one off from `backoff_min` to `backoff_max`.
-    #[must_use]
-    pub fn new(success_ttl: Duration, backoff_min: Duration, backoff_max: Duration) -> Self {
-        Self(Arc::new(CacheInner {
-            success_ttl,
-            backoff: (backoff_min, backoff_max.max(backoff_min)),
+    pub(super) fn shares_history(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Creates an empty cache with shared scoring and backoff settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid configuration error for zero durations, waits that
+    /// exceed the configured clock, invalid backoff bounds, or invalid scoring settings.
+    pub fn new(config: CarrierCacheConfig) -> Result<Self, InvalidConfig> {
+        config.backoff.validate()?;
+        if config.short_drop_resilient && config.backoff != CarrierCacheConfig::short_drop_backoff()
+        {
+            return Err(InvalidConfig::new(
+                "CarrierCacheConfig::backoff",
+                "cannot override the short-drop-resilient profile",
+            ));
+        }
+        let now = config.clock_domain.now();
+        for (field, duration) in [
+            ("CarrierCacheConfig::half_life", config.half_life),
+            ("CarrierCacheConfig::drop_window", config.drop_window),
+            (
+                "CarrierCacheConfig::performance_window",
+                config.performance_window,
+            ),
+            ("CarrierCacheConfig::health_reset", config.health_reset),
+            ("Backoff::max", config.backoff.wait_upper()),
+        ] {
+            if duration.is_zero() {
+                return Err(InvalidConfig::new(field, "zero duration"));
+            }
+            checked_clock_deadline(now, duration, field)?;
+        }
+        if let Some(max_age) = config.max_age {
+            checked_clock_deadline(now, max_age, "CarrierCacheConfig::max_age")?;
+        }
+        if !config.min_weight.is_finite()
+            || config.min_weight < 0.0
+            || config
+                .kind_priors
+                .values()
+                .any(|&prior| !prior.is_finite() || prior <= 0.0)
+        {
+            return Err(InvalidConfig::new(
+                "CarrierCacheConfig",
+                "invalid weight or prior",
+            ));
+        }
+        Ok(Self::from_config(config))
+    }
+
+    fn from_config(config: CarrierCacheConfig) -> Self {
+        Self(Arc::new(Inner {
+            anchor: Clock::now(&config),
+            config,
             entries: Mutex::default(),
+            episodes: AtomicU64::new(0),
+            changed: tokio::sync::watch::Sender::new(0),
+            cooldown_events: tokio::sync::broadcast::channel(256).0,
         }))
     }
 
-    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<CacheKey, CacheEntry>> {
+    fn owner_clock(&self) -> Clock {
+        let anchor = self.0.anchor;
+        let mono = self.clock_domain().now();
+        let elapsed = time::Duration::try_from(mono.saturating_duration_since(anchor.mono))
+            .unwrap_or(time::Duration::MAX);
+        Clock {
+            mono,
+            wall: anchor.wall.saturating_add(elapsed),
+        }
+    }
+
+    fn entries(&self) -> MutexGuard<'_, HashMap<Key, Entry>> {
         self.0
             .entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn state(
+    pub(super) fn health_deadline(
         &self,
-        key: &str,
-        kind: CarrierKind,
-        variant: Option<&Arc<str>>,
+        key: &Key,
+        since: Instant,
         now: Instant,
-    ) -> Known {
-        match self
-            .entries()
-            .get(&(key.to_owned(), kind, variant.cloned()))
-        {
-            Some(e) if e.fail_until.is_some_and(|t| now < t) => {
-                Known::Failed(e.fail_until.unwrap_or(now))
-            }
-            Some(e) if e.good_until.is_some_and(|t| now < t) => Known::Usable,
-            _ => Known::Unknown,
+    ) -> Option<(Instant, Duration)> {
+        let hold = self.0.config.health_reset;
+        let entries = self.entries();
+        let cooling = &entries.get(key)?.cooling;
+        if cooling.level == 0 {
+            return None;
         }
+        let age = cooling
+            .point
+            .known_age(now)?
+            .min(now.saturating_duration_since(since));
+        Some((now.checked_add(hold.saturating_sub(age))?, hold))
     }
 
-    /// Records an outcome the host learnt after a dial: `key` the
-    /// [`CarrierChoicePolicy::key`](crate::CarrierChoicePolicy::key) in use, `variant` the
-    /// candidate's ([`Candidate::with_variant`](crate::Candidate::with_variant)).
-    /// The same table as the automatic results and under the same rules: a
-    /// usable kind keeps the URL remembered for it; a failed one starts at
-    /// its base URL again.
-    pub fn report(
-        &self,
-        key: &str,
-        kind: CarrierKind,
-        variant: Option<&str>,
-        outcome: CacheOutcome,
-    ) {
-        let variant = variant.map(Arc::from);
-        let now = Instant::now();
-        match outcome {
-            CacheOutcome::Usable => self.record(key, kind, variant.as_ref(), None, true, now),
-            CacheOutcome::Failed => self.record(key, kind, variant.as_ref(), None, false, now),
-            CacheOutcome::Rejected => {
-                let hi = self.0.backoff.1;
-                let mut entries = self.entries();
-                let e = entries.entry((key.to_owned(), kind, variant)).or_default();
-                e.backoff = hi;
-                e.good_until = None;
-                e.fail_until = now.checked_add(hi);
-                e.url.clear();
-            }
-        }
-    }
-
-    pub(crate) fn record(
-        &self,
-        key: &str,
-        kind: CarrierKind,
-        variant: Option<&Arc<str>>,
-        target: Option<&crate::HttpTarget>,
-        usable: bool,
-        now: Instant,
-    ) {
-        let mut entries = self.entries();
-        // Entries past every time they keep go here, with the outcomes that
-        // arrive (once per dial), not only from snapshots.
-        let hi = self.0.backoff.1;
-        entries.retain(|_, e| !e.expired(now, hi));
-        let e = entries
-            .entry((key.to_owned(), kind, variant.cloned()))
-            .or_default();
-        if usable {
-            // A kind with a target keeps the URL its redirects led to; an
-            // outcome without one keeps the URL known.
-            let url = match target {
-                Some(t) => {
-                    let u = t.url();
-                    if u == t.base() { String::new() } else { u }
-                }
-                None => std::mem::take(&mut e.url),
-            };
-            *e = CacheEntry {
-                good_until: now.checked_add(self.0.success_ttl),
-                url,
-                ..CacheEntry::default()
-            };
-            return;
-        }
-        if let Some(t) = target {
-            t.reset();
-        }
-        let (lo, hi) = self.0.backoff;
-        e.backoff = e.backoff.saturating_mul(2).clamp(lo, hi);
-        e.good_until = None;
-        e.fail_until = now.checked_add(e.backoff);
-        e.url.clear();
-    }
-
-    /// Whether `kind` with `variant` is held as usable under `key` now.
-    pub fn is_usable(&self, key: &str, kind: CarrierKind, variant: Option<&str>) -> bool {
-        let variant = variant.map(Arc::from);
-        self.state(key, kind, variant.as_ref(), Instant::now()) == Known::Usable
-    }
-
-    /// Until when `kind` with `variant` is skipped under `key`, if it is
-    /// backing off.
-    pub fn failed_until(
-        &self,
-        key: &str,
-        kind: CarrierKind,
-        variant: Option<&str>,
-    ) -> Option<Instant> {
-        let variant = variant.map(Arc::from);
-        match self.state(key, kind, variant.as_ref(), Instant::now()) {
-            Known::Failed(t) => Some(t),
-            _ => None,
-        }
-    }
-
-    /// The URL redirects last led a usable `kind` with `variant` to under
-    /// `key`, where its carriers start (`None`: its base URL).
-    pub fn url(&self, key: &str, kind: CarrierKind, variant: Option<&str>) -> Option<String> {
-        let variant = variant.map(Arc::from);
-        self.entries()
-            .get(&(key.to_owned(), kind, variant))
-            .map(|e| e.url.clone())
-            .filter(|u| !u.is_empty())
-    }
-
-    /// Starts `cand`'s target at the URL the cache remembers for it under
-    /// `key`.
-    pub(crate) fn prime(&self, key: &str, cand: &crate::Candidate) {
-        let Some(t) = cand.target() else { return };
-        let variant = cand.variant().map(|v| &**v);
-        if let Some(u) = self.url(key, cand.kind(), variant) {
-            t.redirected(&u);
-        }
-    }
-
-    /// What the cache knows, with its times on the wall clock, to be
-    /// [restored](Self::restore) later, such as in the next run of the
-    /// process ([`CacheSnapshot::to_json`]). Expired entries (both times
-    /// past, and the failure time plus the longest backoff past too) are
-    /// left out.
+    /// Clock domain of observations entering this cache.
     #[must_use]
-    pub fn snapshot(&self) -> CacheSnapshot {
-        let (now, wall) = (Instant::now(), WallTime::now());
-        let hi = self.0.backoff.1;
-        let mut entries: Vec<CacheSnapshotEntry> = self
-            .entries()
-            .iter()
-            .filter(|(_, e)| !e.expired(now, hi))
-            .map(|((key, kind, variant), e)| CacheSnapshotEntry {
-                key: key.clone(),
-                kind: *kind,
-                variant: variant.as_deref().map(str::to_owned),
-                good_until: e.good_until.map(|t| to_wall(t, now, wall)),
-                fail_until: e.fail_until.map(|t| to_wall(t, now, wall)),
-                backoff: e.backoff,
-                url: e.url.clone(),
-            })
-            .collect();
-        entries.sort_by(|a, b| {
-            (&a.key, a.kind.name(), &a.variant).cmp(&(&b.key, b.kind.name(), &b.variant))
-        });
-        CacheSnapshot { entries }
+    pub fn clock_domain(&self) -> &crate::ClockDomain {
+        &self.0.config.clock_domain
     }
 
-    /// Merges a snapshot into the cache: for a key and kind that the cache
-    /// already holds, or that the snapshot holds more than once, the newer
-    /// entry (the later of its two times is later) is kept. A nonzero
-    /// backoff outside this cache's bounds is brought within them (the
-    /// snapshot may come from another configuration), a time further
-    /// ahead than the success TTL (`good_until`) or the longest backoff
-    /// (`fail_until`) is brought back to it, and expired entries are
-    /// dropped. The cache's configuration is unchanged.
-    pub fn restore(&self, snapshot: &CacheSnapshot) {
-        let (now, wall) = (Instant::now(), WallTime::now());
-        let (lo, hi) = self.0.backoff;
-        let bound = |t: WallTime, ahead: Duration| {
-            let t = to_mono(t, now, wall);
-            now.checked_add(ahead).map_or(t, |b| t.min(b))
-        };
-        let mut merged: HashMap<CacheKey, CacheEntry> = HashMap::new();
-        for s in &snapshot.entries {
-            let e = CacheEntry {
-                good_until: s.good_until.map(|t| bound(t, self.0.success_ttl)),
-                fail_until: s.fail_until.map(|t| bound(t, hi)),
-                // 0: no failure in a row.
-                backoff: if s.backoff.is_zero() {
-                    Duration::ZERO
-                } else {
-                    s.backoff.clamp(lo, hi)
-                },
-                url: s.url.clone(),
-            };
-            if e.expired(now, hi) {
-                continue;
-            }
-            merge(
-                &mut merged,
-                (s.key.clone(), s.kind, s.variant.as_deref().map(Arc::from)),
-                e,
-            );
-        }
-        let mut entries = self.entries();
-        for (k, e) in merged {
-            merge(&mut entries, k, e);
-        }
+    pub(super) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.0.changed.subscribe()
     }
-}
 
-/// Keeps the newer of `e` and the entry at `k`.
-fn merge(m: &mut HashMap<CacheKey, CacheEntry>, k: CacheKey, e: CacheEntry) {
-    match m.get(&k) {
-        Some(o) if e.latest() <= o.latest() => {}
-        _ => {
-            m.insert(k, e);
-        }
+    fn notify(&self) {
+        self.0.changed.send_modify(|seq| *seq = seq.wrapping_add(1));
     }
-}
 
-/// `t` on the wall clock, by its distance from `now` (`wall`).
-fn to_wall(t: Instant, now: Instant, wall: WallTime) -> WallTime {
-    if t >= now {
-        WallTime(wall.0.saturating_add(span_nanos(t - now)))
-    } else {
-        WallTime(wall.0.saturating_sub(span_nanos(now - t)))
+    pub(crate) fn drop_window(&self) -> Duration {
+        self.0.config.drop_window
     }
-}
 
-/// The wall-clock time `t` on the monotonic clock; one before the
-/// monotonic clock's range is its earliest representable time near `now`.
-fn to_mono(t: WallTime, now: Instant, wall: WallTime) -> Instant {
-    let d = t.0.saturating_sub(wall.0);
-    let span = nanos(d.unsigned_abs());
-    if d >= 0 {
-        now.checked_add(span)
-            .or_else(|| now.checked_add(Duration::from_hours(876_000)))
-            .unwrap_or(now)
-    } else {
-        now.checked_sub(span).unwrap_or(now)
-    }
-}
-
-/// `d` in nanoseconds, exact: a [`Duration`] holds fewer than 2^95.
-#[allow(
-    clippy::cast_possible_wrap,
-    reason = "a Duration's nanoseconds are below 2^95, far inside i128"
-)]
-fn span_nanos(d: Duration) -> i128 {
-    d.as_nanos() as i128
-}
-
-/// `n` nanoseconds, saturated to the longest [`Duration`].
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "the remainder is below 10^9, inside u32"
-)]
-fn nanos(n: u128) -> Duration {
-    let secs = u64::try_from(n / NANOS as u128).unwrap_or(u64::MAX);
-    Duration::new(secs, (n % NANOS as u128) as u32)
-}
-
-const NANOS: i128 = 1_000_000_000;
-
-/// A wall-clock time of a [`CacheSnapshot`]: nanoseconds since the Unix
-/// epoch (negative before it). Exact on every platform, so that the
-/// interchange form round-trips whatever the resolution of
-/// [`SystemTime`] where it is read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WallTime(i128);
-
-impl WallTime {
-    /// The current time of the system clock.
+    /// Subscribes to future cooldown commits, in commit order.
+    ///
+    /// A receiver that falls behind the bounded history receives a lag error.
     #[must_use]
-    pub fn now() -> Self {
-        SystemTime::now().into()
+    pub fn subscribe_cooldown(&self) -> tokio::sync::broadcast::Receiver<CooldownEvent> {
+        self.0.cooldown_events.subscribe()
     }
 
-    /// The time `n` nanoseconds after the Unix epoch.
+    /// Returns a point-in-time view of retry counters and the local wait.
     #[must_use]
-    pub const fn from_unix_nanos(n: i128) -> Self {
-        Self(n)
-    }
-
-    /// Nanoseconds since the Unix epoch.
-    #[must_use]
-    pub const fn unix_nanos(self) -> i128 {
-        self.0
-    }
-
-    /// The time as a [`SystemTime`], at that clock's resolution; `None`
-    /// outside its range.
-    #[must_use]
-    pub fn to_system_time(self) -> Option<SystemTime> {
-        let span = nanos(self.0.unsigned_abs());
-        if self.0 >= 0 {
-            UNIX_EPOCH.checked_add(span)
-        } else {
-            UNIX_EPOCH.checked_sub(span)
-        }
-    }
-
-    /// `d` later, saturated.
-    #[must_use]
-    pub fn saturating_add(self, d: Duration) -> Self {
-        Self(self.0.saturating_add(span_nanos(d)))
-    }
-
-    /// `d` earlier, saturated.
-    #[must_use]
-    pub fn saturating_sub(self, d: Duration) -> Self {
-        Self(self.0.saturating_sub(span_nanos(d)))
-    }
-}
-
-impl From<SystemTime> for WallTime {
-    fn from(t: SystemTime) -> Self {
-        match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => Self(span_nanos(d)),
-            Err(e) => Self(-span_nanos(e.duration())),
-        }
-    }
-}
-
-/// The content of a [`CarrierCache`] with wall-clock times
-/// ([`CarrierCache::snapshot`], [`CarrierCache::restore`]), and its JSON
-/// interchange form, the same in every language:
-///
-/// ```json
-/// {"version":1,"entries":[{"key":"…","kind":"websocket",
-///   "good_until":"2026-11-01T12:00:00Z","fail_until":"","backoff_ms":60000,"url":""}]}
-/// ```
-///
-/// zmux stores nothing itself; the host keeps the JSON.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct CacheSnapshot {
-    /// The entries, in no meaningful order.
-    pub entries: Vec<CacheSnapshotEntry>,
-}
-
-/// One entry of a [`CacheSnapshot`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct CacheSnapshotEntry {
-    /// The server and local network ([`CarrierChoicePolicy::key`](crate::CarrierChoicePolicy::key)).
-    pub key: String,
-    /// The carrier kind.
-    pub kind: CarrierKind,
-    /// The candidate's variant.
-    pub variant: Option<String>,
-    /// Until when the kind is held as usable.
-    pub good_until: Option<WallTime>,
-    /// Until when the kind is skipped as failed.
-    pub fail_until: Option<WallTime>,
-    /// The current backoff (zero: no failure in a row).
-    pub backoff: Duration,
-    /// The final URL that redirects led the kind to (empty: its base).
-    pub url: String,
-}
-
-impl CacheSnapshotEntry {
-    /// An entry of `kind` under `key` that holds nothing yet.
-    pub fn new(key: impl Into<String>, kind: CarrierKind) -> Self {
-        Self {
-            key: key.into(),
+    pub fn retry_metrics(&self, key: &str, kind: CarrierKind, variant: &str) -> RetryMetrics {
+        self.query_at(
+            key,
             kind,
-            variant: None,
-            good_until: None,
-            fail_until: None,
-            backoff: Duration::ZERO,
-            url: String::new(),
-        }
-    }
-}
-
-/// The version of the interchange form.
-const SNAPSHOT_VERSION: i64 = 1;
-
-/// A [`CacheSnapshot`]'s JSON was rejected: it does not parse, is of
-/// another version, has a field of the wrong type, or a negative backoff.
-/// Nothing of it is imported.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotError(String);
-
-impl fmt::Display for SnapshotError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid carrier cache snapshot: {}", self.0)
-    }
-}
-
-impl std::error::Error for SnapshotError {}
-
-fn invalid(e: impl Into<String>) -> SnapshotError {
-    SnapshotError(e.into())
-}
-
-impl CacheSnapshot {
-    /// The JSON interchange form: times in RFC 3339 UTC, the backoff in
-    /// milliseconds, absent fields for no time, no backoff and the base
-    /// URL.
-    #[must_use]
-    pub fn to_json(&self) -> String {
-        let mut out = format!("{{\"version\":{SNAPSHOT_VERSION},\"entries\":[");
-        for (i, e) in self.entries.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str("{\"key\":");
-            json::write_str(&mut out, &e.key);
-            out.push_str(",\"kind\":");
-            json::write_str(&mut out, e.kind.name());
-            for (name, t) in [("good_until", e.good_until), ("fail_until", e.fail_until)] {
-                if let Some(t) = t {
-                    out.push_str(",\"");
-                    out.push_str(name);
-                    out.push_str("\":");
-                    json::write_str(&mut out, &rfc3339::format(t));
+            variant,
+            self.clock_domain().now(),
+            |entry, _, now, _| {
+                let mut metrics = entry.metrics.clone();
+                metrics.recovery_nominal = entry.recovery.nominal;
+                metrics.recovery_sampled = entry.recovery.sampled;
+                metrics.recovery_retry_at = entry.recovery.retry_at;
+                if !entry.cooling.nominal().is_zero() || entry.cooling.level > 0 {
+                    metrics.elapsed = entry.cooling.point.known_age(now);
                 }
-            }
-            let ms = e.backoff.as_millis();
-            if ms > 0 {
-                let _ = write!(out, ",\"backoff_ms\":{}", ms.min(i64::MAX as u128));
-            }
-            if !e.url.is_empty() {
-                out.push_str(",\"url\":");
-                json::write_str(&mut out, &e.url);
-            }
-            if let Some(v) = &e.variant {
-                out.push_str(",\"variant\":");
-                json::write_str(&mut out, v);
-            }
-            out.push('}');
-        }
-        out.push_str("]}");
-        out
+                metrics.remaining = entry
+                    .cooling
+                    .active(now)
+                    .map_or(Duration::ZERO, |at| at - now);
+                metrics
+            },
+        )
     }
 
-    /// Parses the JSON interchange form. Unknown fields are ignored, and
-    /// so are entries of a kind this version does not know; empty or
-    /// absent times are none. Malformed JSON, a version other than 1, a
-    /// field of the wrong type (times are RFC 3339 strings, `backoff_ms` a
-    /// non-negative integer) is a [`SnapshotError`].
+    pub(super) fn suppress<D: Driver>(
+        &self,
+        key: &str,
+        candidate: &Candidate<D>,
+        reason: RetryAdmission,
+    ) {
+        self.entries()
+            .entry(candidate_key(key, candidate))
+            .or_default()
+            .metrics
+            .suppress(reason);
+    }
+
+    /// Returns the current score and backing evidence.
+    #[must_use]
+    pub fn score(&self, key: &str, kind: CarrierKind, variant: &str) -> CarrierScore {
+        self.query_at(key, kind, variant, self.clock_domain().now(), Entry::score)
+    }
+
+    pub(super) fn rank_at(
+        &self,
+        key: &str,
+        kind: CarrierKind,
+        variant: &str,
+        now: Instant,
+    ) -> CarrierRank {
+        self.query_at(key, kind, variant, now, Entry::rank)
+    }
+
+    fn query_at<T>(
+        &self,
+        key: &str,
+        kind: CarrierKind,
+        variant: &str,
+        now: Instant,
+        query: impl FnOnce(&Entry, &CarrierCacheConfig, Instant, f64) -> T,
+    ) -> T {
+        let config = &self.0.config;
+        let prior = config.kind_priors.get(&kind).copied().unwrap_or(1.0);
+        let entries = self.entries();
+        let entry = entries
+            .get(&(key.to_owned(), kind, variant.to_owned()))
+            .filter(|entry| entry.keep(config, now));
+        match entry {
+            Some(entry) => query(entry, config, now, prior),
+            None => query(&Entry::default(), config, now, prior),
+        }
+    }
+
+    /// Registers a host source scoped to the given cache key, carrier kind and variant.
+    #[must_use]
+    pub fn register_report_source(
+        &self,
+        key: impl Into<String>,
+        kind: CarrierKind,
+        variant: impl Into<String>,
+    ) -> CarrierReportSource {
+        CarrierReportSource(Arc::new(ReportSource {
+            cache: Arc::downgrade(&self.0),
+            key: (key.into(), kind, variant.into()),
+            replay: Mutex::default(),
+        }))
+    }
+
+    /// Applies a typed host observation once in its source's sequence space.
+    ///
+    /// Returns whether the observation was new.
     ///
     /// # Errors
     ///
-    /// [`SnapshotError`] for text that is not a valid snapshot, as above.
-    pub fn from_json(text: &str) -> Result<Self, SnapshotError> {
-        use json::Value;
-        let Value::Object(top) = json::parse(text).map_err(invalid)? else {
-            return Err(invalid("not an object"));
-        };
-        match json::field(&top, "version") {
-            Some(Value::Int(SNAPSHOT_VERSION)) => {}
-            Some(Value::Int(v)) => return Err(invalid(format!("version {v}"))),
-            _ => return Err(invalid("no integer version")),
+    /// Rejects foreign sources, invalid samples and sequences outside the replay window.
+    pub fn report_from(
+        &self,
+        source: &CarrierReportSource,
+        sequence: u64,
+        outcome: CacheOutcome,
+        mut observation: CarrierObservation,
+    ) -> Result<bool, CarrierCacheError> {
+        let source = &source.0;
+        if !std::ptr::eq(source.cache.as_ptr(), Arc::as_ptr(&self.0)) {
+            return Err(CarrierCacheError::UnknownSource);
         }
-        let list = match json::field(&top, "entries") {
-            None | Some(Value::Null) => &[][..],
-            Some(Value::Array(a)) => a.as_slice(),
-            Some(_) => return Err(invalid("entries not an array")),
-        };
-        let mut entries = Vec::new();
-        for v in list {
-            let Value::Object(o) = v else {
-                return Err(invalid("an entry not an object"));
-            };
-            let s = |name: &str| match json::field(o, name) {
-                None | Some(Value::Null) => Ok(String::new()),
-                Some(Value::Str(s)) => Ok(s.clone()),
-                Some(_) => Err(invalid(format!("{name} not a string"))),
-            };
-            let (key, kind, url) = (s("key")?, s("kind")?, s("url")?);
-            let variant = Some(s("variant")?).filter(|v| !v.is_empty());
-            let time = |name: &str| -> Result<Option<WallTime>, SnapshotError> {
-                let t = s(name)?;
-                if t.is_empty() {
-                    return Ok(None);
-                }
-                rfc3339::parse(&t)
-                    .map(Some)
-                    .ok_or_else(|| invalid(format!("{name} {t:?} not an RFC 3339 time")))
-            };
-            let (good_until, fail_until) = (time("good_until")?, time("fail_until")?);
-            let backoff = match json::field(o, "backoff_ms") {
-                None | Some(Value::Null) => Duration::ZERO,
-                Some(Value::Int(ms)) if *ms >= 0 => Duration::from_millis(ms.unsigned_abs()),
-                Some(_) => return Err(invalid("backoff_ms not a non-negative integer")),
-            };
-            // A kind of a later version is skipped.
-            let Some(kind) = CarrierKind::from_name(&kind) else {
-                continue;
-            };
-            entries.push(CacheSnapshotEntry {
-                key,
-                kind,
-                variant,
-                good_until,
-                fail_until,
-                backoff,
-                url,
+        let now = Clock::now(&self.0.config);
+        if observation.at.is_some_and(|at| at > now.mono) {
+            return Err(CarrierCacheError::Value);
+        }
+        let mut replay = source
+            .replay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !replay.claim(sequence)? {
+            return Ok(false);
+        }
+        observation.source = CarrierMeasurementSource::HostReport;
+        self.update(&source.key, outcome, observation, None, Some(now), true)?;
+        Ok(true)
+    }
+
+    /// Records one completed attempt or later observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CarrierCacheError::Value`] when the sample is from the future.
+    pub(super) fn report(
+        &self,
+        key: &str,
+        kind: CarrierKind,
+        variant: &str,
+        outcome: CacheOutcome,
+        observation: CarrierObservation,
+    ) -> Result<(), CarrierCacheError> {
+        self.update(
+            &(key.to_owned(), kind, variant.to_owned()),
+            outcome,
+            observation,
+            None,
+            None,
+            true,
+        )
+    }
+
+    pub(super) fn record<D: Driver>(
+        &self,
+        key: &str,
+        candidate: &Candidate<D>,
+        outcome: CacheOutcome,
+        start_cooling: bool,
+    ) {
+        let _ = self.update(
+            &candidate_key(key, candidate),
+            outcome,
+            CarrierObservation::default(),
+            candidate.target().map(AsRef::as_ref),
+            None,
+            start_cooling,
+        );
+    }
+
+    fn cool(&self, key: &Key, entry: &mut Entry, reason: CooldownReason, now: Clock, at: Instant) {
+        let config = &self.0.config;
+        let sampled_wait = entry.cooling.escalate(
+            config.backoff,
+            at,
+            Point::new(now, at),
+            reason,
+            config
+                .short_drop_resilient
+                .then_some(Duration::from_mins(10)),
+            |point| point.age(at),
+        );
+        // All episode commits hold the entries lock.
+        let episode = self
+            .0
+            .episodes
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .expect("carrier cache episode IDs exhausted");
+        self.0.episodes.store(episode, Ordering::Relaxed);
+        entry.cooling.local = Some(LocalCooldown {
+            episode,
+            reason,
+            at,
+            sampled_wait,
+        });
+        entry.metrics.faults = entry.metrics.faults.saturating_add(1);
+        if self.0.cooldown_events.receiver_count() != 0 {
+            let _ = self.0.cooldown_events.send(CooldownEvent::Started {
+                key: key.into(),
+                episode,
+                level: entry.cooling.level.unsigned_abs(),
+                reason,
+                started_at: at,
+                nominal_wait: entry.cooling.nominal(),
+                sampled_wait,
+                retry_at: entry.cooling.until.unwrap_or(at),
             });
         }
-        Ok(Self { entries })
+    }
+
+    fn update(
+        &self,
+        key: &Key,
+        outcome: CacheOutcome,
+        observation: CarrierObservation,
+        target: Option<&crate::HttpTarget>,
+        clock: Option<Clock>,
+        start_cooling: bool,
+    ) -> Result<(), CarrierCacheError> {
+        let redirected = target.and_then(|target| match outcome {
+            CacheOutcome::Usable => {
+                let url = target.url();
+                (url != target.base()).then_some(url)
+            }
+            CacheOutcome::Failed | CacheOutcome::Rejected => {
+                target.reset();
+                None
+            }
+            _ => None,
+        });
+        let config = &self.0.config;
+        let now = clock.unwrap_or_else(|| self.owner_clock());
+        let mut entries = self.entries();
+        let at = observation.at.unwrap_or(now.mono);
+        if at > now.mono {
+            return Err(CarrierCacheError::Value);
+        }
+        entries.retain(|_, entry| entry.keep(config, now.mono));
+        let entry = entries.entry(key.clone()).or_default();
+        let start_cooling = start_cooling
+            && observation
+                .physical_failure
+                .is_none_or(|failure| entry.physical_failure(&failure));
+        let age = now.mono - at;
+        let weight = decay(age, config.half_life);
+        let h = &mut entry.history;
+        if !matches!(outcome, CacheOutcome::Performance | CacheOutcome::Recovered) {
+            h.decay(decay(h.point.age(now.mono), config.half_life));
+            h.point = Point::new(now, now.mono);
+        }
+        let cool = |entry: &mut Entry, reason| {
+            if start_cooling {
+                self.cool(key, entry, reason, now, at);
+            }
+        };
+        match outcome {
+            CacheOutcome::Usable => {
+                h.attempts = h.attempts.saturating_add(1);
+                h.success += weight;
+                if target.is_some() {
+                    entry.url = redirected;
+                }
+            }
+            CacheOutcome::Failed | CacheOutcome::Rejected => {
+                h.attempts = h.attempts.saturating_add(1);
+                h.failure += weight;
+                cool(
+                    entry,
+                    if outcome == CacheOutcome::Rejected {
+                        CooldownReason::Rejected
+                    } else {
+                        CooldownReason::Attempt
+                    },
+                );
+                entry.url = None;
+            }
+            CacheOutcome::Survived => h.survived += weight,
+            CacheOutcome::ShortDrop | CacheOutcome::LateDrop => {
+                if outcome == CacheOutcome::ShortDrop {
+                    h.short_drop += weight;
+                } else {
+                    h.late_drop += weight;
+                }
+                cool(
+                    entry,
+                    if outcome == CacheOutcome::ShortDrop {
+                        CooldownReason::ShortDrop
+                    } else {
+                        CooldownReason::LateDrop
+                    },
+                );
+            }
+            CacheOutcome::Lifetime => {
+                let lambda = std::f64::consts::LN_2 / config.half_life.as_secs_f64();
+                let seconds = observation.duration.as_secs_f64();
+                h.late_seconds += weight * -(-lambda * seconds).exp_m1() / lambda;
+            }
+            CacheOutcome::Performance => {
+                let point = Point::new(now, at);
+                entry.rtt.update(
+                    &point,
+                    observation.rtt.as_secs_f64(),
+                    observation.valid_for,
+                    observation.source,
+                );
+                entry.rate.update(
+                    &point,
+                    crate::util::f64_of(observation.rate),
+                    observation.valid_for,
+                    observation.source,
+                );
+            }
+            CacheOutcome::Recovered => {
+                if observation.duration >= config.health_reset
+                    && entry.cooling.point.age(now.mono) >= age.saturating_add(observation.duration)
+                {
+                    let previous = std::mem::take(&mut entry.cooling);
+                    entry.cooling.point = Point::new(now, now.mono);
+                    if (previous.level != 0 || !previous.nominal().is_zero())
+                        && self.0.cooldown_events.receiver_count() != 0
+                    {
+                        let _ = self.0.cooldown_events.send(CooldownEvent::Reset {
+                            key: key.into(),
+                            episode: previous.local.map(|local| local.episode),
+                            reset_at: now.mono,
+                        });
+                    }
+                }
+            }
+        }
+        drop(entries);
+        self.notify();
+        Ok(())
+    }
+
+    pub(crate) fn prime<D: Driver>(&self, key: &str, candidate: &Candidate<D>) {
+        let Some(target) = candidate.target() else {
+            return;
+        };
+        let url = self
+            .entries()
+            .get(&candidate_key(key, candidate))
+            .and_then(|entry| entry.url.clone());
+        if let Some(url) = url {
+            target.redirected(&url);
+        }
+    }
+
+    pub(super) fn candidate_admission<D: Driver>(
+        &self,
+        key: &str,
+        candidate: &Candidate<D>,
+        recover_direction: bool,
+    ) -> Result<bool, RetryAdmission> {
+        let entries = self.entries();
+        let now = self.clock_domain().now();
+        entries
+            .get(&candidate_key(key, candidate))
+            .map_or(Ok(false), |entry| {
+                Self::admission(entry, now, recover_direction)
+            })
+    }
+
+    pub(super) fn recovery_due<D: Driver>(
+        &self,
+        key: &str,
+        candidate: &Candidate<D>,
+        now: Instant,
+    ) -> bool {
+        self.entries()
+            .get(&candidate_key(key, candidate))
+            .and_then(|entry| entry.recovery.retry_at)
+            .is_none_or(|at| now >= at)
+    }
+
+    pub(super) fn next_candidate_retry<D: Driver>(
+        &self,
+        key: &str,
+        candidate: &Candidate<D>,
+        recovery: bool,
+    ) -> Option<Instant> {
+        let now = self.clock_domain().now();
+        let entries = self.entries();
+        let entry = entries.get(&candidate_key(key, candidate))?;
+        if recovery {
+            entry
+                .recovery
+                .retry_at
+                .max(entry.hard_retry)
+                .filter(|&due| due > now)
+        } else {
+            entry.retry_at(now)
+        }
+    }
+
+    /// Reads retry admission for a candidate's cache key.
+    ///
+    /// Admission is checked again when a dial reserves its token. Session and
+    /// host admission constraints are evaluated by the caller of the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns the current cache-level reason if an attempt is suppressed.
+    pub fn retry_admission(
+        &self,
+        key: &str,
+        kind: CarrierKind,
+        variant: &str,
+    ) -> Result<(), RetryAdmission> {
+        let now = self.clock_domain().now();
+        self.entries()
+            .get(&(key.to_owned(), kind, variant.to_owned()))
+            .map_or(Ok(()), |entry| {
+                Self::admission(entry, now, false).map(|_| ())
+            })
+    }
+
+    fn admission(
+        entry: &Entry,
+        now: Instant,
+        recover_direction: bool,
+    ) -> Result<bool, RetryAdmission> {
+        if entry.in_flight.is_some() {
+            return Err(RetryAdmission::AlreadyInFlight);
+        }
+        if entry.hard_retry.is_some_and(|retry_at| retry_at > now) {
+            return Err(RetryAdmission::RetryAfter);
+        }
+        Self::time_admission(entry, now, recover_direction)
+    }
+
+    fn time_admission(entry: &Entry, now: Instant, recovery: bool) -> Result<bool, RetryAdmission> {
+        if recovery && entry.recovery.retry_at.is_some_and(|due| now < due) {
+            return Err(RetryAdmission::RecoveryWait);
+        }
+        let cooling = entry.cooling.active(now).is_some();
+        if cooling && !recovery {
+            return Err(RetryAdmission::Cooling);
+        }
+        Ok(cooling)
+    }
+
+    pub(super) fn recovery_demand(&self, key: &Key, add: bool) {
+        let mut entries = self.entries();
+        let entry = entries.entry(key.clone()).or_default();
+        if add {
+            entry.demand += 1;
+        } else {
+            entry.demand -= 1;
+            if entry.demand == 0 {
+                entry.recovery = RecoveryCadence::default();
+            }
+        }
+    }
+
+    pub(super) fn begin<D: Driver>(
+        &self,
+        key: &str,
+        candidate: &Candidate<D>,
+        recover_direction: bool,
+        dial: Option<super::controller::DialGate>,
+    ) -> Result<AttemptPermit, RetryAdmission> {
+        let key = candidate_key(key, candidate);
+        let mut entries = self.entries();
+        let now = self.clock_domain().now();
+        let entry = entries.entry(key.clone()).or_default();
+        let admission = if dial
+            .as_ref()
+            .is_some_and(|gate| gate.blocked(now).is_some())
+        {
+            Err(RetryAdmission::DialAfter)
+        } else {
+            Self::admission(entry, now, recover_direction)
+        };
+        admission?;
+        let ticket = Arc::new(AttemptTicket {
+            key,
+            started: AtomicBool::new(false),
+            logical_done: AtomicBool::new(false),
+            host_returned: AtomicBool::new(false),
+            handshake_recorded: AtomicBool::new(false),
+            replies: Mutex::new((candidate.layout.len(), None)),
+            recovery: recover_direction,
+        });
+        entry.in_flight = Some(ticket.clone());
+        Ok(AttemptPermit(AttemptStart {
+            cache: self.clone(),
+            ticket,
+            target: candidate.target().cloned(),
+            dial,
+            opportunity: None,
+        }))
+    }
+
+    /// Exports the Go-compatible version 2 snapshot. Redirect hints are process-local.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error if the snapshot cannot be represented in JSON.
+    pub fn export(&self) -> Result<Vec<u8>, CarrierCacheError> {
+        let now = Clock::now(&self.0.config);
+        let mut entries: Vec<_> = self
+            .entries()
+            .iter()
+            .filter(|(_, entry)| entry.has_snapshot_data() && entry.keep(&self.0.config, now.mono))
+            .map(|((key, kind, variant), entry)| Row {
+                key: key.clone(),
+                kind: kind.name().into(),
+                variant: variant.clone(),
+                entry: entry.clone().export(now.mono),
+            })
+            .collect();
+        entries.sort_unstable_by(|a, b| {
+            (&a.key, &a.kind, &a.variant).cmp(&(&b.key, &b.kind, &b.variant))
+        });
+        serde_json::to_vec(&Snapshot {
+            version: VERSION,
+            exported_at: now.wall,
+            entries,
+        })
+        .map_err(|_| CarrierCacheError::Format)
+    }
+
+    /// Atomically validates and merges a version 2 snapshot. Replay of an equal
+    /// timestamp preserves the local observation and cooling deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a distinct error for an unsupported version, malformed format,
+    /// or an invalid value. All entries are validated before any are merged.
+    pub fn import(&self, bytes: &[u8]) -> Result<(), CarrierCacheError> {
+        let config = &self.0.config;
+        let snapshot: Snapshot =
+            serde_json::from_slice(bytes).map_err(|_| CarrierCacheError::Format)?;
+        if snapshot.version != VERSION {
+            return Err(CarrierCacheError::Version);
+        }
+        if snapshot.exported_at == zero_time()
+            || config
+                .import_limit
+                .is_some_and(|limit| snapshot.entries.len() > limit)
+        {
+            return Err(CarrierCacheError::Value);
+        }
+        let mut keys = HashSet::new();
+        let mut validated = Vec::with_capacity(snapshot.entries.len());
+        for row in snapshot.entries {
+            let kind = CarrierKind::from_name(&row.kind).ok_or(CarrierCacheError::Value)?;
+            let key = (row.key, kind, row.variant);
+            let mut entry = row.entry;
+            if !entry.validate(config.backoff) || !keys.insert(key.clone()) {
+                return Err(CarrierCacheError::Value);
+            }
+            validated.push((key, entry));
+        }
+        let now = Clock::now(config);
+        let elapsed = now.age(snapshot.exported_at);
+        let mut entries = self.entries();
+        for (key, entry) in validated {
+            entries.entry(key).or_default().merge(entry, now, elapsed);
+        }
+        entries.retain(|_, entry| entry.keep(config, now.mono));
+        drop(entries);
+        self.notify();
+        Ok(())
     }
 }
 
-/// RFC 3339 times in UTC.
-mod rfc3339 {
-    use super::{NANOS, WallTime};
+pub(super) fn candidate_key<D: Driver>(key: &str, candidate: &Candidate<D>) -> Key {
+    (
+        key.to_owned(),
+        candidate.kind(),
+        candidate.variant().map_or("", |v| v.as_ref()).to_owned(),
+    )
+}
 
-    /// Days since 1970-01-01 of a civil date (proleptic Gregorian).
-    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-        let y = if m <= 2 { y - 1 } else { y };
-        let era = y.div_euclid(400);
-        let yoe = y - era * 400;
-        let mp = (m + 9) % 12;
-        let doy = (153 * mp + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146_097 + doe - 719_468
+/// A carrier opener's authenticated refusal with a retry deadline for its candidate.
+/// Convert to `std::io::Error` and return it from the opener.
+#[derive(Debug, Clone, Copy)]
+pub struct CarrierRetryAfter {
+    delay: Duration,
+}
+
+impl CarrierRetryAfter {
+    /// Creates a refusal with a delay measured from the observed completion.
+    #[must_use]
+    pub const fn new(delay: Duration) -> Self {
+        Self { delay }
     }
 
-    fn civil_from_days(z: i64) -> (i64, i64, i64) {
-        let z = z + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        (yoe + era * 400 + i64::from(m <= 2), m, d)
-    }
-
-    /// `t` as `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, the fraction without
-    /// trailing zeros.
-    pub(super) fn format(t: WallTime) -> String {
-        let n = t.unix_nanos();
-        let secs =
-            i64::try_from(n.div_euclid(NANOS)).unwrap_or(if n < 0 { i64::MIN } else { i64::MAX });
-        let nanos = u32::try_from(n.rem_euclid(NANOS)).unwrap_or(0);
-        let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-        let (year, month, day) = civil_from_days(days);
-        let mut s = format!(
-            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
-            rem / 3600,
-            rem / 60 % 60,
-            rem % 60
-        );
-        if nanos > 0 {
-            let f = format!("{nanos:09}");
-            s.push('.');
-            s.push_str(f.trim_end_matches('0'));
+    fn find(mut source: &(dyn std::error::Error + 'static)) -> Option<Duration> {
+        loop {
+            if let Some(retry) = source.downcast_ref::<Self>() {
+                return Some(retry.delay);
+            }
+            source = if let Some(io) = source.downcast_ref::<std::io::Error>()
+                && let Some(inner) = io.get_ref()
+            {
+                inner
+            } else {
+                source.source()?
+            };
         }
-        s.push('Z');
-        s
     }
+}
 
-    fn num(b: &[u8]) -> Option<i64> {
-        if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
-            return None;
+fn retry_deadline(now: Instant, delay: Duration) -> Instant {
+    if let Some(at) = now.checked_add(delay) {
+        return at;
+    }
+    // An unrepresentable peer deadline blocks until the end of the clock.
+    let mut lower = Duration::ZERO;
+    let mut upper = delay;
+    while upper.saturating_sub(lower) > Duration::from_nanos(1) {
+        let midpoint = lower + upper.saturating_sub(lower) / 2;
+        if now.checked_add(midpoint).is_some() {
+            lower = midpoint;
+        } else {
+            upper = midpoint;
         }
-        Some(b.iter().fold(0, |n, &c| n * 10 + i64::from(c - b'0')))
+    }
+    now + lower
+}
+
+impl fmt::Display for CarrierRetryAfter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the carrier requires a later retry")
+    }
+}
+
+impl std::error::Error for CarrierRetryAfter {}
+
+impl From<CarrierRetryAfter> for std::io::Error {
+    fn from(error: CarrierRetryAfter) -> Self {
+        Self::new(std::io::ErrorKind::ConnectionRefused, error)
+    }
+}
+
+#[derive(Debug)]
+struct AttemptTicket {
+    handshake_recorded: AtomicBool,
+    replies: Mutex<(usize, Option<Instant>)>,
+    key: Key,
+    recovery: bool,
+    logical_done: AtomicBool,
+    host_returned: AtomicBool,
+    started: AtomicBool,
+}
+
+#[derive(Clone)]
+pub(super) struct AttemptStart {
+    target: Option<Arc<crate::HttpTarget>>,
+    cache: CarrierCache,
+    ticket: Arc<AttemptTicket>,
+    dial: Option<super::controller::DialGate>,
+    opportunity: Option<super::controller::domain::Suppression>,
+}
+
+impl AttemptStart {
+    pub(super) fn handshake(&self, outcome: CacheOutcome, at: Option<Instant>) {
+        if !self.ticket.handshake_recorded.swap(true, Ordering::Relaxed) {
+            let _ = self.cache.update(
+                &self.ticket.key,
+                outcome,
+                CarrierObservation {
+                    at,
+                    ..CarrierObservation::default()
+                },
+                self.target.as_deref(),
+                None,
+                true,
+            );
+        }
     }
 
-    /// Parses `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`.
-    pub(super) fn parse(s: &str) -> Option<WallTime> {
-        let b = s.as_bytes();
-        if b.len() < 20
-            || b[4] != b'-'
-            || b[7] != b'-'
-            || !matches!(b[10], b'T' | b't')
-            || b[13] != b':'
-            || b[16] != b':'
+    pub(super) fn start(&self) -> Result<(), RetryAdmission> {
+        let mut entries = self.cache.entries();
+        let now = self.cache.clock_domain().now();
+        let entry = entries.entry(self.ticket.key.clone()).or_default();
+        let result = self.check_start(entry, now);
+        if let Err(reason) = result {
+            if self.count_suppression() {
+                entry.metrics.suppress(reason);
+            }
+            return Err(reason);
+        }
+        if let Some(opportunity) = &self.opportunity {
+            opportunity.started();
+        }
+        self.ticket.started.store(true, Ordering::Relaxed);
+        entry.metrics.attempted_starts = entry.metrics.attempted_starts.saturating_add(1);
+        Ok(())
+    }
+
+    fn check_start(&self, entry: &mut Entry, now: Instant) -> Result<(), RetryAdmission> {
+        if self.ticket.started.load(Ordering::Relaxed)
+            || entry
+                .in_flight
+                .as_ref()
+                .is_none_or(|held| !Arc::ptr_eq(held, &self.ticket))
         {
-            return None;
+            return Err(RetryAdmission::Stale);
         }
-        let (year, mo, day) = (num(&b[0..4])?, num(&b[5..7])?, num(&b[8..10])?);
-        let (hour, mi, se) = (num(&b[11..13])?, num(&b[14..16])?, num(&b[17..19])?);
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-        let dim = [
-            31,
-            if leap { 29 } else { 28 },
-            31,
-            30,
-            31,
-            30,
-            31,
-            31,
-            30,
-            31,
-            30,
-            31,
-        ];
-        if !(1..=12).contains(&mo) {
-            return None;
+        if self
+            .dial
+            .as_ref()
+            .is_some_and(|gate| gate.blocked(now).is_some())
+        {
+            return Err(RetryAdmission::DialAfter);
         }
-        let days_in_month = dim[usize::try_from(mo - 1).ok()?];
-        if day < 1 || day > days_in_month || hour > 23 || mi > 59 || se > 59 {
-            return None;
+        if entry.hard_retry.is_some_and(|at| at > now) {
+            return Err(RetryAdmission::RetryAfter);
         }
-        let mut rest = &b[19..];
-        let mut nanos = 0u32;
-        if rest.first() == Some(&b'.') {
-            let n = rest[1..].iter().take_while(|c| c.is_ascii_digit()).count();
-            if n == 0 || n > 9 {
-                return None;
-            }
-            let scale = 10i64.pow(9 - u32::try_from(n).ok()?);
-            nanos = u32::try_from(num(&rest[1..=n])? * scale).ok()?;
-            rest = &rest[1 + n..];
+        CarrierCache::time_admission(entry, now, self.ticket.recovery).map(|_| ())
+    }
+
+    fn count_suppression(&self) -> bool {
+        self.opportunity
+            .as_ref()
+            .is_none_or(super::controller::domain::Suppression::count)
+    }
+
+    pub(super) fn suppress(&self, reason: RetryAdmission) {
+        if !self.count_suppression() {
+            return;
         }
-        let offset = match rest {
-            [b'Z' | b'z'] => 0,
-            [sign @ (b'+' | b'-'), oh @ .., b':', _, _] if oh.len() == 2 => {
-                let (oh, om) = (num(oh)?, num(&rest[4..6])?);
-                if oh > 23 || om > 59 {
-                    return None;
-                }
-                let o = oh * 3600 + om * 60;
-                if *sign == b'-' { -o } else { o }
-            }
-            _ => return None,
+        self.cache
+            .entries()
+            .entry(self.ticket.key.clone())
+            .or_default()
+            .metrics
+            .suppress(reason);
+    }
+
+    pub(super) fn sample(&self) -> f64 {
+        (self.cache.0.config.recovery_sample)()
+    }
+
+    pub(super) fn record_refusal(&self, error: &std::io::Error) {
+        self.record_refusal_at(error, self.cache.clock_domain().now());
+    }
+
+    fn record_refusal_at(&self, error: &std::io::Error, at: Instant) {
+        let Some(delay) = CarrierRetryAfter::find(error) else {
+            return;
         };
-        let secs = days_from_civil(year, mo, day) * 86_400 + hour * 3600 + mi * 60 + se - offset;
-        Some(WallTime::from_unix_nanos(
-            i128::from(secs) * NANOS + i128::from(nanos),
-        ))
+        let mut entries = self.cache.entries();
+        if let Some(entry) = entries.get_mut(&self.ticket.key)
+            && entry
+                .in_flight
+                .as_ref()
+                .is_some_and(|held| Arc::ptr_eq(held, &self.ticket))
+        {
+            entry.defer_until(retry_deadline(at, delay));
+        }
+        drop(entries);
+        self.cache.notify();
+    }
+}
+
+impl OpenerAdmission for AttemptStart {
+    fn replied(&self, at: Instant) {
+        let mut replies = self
+            .ticket
+            .replies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if replies.0 == 0 {
+            return;
+        }
+        replies.0 -= 1;
+        replies.1 = Some(replies.1.map_or(at, |prior| prior.max(at)));
+        if replies.0 == 0 {
+            self.handshake(CacheOutcome::Usable, replies.1);
+        }
+    }
+    fn start(&self) -> Result<(), RetryAdmission> {
+        self.start()
+    }
+    fn suppress(&self, reason: RetryAdmission) {
+        self.suppress(reason);
+    }
+    fn host_returned(&self) {
+        self.finish(false);
+    }
+}
+
+pub(crate) struct AttemptPermit(AttemptStart);
+
+impl AttemptPermit {
+    pub(super) fn with_opportunity(
+        mut self,
+        opportunity: super::controller::domain::Suppression,
+    ) -> Self {
+        self.0.opportunity = Some(opportunity);
+        self
+    }
+
+    pub(super) fn start_handle(&self) -> AttemptStart {
+        self.0.clone()
+    }
+
+    pub(super) fn confirm(&self) {
+        let start = &self.0;
+        if let Some(entry) = start.cache.entries().get_mut(&start.ticket.key) {
+            entry.recovery = RecoveryCadence::default();
+        }
+    }
+
+    /// Linearizes the demand check with its cadence update while the session
+    /// still owns the attempt. Sampling happens only after releasing both owners.
+    pub(super) fn commit_cadence(
+        &self,
+        reason: crate::AttemptReason,
+        failed: bool,
+        at: Instant,
+        sample: Option<f64>,
+    ) -> Result<(), AttemptStart> {
+        let start = &self.0;
+        if !start.ticket.started.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut entries = start.cache.entries();
+        let Some(entry) = entries.get_mut(&start.ticket.key) else {
+            return Ok(());
+        };
+        if reason == crate::AttemptReason::Confirmed {
+            entry.recovery = RecoveryCadence::default();
+        } else if failed && start.ticket.recovery && entry.demand != 0 {
+            let Some(sample) = sample else {
+                return Err(start.clone());
+            };
+            entry.recovery.advance(at, sample);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
+    pub(super) fn record_refusal(&self, error: &std::io::Error) {
+        self.0.record_refusal(error);
+    }
 
-        #[test]
-        fn round_trips() {
-            for s in [
-                "1970-01-01T00:00:00Z",
-                "2026-11-01T12:00:00Z",
-                "2026-11-01T12:00:00.5Z",
-                // Finer than `SystemTime` on Windows (100 ns).
-                "2000-02-29T23:59:59.123456789Z",
-                "1969-12-31T23:59:59.25Z",
-                "2999-06-01T00:00:00.001Z",
-            ] {
-                assert_eq!(format(parse(s).unwrap()), s);
+    pub(super) fn settle(self, result: &crate::AttemptResult, at: Instant) {
+        let start = &self.0;
+        if !start.ticket.started.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(error) = &result.open_error {
+            start.record_refusal_at(error, at);
+        }
+        if result.candidate_failed() {
+            let now = start.cache.owner_clock();
+            if start.ticket.handshake_recorded.load(Ordering::Relaxed) {
+                let mut entries = start.cache.entries();
+                if let Some(entry) = entries.get_mut(&start.ticket.key) {
+                    start
+                        .cache
+                        .cool(&start.ticket.key, entry, CooldownReason::Attempt, now, at);
+                }
+            } else {
+                start.handshake(CacheOutcome::Failed, Some(at));
             }
-            assert_eq!(
-                format(parse("2026-11-01T23:30:00+10:00").unwrap()),
-                "2026-11-01T13:30:00Z"
-            );
-            for bad in [
-                "tomorrow",
-                "2026-11-01",
-                "2026-11-01T12:00:00",
-                "2026-02-30T12:00:00Z",
-                "2026-11-01T24:00:00Z",
-                "2026-11-01T12:00:00.Z",
-                "2026-11-01 12:00:00Z",
-            ] {
-                assert!(parse(bad).is_none(), "{bad}");
-            }
+            start.cache.notify();
         }
     }
 }
 
-/// The JSON subset of the interchange form: values are parsed whole, so
-/// that unknown fields of any type are skipped; integers are kept apart
-/// from other numbers.
-mod json {
-    use std::fmt::Write as _;
-
-    pub(super) enum Value {
-        Null,
-        Bool,
-        Int(i64),
-        /// A number that is not an integer of `i64`.
-        Number,
-        Str(String),
-        Array(Vec<Value>),
-        Object(Vec<(String, Value)>),
+impl Drop for AttemptPermit {
+    fn drop(&mut self) {
+        self.0.finish(true);
     }
+}
 
-    /// The last value of `name` (as for duplicate names elsewhere).
-    pub(super) fn field<'a>(o: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
-        o.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v)
-    }
-
-    pub(super) fn write_str(out: &mut String, s: &str) {
-        out.push('"');
-        for c in s.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if (c as u32) < 0x20 => {
-                    let _ = write!(out, "\\u{:04x}", c as u32);
-                }
-                c => out.push(c),
-            }
-        }
-        out.push('"');
-    }
-
-    /// Nesting beyond this is refused (no recursion without a bound).
-    const MAX_DEPTH: usize = 64;
-
-    pub(super) fn parse(text: &str) -> Result<Value, String> {
-        let mut p = Parser {
-            b: text.as_bytes(),
-            i: 0,
+impl AttemptStart {
+    fn finish(&self, logical: bool) {
+        let mut entries = self.cache.entries();
+        let ticket = &self.ticket;
+        let Some(entry) = entries.get_mut(&ticket.key) else {
+            return;
         };
-        let v = p.value(0)?;
-        p.ws();
-        if p.i != p.b.len() {
-            return Err(format!("trailing data at {}", p.i));
+        if entry
+            .in_flight
+            .as_ref()
+            .is_none_or(|held| !Arc::ptr_eq(held, ticket))
+        {
+            return;
         }
-        Ok(v)
-    }
-
-    struct Parser<'a> {
-        b: &'a [u8],
-        i: usize,
-    }
-
-    impl Parser<'_> {
-        fn ws(&mut self) {
-            while self
-                .b
-                .get(self.i)
-                .is_some_and(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
-            {
-                self.i += 1;
-            }
+        if logical {
+            ticket.logical_done.store(true, Ordering::Relaxed);
+        } else {
+            ticket.host_returned.store(true, Ordering::Relaxed);
         }
-
-        fn err<T>(&self, what: &str) -> Result<T, String> {
-            Err(format!("{what} at {}", self.i))
+        if !ticket.logical_done.load(Ordering::Relaxed)
+            || ticket.started.load(Ordering::Relaxed)
+                && !ticket.host_returned.load(Ordering::Relaxed)
+        {
+            return;
         }
-
-        fn lit(&mut self, word: &[u8], v: Value) -> Result<Value, String> {
-            if self.b[self.i..].starts_with(word) {
-                self.i += word.len();
-                Ok(v)
-            } else {
-                self.err("unexpected token")
-            }
+        entry.in_flight = None;
+        if entry.demand == 0
+            && !entry.has_snapshot_data()
+            && entry.hard_retry.is_none()
+            && entry.metrics == RetryMetrics::default()
+        {
+            entries.remove(&ticket.key);
         }
-
-        fn value(&mut self, depth: usize) -> Result<Value, String> {
-            if depth > MAX_DEPTH {
-                return self.err("nesting too deep");
-            }
-            self.ws();
-            match self.b.get(self.i) {
-                None => self.err("unexpected end"),
-                Some(b'n') => self.lit(b"null", Value::Null),
-                Some(b't') => self.lit(b"true", Value::Bool),
-                Some(b'f') => self.lit(b"false", Value::Bool),
-                Some(b'"') => self.string().map(Value::Str),
-                Some(b'[') => {
-                    self.i += 1;
-                    let mut a = Vec::new();
-                    self.ws();
-                    if self.b.get(self.i) == Some(&b']') {
-                        self.i += 1;
-                        return Ok(Value::Array(a));
-                    }
-                    loop {
-                        a.push(self.value(depth + 1)?);
-                        self.ws();
-                        match self.b.get(self.i) {
-                            Some(b',') => self.i += 1,
-                            Some(b']') => {
-                                self.i += 1;
-                                return Ok(Value::Array(a));
-                            }
-                            _ => return self.err("expected , or ]"),
-                        }
-                    }
-                }
-                Some(b'{') => {
-                    self.i += 1;
-                    let mut o = Vec::new();
-                    self.ws();
-                    if self.b.get(self.i) == Some(&b'}') {
-                        self.i += 1;
-                        return Ok(Value::Object(o));
-                    }
-                    loop {
-                        self.ws();
-                        if self.b.get(self.i) != Some(&b'"') {
-                            return self.err("expected a name");
-                        }
-                        let k = self.string()?;
-                        self.ws();
-                        if self.b.get(self.i) != Some(&b':') {
-                            return self.err("expected :");
-                        }
-                        self.i += 1;
-                        let v = self.value(depth + 1)?;
-                        o.push((k, v));
-                        self.ws();
-                        match self.b.get(self.i) {
-                            Some(b',') => self.i += 1,
-                            Some(b'}') => {
-                                self.i += 1;
-                                return Ok(Value::Object(o));
-                            }
-                            _ => return self.err("expected , or }"),
-                        }
-                    }
-                }
-                Some(b'-' | b'0'..=b'9') => self.number(),
-                Some(_) => self.err("unexpected character"),
-            }
-        }
-
-        fn number(&mut self) -> Result<Value, String> {
-            let start = self.i;
-            let digits = |p: &mut Self| {
-                let s = p.i;
-                while p.b.get(p.i).is_some_and(u8::is_ascii_digit) {
-                    p.i += 1;
-                }
-                p.i - s
-            };
-            if self.b.get(self.i) == Some(&b'-') {
-                self.i += 1;
-            }
-            let first = self.i;
-            let n = digits(self);
-            if n == 0 || (n > 1 && self.b[first] == b'0') {
-                return self.err("bad number");
-            }
-            let mut integer = true;
-            if self.b.get(self.i) == Some(&b'.') {
-                self.i += 1;
-                integer = false;
-                if digits(self) == 0 {
-                    return self.err("bad number");
-                }
-            }
-            if matches!(self.b.get(self.i), Some(b'e' | b'E')) {
-                self.i += 1;
-                integer = false;
-                if matches!(self.b.get(self.i), Some(b'+' | b'-')) {
-                    self.i += 1;
-                }
-                if digits(self) == 0 {
-                    return self.err("bad number");
-                }
-            }
-            let text = std::str::from_utf8(&self.b[start..self.i]).unwrap_or_default();
-            Ok(match integer.then(|| text.parse::<i64>().ok()).flatten() {
-                Some(v) => Value::Int(v),
-                None => Value::Number,
-            })
-        }
-
-        fn hex4(&mut self) -> Result<u32, String> {
-            let h = self
-                .b
-                .get(self.i..self.i + 4)
-                .and_then(|h| std::str::from_utf8(h).ok())
-                .and_then(|h| u32::from_str_radix(h, 16).ok());
-            match h {
-                Some(v) => {
-                    self.i += 4;
-                    Ok(v)
-                }
-                None => self.err("bad \\u escape"),
-            }
-        }
-
-        fn string(&mut self) -> Result<String, String> {
-            self.i += 1;
-            let mut out = Vec::new();
-            loop {
-                let Some(&c) = self.b.get(self.i) else {
-                    return self.err("unterminated string");
-                };
-                self.i += 1;
-                match c {
-                    b'"' => break,
-                    b'\\' => {
-                        let Some(&e) = self.b.get(self.i) else {
-                            return self.err("unterminated string");
-                        };
-                        self.i += 1;
-                        let ch = match e {
-                            b'"' => '"',
-                            b'\\' => '\\',
-                            b'/' => '/',
-                            b'b' => '\u{8}',
-                            b'f' => '\u{c}',
-                            b'n' => '\n',
-                            b'r' => '\r',
-                            b't' => '\t',
-                            b'u' => {
-                                let hi = self.hex4()?;
-                                let cp = if (0xD800..0xDC00).contains(&hi)
-                                    && self.b[self.i..].starts_with(b"\\u")
-                                {
-                                    let save = self.i;
-                                    self.i += 2;
-                                    let lo = self.hex4()?;
-                                    if (0xDC00..0xE000).contains(&lo) {
-                                        0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                                    } else {
-                                        self.i = save;
-                                        0xFFFD
-                                    }
-                                } else {
-                                    hi
-                                };
-                                char::from_u32(cp).unwrap_or('\u{FFFD}')
-                            }
-                            _ => return self.err("bad escape"),
-                        };
-                        let mut buf = [0; 4];
-                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                    }
-                    c if c < 0x20 => return self.err("control character in string"),
-                    c => out.push(c),
-                }
-            }
-            // The input is a &str: unescaped bytes are whole characters.
-            String::from_utf8(out).map_err(|_| "bad UTF-8".to_owned())
-        }
+        drop(entries);
+        self.cache.notify();
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn at(t: Instant, now: Instant) -> Duration {
-        t.saturating_duration_since(now)
-    }
-
-    #[test]
-    fn a_huge_backoff_bound_saturates_and_expired_entries_go() {
-        let c = CarrierCache::new(
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::MAX,
-        );
-        let now = Instant::now();
-        for _ in 0..80 {
-            c.record("k", CarrierKind::Streaming, None, None, false, now);
-        }
-        let c = CarrierCache::default();
-        if let Some(old) = now.checked_sub(Duration::from_hours(7)) {
-            c.record("old", CarrierKind::Split, None, None, false, old);
-        }
-        c.record("new", CarrierKind::Split, None, None, true, now);
-        assert_eq!(c.entries().len(), 1, "the expired entry went on record");
-    }
-
-    #[test]
-    fn snapshot_round_trips_and_drops_expired() {
-        let c = CarrierCache::default();
-        let now = Instant::now();
-        c.record("k", CarrierKind::Streaming, None, None, false, now);
-        c.record("k", CarrierKind::Streaming, None, None, false, now); // 2 min
-        c.record("k2", CarrierKind::Streaming, None, None, true, now);
-        if let Some(old) = now.checked_sub(Duration::from_hours(7)) {
-            c.record("old", CarrierKind::Split, None, None, false, old);
-        }
-        let snap = c.snapshot();
-        assert_eq!(snap.entries.len(), 2);
-        let json = snap.to_json();
-        let back = CacheSnapshot::from_json(&json).unwrap();
-        let r = CarrierCache::default();
-        r.restore(&back);
-        let Known::Failed(t) = r.state("k", CarrierKind::Streaming, None, now) else {
-            panic!("backoff not restored");
-        };
-        assert!(at(t, now).abs_diff(Duration::from_secs(120)) < Duration::from_millis(50));
-        assert!(r.is_usable("k2", CarrierKind::Streaming, None));
-        assert_eq!(
-            r.state("old", CarrierKind::Split, None, now),
-            Known::Unknown
-        );
-        // The restored backoff doubles on the next failure.
-        r.record("k", CarrierKind::Streaming, None, None, false, now);
-        let Known::Failed(t) = r.state("k", CarrierKind::Streaming, None, now) else {
-            panic!();
-        };
-        assert!(at(t, now).abs_diff(Duration::from_secs(240)) < Duration::from_millis(50));
-    }
-
-    /// A reported URL stays while the kind is usable, travels in the
-    /// snapshot, and is dropped once the kind fails.
-    #[test]
-    fn a_redirect_url_is_kept_while_usable() {
-        let c = CarrierCache::default();
-        let (k, kind) = ("k", CarrierKind::WebSocket);
-        let t = crate::HttpTarget::new("wss://a.example/old");
-        let cand = crate::Candidate::new(kind, || async {
-            Err::<crate::PipeIo, _>(std::io::Error::other("unused"))
-        })
-        .with_target(Arc::new(crate::HttpTarget::new("wss://a.example/old")));
-        let now = Instant::now();
-        assert_eq!(c.url(k, kind, None), None);
-        t.redirected("wss://a.example/new");
-        c.record(k, kind, None, Some(&t), true, now);
-        assert_eq!(c.url(k, kind, None).as_deref(), Some("wss://a.example/new"));
-        assert_eq!(c.url(k, kind, Some("v")), None);
-        // An outcome the host reports keeps it.
-        c.report(k, kind, None, CacheOutcome::Usable);
-        assert_eq!(c.url(k, kind, None).as_deref(), Some("wss://a.example/new"));
-        // A later candidate starts there, in this run or the next.
-        let r = CarrierCache::default();
-        r.restore(&CacheSnapshot::from_json(&c.snapshot().to_json()).unwrap());
-        r.prime(k, &cand);
-        assert_eq!(cand.target().unwrap().url(), "wss://a.example/new");
-        // A failure forgets it and starts the target at its base again.
-        c.record(k, kind, None, Some(&t), false, now);
-        assert_eq!(c.url(k, kind, None), None);
-        assert_eq!(t.url(), "wss://a.example/old");
-    }
-
-    #[test]
-    fn restore_bounds_times() {
-        let wall = WallTime::now();
-        let far = wall.saturating_add(Duration::from_hours(87600));
-        let mut s = CacheSnapshot::default();
-        let mut good = CacheSnapshotEntry::new("g", CarrierKind::Split);
-        good.good_until = Some(far);
-        let mut bad = CacheSnapshotEntry::new("f", CarrierKind::Split);
-        bad.fail_until = Some(far);
-        bad.backoff = Duration::from_secs(60);
-        s.entries = vec![good, bad];
-        let c = CarrierCache::default();
-        // Judged on the monotonic clock the cache keeps: a snapshot's wall
-        // times come from a second pair of clock reads, whose skew is no
-        // bound of `restore`.
-        let ahead = Duration::from_hours(6);
-        let before = Instant::now();
-        c.restore(&s);
-        let after = Instant::now();
-        for (k, e) in c.entries().iter() {
-            for t in [e.good_until, e.fail_until].into_iter().flatten() {
-                assert!(
-                    t >= before + ahead && t <= after + ahead,
-                    "{k:?} not at its bound"
-                );
-            }
-        }
-        assert!(c.is_usable("g", CarrierKind::Split, None));
-        assert!(c.failed_until("f", CarrierKind::Split, None).is_some());
-    }
-
-    #[test]
-    fn json_rejects_whole() {
-        for bad in [
-            r#"{"version":2,"entries":[]}"#,
-            r#"{"entries":[]}"#,
-            "not json",
-            r#"{"version":"1","entries":[]}"#,
-            r#"{"version":1,"entries":[{"key":"z","kind":"split","backoff_ms":-1}]}"#,
-            r#"{"version":1,"entries":[{"key":"z","kind":"split","backoff_ms":1.5}]}"#,
-            r#"{"version":1,"entries":[{"key":"z","kind":"split","backoff_ms":1e3}]}"#,
-            r#"{"version":1,"entries":[{"key":"z","kind":"split","good_until":3}]}"#,
-            r#"{"version":1,"entries":[{"key":"z","kind":"split","good_until":"tomorrow"}]}"#,
-            r#"{"version":1,"entries":[{"key":3,"kind":"split"}]}"#,
-            r#"{"version":1,"entries":{}}"#,
-            r#"{"version":1,"entries":[]} x"#,
-        ] {
-            assert!(CacheSnapshot::from_json(bad).is_err(), "{bad}");
-        }
-        let ok = CacheSnapshot::from_json(
-            r#"{"version":1,"x":[{"y":null}],"entries":[{"key":"ké","kind":"split","n":1e9},{"key":"k","kind":"later"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            ok.entries,
-            [CacheSnapshotEntry::new("ké", CarrierKind::Split)]
-        );
-    }
-}
+mod vectors;

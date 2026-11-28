@@ -373,8 +373,11 @@ pub async fn handle_lane(io: PipeIo) -> Result<(), HandleError> {
     let framing = io.framing;
     let mut probe = LaneProbe::new(ZMUX_MAX_RECORD_SIZE, framing);
     let first = first_record(io, |_, bytes| probe.data(bytes));
-    match tokio::time::timeout(FIRST_RECORD, first).await {
-        Ok(Classified::Lane {
+    // The lane's session becomes known only after its first record.
+    let clock = crate::ClockDomain::default();
+    let deadline = clock.now().checked_add(FIRST_RECORD);
+    match super::deadline::timeout(&clock, deadline, first).await {
+        Some(Classified::Lane {
             lane_key,
             pipe,
             lane,
@@ -390,8 +393,8 @@ pub async fn handle_lane(io: PipeIo) -> Result<(), HandleError> {
                 None => install(setup, &entry.session, at, bytes),
             }
         }
-        Ok(_) => Err(HandleError::Rejected),
-        Err(_) => Err(HandleError::TimedOut),
+        Some(_) => Err(HandleError::Rejected),
+        None => Err(HandleError::TimedOut),
     }
 }
 

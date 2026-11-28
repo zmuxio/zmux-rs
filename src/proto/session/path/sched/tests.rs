@@ -16,14 +16,30 @@ use crate::proto::session::{
 };
 use crate::util::f64_of;
 
+mod relative_stall;
+
 const BS: Framing = Framing::ByteStream;
 const MS: Duration = Duration::from_millis(1);
 /// 100 Mbit/s.
 pub(in crate::proto::session) const FAST: u64 = 12_500_000;
 
+#[test]
+fn eta_at_the_carrier_queue_limit_stays_large() {
+    let eta = super::Eta {
+        queued: u64::MAX,
+        rate: 1,
+        estimate: 1,
+        owd: 0.0,
+    };
+    assert_eq!(
+        eta.of(128).total_cmp(&f64_of(u64::MAX)),
+        std::cmp::Ordering::Equal,
+    );
+}
+
 fn config(policy: Scheduler) -> Config {
     let mut c = Config {
-        max_pipes: 4,
+        session_policy: crate::SessionPolicy::with_steady_attachments(4),
         pipe_auth: PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end(),
         scheduler: policy,
         max_idle_timeout: Some(Duration::from_secs(600)),
@@ -34,10 +50,9 @@ fn config(policy: Scheduler) -> Config {
     c
 }
 
-/// Runs the handshake of pipe 2 on in-memory bytes: Hello through B's listener, Reply,
+/// Runs a pipe handshake on in-memory bytes: Hello through B's listener, Reply,
 /// Confirm. Records on it start after that.
-fn join(a: &mut SessionCore, b: &mut SessionCore, l: &mut ListenerCore, now: Instant) {
-    let id = PipeId(2);
+fn join(a: &mut SessionCore, b: &mut SessionCore, l: &mut ListenerCore, id: PipeId, now: Instant) {
     a.join_prepare(id, now).unwrap().expect("not deferred");
     let plan = crate::shaping::UnitPlan::default();
     let hello = a.join_hello(id, (BS, 0), &plan, now).unwrap();
@@ -50,13 +65,15 @@ fn join(a: &mut SessionCore, b: &mut SessionCore, l: &mut ListenerCore, now: Ins
         panic!("Hello not verified");
     };
     let carrier = PeerCarrier {
+        setup: None,
+        sources: crate::CarrierHalfSources::default(),
         inbound: Some(BS),
         outbound: Some(BS),
         looped: false,
         overhead: 0,
         received: 0,
     };
-    let ClaimedHello::Accept(reply) = b.claim_hello(&mut peer, carrier, &plan, now) else {
+    let ClaimedHello::Accept { reply, .. } = b.claim_hello(&mut peer, &carrier, &plan, now) else {
         panic!("Hello not accepted");
     };
     let JoinStep::Verified { .. } = a.verify_reply(id, &reply, now) else {
@@ -64,7 +81,7 @@ fn join(a: &mut SessionCore, b: &mut SessionCore, l: &mut ListenerCore, now: Ins
     };
     let confirm = a.join_finish(id, &plan, now).unwrap().confirm;
     assert!(peer.read_confirm(&confirm).unwrap().is_some());
-    let confirmed = b.confirm_join(*peer, carrier, now);
+    let confirmed = b.confirm_join(*peer, &carrier, now);
     assert!(matches!(confirmed, ConfirmedJoin::Attached { pipe, .. } if pipe == id));
     l.done(c);
 }
@@ -134,7 +151,7 @@ pub(in crate::proto::session) fn two_pipes(
         )
         .unwrap();
     assert_eq!(id, PipeId(2));
-    join(&mut a, &mut b, &mut l, now);
+    join(&mut a, &mut b, &mut l, id, now);
     for _ in 0..20 {
         pump(&mut a, &mut b, &[0, 2], now);
         now += 5 * MS;
@@ -379,12 +396,12 @@ fn t_suspect_includes_the_write_calls_in_progress_ahead() {
     let o = a.out_mut(2).unwrap();
     assert!(o.oldest_eliciting_batch().is_none());
     assert_eq!(o.request_lane(), 1);
-    assert!(o.lane_attached(1, BS, now));
+    assert!(o.lane_attached(1, BS));
     o.lanes_mut().unwrap().wrote_first(1, 23);
     o.batch_sent(0, 50_000, 1, None);
-    o.mp_batch_sent(0, false, mad, now);
+    o.mp_batch_sent(0, false, None, now);
     o.batch_sent(1, 1000, 1, Some(1000));
-    o.mp_batch_sent(1, true, mad, now);
+    o.mp_batch_sent(1, true, None, now);
     let o = a.out_ref(2).unwrap();
     assert_eq!(o.oldest_eliciting_batch().unwrap().unsent_ahead, 50_000);
     let queue =
@@ -392,10 +409,9 @@ fn t_suspect_includes_the_write_calls_in_progress_ahead() {
     assert!(queue >= 100 * MS, "{queue:?}");
     let pto = o.est().pto(mad);
     let floor = o.detection().0;
-    let (t_suspect, t_fail, _) = a.limits(o);
+    let t_suspect = a.absolute_stall_limit(o);
     assert_eq!(t_suspect, floor.max((pto + queue) * 2));
     assert!(t_suspect > floor.max(pto * 2));
-    assert_eq!(t_fail, Duration::from_secs(2).max((pto + queue) * 8));
 }
 
 /// `spread-round-robin` shares bytes by chunks of `spread_chunk`, not by

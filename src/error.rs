@@ -22,6 +22,8 @@ pub enum ConnectError {
     Io(Arc<io::Error>),
     /// The configuration is invalid.
     InvalidConfig(InvalidConfig),
+    /// The initial receive promise and working space did not fit the budget.
+    MemoryBudget,
 }
 
 impl ConnectError {
@@ -38,6 +40,7 @@ impl fmt::Display for ConnectError {
             Self::SessionLost(e) => write!(f, "session lost during establishment: {e}"),
             Self::Io(e) => write!(f, "carrier error: {e}"),
             Self::InvalidConfig(e) => e.fmt(f),
+            Self::MemoryBudget => f.write_str("initial session memory budget exhausted"),
         }
     }
 }
@@ -48,7 +51,14 @@ impl std::error::Error for ConnectError {
             Self::SessionLost(e) => Some(e),
             Self::Io(e) => Some(&**e),
             Self::InvalidConfig(e) => Some(e),
+            Self::MemoryBudget => None,
         }
+    }
+}
+
+impl From<InvalidConfig> for ConnectError {
+    fn from(error: InvalidConfig) -> Self {
+        Self::InvalidConfig(error)
     }
 }
 
@@ -58,6 +68,7 @@ impl From<ConnectError> for io::Error {
             ConnectError::SessionLost(s) => io::Error::from(s.clone()).kind(),
             ConnectError::Io(io) => io.kind(),
             ConnectError::InvalidConfig(_) => io::ErrorKind::InvalidInput,
+            ConnectError::MemoryBudget => io::ErrorKind::OutOfMemory,
         };
         io::Error::new(kind, e)
     }

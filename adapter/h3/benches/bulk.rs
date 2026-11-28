@@ -9,7 +9,6 @@ mod benchmark {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use bytes::Bytes;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use zmux::{Config, Listener, ListenerConfig, Session};
     use zmux_h3::Options;
@@ -72,7 +71,7 @@ mod benchmark {
             (n, server)
         });
         let mut s = client.open_uni().await.unwrap();
-        let chunk = Bytes::from(vec![1u8; 64 * 1024]);
+        let chunk = zmux::Chunk::from(vec![1u8; 64 * 1024]);
         let (mut sent, mut t) = (0u64, Instant::now());
         while sent < total + warm {
             if sent == warm {

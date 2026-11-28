@@ -6,9 +6,11 @@
 use std::io::IoSlice;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use crate::Chunk;
 #[cfg(feature = "tokio")]
-use bytes::BytesMut;
+use crate::proto::session::ChunkBuffer;
+#[cfg(feature = "tokio")]
+use std::{sync::Arc, task::Context};
 
 use super::CallLimit;
 use crate::proto::record::Framing;
@@ -178,17 +180,34 @@ impl Progress {
 
 /// A pipe's outbound batch: taken from the core under its lock, written in
 /// bounded calls without it.
+struct BatchAccounting {
+    lane: u64,
+    ledger: std::sync::Arc<crate::proto::session::accounting::Ledger>,
+    records: usize,
+    complete: usize,
+}
+
+/// Optional state used by message framing and attributed record writes.
+#[derive(Default)]
+struct WriteExtras {
+    message: Vec<u8>,
+    accounting: Option<BatchAccounting>,
+}
+
 pub(crate) struct Outbound {
+    extra: Option<Box<WriteExtras>>,
     framing: Framing,
     calls: Calls,
     out: TransmitBuf,
     /// Bytes of the batch already written.
     pos: usize,
+    /// The writer may have consumed a prefix it never reported.
+    unproved_progress: bool,
     /// Bytes written that the core has not been told of
     /// ([`Outbound::tell`]).
     untold: u64,
     /// The batch ends with a shutdown of the write side.
-    shutdown: bool,
+    shutdown: Shutdown,
     /// The most bytes one write call hands the carrier.
     call_limit: usize,
     /// `call_limit` as computed under the core lock, reused within the
@@ -197,42 +216,51 @@ pub(crate) struct Outbound {
     /// The next message of a message-framed carrier: its index among the
     /// batch's messages (written ones are whole).
     msg_index: usize,
-    /// A message of more than one piece for a carrier that takes slices,
-    /// copied, reused.
-    msg: Vec<u8>,
     /// Where the last walk of the batch ended.
     cursor: PieceCursor,
     /// The batch from `pos` on as owned buffers, for a carrier that takes
     /// them (`ChunkWrite`): built up to byte `owned_end` as
     /// write calls need them, taken from `owned_head` on (the carrier
     /// leaves what it took empty).
-    owned: Vec<Bytes>,
+    owned: Vec<Chunk>,
     owned_head: usize,
     owned_end: usize,
     /// The copies of built bytes in `owned`, split off as they are made.
     #[cfg(feature = "tokio")]
-    scratch: BytesMut,
+    scratch: ChunkBuffer,
+    #[cfg(feature = "tokio")]
+    memory_wait: Option<Arc<crate::proto::memory::BudgetWait>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shutdown {
+    None,
+    Pending,
+    Complete,
 }
 
 impl Outbound {
     pub(crate) fn new(framing: Framing, calls: Calls) -> Self {
         Self {
+            extra: None,
             framing,
             calls,
             out: TransmitBuf::default(),
             pos: 0,
+            unproved_progress: false,
             untold: 0,
-            shutdown: false,
+            shutdown: Shutdown::None,
             call_limit: WRITE_CALL_MIN,
             cached: CallLimit::default(),
             msg_index: 0,
-            msg: Vec::new(),
             cursor: PieceCursor::default(),
             owned: Vec::new(),
             owned_head: 0,
             owned_end: 0,
             #[cfg(feature = "tokio")]
-            scratch: BytesMut::new(),
+            scratch: ChunkBuffer::default(),
+            #[cfg(feature = "tokio")]
+            memory_wait: None,
         }
     }
 
@@ -254,7 +282,7 @@ impl Outbound {
 
     /// Bytes of the batch left to write.
     pub(crate) fn left(&self) -> usize {
-        self.out.len() - self.pos
+        self.out.len().saturating_sub(self.pos)
     }
 
     /// Nothing left to write.
@@ -264,27 +292,31 @@ impl Outbound {
 
     /// The batch ends with a shutdown of the write side, still to do.
     pub(crate) fn shutdown_pending(&self) -> bool {
-        self.shutdown
+        self.shutdown == Shutdown::Pending
     }
 
-    /// The shutdown was done (or the side closed).
+    /// The carrier confirmed shutdown of its sending half.
     pub(crate) fn shutdown_done(&mut self) {
-        self.shutdown = false;
+        self.shutdown = Shutdown::Complete;
     }
 
     /// Drops the batch: the write side is closed.
-    #[cfg(feature = "tokio")]
     pub(crate) fn clear(&mut self) {
-        self.out.clear();
-        self.restart();
-        self.shutdown = false;
+        self.finish_io();
+        self.shutdown = Shutdown::None;
     }
 
-    /// Writes start at the batch's beginning, and owned buffers made for
-    /// the last one are released.
+    /// Writes for the next batch start at its beginning.
     fn restart(&mut self) {
         self.pos = 0;
         self.msg_index = 0;
+        self.unproved_progress = false;
+    }
+
+    /// Clears I/O storage while preserving the confirmed prefix for `tell`.
+    fn finish_io(&mut self) {
+        self.finish_accounting();
+        self.out.clear_io();
         self.owned.clear();
         self.owned_head = 0;
         self.owned_end = 0;
@@ -294,9 +326,11 @@ impl Outbound {
     #[cfg(feature = "tokio")]
     pub(crate) fn release(&mut self) {
         self.out.shrink();
-        self.msg = Vec::new();
+        if let Some(extra) = &mut self.extra {
+            extra.message = Vec::new();
+        }
         self.owned = Vec::new();
-        self.scratch = BytesMut::new();
+        self.scratch.release_storage();
     }
 
     /// The batch's storage is that of a small batch.
@@ -309,9 +343,11 @@ impl Outbound {
     #[cfg(feature = "tokio")]
     pub(crate) fn capacity(&self) -> usize {
         self.out.capacity()
-            + self.msg.capacity()
-            + self.owned.capacity() * size_of::<Bytes>()
-            + self.scratch.capacity()
+            + self.extra.as_ref().map_or(0, |extra| {
+                size_of::<WriteExtras>() + extra.message.capacity()
+            })
+            + self.owned.capacity() * size_of::<Chunk>()
+            + self.scratch.bytes.capacity()
     }
 
     /// Takes the next batch of pipe `id` from the core, under its lock,
@@ -327,7 +363,7 @@ impl Outbound {
     ) -> bool {
         let id = id.into();
         self.tell(core, id, now);
-        if !self.out.is_empty() || self.shutdown || !core.wants_write(id) {
+        if !self.out.is_empty() || self.shutdown_pending() || !core.wants_write(id) {
             return false;
         }
         let blocking = self.calls == Calls::Blocking;
@@ -343,17 +379,40 @@ impl Outbound {
         if self.framing == Framing::Records {
             // One message per call, built within the bound.
             let limit = core.write_call_limit(id.pipe, batch, blocking, input, now);
+            #[cfg(feature = "tokio")]
+            let limit = if self.scratch.space.is_some() {
+                limit.min(crate::proto::memory::WriteWorkspace::MAX_ROOT)
+            } else {
+                limit
+            };
             self.out.set_max_message(limit);
         }
         let t = core.poll_transmit(id, now, &mut self.out);
         self.restart();
-        self.shutdown = t == Transmit::Shutdown;
+        if let Some(ledger) = core.pipe_ledger(id.pipe) {
+            let accounting = self
+                .extra
+                .get_or_insert_default()
+                .accounting
+                .get_or_insert_with(|| BatchAccounting {
+                    lane: id.lane.0,
+                    ledger: ledger.clone(),
+                    records: 0,
+                    complete: 0,
+                });
+            if !std::sync::Arc::ptr_eq(ledger, &accounting.ledger) {
+                accounting.ledger = ledger.clone();
+            }
+        }
+        if t == Transmit::Shutdown {
+            self.shutdown = Shutdown::Pending;
+        }
         let left = self.out.len();
         let limit = core.write_call_limit(id.pipe, left, blocking, input, now);
         self.call_limit = self
             .cached
             .set(left, limit, input, now, core.latency_budget());
-        !self.out.is_empty() || self.shutdown
+        !self.out.is_empty() || self.shutdown_pending()
     }
 
     /// The limit of the next write call: the cached one while it holds,
@@ -408,8 +467,9 @@ impl Outbound {
     /// the batch when it is one piece, else copied once.
     pub(crate) fn message(&mut self) -> &[u8] {
         let len = self.message_len();
+        let extra = self.extra.get_or_insert_default();
         self.out
-            .contiguous(&mut self.cursor, self.pos, len, &mut self.msg)
+            .contiguous(&mut self.cursor, self.pos, len, &mut extra.message)
     }
 
     /// The next call's bytes for a carrier that takes owned buffers: at
@@ -417,40 +477,28 @@ impl Outbound {
     /// whole, on a message-framed carrier), referenced payloads shared and
     /// built bytes copied once. The carrier leaves what it takes empty.
     #[cfg(feature = "tokio")]
-    pub(crate) fn chunks(&mut self, limit: usize) -> &mut [Bytes] {
+    pub(crate) fn chunks(&mut self, limit: usize, cx: &Context<'_>) -> Option<&mut [Chunk]> {
         let head = self.owned_head;
         if self.framing == Framing::Records {
             if head == self.owned.len() {
-                let len = self.message_len();
-                self.owned_end += self.out.owned_pieces(
-                    &mut self.cursor,
-                    self.pos,
-                    len,
-                    true,
-                    &mut self.owned,
-                    &mut self.scratch,
-                );
+                self.prepare_chunks(self.pos, self.message_len(), true, cx)?;
             }
             let end = (head + 1).min(self.owned.len());
-            return &mut self.owned[head..end];
+            return Some(&mut self.owned[head..end]);
         }
+        let limit = limit.min(crate::proto::memory::WriteWorkspace::MAX_ROOT);
         let want = (self.pos + limit).min(self.out.len());
         if self.owned_end < want {
-            self.owned_end += self.out.owned_pieces(
-                &mut self.cursor,
-                self.owned_end,
-                want - self.owned_end,
-                false,
-                &mut self.owned,
-                &mut self.scratch,
-            );
+            let ready = self.prepare_chunks(self.owned_end, want - self.owned_end, false, cx);
+            if ready.is_none() && head == self.owned.len() {
+                return None;
+            }
         }
         let mut sum = 0;
         let mut end = head;
         while end < self.owned.len() && sum < limit {
             let len = self.owned[end].len();
             if sum + len > limit {
-                // The call ends inside this buffer: split there.
                 let tail = self.owned[end].split_off(limit - sum);
                 self.owned.insert(end + 1, tail);
                 end += 1;
@@ -459,14 +507,62 @@ impl Outbound {
             sum += len;
             end += 1;
         }
-        &mut self.owned[head..end]
+        Some(&mut self.owned[head..end])
     }
 
-    /// Every remaining message of a message-framed carrier, each one buffer,
-    /// for a carrier that takes them in one call
-    /// ([`ChunkWrite::takes_message_batches`](super::tokio::ChunkWrite::takes_message_batches)).
     #[cfg(feature = "tokio")]
-    pub(crate) fn message_batch(&mut self) -> &mut [Bytes] {
+    fn prepare_chunks(
+        &mut self,
+        offset: usize,
+        len: usize,
+        whole: bool,
+        cx: &Context<'_>,
+    ) -> Option<()> {
+        loop {
+            let epoch = self
+                .scratch
+                .space
+                .as_ref()
+                .map(|space| space.domain().release_epoch());
+            if let Some(n) = self.out.owned_pieces(
+                &mut self.cursor,
+                offset,
+                len,
+                whole,
+                &mut self.owned,
+                &mut self.scratch,
+            ) {
+                self.owned_end += n;
+                self.memory_wait = None;
+                return Some(());
+            }
+            let space = self
+                .scratch
+                .space
+                .as_ref()
+                .expect("an unlimited workspace cannot be denied");
+            if !space
+                .domain()
+                .watch(epoch.unwrap(), &mut self.memory_wait, cx.waker())
+            {
+                return None;
+            }
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn with_workspace(
+        mut self,
+        workspace: Option<std::sync::Arc<crate::proto::memory::WriteWorkspace>>,
+    ) -> Self {
+        self.scratch.space = workspace;
+        self
+    }
+
+    /// A prefix of the remaining whole messages, ready for the carrier in
+    /// one call. A later message waiting for memory leaves this prefix ready.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn message_batch(&mut self, cx: &Context<'_>) -> Option<&mut [Chunk]> {
         let head = self.owned_head;
         if head == self.owned.len() {
             let (mut pos, mut index) = (self.pos, self.msg_index);
@@ -477,19 +573,14 @@ impl Outbound {
                     .get(index)
                     .copied()
                     .unwrap_or(self.out.len() - pos);
-                self.owned_end += self.out.owned_pieces(
-                    &mut self.cursor,
-                    pos,
-                    len,
-                    true,
-                    &mut self.owned,
-                    &mut self.scratch,
-                );
+                if self.prepare_chunks(pos, len, true, cx).is_none() {
+                    break;
+                }
                 pos += len;
                 index += 1;
             }
         }
-        &mut self.owned[head..]
+        (head < self.owned.len()).then_some(&mut self.owned[head..])
     }
 
     /// Tells the core, under its lock, the bytes the carrier took since
@@ -498,37 +589,89 @@ impl Outbound {
     /// The last byte of a batch that ends with a shutdown is told once the
     /// shutdown is done: a close counts as handed off only when the
     /// carrier's write side is shut, so a process that exits then leaves no
-    /// half-written carrier behind. Returns whether the core recorded progress.
+    /// half-written carrier behind. Returns whether the driver must dispatch
+    /// the resulting core events.
     pub(crate) fn tell(&mut self, core: &mut Core, id: impl Into<LaneId>, now: Instant) -> bool {
-        let held = u64::from(self.shutdown && self.pos >= self.out.len() && self.untold > 0);
+        let id = id.into();
+        let held =
+            u64::from(self.shutdown_pending() && self.pos >= self.out.len() && self.untold > 0);
         let n = self.untold - held;
         self.untold = held;
+        let done = self.out.is_empty();
+        let shaped = (self.untold != 0 || n != 0 || done && self.out.has_committed_cover())
+            && self.complete_prefix(core, id, done, now);
         if n > 0 {
             core.pipe_written(id, n, now);
         }
-        n != 0
+        let completed = self.shutdown == Shutdown::Complete;
+        if completed {
+            self.shutdown = Shutdown::None;
+            core.write_shutdown_complete(id, now);
+        }
+        shaped || completed || n != 0 && core.state() >= crate::proto::session::State::Closing
+    }
+
+    fn complete_prefix(&mut self, core: &mut Core, id: LaneId, done: bool, now: Instant) -> bool {
+        let accepted = if self.framing == Framing::Records {
+            self.msg_index
+                .checked_sub(1)
+                .and_then(|i| self.out.records().get(i))
+                .map_or(0, |record| record.end)
+        } else {
+            self.pos as u64
+        };
+        if done && self.unproved_progress {
+            core.transmit_progress_unknown(id, &mut self.out, accepted, now)
+        } else {
+            core.transmit_progress(id, &mut self.out, accepted, done, now)
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) const fn note_unproved_progress(&mut self, unknown: bool) {
+        self.unproved_progress = unknown;
+    }
+
+    /// Settles observed progress when the runtime abandons the remaining I/O.
+    pub(crate) fn cancel(&mut self, core: &mut Core, id: impl Into<LaneId>, now: Instant) -> bool {
+        let id = id.into();
+        let notified = self.tell(core, id, now);
+        self.complete_prefix(core, id, true, now) || notified
     }
 
     /// A write call took `n` bytes; returns whether the batch is done.
     pub(crate) fn written(&mut self, n: usize) -> bool {
         self.pos += n;
+        if let Some(accounting) = self
+            .extra
+            .as_mut()
+            .and_then(|extra| extra.accounting.as_mut())
+        {
+            accounting.written(&self.out, self.pos);
+        }
         let done = self.pos >= self.out.len();
-        self.untold += if self.framing == Framing::Records && n > 0 {
-            // The core accounts in byte-stream form. A carrier takes whole
-            // messages without their Size fields, either one or the batch.
-            let ends = self.out.record_ends();
-            let start = self.msg_index.checked_sub(1).map_or(0, |i| ends[i]);
-            self.msg_index = if done { ends.len() } else { self.msg_index + 1 };
-            ends[self.msg_index - 1] - start
+        let accepted = if self.framing == Framing::Records && n > 0 {
+            // The core counts accepted whole messages with their synthetic Size.
+            let records = self.out.records();
+            let start = self.msg_index.checked_sub(1).map_or(0, |i| records[i].end);
+            let mut pending = n;
+            while pending != 0 {
+                let len = self.out.message_lens()[self.msg_index];
+                pending = pending
+                    .checked_sub(len)
+                    .expect("carrier accepted whole messages");
+                self.msg_index += 1;
+            }
+            records[self.msg_index - 1].end - start
         } else {
             n as u64
         };
+        self.untold += accepted;
         if done {
-            self.out.clear();
-            self.restart();
+            self.finish_io();
             return true;
         }
-        while self.owned.get(self.owned_head).is_some_and(Bytes::is_empty) {
+        while self.owned.get(self.owned_head).is_some_and(Chunk::is_empty) {
             self.owned_head += 1;
         }
         if self.owned_head == self.owned.len() {
@@ -536,6 +679,58 @@ impl Outbound {
             self.owned_head = 0;
         }
         false
+    }
+}
+
+impl Outbound {
+    fn finish_accounting(&mut self) {
+        if self.out.is_empty() {
+            return;
+        }
+        if let Some(accounting) = self
+            .extra
+            .as_mut()
+            .and_then(|extra| extra.accounting.as_mut())
+        {
+            if self.pos > accounting.complete {
+                accounting.ledger.finish_write(accounting.lane);
+            }
+            accounting.records = 0;
+            accounting.complete = 0;
+        }
+    }
+}
+
+impl Drop for Outbound {
+    fn drop(&mut self) {
+        self.finish_accounting();
+    }
+}
+
+impl BatchAccounting {
+    fn written(&mut self, batch: &TransmitBuf, pos: usize) {
+        let before = (self.records, self.complete);
+        if batch.is_records() {
+            for &len in &batch.message_lens()[self.records..] {
+                if self.complete + len > pos {
+                    break;
+                }
+                self.records += 1;
+                self.complete += len;
+            }
+        } else {
+            let ends = batch.records();
+            self.records = ends.partition_point(|record| record.end <= pos as u64);
+            if self.records != 0 {
+                self.complete = crate::util::usize_sat(ends[self.records - 1].end);
+            }
+        }
+        self.ledger.write_progress(
+            self.lane,
+            (self.complete - before.1) as u64,
+            (self.records - before.0) as u64,
+            (pos - self.complete) as u64,
+        );
     }
 }
 
@@ -547,7 +742,7 @@ mod tests {
     /// A batch of `n` records, each of a built part and a referenced
     /// payload (or, on a message-framed pipe with `alone`, the first
     /// message a payload only).
-    fn records(framing: Framing, n: u8, alone: bool) -> (TransmitBuf, Vec<Bytes>) {
+    fn records(framing: Framing, n: u8, alone: bool) -> (TransmitBuf, Vec<Chunk>) {
         let mut b = TransmitBuf::default();
         b.set_framing(framing);
         let mut payloads = Vec::new();
@@ -556,7 +751,7 @@ mod tests {
             if !(alone && i == 0) {
                 b.push_bytes(&[i; 7]);
             }
-            let p = Bytes::from(vec![i.wrapping_mul(31); 5000 + usize::from(i)]);
+            let p = Chunk::from(vec![i.wrapping_mul(31); 5000 + usize::from(i)]);
             b.push_shared(p.clone());
             payloads.push(p);
             assert!(b.end_record());
@@ -580,10 +775,12 @@ mod tests {
         loop {
             step += 1;
             let limit = [3000, 100, 9000, 1, 70000][step % 5];
-            let chunks = o.chunks(limit);
-            assert!(chunks.iter().map(Bytes::len).sum::<usize>() <= limit);
+            let chunks = o
+                .chunks(limit, &Context::from_waker(std::task::Waker::noop()))
+                .unwrap();
+            assert!(chunks.iter().map(Chunk::len).sum::<usize>() <= limit);
             // Take all but a few bytes now and then.
-            let mut want = chunks.iter().map(Bytes::len).sum::<usize>();
+            let mut want = chunks.iter().map(Chunk::len).sum::<usize>();
             if step.is_multiple_of(3) {
                 want = want.saturating_sub(5);
             }
@@ -608,7 +805,7 @@ mod tests {
         }
         assert_eq!(got, whole);
         assert!(shared >= payloads.len());
-        assert_eq!(o.owned, Vec::<Bytes>::new());
+        assert_eq!(o.owned, Vec::<Chunk>::new());
     }
 
     /// A message-framed carrier gets one message per call: a message of
@@ -638,11 +835,14 @@ mod tests {
         let (batch, _) = records(Framing::Records, 3, true);
         o2.untold = 0;
         o2.out = batch;
+        o2.restart();
         assert!(o2.written(lens.iter().sum()));
         assert_eq!(o2.untold, stream_len);
         // Owned buffers: the first message is the payload itself.
         for (i, len) in lens.iter().enumerate() {
-            let chunks = o.chunks(1);
+            let chunks = o
+                .chunks(1, &Context::from_waker(std::task::Waker::noop()))
+                .unwrap();
             assert_eq!(chunks.len(), 1);
             assert_eq!(chunks[0].len(), *len);
             if i == 0 {
@@ -650,7 +850,7 @@ mod tests {
             } else {
                 assert_eq!(&chunks[0][7..], &payloads[i][..]);
             }
-            chunks[0] = Bytes::new();
+            chunks[0] = Chunk::new();
             o.written(*len);
         }
         assert!(o.is_empty());

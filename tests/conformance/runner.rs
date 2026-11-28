@@ -136,6 +136,8 @@ struct Carrier {
     binding: Vec<u8>,
     /// A Hello held until establishment or the join keys.
     waiting: Option<Vec<u8>>,
+    pause_authorization: bool,
+    authorization: Option<Box<zmux::proto::session::PeerJoin>>,
     /// An Unconfirmed carrier's join; the carrier's bytes until Confirmed.
     join: Option<Box<zmux::proto::session::PeerJoin>>,
     buf: Vec<u8>,
@@ -309,7 +311,8 @@ impl Runner {
             pipe_cap,
             lane_key,
             epoch_locator_prefix,
-            unconfirmed_cap
+            unconfirmed_cap,
+            datagram
         );
 
         let mut config = Config::default();
@@ -323,6 +326,21 @@ impl Runner {
         config.liveness.keep_alive_period = period(cfg.keep_alive_period.unwrap_or(0));
         config.max_idle_timeout = period(tp.max_idle_timeout.unwrap_or(0));
         config.enable_datagrams = cfg.enable_datagrams.unwrap_or(false);
+        if let Some(d) = &hooks.datagram {
+            let datagrams = config.datagram_config_mut();
+            if let Some(window) = d.window {
+                datagrams.dedup_window = window;
+            }
+            datagrams.hold_packets = d.hold_packets;
+            if let Some(copies) = d.copies.and_then(std::num::NonZeroU8::new) {
+                datagrams.copy_limit = copies;
+                datagrams.defaults.copies = Some(zmux::DatagramCopyPolicy::Duplicate(copies));
+            }
+            datagrams.hold_time = d.hold_ms.map(Duration::from_millis);
+            datagrams.defaults.deadline = d
+                .ttl_ms
+                .map(|ms| zmux::DatagramDeadline::After(Duration::from_millis(ms)));
+        }
         // Absent from the profile means configured eagerly (the traces of
         // earlier revisions); `null` means unset, lazy.
         config.max_incoming_uni_streams = match cfg.max_incoming_uni_streams {
@@ -331,7 +349,7 @@ impl Runner {
             None => zmux::UniCredit::Limit(tp_uni),
         };
         if let Some(m) = cfg.max_pipes {
-            config.max_pipes = m;
+            config.session_policy.limits.steady_attachments = m;
         }
         // The test-mode sender : the ETA choice,
         // no probation, no redundant copies, standby pipes probed at 15 s.
@@ -398,14 +416,29 @@ impl Runner {
             config.liveness.probe_jitter = j;
         }
         if let Some(e) = &cfg.early_data {
-            config.early_data =
-                zmux::EarlyData::for_zmux_peer().with_carrier_early_data(e.replayable);
-            config.early_data.zmux_peer = e.zmux_peer;
+            config.early_data = zmux::EarlyData::default().with_carrier_early_data(e.replayable);
+        }
+        if trace.steps.iter().any(|s| {
+            matches!(
+                s.op,
+                Op::PipeUp {
+                    remembered_plain: Some(_),
+                    ..
+                }
+            )
+        }) {
+            config.early_data.carrier_early_data = true;
         }
         if let Some(m) = &tp.zmux_multipath {
             config.test_hooks().locator = m.locator.as_bytes().to_vec();
         }
 
+        if let Some(cap) = hooks.unconfirmed_cap {
+            config.session_policy.limits.pending_peer_joins = usize::try_from(cap)
+                .ok()
+                .and_then(std::num::NonZeroUsize::new)
+                .ok_or("unconfirmed_cap")?;
+        }
         let th = config.test_hooks();
         th.transport_parameters = Some(tp);
         th.grease_tp = hooks.grease_tp.map(|g| (g.id, g.value.0));
@@ -431,11 +464,7 @@ impl Runner {
             })
             .collect::<Result<_, &str>>()?;
         th.pipe_cap = hooks.pipe_cap.map(|c| c as usize);
-        let mut listener_config = ListenerConfig::default();
-        if let Some(cap) = hooks.unconfirmed_cap {
-            listener_config.limits.max_pending_per_session =
-                usize::try_from(cap).map_err(|_| "unconfirmed_cap")?;
-        }
+        let listener_config = ListenerConfig::default();
         th.epoch_locator_prefix = hooks.epoch_locator_prefix.map(|p| p.0);
         th.lane_key = hooks
             .lane_key
@@ -456,8 +485,11 @@ impl Runner {
             },
         };
         let base = Instant::now();
-        let session = SessionCore::new(config, role, Some(transport), base)
+        let mut session = SessionCore::new(config, role, Some(transport), base)
             .map_err(|e| format!("session: {e}"))?;
+        if let Some(next) = hooks.datagram.and_then(|d| d.next_sequence) {
+            session.seed_datagram_sequence(next);
+        }
         Ok(Self {
             session,
             base,
@@ -584,6 +616,7 @@ impl Runner {
                     }
                     match t {
                         Transmit::Shutdown => {
+                            self.session.write_shutdown_complete(at, now);
                             self.pipe_mut(id)
                                 .lane_mut(lane)
                                 .closed
@@ -851,7 +884,11 @@ impl Runner {
 
     fn message(&mut self, id: u64, m: &[u8]) {
         let now = self.now();
-        self.session.receive_message(PipeId::new(id), m, now);
+        self.session.receive_message(
+            PipeId::new(id),
+            zmux::proto::ReceivedRecord::copy_from_slice(m),
+            now,
+        );
         self.drain_events();
     }
 
@@ -981,7 +1018,7 @@ impl Runner {
             c.held.push(bytes.to_vec());
             return;
         }
-        if c.join.is_some() || c.waiting.is_some() {
+        if c.join.is_some() || c.waiting.is_some() || c.authorization.is_some() {
             c.buf.extend_from_slice(bytes);
             c.msgs.extend_from_slice(messages);
             return;
@@ -1025,6 +1062,7 @@ impl Runner {
             c.msgs.clear();
             c.waiting = None;
             c.join = None;
+            c.authorization = None;
             if let Some(id) = c.id.take() {
                 self.listener.done(id);
             }
@@ -1034,6 +1072,8 @@ impl Runner {
     fn peer_carrier(&self, name: &str) -> PeerCarrier {
         let c = &self.carriers[name];
         PeerCarrier {
+            setup: c.id,
+            sources: zmux::CarrierHalfSources::default(),
             inbound: c.can_read.then_some(c.framing),
             outbound: c.can_write.then_some(c.framing),
             looped: false,
@@ -1060,16 +1100,16 @@ impl Runner {
         if !self.session.accepts_locator(parsed.locator()) {
             return self.close_carrier(name, "reject");
         }
-        let locator = parsed.locator().to_vec();
         let opened = self.session.open_hello(&parsed, &binding, now);
         self.drain_events();
-        let mut join = match opened {
+        let join = match opened {
             OpenedHello::Hold | OpenedHello::KeyWait => {
                 self.carriers.get_mut(name).expect("carrier").waiting = Some(hello.to_vec());
                 return;
             }
             OpenedHello::Verified(j) => j,
             OpenedHello::Fatal => return self.close_carrier(name, "fatal"),
+            OpenedHello::MemoryBudget => return self.close_carrier(name, "memory_budget"),
             OpenedHello::AuthFailed
             | OpenedHello::UnknownSuite
             | OpenedHello::UnknownLocator
@@ -1096,23 +1136,42 @@ impl Runner {
         if !allowed {
             return self.close_carrier(name, "reject"); // the Pipe ID's bit stays clear
         }
+        let c = self.carriers.get_mut(name).expect("carrier");
+        if c.pause_authorization {
+            c.authorization = Some(join);
+            return;
+        }
+        self.claim_peer_hello(name, join);
+    }
+
+    fn claim_peer_hello(&mut self, name: &str, mut join: Box<zmux::proto::session::PeerJoin>) {
+        let now = self.now();
+        if self.carriers[name]
+            .deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.close_carrier(name, "reject");
+            return;
+        }
         let carrier = self.peer_carrier(name);
-        let claimed =
-            self.session
-                .claim_hello(&mut join, carrier, &zmux::shaping::UnitPlan::default(), now);
+        let claimed = self.session.claim_hello(
+            &mut join,
+            &carrier,
+            &zmux::shaping::UnitPlan::default(),
+            now,
+        );
         self.drain_events();
         match claimed {
-            ClaimedHello::Accept(reply) => {
+            ClaimedHello::Accept { mut reply, evicted } => {
+                let len = reply.len();
+                self.session
+                    .complete_join_write(&mut reply, len, false, now);
                 let c = self.carriers.get_mut(name).expect("carrier");
                 c.join_pipe = Some(join.pipe().id);
-                c.reply = Some(reply);
+                c.reply = Some(reply.to_vec());
                 c.join = Some(join);
                 c.outcome = Some("accept");
-                // Unconfirmed: at the session's bound, the listener closes
-                // its oldest Unconfirmed carrier first (MULTIPATH.md 5.4
-                // step 7), as the drivers do.
-                let evicted = c.id.and_then(|id| self.listener.unconfirmed(id, &locator));
-                if let Some(e) = evicted {
+                for e in evicted {
                     let old = self
                         .carriers
                         .iter()
@@ -1128,12 +1187,17 @@ impl Runner {
                     self.write_confirm(name);
                 }
             }
-            ClaimedHello::Refuse(reply) => {
-                self.carriers.get_mut(name).expect("carrier").reply = Some(reply);
+            ClaimedHello::Refuse(mut reply) => {
+                let len = reply.len();
+                self.session
+                    .complete_join_write(&mut reply, len, false, now);
+                self.carriers.get_mut(name).expect("carrier").reply = Some(reply.to_vec());
                 self.peer_reads_reply(name);
                 self.close_carrier(name, "refuse");
             }
-            ClaimedHello::Close => self.close_carrier(name, "reject"),
+            ClaimedHello::Close
+            | ClaimedHello::AuthorizationChanged
+            | ClaimedHello::UnknownSource => self.close_carrier(name, "reject"),
         }
     }
 
@@ -1178,7 +1242,7 @@ impl Runner {
         }
         let pipe = join.pipe().id;
         let direction = join.pipe().direction;
-        let confirmed = self.session.confirm_join(*join, carrier, now);
+        let confirmed = self.session.confirm_join(*join, &carrier, now);
         self.drain_events();
         match confirmed {
             ConfirmedJoin::Attached { .. } => {
@@ -1199,10 +1263,14 @@ impl Runner {
                     self.message(pipe, &m);
                 }
             }
-            ConfirmedJoin::Refused | ConfirmedJoin::Close => {
+            ConfirmedJoin::Refused
+            | ConfirmedJoin::Close
+            | ConfirmedJoin::AuthorizationChanged
+            | ConfirmedJoin::UnknownSource => {
                 let outcome = self.carriers[name].outcome.unwrap_or("reject");
                 self.close_carrier(name, outcome);
             }
+            ConfirmedJoin::Evicted => self.close_carrier(name, "evicted"),
         }
     }
 
@@ -1376,7 +1444,12 @@ impl Runner {
             });
             self.drain_events();
             match r {
-                Ok(Some(Ok(hello))) => self.pipes.get_mut(&id).expect("pipe").hello = Some(hello),
+                Ok(Some(Ok(mut hello))) => {
+                    let len = hello.len();
+                    self.session
+                        .complete_join_write(&mut hello, len, false, now);
+                    self.pipes.get_mut(&id).expect("pipe").hello = Some(hello.to_vec());
+                }
                 Ok(None) => {}
                 Ok(Some(Err(_))) | Err(_) => self.pipes.get_mut(&id).expect("pipe").joining = false,
             }
@@ -1477,6 +1550,8 @@ impl Runner {
                 framing,
                 source,
                 conn,
+                channel,
+                remembered_plain,
             } => {
                 let framing = match framing {
                     Some(FramingName::Records) => Framing::Records,
@@ -1499,6 +1574,8 @@ impl Runner {
                             id: Some(id),
                             binding: Vec::new(),
                             waiting: None,
+                            pause_authorization: false,
+                            authorization: None,
                             join: None,
                             buf: Vec::new(),
                             msgs: Vec::new(),
@@ -1528,6 +1605,24 @@ impl Runner {
                             write.then_some(framing),
                             now,
                         );
+                        if *channel {
+                            self.session.set_pipe_channel(PipeId::new(0), None, 0, 0);
+                        }
+                        if let Some(remembered) = remembered_plain {
+                            let list = remembered
+                                .iter()
+                                .map(|(name, value)| ParamSpec {
+                                    id: ParamId::Name(name.clone()),
+                                    value: value.clone(),
+                                    raw: None,
+                                })
+                                .collect::<Vec<_>>();
+                            let tp = TransportParameters::decode(&wire::param_block(&list))
+                                .map_err(|e| format!("remembered parameters: {e:?}"))?;
+                            if !self.session.assume_remembered(&tp) {
+                                return Err("plain QMux early data refused".into());
+                            }
+                        }
                     }
                     if conn.is_some() {
                         self.pipe_mut(pipe).conn.clone_from(conn);
@@ -1550,6 +1645,8 @@ impl Runner {
                         .map(|b| b.0.clone())
                         .unwrap_or_default(),
                     waiting: None,
+                    pause_authorization: false,
+                    authorization: None,
                     join: None,
                     buf: Vec::new(),
                     msgs: Vec::new(),
@@ -1754,6 +1851,7 @@ impl Runner {
                 let c = self.carriers.get_mut(carrier).expect("carrier");
                 c.joiner = Some(sent);
                 c.confirm = confirm.unwrap_or(true);
+                c.pause_authorization = matches!(hold, Some(crate::model::JoinHold::Stage(_)));
                 if c.rejected {
                     return self.check_outcome(carrier, outcome);
                 }
@@ -1762,16 +1860,44 @@ impl Runner {
                 } else {
                     self.carrier_bytes(carrier, &hello, &[]);
                 }
-                if *hold {
-                    return if self.carriers[carrier].waiting.is_some() {
-                        Ok(())
-                    } else {
-                        Err(format!("carrier {carrier}: the join was not held"))
-                    };
+                match hold {
+                    Some(crate::model::JoinHold::Keys(true)) => {
+                        return self.carriers[carrier]
+                            .waiting
+                            .is_some()
+                            .then_some(())
+                            .ok_or_else(|| format!("carrier {carrier}: the join was not held"));
+                    }
+                    Some(crate::model::JoinHold::Stage(crate::model::JoinStage::Authorization)) => {
+                        return self.carriers[carrier]
+                            .authorization
+                            .is_some()
+                            .then_some(())
+                            .ok_or_else(|| {
+                                format!("carrier {carrier}: authorization did not start")
+                            });
+                    }
+                    _ => {}
                 }
                 self.check_outcome(carrier, outcome)
             }
-            Op::PeerJoinFinish { carrier, outcome } => {
+            Op::PeerJoinFinish {
+                carrier,
+                outcome,
+                authorized,
+            } => {
+                if let Some(allowed) = authorized {
+                    let join = self
+                        .carriers
+                        .get_mut(carrier)
+                        .and_then(|carrier| carrier.authorization.take())
+                        .ok_or("no pending authorization")?;
+                    if *allowed {
+                        self.claim_peer_hello(carrier, join);
+                    } else {
+                        self.close_carrier(carrier, "reject");
+                    }
+                }
                 self.retry_waiting();
                 if self
                     .carriers
@@ -1918,6 +2044,7 @@ impl Runner {
                 messages,
                 messages_hex,
                 chunks,
+                carrier_early,
                 ..
             } => {
                 let sent: BTreeMap<(u64, u64), u64> = self
@@ -1954,6 +2081,7 @@ impl Runner {
                         }
                         _ => return Err("peer_send without messages".into()),
                     };
+                    self.session.set_carrier_early_data(*carrier_early);
                     match (target, carrier) {
                         (Some(p), _) => {
                             for m in msgs {
@@ -1966,6 +2094,7 @@ impl Runner {
                         }
                         _ => return Err("peer_send without a target".into()),
                     }
+                    self.session.set_carrier_early_data(false);
                     return Ok(());
                 }
                 let bytes = match (hex, records) {
@@ -1976,6 +2105,7 @@ impl Runner {
                         .collect(),
                     _ => return Err("peer_send without bytes".into()),
                 };
+                self.session.set_carrier_early_data(*carrier_early);
                 match (target, carrier) {
                     (Some(p), _) => self.deliver(p, &bytes, chunks.as_deref()),
                     (None, Some(c))
@@ -1992,6 +2122,13 @@ impl Runner {
                     }
                     _ => return Err("peer_send without a target".into()),
                 }
+                self.session.set_carrier_early_data(false);
+                Ok(())
+            }
+            Op::PeerDatagram { pipe, hex } => {
+                let now = self.now();
+                self.session
+                    .receive_channel_datagram(PipeId::new(*pipe), &hex.0, now);
                 Ok(())
             }
             Op::PeerEpoch {
@@ -2471,8 +2608,9 @@ impl Runner {
             }
             Call::Read(a) => {
                 let key = self.key(&a.stream)?;
-                match self.session.read_chunk(key, a.max) {
-                    Ok(Some((data, fin))) => json!({"data": to_hex(&data), "fin": fin}),
+                let mut data = Vec::new();
+                match self.session.read_append(key, &mut data, a.max) {
+                    Ok(Some((_, fin))) => json!({"data": to_hex(&data), "fin": fin}),
                     Ok(None) => json!({"pending": true}),
                     Err(e) => stream_error(&e),
                 }
@@ -2512,7 +2650,7 @@ impl Runner {
                     None => self.session.send_datagram(data, true, self.now()),
                 };
                 match r {
-                    Ok(_) => ok,
+                    Ok(()) => ok,
                     Err(e) => datagram_error(&e),
                 }
             }
@@ -2864,7 +3002,6 @@ fn features_list(f: Features) -> Vec<Feature> {
         (f.goaway, Feature::Goaway),
         (f.preamble, Feature::Preamble),
         (f.priority, Feature::Priority),
-        (f.datagram_flows, Feature::DatagramFlows),
         (f.multipath, Feature::Multipath),
         (f.pipe_ack, Feature::PipeAck),
         (f.resume, Feature::Resume),
@@ -3325,6 +3462,7 @@ fn profiles() -> BTreeMap<String, Profile> {
 fn traces_run_against_the_core() {
     let profiles = profiles();
     let only = std::env::var("ZMUX_TRACE").ok();
+    let report = std::env::var_os("ZMUX_TRACE_REPORT").is_some();
     let mut passed: BTreeMap<String, usize> = BTreeMap::new();
     let mut failed = Vec::new();
     let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -3359,7 +3497,13 @@ fn traces_run_against_the_core() {
             Err(format!("panicked: {msg}"))
         });
         match result {
-            Ok(()) => *passed.entry(group).or_default() += 1,
+            Ok(()) => {
+                if report {
+                    eprintln!("PASSED {id}");
+                }
+                *passed.entry(group).or_default() += 1;
+            }
+
             Err(e) if KNOWN_SPEC_ISSUES.iter().any(|(t, _)| *t == id) => {
                 let why = KNOWN_SPEC_ISSUES
                     .iter()

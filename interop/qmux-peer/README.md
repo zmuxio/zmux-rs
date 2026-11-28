@@ -1,6 +1,6 @@
 # qmux-peer
 
-A scripted plain QMux peer built on the `qmux` crate (version 0.6.2, QMux
+A scripted plain QMux peer built on the `qmux` crate (version 0.7, QMux
 draft-02) for interoperability tests over TCP. It sends no zmux transport
 parameters, so a zmux endpoint talking to it treats it as a plain QMux peer.
 It does not depend on zmux.

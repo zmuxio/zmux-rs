@@ -271,6 +271,28 @@ pub(crate) fn signer_panicked() -> std::io::Error {
     std::io::Error::other("the signer panicked")
 }
 
+/// Applies the authenticated verdict to both Establish roles.
+pub(crate) fn verify_application_data(
+    verdict: Option<&VerifyVerdict>,
+    require_pq: bool,
+    check_proof: impl FnOnce(Option<&KeyId>) -> Result<bool, zmux_seal_proto::Error>,
+    data: &mut [AppData],
+) -> Result<bool, crate::CredentialFailure> {
+    use crate::{CredentialFailure, CredentialFailureReason as Reason};
+    let pq = match verdict {
+        Some(v) => check_proof(v.proof_key.as_ref())
+            .map_err(|e| CredentialFailure::new(Reason::Proof).with_cause(e))?,
+        None => false,
+    };
+    if require_pq && !pq {
+        return Err(CredentialFailure::new(Reason::PqAuthRequired));
+    }
+    if verdict.is_some() {
+        AppData::mark_authenticated(data);
+    }
+    Ok(pq)
+}
+
 /// Runs `verifier` on `input` ([`guarded`]).
 pub(crate) async fn judge(
     verifier: &dyn Verifier,
@@ -359,6 +381,20 @@ pub trait Signer: Send + Sync {
 
     /// Signs `message`, the M of the proof; the signature has the `KeyAlg`'s length.
     fn sign<'a>(&'a self, message: &'a [u8]) -> BoxFuture<'a, std::io::Result<Vec<u8>>>;
+
+    /// Signs message 2 with a guard that holds the execution permit. A signer
+    /// dispatching work to another executor must move the guard to its actual
+    /// completion callback, including when the caller stops waiting.
+    fn sign_with_worker<'a>(
+        &'a self,
+        message: &'a [u8],
+        worker: std::sync::Arc<dyn Send + Sync>,
+    ) -> BoxFuture<'a, std::io::Result<Vec<u8>>> {
+        Box::pin(async move {
+            let _worker = worker;
+            self.sign(message).await
+        })
+    }
 }
 
 /// A [`Signer`] of a key in this process.

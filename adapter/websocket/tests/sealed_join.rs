@@ -51,7 +51,7 @@ impl Gate for OneKey {
 
 fn config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.resume_timeout = Some(LIMIT);
     c.pipe_auth = PipeAuth::none();
     c.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| true));
@@ -131,7 +131,7 @@ async fn a_joined_pipe_takes_over_after_the_first_is_aborted() {
                 .await
                 .unwrap();
             let pipe = client
-                .begin_add_pipe(io, PipeOptions::new().with_record_mode(mode))
+                .test_begin_join(io, PipeOptions::new().with_record_mode(mode))
                 .unwrap();
             pipe.joined().await.unwrap();
             client.pipe(PipeId::new(0)).unwrap().abort().unwrap();
@@ -152,7 +152,7 @@ async fn a_joined_pipe_takes_over_after_the_first_is_aborted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_large_first_message_is_read_whole() {
     let mut config = Config::default();
-    config.max_pipes = 4;
+    config.session_policy.limits.steady_attachments = 4;
     config.resume_timeout = Some(LIMIT);
     config.pipe_auth = PipeAuth::psk(vec![7u8; 32]).with_end_to_end();
     config.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| true));
@@ -183,7 +183,7 @@ async fn a_large_first_message_is_read_whole() {
             .await
             .unwrap();
         client
-            .begin_add_pipe(io, PipeOptions::new().with_record_mode(RecordMode::Sealed))
+            .test_begin_join(io, PipeOptions::new().with_record_mode(RecordMode::Sealed))
             .unwrap()
             .joined()
             .await

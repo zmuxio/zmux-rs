@@ -1,7 +1,7 @@
 //! A listener's backlog of sessions nobody accepted is bounded
 //! (`ListenerConfig::max_unaccepted`), in both drivers; the blocking
-//! listener's graceful shutdown closes its sessions together within one
-//! deadline; a listener whose memory hook needs a runtime is refused
+//! listener's graceful shutdown starts closing all its sessions together;
+//! a listener whose memory hook needs a runtime is refused
 //! outside one.
 
 use std::time::{Duration, Instant};
@@ -107,31 +107,42 @@ mod blocking {
         assert!(l.accept_timeout(Duration::from_secs(5)).unwrap().is_some());
     }
 
-    /// Sessions whose peers never answer the GOAWAY: the shutdown ends at
-    /// its one deadline, not at the sum of the sessions' waits.
+    /// Every peer receives GOAWAY before any of the active streams can drain.
     #[test]
-    fn blocking_shutdown_ends_all_sessions_within_one_deadline() {
+    fn blocking_shutdown_starts_every_session_before_waiting_for_drain() {
+        let watchdog = Duration::from_secs(60);
         let l = Listener::new(Config::default(), ListenerConfig::default(), None).unwrap();
         let addr = serve(&l);
-        // Eight sessions: waited one after another they would take 2.4 s.
-        let clients: Vec<_> = (0..8).map(|_| dial(addr)).collect();
+        let mut clients = Vec::new();
         let mut held = Vec::new();
-        for c in &clients {
-            // A stream both ends hold keeps each graceful close waiting.
+        for _ in 0..8 {
+            let c = dial(addr);
+            let server = l.accept_timeout(watchdog).unwrap().unwrap();
             let (mut s, r) = c.open_bi().unwrap();
             std::io::Write::write_all(&mut s, b"x").unwrap();
-            let server = l.accept_timeout(Duration::from_secs(5)).unwrap().unwrap();
-            let pair = server.accept_bi().unwrap();
+            let pair = server.accept_bi_timeout(watchdog).unwrap();
             held.push((s, r, server, pair));
+            clients.push(c);
         }
-        let start = Instant::now();
-        l.shutdown_timeout(VarInt::from_u32(0), b"bye", Duration::from_millis(300));
-        // One deadline, with room for scheduling: under 2.5 deadlines.
-        assert!(
-            start.elapsed() < Duration::from_millis(750),
-            "{:?}",
-            start.elapsed()
-        );
-        drop((held, clients));
+        let (finished, result) = std::sync::mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            l.shutdown(VarInt::ZERO, b"bye");
+            finished.send(()).unwrap();
+        });
+        for client in &clients {
+            loop {
+                let event = client.next_event_timeout(watchdog).unwrap();
+                let event = event.expect("the session ended before GOAWAY");
+                if matches!(event, zmux::SessionEvent::GoAwayReceived(_)) {
+                    break;
+                }
+            }
+        }
+        assert!(result.try_recv().is_err());
+        drop(held);
+        result
+            .recv_timeout(watchdog)
+            .expect("shutdown did not finish");
+        shutdown.join().unwrap();
     }
 }

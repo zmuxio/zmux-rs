@@ -54,7 +54,7 @@ fn keys() -> HandlePsk {
 
 fn config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::none();
     c
 }
@@ -133,14 +133,14 @@ fn establish_and_join_on_threads() {
     );
     echo(&c, &s, b"on pipe 0");
     let pipe = c
-        .begin_add_pipe(
+        .test_begin_join(
             PipeIo::from_tcp(TcpStream::connect(addr).unwrap()),
             PipeOptions::new().with_record_mode(RecordMode::Sealed),
         )
         .unwrap();
     pipe.joined().unwrap();
     assert_eq!(*asked.lock().unwrap(), ["hello", "confirm"]);
-    assert!(c.shaping_stats().wire_spent > 500);
+    assert!(c.shaping_stats().handshake_measured_bytes > 500);
     // Joined here is before the acceptor read the confirmation.
     let begun = Instant::now();
     while s.pipe(pipe.id()).is_none() {
@@ -354,6 +354,14 @@ fn a_shaper_wait_ends_with_the_timeout() {
     });
     let mut cfg = client_config();
     cfg.shaper = Some(shaper.clone());
+    let mut limits = zmux::shaping::Limits::default();
+    limits.profile = Some(zmux::shaping::ProfileLimits::new(
+        10,
+        50_000,
+        540,
+        Duration::from_secs(60),
+    ));
+    cfg.shaping_limits = Some(limits);
     // The carrier has a closer: the watchdog shuts it during the wait.
     let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
     let carrier = TcpStream::connect(tcp.local_addr().unwrap()).unwrap();

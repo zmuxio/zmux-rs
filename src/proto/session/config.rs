@@ -5,12 +5,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::Tracer;
 use super::policy::Scheduler;
+use super::{CapacityLimits, SessionPolicy, Tracer};
 use crate::proto::decision::{self, Decision};
 use crate::proto::keys::secret_flags;
 use crate::proto::limit::DatagramLimiter;
-use crate::proto::params::floor;
 use crate::proto::params::{
     Grease, LanesParameter, Locator, MultipathParameter, RoleParameter, TransportParameters,
     ZMUX_MAX_RECORD_SIZE, grease_id,
@@ -311,19 +310,56 @@ impl AllowRecordMode {
     }
 }
 
-/// An acceptor's further check of a join: [`Config::authorize_join`]. Asked
-/// as [`AllowRecordMode`] is.
+/// The authenticated Join Hello and the local carrier's admission evidence.
+/// The direction is relative to the acceptor.
+#[derive(Clone, Debug)]
+pub struct JoinAuthorization {
+    /// The local session receiving the Join.
+    pub session: super::SessionId,
+    /// The authorization generation captured when the Hello verified.
+    pub auth_generation: u64,
+    /// The epoch whose keys authenticated the Hello.
+    pub join_epoch: u64,
+    /// The local admission's authenticated principal of the bootstrap carrier.
+    pub principal: Option<crate::AdmittedValue>,
+    /// The locally verified sources of the carrier's halves.
+    pub sources: crate::CarrierHalfSources,
+    pub pipe_id: super::PipeId,
+    pub direction: super::PipeDirection,
+    pub record_mode: crate::RecordMode,
+    pub carrier_kind: Option<crate::CarrierKind>,
+    pub admitted: Option<crate::proto::admission::AdmittedValue>,
+    /// Structure of the authenticated Hello's first batch.
+    pub first_batch: JoinFirstBatch,
+}
+
+/// Summary of the authenticated first batch. Flow control and stream state are
+/// checked separately before application delivery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JoinFirstBatch {
+    /// Encoded size in bytes, excluding the Hello envelope.
+    pub encoded_bytes: usize,
+    /// Number of structurally valid STREAM frames without FIN.
+    pub stream_frames: usize,
+    /// Payload bytes in those STREAM frames.
+    pub stream_bytes: usize,
+    /// The batch included an invalid frame or a frame other than STREAM without FIN.
+    pub malformed: bool,
+}
+
+/// An acceptor's further check of an authenticated join, called outside the session lock.
 #[derive(Clone)]
-pub struct AuthorizeJoin(Arc<dyn Fn(super::PipeId) -> Decision<bool> + Send + Sync>);
+pub struct AuthorizeJoin(Arc<dyn Fn(JoinAuthorization) -> Decision<bool> + Send + Sync>);
 
 impl AuthorizeJoin {
-    /// The check `f`, given the pipe ID of the join.
-    pub fn new(f: impl Fn(super::PipeId) -> bool + Send + Sync + 'static) -> Self {
+    /// The check `f`, given the authenticated join and carrier evidence.
+    pub fn new(f: impl Fn(JoinAuthorization) -> bool + Send + Sync + 'static) -> Self {
         Self(Arc::new(move |p| Decision::Now(f(p))))
     }
 
     /// The check `f`, answering when its future completes.
-    pub fn new_async<F>(f: impl Fn(super::PipeId) -> F + Send + Sync + 'static) -> Self
+    pub fn new_async<F>(f: impl Fn(JoinAuthorization) -> F + Send + Sync + 'static) -> Self
     where
         F: Future<Output = bool> + Send + 'static,
     {
@@ -332,8 +368,8 @@ impl AuthorizeJoin {
 
     /// Asks the check; a panic of the call is `None`.
     #[must_use]
-    pub fn allows(&self, pipe: super::PipeId) -> Decision<Option<bool>> {
-        decision::call(|| self.0(pipe))
+    pub fn allows(&self, request: JoinAuthorization) -> Decision<Option<bool>> {
+        decision::call(|| self.0(request))
     }
 }
 
@@ -409,7 +445,7 @@ pub struct Liveness {
     /// direction at the peer stay, and a pipe pair with them off at both
     /// ends is not judged while the session is quiet. The deadline is
     /// measured to the carrier: records that shaping may hold for up to
-    /// `max_delay` are built that much earlier (but not more often than
+    /// `max_added_delay` are built that much earlier (but not more often than
     /// every second). Pipes whose attachment has no outbound direction at
     /// the peer are always probed, at most every 15 s.
     pub probe_interval: Option<Duration>,
@@ -581,7 +617,7 @@ impl Period {
 pub const MAX_STREAM_CREDIT: u64 = crate::proto::frame::MAX_COUNT;
 
 /// The default payload bytes of a stream's received datagram queue
-/// ([`Config::datagram_stream_bytes`]): 512 KiB.
+/// ([`super::DatagramConfig::stream_receive_bytes`]): 512 KiB.
 pub(crate) const DEFAULT_DATAGRAM_STREAM_BYTES: usize = 512 * 1024;
 
 /// The default handshake timeout ([`Config::handshake_timeout`]).
@@ -624,18 +660,10 @@ pub const DEFAULT_OVERFLOW_DELAY: Duration = Duration::from_secs(1);
 /// The default latency budget B of receive-window auto-tuning.
 pub const DEFAULT_LATENCY_BUDGET: Duration = Duration::from_micros(100);
 
-/// The floor of the automatic maximum of the session send buffer in
-/// multipath sessions, which also caps the retransmit budget: the stream window floor.
-pub const DEFAULT_SEND_BUFFER_MAX: u64 = 64 * 1024 * 1024;
-
 /// The floor of the automatic stream window cap: K x the BDP of the
 /// 1 Gbit/s x 100 ms design point (4 x 12.5 MB) rounded up to a power of
 /// two.
 pub const STREAM_WINDOW_FLOOR: u64 = 64 * 1024 * 1024;
-
-/// The floor of the automatic session window cap, 1.5 x the stream floor;
-/// also the cap the session receive buffer cap is computed from.
-pub const SESSION_WINDOW_FLOOR: u64 = 96 * 1024 * 1024;
 
 /// The default memory budget of a session without a listener, the same as a listener's.
 pub const DEFAULT_MEMORY_BUDGET: u64 = 1 << 30;
@@ -659,18 +687,21 @@ pub enum Cap<T = u64> {
 /// ([`Config::max_incoming_uni_streams`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UniCredit {
-    /// Staged credit (the default): `initial_max_streams_uni` is 16, and
-    /// `MAX_STREAMS` 256 is sent when the application first accepts a
-    /// unidirectional stream.
+    /// Staged credit (the default): `initial_max_streams_uni` is 16. The
+    /// first accept raises the target to 256. A shared listener grants as
+    /// many slots as its memory budget backs and retries a short grant
+    /// when memory is returned.
     #[default]
     Staged,
-    /// This many at once (0: none; at most [`MAX_STREAM_CREDIT`]).
+    /// This many concurrently (0: none; at most [`MAX_STREAM_CREDIT`]).
+    /// A finite shared listener may grant that concurrency in batches.
     Limit(u64),
 }
 
 /// The `initial_max_streams_uni` of an unset `max_incoming_uni_streams`,
 /// and the limit the first accept raises it to.
 pub(crate) const STAGED_UNI_STREAMS: (u64, u64) = (16, 256);
+pub(super) const DEFAULT_INITIAL_STREAM_RECEIVE_WINDOW: u64 = 256 * 1024;
 
 /// The predicate of `allow_connection_window_increase`:
 /// it is shown the proposed increase of the session receive window and
@@ -733,7 +764,7 @@ pub enum Redundancy {
 /// use zmux::{Config, PipeAuth, sched::Scheduler};
 ///
 /// let mut config = Config::default();
-/// config.max_pipes = 8;
+/// config.session_policy.limits.steady_attachments = 8;
 /// config.resume_timeout = Some(Duration::from_secs(60));
 /// config.pipe_auth = PipeAuth::psk(b"a pre-shared key, 16 bytes or more".to_vec());
 /// config.scheduler = Scheduler::SpreadEta;
@@ -771,8 +802,7 @@ pub struct Config {
     /// (default [`Liveness::default`]): keep-alive, the suspicion floor, the
     /// dead timeout and the probes.
     pub liveness: Liveness,
-    /// Initial stream receive window (default 256 KiB; at least 4 KiB,
-    /// the early-data floor of [`params::floor`](floor)).
+    /// Initial stream receive window (default 256 KiB).
     pub initial_stream_receive_window: u64,
     /// Cap of auto-tuned stream windows (default [`Cap::Auto`]: at least
     /// [`STREAM_WINDOW_FLOOR`], 64 MiB, K x the BDP of the 1 Gbit/s x
@@ -783,39 +813,37 @@ pub struct Config {
     /// `max_stream_receive_window` (default 100 us): each window is the
     /// arrival rate times max(4 x `RTT_min`, B).
     pub latency_budget: Duration,
-    /// Initial session receive window (default 1 MiB; at least 16 KiB,
-    /// the early-data floor of [`params::floor`](floor)).
+    /// Initial session receive window (default 1 MiB, minimum 16 KiB).
     pub initial_connection_receive_window: u64,
-    /// Cap of the auto-tuned session window (default [`Cap::Auto`]: at
-    /// least [`SESSION_WINDOW_FLOOR`], 96 MiB, and beyond it within the
-    /// memory budget). The session receive buffer cap is computed from a
-    /// fixed cap or from the floor, never from a grown window.
+    /// Cap of the auto-tuned session window. The default [`Cap::Auto`]
+    /// grows within the space the session can reserve for receive credit.
     pub max_connection_receive_window: Cap,
-    /// The `memory_budget` parameter of `max_connection_receive_window`
-    /// (default [`DEFAULT_MEMORY_BUDGET`], 1 GiB; `None` is unlimited): the
-    /// memory budget of a session without a listener, a listener's
-    /// `memory_budget` otherwise. Buffered, retained and unread bytes and the
-    /// session window's growth count against it; window and send-buffer
-    /// growth above the floors of [`Cap::Auto`] stops at it.
+    /// Memory budget of a standalone session (default [`DEFAULT_MEMORY_BUDGET`],
+    /// 1 GiB, and `None` for unlimited). Accepted sessions share the
+    /// listener's budget. Admission reserves receive credit before sending
+    /// transport parameters. It reduces the initial connection credit to
+    /// what fits and refuses the session if it cannot reserve 16 KiB of
+    /// connection credit and carrier working space.
     pub memory_budget: Option<u64>,
-    /// Concurrent bidirectional streams the peer may open (default 256; 0,
-    /// or from 4, the early-data floor of [`params::floor`](floor), to
-    /// [`MAX_STREAM_CREDIT`], which grants as many as the protocol can
-    /// count). An
-    /// application that never accepts peer streams sets 0; a peer's early
-    /// data then fails with `EarlyDataRejected` at the peer.
+    /// Concurrent bidirectional streams the peer may open (default 256),
+    /// up to [`MAX_STREAM_CREDIT`]. An application that never accepts peer
+    /// streams sets 0. A listener with a finite shared budget may grant
+    /// this concurrency in batches as the peer needs it.
     pub max_incoming_streams: u64,
-    /// Concurrent unidirectional streams the peer may open (default
-    /// [`UniCredit::Staged`]: `initial_max_streams_uni` is 16 and
-    /// `MAX_STREAMS` 256 is sent when the application first accepts a
-    /// unidirectional stream). A [`UniCredit::Limit`], 0 included, is
-    /// advertised at once.
+    /// Concurrent unidirectional streams the peer may open. The default,
+    /// [`UniCredit::Staged`], funds more slots on the first accept call.
+    /// [`UniCredit::Limit`] sets the target from establishment.
     pub max_incoming_uni_streams: UniCredit,
     /// Announce datagram support (default false).
     pub enable_datagrams: bool,
-    /// Datagrams waiting for a pipe (default 64, at least 1); when the
-    /// queue is full the oldest is dropped.
+    /// Shared limit for queued originals and submitted native originals
+    /// awaiting a carrier outcome (default 64, at least 1). At capacity,
+    /// the oldest queued original makes room. If every slot awaits an
+    /// outcome, new datagrams are dropped. Copies have their own queue
+    /// with the same bound.
     pub datagram_send_queue: usize,
+    /// Additional datagram limits and defaults. An unset value uses [`super::DatagramConfig::default`].
+    pub datagram: Option<Arc<super::DatagramConfig>>,
     /// Received session datagrams (flow 0) waiting for the application
     /// (default 128, at least 1); the oldest make room.
     pub datagram_receive_queue: usize,
@@ -826,15 +854,6 @@ pub struct Config {
     /// for streams not opened yet, together (default 1 MiB, at least 1);
     /// stream queues are bounded by their own limits and do not count.
     pub datagram_receive_bytes: usize,
-    /// Payload bytes of received datagrams waiting per stream (default
-    /// `Some(512 KiB)`; `None` leaves
-    /// [`Config::datagram_stream_queue`] the only bound; `Some(0)` is a
-    /// configuration error). A datagram that would exceed this or the
-    /// count drops the stream's oldest datagrams until both hold, each
-    /// counted as dropped; a single datagram larger than this is kept
-    /// alone. The default holds the default 32 datagrams up to 9000-byte
-    /// packets without a drop the count would not make.
-    pub datagram_stream_bytes: Option<usize>,
     /// The target queueing delay of every datagram queue: the send queue,
     /// the session receive queue and each stream's (default `Some(20 ms)`;
     /// `None` turns the bound off, leaving the count and byte bounds;
@@ -851,26 +870,23 @@ pub struct Config {
     /// multipath session. Shared fairly between stream directions, each of
     /// which can always hold 64 KiB.
     pub send_buffer: u64,
-    /// The `max` parameter of `send_buffer` (default [`Cap::Auto`]: at
-    /// least [`DEFAULT_SEND_BUFFER_MAX`], 64 MiB, and beyond it within the
-    /// memory budget, which retained data is charged to): in a multipath
-    /// session the send buffer grows to the retransmit budget up to this,
-    /// which also caps that budget. A fixed
-    /// value below `send_buffer` is a configuration error.
+    /// Maximum buffered and retained stream bytes in the session. The
+    /// [`Cap::Auto`] default relies on live backing reservations from the
+    /// session memory domain.
+    /// A fixed value below `send_buffer` is a configuration error.
     pub send_buffer_max: Cap,
     /// The largest Frames field of the records this endpoint sends, before
     /// the peer's `max_record_size` caps it (default 16382, one TLS record; at least
     /// 8192, the carrier record floor, and no upper bound: a cap that the peer's limit
     /// reduces).
     pub max_send_record: usize,
-    /// The attachments this endpoint aims for with its own joins. 1 (the
-    /// default) keeps multipath off; 8 is the recommended value when
-    /// multipath is used. The peer may have up to `max_pipes +
-    /// pipe_headroom` attachments live at once.
-    pub max_pipes: u32,
-    /// The attachment headroom H, a parameter of `max_pipes` (default 8):
-    /// room for failed attachments whose retirement has not completed.
-    pub pipe_headroom: u32,
+    /// Initial local capacity and Join authorization. Runtime changes go
+    /// through the session's policy commit.
+    pub session_policy: SessionPolicy,
+    /// Monotonic clock domain shared with an optional controller and its cache.
+    pub clock_domain: super::ClockDomain,
+    /// Captured when a session first updates its local capacity policy.
+    pub(crate) initial_capacity: Option<Box<CapacityLimits>>,
     /// This endpoint's sets of Join Suites and Groups, as `zmux_session_crypto` declares
     /// them and the join keys and epoch secrets take them: every Suite and Group of this
     /// build by default. Each set is ascending, without duplicates, and holds Suite 1 and
@@ -895,17 +911,8 @@ pub struct Config {
     pub handshake_shaper: Option<super::shaping::HandshakeShaper>,
     /// The acceptor's check of a Hello's mode; unset passes only Sealed.
     pub allow_record_mode: Option<AllowRecordMode>,
-    /// An acceptor's further check of a join; unset passes all.
-    pub authorize_join: Option<AuthorizeJoin>,
-    /// Observes every authorized inbound and carrier-backed outbound join.
-    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
-    pub join_outcome: Option<crate::JoinOutcome>,
-    /// The replay window W, a parameter of `max_pipes`, in pipe IDs of the
-    /// peer's parity; [`Cap::Auto`] (the default) is max(64, 2 x (`max_pipes` +
-    /// H)), and a fixed value is at least `max_pipes` + H.
-    pub replay_window: Cap,
     /// The lanes accepted on each inbound pipe, lane 0 included, a
-    /// parameter of `max_pipes` that applies to every session, single-pipe
+    /// limit that applies to every session, single-pipe
     /// ones included (default [`DEFAULT_MAX_LANES`](crate::DEFAULT_MAX_LANES), 258; any value, and 1 accepts no lanes): the `zmux_max_lanes` this
     /// endpoint sends. Outbound lanes follow the peer's value and the carrier.
     pub max_lanes: std::num::NonZeroU64,
@@ -933,7 +940,7 @@ pub struct Config {
     /// [`redial_backoff`](Config#structfield.redial_backoff); a refused
     /// join adds its own backoff, and a dial waits for the longer of the
     /// two. A multipath session that keeps several pipes uses pipe pools
-    /// instead (`helpers::maintain_pipes`). The hook is built for the
+    /// instead. The hook is built for the
     /// driver that runs the session (`Redial::new` for the tokio driver,
     /// `Redial::blocking` for the std driver); a driver ignores a hook
     /// built for the other one.
@@ -945,10 +952,12 @@ pub struct Config {
     /// [`SessionEvent::ResumeUnattended`](crate::SessionEvent::ResumeUnattended),
     /// and failures of host callbacks that zmux contains.
     pub logger: Option<Logger>,
-    /// The session's default scheduling policy (default `affinity`).
+    /// The session's default send scheduling policy (default `affinity`).
     pub scheduler: Scheduler,
-    /// The application's bounds on shaping (default: no account, one wait up to 1 s).
-    pub shaping_limits: super::shaping::Limits,
+    /// The local receive scheduling preference (default `affinity`).
+    pub receive_scheduler: Scheduler,
+    /// Local caps on the direction's shaping policy.
+    pub shaping_limits: Option<Box<super::shaping::Limits>>,
     /// Gives the shaping configuration's budget, called once when the session is created
     /// (default: none). It cannot widen `shaping_limits`.
     pub shaping_budget: Option<super::shaping::ShapingBudget>,
@@ -965,6 +974,12 @@ pub struct Config {
     /// s, 4 x smoothed RTT) otherwise; `None` turns probation off; a fixed
     /// base is above zero).
     pub probation: Option<Cap<Duration>>,
+    /// Continuous health required before a pipe can replace existing service.
+    pub stability: super::StabilityPolicy,
+    /// Opt-in attribution of protocol records.
+    pub accounting: super::AccountingPolicy,
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) accounting_tickets: Option<crate::driver::accounting::AccountingTicketSink>,
     /// The overflow delay D of tier gating: a
     /// tier is saturated when the data offered to it and queued on its
     /// pipes would take longer than this to drain at its aggregate rate,
@@ -1013,83 +1028,12 @@ pub struct Config {
     pub(crate) hooks: TestHooks,
 }
 
-/// Early data: stream data sent before the peer's transport parameters
-/// arrive, saving the round trip that would otherwise pass before the
-/// first stream byte. Off by default.
-///
-/// With [`EarlyData::zmux_peer`] the application declares the peer a zmux
-/// endpoint. Every zmux endpoint advertises at least the floor of
-/// [`params::floor`](floor), so data within it needs no
-/// parameters: at most the first 4 bidirectional streams, 4096 bytes of
-/// each (preamble included) and 16384 bytes in all. Opening more streams
-/// and writing more is allowed; what lies beyond the floor simply waits
-/// and goes out once the parameters arrive. If the declaration was wrong
-/// (the peer is a plain QMux endpoint, or accepts no bidirectional
-/// streams), the peer processed none of the early data and the session
-/// ends with [`SessionError::EarlyDataRejected`](super::SessionError):
-/// open the streams again on a new session without early data. Early data
-/// needs a role that does not depend on the peer: `Session::peer` (role
-/// auto) refuses a configuration with it as
-/// [`ConnectError::InvalidConfig`](crate::ConnectError::InvalidConfig), and
-/// the sans-IO core given role auto sends no early data.
-///
-/// [`EarlyData::carrier_early_data`] allows TLS 1.3 early data or QUIC
-/// 0-RTT on a resumed carrier. Such data can be replayed by an attacker:
-/// a client allows it only for streams whose effect may happen twice, and
-/// a server that allows it sees the streams opened in it as replayable
-/// for their whole life (`RecvStream::is_replayable`).
-/// The flow: (1) a first session, established in full, yields the
-/// server's parameters (`Session::parameters_to_remember`);
-/// (2) the client keeps them with the carrier's resumption state; (3) a
-#[cfg_attr(
-    feature = "tokio",
-    doc = " resumed carrier is given them ([`PipeIo::with_early_data`](crate::PipeIo::with_early_data)),"
-)]
-#[cfg_attr(
-    not(feature = "tokio"),
-    doc = " resumed carrier is given them (`PipeIo::with_early_data`),"
-)]
-/// and the session's first records go out as carrier early data; (4) if
-/// the carrier rejects that data, the session writes everything again
-/// once the handshake completed, and no stream fails. The QUIC adapter
-/// (`zmux-quinn`, `connect`) does all four with a parameter memory and
-/// documents a complete client.
-///
-/// A session that ends with `EarlyDataRejected` is the one end that
-/// [`SessionError::is_retryable`](super::SessionError::is_retryable) reports:
-///
-/// ```no_run
-/// # async fn f(carrier: zmux::PipeIo, again: zmux::PipeIo) -> Result<(), zmux::ConnectError> {
-/// use zmux::{Config, EarlyData, Session};
-///
-/// let mut config = Config::default();
-/// config.early_data = EarlyData::for_zmux_peer();
-/// let session = Session::connect(carrier, config.clone()).await?;
-/// let (send, recv) = session.open_bi().await.map_err(|e| zmux::ConnectError::Io(std::sync::Arc::new(e.into())))?;
-/// // ... the request leaves with the parameters, before the peer's arrive ...
-/// # drop((send, recv));
-/// if session.closing().await.is_early_data_rejected() {
-///     // The peer is not a zmux endpoint and processed nothing.
-///     config.early_data = EarlyData::default();
-///     let session = Session::connect(again, config).await?;
-///     # drop(session);
-/// }
-/// # Ok(()) }
-/// ```
-///
-/// ```
-/// use zmux::{Config, EarlyData};
-///
-/// // Both ends run zmux: the first request leaves with the parameters.
-/// let mut config = Config::default();
-/// config.early_data = EarlyData::for_zmux_peer();
-/// assert!(config.early_data.zmux_peer && !config.early_data.carrier_early_data);
-/// ```
+/// Carrier 0-RTT under remembered parameters from a plain QMux peer.
+/// Store the parameters with the carrier's resumption context and pass
+/// them back only for the same context. Early STREAM data may be replayed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EarlyData {
-    /// The peer is declared a zmux endpoint: early data under the floor.
-    pub zmux_peer: bool,
     /// Carrier early data (TLS 1.3 early data, QUIC 0-RTT) is allowed, so
     /// early streams may be replayed.
     pub carrier_early_data: bool,
@@ -1103,31 +1047,12 @@ pub struct EarlyData {
     /// started
     /// ([`SessionStats::first_flight_timeouts`](super::SessionStats::first_flight_timeouts)); the
     /// handshake timeout runs from the release. Streams written before the release leave in the
-    /// same write as the transport parameters, as a carrier whose first message carries the first
-    /// flight wants. A client with early data only ([`Self::zmux_peer`] or
-    /// [`Self::carrier_early_data`]).
+    /// same write as the transport parameters when carrier 0-RTT is authorized.
+    /// Available to the initiating endpoint.
     pub hold_first_flight: bool,
 }
 
 impl EarlyData {
-    /// Early data toward a peer declared a zmux endpoint, without carrier
-    /// early data.
-    #[must_use]
-    pub const fn for_zmux_peer() -> Self {
-        Self {
-            zmux_peer: true,
-            carrier_early_data: false,
-            hold_first_flight: false,
-        }
-    }
-
-    /// With the peer declared a zmux endpoint (or not).
-    #[must_use]
-    pub const fn with_zmux_peer(mut self, on: bool) -> Self {
-        self.zmux_peer = on;
-        self
-    }
-
     /// With carrier early data allowed (or not); see the type's
     /// documentation for replay.
     #[must_use]
@@ -1149,28 +1074,108 @@ impl EarlyData {
 /// function built for the driver that runs the session. Clones share the
 /// function.
 #[derive(Clone)]
-pub struct Redial(RedialFn);
+pub struct Redial {
+    #[cfg(all(feature = "blocking", not(loom)))]
+    dial: RedialFn,
+    finished: Option<Arc<dyn Fn(RedialResult) + Send + Sync>>,
+}
 
+/// The reason a session calls its redial hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedialCause {
+    Recovery,
+    QualityReplacement,
+    ReplacePipes,
+}
+
+/// Session-local identity and reason of a redial hook invocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RedialAttempt {
+    pub id: u64,
+    pub direction: super::PipeDirection,
+    pub cause: RedialCause,
+}
+
+/// Terminal result of one invocation. Success means the join was confirmed.
+#[derive(Clone, Debug)]
+pub struct RedialResult {
+    pub attempt: RedialAttempt,
+    pub pipe_ids: Vec<super::PipeId>,
+    pub outcome: RedialOutcome,
+}
+
+#[derive(Clone, Debug)]
+pub enum RedialOutcome {
+    Attached,
+    Failed(super::PipeError),
+    Cancelled(super::PipeError),
+}
+
+/// Sole holder of a redial's completion. The callback belongs to the attempt
+/// until the carrier handoff transfers it to the pending attachment.
+#[cfg(all(feature = "blocking", not(loom)))]
+pub(crate) struct RedialCompletion {
+    request: RedialAttempt,
+    finished: Option<Arc<dyn Fn(RedialResult) + Send + Sync>>,
+    pipe_ids: Vec<super::PipeId>,
+}
+
+#[cfg(all(feature = "blocking", not(loom)))]
+impl RedialCompletion {
+    pub(crate) fn panicked() -> std::io::Error {
+        std::io::Error::other("redial dial callback panicked")
+    }
+
+    pub(crate) fn request(&self) -> crate::DialRequest {
+        let mut request = crate::DialRequest::new(self.request.direction);
+        request.redial = Some(self.request);
+        request
+    }
+
+    pub(crate) fn set_pipe(&mut self, pipe: super::PipeId) {
+        self.pipe_ids.push(pipe);
+    }
+
+    pub(crate) fn complete(mut self, result: Result<(), super::PipeError>) {
+        let outcome = match result {
+            Ok(()) => RedialOutcome::Attached,
+            Err(
+                error @ (super::PipeError::CallerCancelled(_) | super::PipeError::SessionLost(_)),
+            ) => RedialOutcome::Cancelled(error),
+            Err(error) => RedialOutcome::Failed(error),
+        };
+        self.notify(outcome);
+    }
+
+    fn notify(&mut self, outcome: RedialOutcome) {
+        if let Some(finished) = self.finished.take() {
+            let result = RedialResult {
+                attempt: self.request,
+                pipe_ids: std::mem::take(&mut self.pipe_ids),
+                outcome,
+            };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| finished(result)));
+        }
+    }
+}
+
+#[cfg(all(feature = "blocking", not(loom)))]
+impl Drop for RedialCompletion {
+    fn drop(&mut self) {
+        self.notify(RedialOutcome::Cancelled(super::PipeError::CallerCancelled(
+            None,
+        )));
+    }
+}
+
+#[cfg(all(feature = "blocking", not(loom)))]
 #[derive(Clone)]
 enum RedialFn {
-    #[cfg(all(feature = "tokio", not(loom)))]
-    Tokio(crate::Dial),
     #[cfg(all(feature = "blocking", not(loom)))]
     Blocking(crate::blocking::Dial),
 }
 
 impl Redial {
-    /// The tokio driver's hook: an async dial function, run on a task of
-    /// the session.
-    #[cfg(all(feature = "tokio", not(loom)))]
-    pub fn new<F, Fut>(f: F) -> Self
-    where
-        F: Fn(crate::DialRequest) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = std::io::Result<crate::PipeIo>> + Send + 'static,
-    {
-        Self(RedialFn::Tokio(crate::Dial::new(f)))
-    }
-
     /// The std driver's hook: a blocking dial function, run on a thread of
     /// the session.
     #[cfg(all(feature = "blocking", not(loom)))]
@@ -1181,20 +1186,28 @@ impl Redial {
             + Sync
             + 'static,
     {
-        Self(RedialFn::Blocking(crate::blocking::Dial::new(f)))
+        Self {
+            dial: RedialFn::Blocking(crate::blocking::Dial::new(f)),
+            finished: None,
+        }
     }
 
-    /// The tokio driver's dial function, if built for it.
-    #[cfg(all(feature = "tokio", not(loom)))]
-    pub(crate) fn as_tokio(&self) -> Option<&crate::Dial> {
-        #[allow(
-            unreachable_patterns,
-            clippy::match_wildcard_for_single_variants,
-            reason = "the other variant exists only when both drivers are built"
-        )]
-        match &self.0 {
-            RedialFn::Tokio(d) => Some(d),
-            _ => None,
+    /// Invoked once for every attempt that calls this hook's dial function.
+    #[must_use]
+    pub fn with_finished(
+        mut self,
+        finished: impl Fn(RedialResult) + Send + Sync + 'static,
+    ) -> Self {
+        self.finished = Some(Arc::new(finished));
+        self
+    }
+
+    #[cfg(all(feature = "blocking", not(loom)))]
+    pub(crate) fn completion(&self, attempt: RedialAttempt) -> RedialCompletion {
+        RedialCompletion {
+            request: attempt,
+            finished: self.finished.clone(),
+            pipe_ids: Vec::new(),
         }
     }
 
@@ -1206,7 +1219,7 @@ impl Redial {
             clippy::match_wildcard_for_single_variants,
             reason = "the other variant exists only when both drivers are built"
         )]
-        match &self.0 {
+        match &self.dial {
             RedialFn::Blocking(d) => Some(d),
             _ => None,
         }
@@ -1226,7 +1239,7 @@ impl Default for Config {
             join_timeout: DEFAULT_JOIN_TIMEOUT,
             max_idle_timeout: Some(DEFAULT_MAX_IDLE_TIMEOUT),
             liveness: Liveness::default(),
-            initial_stream_receive_window: 256 * 1024,
+            initial_stream_receive_window: DEFAULT_INITIAL_STREAM_RECEIVE_WINDOW,
             max_stream_receive_window: Cap::Auto,
             latency_budget: DEFAULT_LATENCY_BUDGET,
             initial_connection_receive_window: 1024 * 1024,
@@ -1236,37 +1249,39 @@ impl Default for Config {
             max_incoming_uni_streams: UniCredit::Staged,
             enable_datagrams: false,
             datagram_send_queue: 64,
+            datagram: None,
             datagram_receive_queue: 128,
             datagram_stream_queue: 32,
             datagram_receive_bytes: 1024 * 1024,
-            datagram_stream_bytes: Some(DEFAULT_DATAGRAM_STREAM_BYTES),
             datagram_queue_delay: Some(super::codel::DEFAULT_DATAGRAM_QUEUE_DELAY),
             send_buffer: 4 * 1024 * 1024,
             send_buffer_max: Cap::Auto,
             max_send_record: crate::util::usize_sat(crate::proto::params::DEFAULT_MAX_RECORD_SIZE),
-            max_pipes: 1,
-            pipe_headroom: 8,
+            session_policy: SessionPolicy::default(),
+            clock_domain: super::ClockDomain::default(),
+            initial_capacity: None,
             session_crypto: crate::proto::seal::SessionCrypto::local(),
             epoch_policy: crate::proto::session::EpochPolicy::default(),
             join_early_hello: Some(8 << 10),
             record_policy: None,
             handshake_shaper: None,
             allow_record_mode: None,
-            authorize_join: None,
-            #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
-            join_outcome: None,
-            replay_window: Cap::Auto,
             max_lanes: crate::proto::params::DEFAULT_MAX_LANES,
             resume_timeout: None,
             redial_backoff: crate::Backoff::default(),
             redial: None,
             logger: None,
             scheduler: Scheduler::Affinity,
-            shaping_limits: super::shaping::Limits::default(),
+            receive_scheduler: Scheduler::Affinity,
+            shaping_limits: None,
             shaping_budget: None,
             shaper: None,
             spread_chunk: 16 * 1024,
             probation: Some(Cap::Auto),
+            stability: super::StabilityPolicy::default(),
+            accounting: super::AccountingPolicy::default(),
+            #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+            accounting_tickets: None,
             overflow_delay: DEFAULT_OVERFLOW_DELAY,
             redundancy: Redundancy::Urgent,
             allow_connection_window_increase: None,
@@ -1313,8 +1328,7 @@ pub struct TestHooks {
     pub locator: Vec<u8>,
     /// The Locator of epoch e announced as this prefix followed by e in decimal ASCII.
     pub epoch_locator_prefix: Option<Vec<u8>>,
-    /// The cap of unretired attachments of the peer, instead of `max_pipes` +
-    /// H.
+    /// The cap of unretired attachments of the peer, instead of the initial protocol envelope.
     pub pipe_cap: Option<usize>,
     /// No `QX_PING` request in the first record (the traces predate that
     /// optional sample).
@@ -1322,6 +1336,10 @@ pub struct TestHooks {
     /// The carrier queue limiter paces no carrier: the traces' in-memory
     /// carriers take bytes as the trace says.
     pub unpaced: bool,
+    /// Leave all batches to the Tokio driver task so a test can stage
+    /// multiple ready writes in one application poll.
+    #[cfg(feature = "test-hooks")]
+    pub disable_write_through: bool,
     /// The seed of the idle-probe and keep-alive waits' draws instead of
     /// a random one (each pipe's draws follow from it and the pipe ID).
     pub probe_seed: Option<u64>,
@@ -1346,6 +1364,16 @@ pub struct TestHooks {
 }
 
 impl Config {
+    /// Enables accounting and publishes each attachment's ticket to the given
+    /// collection at handoff. The caller owns the collection's lifetime.
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    #[must_use]
+    pub fn with_accounting_tickets(mut self, tickets: &crate::AccountingTickets) -> Self {
+        self.accounting.enabled = true;
+        self.accounting_tickets = Some(tickets.sink());
+        self
+    }
+
     /// Subscribes to what this configuration's logger and tracer are told:
     /// queued for the host to read from the returned
     /// [`HostEvents`](crate::HostEvents) when it wants, on its own thread,
@@ -1376,19 +1404,19 @@ impl Config {
     }
 
     /// A configuration for multipath: the
-    /// recommended `max_pipes` of 8 and the join
+    /// recommended steady attachment limit of 8 and the Join
     /// credentials, which multipath needs; the rest default.
     ///
     /// ```
     /// use zmux::{Config, PipeAuth};
     ///
     /// let config = Config::multipath(PipeAuth::psk(*b"a pre-shared key of 32 bytes...."));
-    /// assert_eq!(config.max_pipes, 8);
+    /// assert_eq!(config.session_policy.limits.steady_attachments, 8);
     /// ```
     #[must_use]
     pub fn multipath(pipe_auth: PipeAuth) -> Self {
         Self {
-            max_pipes: 8,
+            session_policy: SessionPolicy::with_steady_attachments(8),
             pipe_auth,
             ..Self::default()
         }
@@ -1426,18 +1454,16 @@ impl Config {
         }
     }
 
-    /// The session window cap the receive buffer cap is computed from: a
-    /// fixed cap, or the floor of the automatic one.
-    pub(crate) fn session_window_base(&self) -> u64 {
-        match self.max_connection_receive_window {
-            Cap::Fixed(v) => v,
-            Cap::Auto => SESSION_WINDOW_FLOOR,
-        }
-    }
-
     /// Whether this endpoint offers multipath.
     pub(crate) fn offers_multipath(&self) -> bool {
-        self.max_pipes > 1 || self.resume_timeout.is_some()
+        self.initial_capacity().steady_attachments > 1 || self.resume_timeout.is_some()
+    }
+
+    pub(super) fn initial_capacity(&self) -> CapacityLimits {
+        self.initial_capacity
+            .as_deref()
+            .copied()
+            .unwrap_or(self.session_policy.limits)
     }
 
     /// The transport parameters this endpoint sends,
@@ -1485,11 +1511,12 @@ impl Config {
                 max_lanes: self.max_lanes,
                 lane_key,
             }),
-            zmux_datagram_flows: self.enable_datagrams,
+            zmux_datagram_family: true,
             // A pipe that a multipath session joins may have a datagram
             // channel; a single-pipe session announces it only when its
             // bootstrap carrier has one ([`super::SessionCore::set_pipe_channel`]).
             zmux_carrier_datagrams: self.enable_datagrams && mp,
+            zmux_carrier_datagram_padding: self.enable_datagrams && mp,
             application_protocols: self
                 .protocols
                 .as_ref()
@@ -1508,6 +1535,33 @@ impl Config {
         let len = ((random >> 32) % 17) as usize;
         let value = (0..len).map(|i| random.to_le_bytes()[i % 8]).collect();
         (id, value)
+    }
+
+    /// Resolves this session's shaping limits before a secure Establish writes.
+    ///
+    /// The budget source is sampled once. Use this same configuration for
+    /// the resulting session so its receipt checks use the sampled budget.
+    ///
+    /// # Errors
+    ///
+    /// The local limits or sampled policy are invalid, or the budget source panicked.
+    pub fn prepare_establish_shaping(
+        &mut self,
+    ) -> Result<super::shaping::Limits, crate::InvalidConfig> {
+        let limits = self.shaping_limits.as_deref().copied().unwrap_or_default();
+        limits.validate()?;
+        if self.shaper.is_none() {
+            return Ok(limits);
+        }
+        let budget = self
+            .shaping_budget
+            .as_ref()
+            .map(super::shaping::ShapingBudget::ask)
+            .transpose()?
+            .unwrap_or_default();
+        budget.validate()?;
+        self.shaping_budget = Some(super::shaping::ShapingBudget::new(move || budget));
+        Ok(limits.under(&budget))
     }
 
     /// The join deadline ([`Config::join_timeout`]).
@@ -1554,16 +1608,53 @@ impl Config {
     pub(crate) fn probe_interval(&self) -> Option<Duration> {
         self.liveness.probe_interval
     }
+    /// Effective datagram limits and defaults.
+    #[must_use]
+    pub fn datagram_config(&self) -> &super::DatagramConfig {
+        self.datagram
+            .as_deref()
+            .unwrap_or(&super::datagram::DEFAULT_DATAGRAM_CONFIG)
+    }
+
+    /// Customizes the datagram limits and defaults.
+    pub fn datagram_config_mut(&mut self) -> &mut super::DatagramConfig {
+        Arc::make_mut(
+            self.datagram
+                .get_or_insert_with(|| Arc::new(super::DatagramConfig::default())),
+        )
+    }
+
     /// Checks the configuration as creating a session does: the error a
     /// connect, accept or listener with it would fail with, naming the
     /// field ([`InvalidConfig::field`](crate::InvalidConfig::field)).
     /// Checks that need the first pipe (its secret source) are left to
     /// the session.
     pub fn validate(&self) -> Result<(), crate::InvalidConfig> {
+        crate::util::checked_clock_deadline(
+            self.clock_domain.now(),
+            self.stability.hold_for,
+            "stability.hold_for",
+        )?;
+        if let Some(lifetime) = self.datagram_config().receive_lifetime {
+            crate::util::checked_clock_deadline(
+                self.clock_domain.now(),
+                lifetime,
+                "receive_lifetime",
+            )?;
+        }
         if self.own_locator().len() > Locator::MAX_LEN {
             return Err(crate::InvalidConfig::new("locator", "above 255 bytes"));
         }
         self.epoch_policy.validate()?;
+        if self.datagram_config().replica_percent > 100 {
+            return Err(crate::InvalidConfig::new("replica_percent", "above 100"));
+        }
+        if !(64..=16_384).contains(&self.datagram_config().dedup_window) {
+            return Err(crate::InvalidConfig::new(
+                "datagram_dedup_window",
+                "outside 64..=16384",
+            ));
+        }
         let fixed = |c: Cap| match c {
             Cap::Auto => u64::MAX,
             Cap::Fixed(v) => v,
@@ -1574,29 +1665,16 @@ impl Config {
                 "above max_stream_receive_window",
             ));
         }
+        if self.initial_connection_receive_window < super::memory::MIN_INITIAL {
+            return Err(crate::InvalidConfig::new(
+                "initial_connection_receive_window",
+                "below 16 KiB",
+            ));
+        }
         if self.initial_connection_receive_window > fixed(self.max_connection_receive_window) {
             return Err(crate::InvalidConfig::new(
                 "initial_connection_receive_window",
                 "above max_connection_receive_window",
-            ));
-        }
-        // Every zmux endpoint advertises at least the early-data floor.
-        if self.initial_stream_receive_window < floor::MAX_STREAM_DATA {
-            return Err(crate::InvalidConfig::new(
-                "initial_stream_receive_window",
-                "below the 4 KiB early-data floor",
-            ));
-        }
-        if self.initial_connection_receive_window < floor::MAX_DATA {
-            return Err(crate::InvalidConfig::new(
-                "initial_connection_receive_window",
-                "below the 16 KiB early-data floor",
-            ));
-        }
-        if self.max_incoming_streams != 0 && self.max_incoming_streams < floor::MAX_STREAMS_BIDI {
-            return Err(crate::InvalidConfig::new(
-                "max_incoming_streams",
-                "neither 0 nor at least the early-data floor of 4",
             ));
         }
         if self.max_incoming_streams > MAX_STREAM_CREDIT {
@@ -1612,7 +1690,7 @@ impl Config {
             ));
         }
         // Values sent as variable-length integers.
-        let varint_max = (1u64 << 62) - 1;
+        let varint_max = crate::proto::varint::MAX;
         let too_large = "too large to encode (above 2^62 - 1)";
         for (field, cap) in [
             ("max_stream_receive_window", self.max_stream_receive_window),
@@ -1639,7 +1717,7 @@ impl Config {
                 return Err(crate::InvalidConfig::new(field, too_large));
             }
         }
-        if self.max_send_record < super::RECORD_FLOOR {
+        if !crate::proto::record::supports_record_floor(self.max_send_record) {
             return Err(crate::InvalidConfig::new("max_send_record", "below 8192"));
         }
         if self.send_buffer == 0 {
@@ -1647,12 +1725,24 @@ impl Config {
         }
         for (field, zero) in [
             ("datagram_send_queue", self.datagram_send_queue == 0),
+            (
+                "datagram_send_bytes",
+                self.datagram_config().send_bytes == 0,
+            ),
+            (
+                "datagram_send_flow_queue",
+                self.datagram_config().send_flow_queue == 0,
+            ),
+            (
+                "datagram_send_flow_bytes",
+                self.datagram_config().send_flow_bytes == 0,
+            ),
             ("datagram_receive_queue", self.datagram_receive_queue == 0),
             ("datagram_stream_queue", self.datagram_stream_queue == 0),
             ("datagram_receive_bytes", self.datagram_receive_bytes == 0),
             (
                 "datagram_stream_bytes",
-                self.datagram_stream_bytes == Some(0),
+                self.datagram_config().stream_receive_bytes == Some(0),
             ),
             (
                 "datagram_queue_delay",
@@ -1663,9 +1753,7 @@ impl Config {
                 return Err(crate::InvalidConfig::new(field, "zero"));
             }
         }
-        if self.max_pipes == 0 {
-            return Err(crate::InvalidConfig::new("max_pipes", "zero"));
-        }
+        self.session_policy.limits.validate()?;
         if self.max_lanes.get() > varint_max {
             return Err(crate::InvalidConfig::new("max_lanes", "above 2^62 - 1"));
         }
@@ -1688,7 +1776,9 @@ impl Config {
                 "a base of zero: turn probation off with None",
             ));
         }
-        self.shaping_limits.validate()?;
+        if let Some(limits) = self.shaping_limits.as_deref() {
+            limits.validate()?;
+        }
         if !(1..=2_147_483_647).contains(&self.spread_chunk) {
             return Err(crate::InvalidConfig::new(
                 "spread_chunk",
@@ -1712,14 +1802,6 @@ impl Config {
             return Err(crate::InvalidConfig::new(
                 "pipe_auth",
                 "a deferred pre-shared key cannot be combined with a static one",
-            ));
-        }
-        if matches!(self.replay_window,
-            Cap::Fixed(w) if w < u64::from(self.max_pipes) + u64::from(self.pipe_headroom))
-        {
-            return Err(crate::InvalidConfig::new(
-                "replay_window",
-                "below max_pipes + pipe_headroom",
             ));
         }
         if self
@@ -1777,7 +1859,7 @@ impl Config {
         } else if self.offers_multipath() && !self.pipe_auth.has_source() {
             return Err(crate::InvalidConfig::new(
                 "pipe_auth",
-                "multipath (max_pipes above 1 or resume_timeout) needs a secret source: a PSK, a deferred PSK, the exporter, or a secure first pipe",
+                "multipath needs a secret source: a PSK, a deferred PSK, the exporter, or a secure first pipe",
             ));
         }
         Ok(())

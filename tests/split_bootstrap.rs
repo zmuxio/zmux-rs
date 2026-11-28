@@ -8,10 +8,15 @@
     reason = "short conventional names in scenario code"
 )]
 
+#[path = "common/clock.rs"]
+mod clock;
+
 use std::task::{Context, Waker};
 use std::time::Duration;
 
+use clock::ManualClock;
 use tokio::io::{DuplexStream, duplex};
+use zmux::{ClockDomain, MonotonicClock};
 use zmux::{Config, HandleError, Listener, ListenerConfig, PipeHint, PipeIo, Session};
 
 const TOKEN: &str = "AAECAwQFBgcICQoLDA0ODw";
@@ -158,19 +163,25 @@ async fn split_drain_owns_token_until_cleanup() {
 #[tokio::test]
 async fn bad_pairs_are_refused() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        let mut limits = ListenerConfig::default();
-        limits.handshake_timeout = Duration::from_millis(300);
-        let listener =
-            Listener::new(Config::default(), limits).expect("valid listener configuration");
+        let limits = ListenerConfig::default();
+        let pairing = limits.handshake_timeout;
+        let (clock, domain) = ManualClock::domain(Duration::from_secs(120));
+        let mut timers = clock.registrations();
+        let expected = domain.now() + pairing;
+        let mut config = Config::default();
+        config.clock_domain = domain;
+        let listener = Listener::new(config.clone(), limits).unwrap();
         // Two downlinks with one token: the second is refused, the first
         // times out without a partner.
         let (a, _ka) = duplex(64);
         let (b, _kb) = duplex(64);
-        let (l1, l2) = (listener.clone(), listener.clone());
-        let first = tokio::spawn(async move { l1.handle_pipe(PipeIo::writer(a), hint()).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let second = l2.handle_pipe(PipeIo::writer(b), hint()).await;
+        let handler = listener.clone();
+        let first =
+            tokio::spawn(async move { handler.handle_pipe(PipeIo::writer(a), hint()).await });
+        assert_eq!(timers.recv().await.unwrap(), expected);
+        let second = listener.handle_pipe(PipeIo::writer(b), hint()).await;
         assert_eq!(second, Err(HandleError::Rejected));
+        clock.advance(pairing);
         assert_eq!(first.await.unwrap(), Err(HandleError::TimedOut));
         // A malformed token, and a carrier with both halves, are refused.
         let (c, _kc) = duplex(64);
@@ -188,16 +199,23 @@ async fn bad_pairs_are_refused() {
         // A pair whose uplink sends no first record times out, and nothing is read of a
         // half before its partner arrives.
         let mut limits = ListenerConfig::default();
-        limits.limits.first_record_timeout = Duration::from_millis(100);
-        let l = Listener::new(Config::default(), limits).expect("valid listener configuration");
+        let first_record = Duration::from_secs(3);
+        limits.limits.first_record_timeout = first_record;
+        let now = config.clock_domain.now();
+        let deadline = now + first_record;
+        let l = Listener::new(config, limits).unwrap();
         let (e, _ke) = duplex(64);
         let (er, _) = tokio::io::split(e);
         let (g, _kg) = duplex(64);
         let late = l.clone();
         let lone = tokio::spawn(async move { late.handle_pipe(PipeIo::reader(er), hint()).await });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!lone.is_finished(), "a lone half waits for its partner");
-        let _ = l.handle_pipe(PipeIo::writer(g), hint()).await;
+        assert_eq!(timers.recv().await.unwrap(), now + pairing);
+        let partner = l.clone();
+        let paired =
+            tokio::spawn(async move { partner.handle_pipe(PipeIo::writer(g), hint()).await });
+        assert_eq!(timers.recv().await.unwrap(), deadline);
+        clock.advance(first_record);
+        assert_eq!(paired.await.unwrap(), Err(HandleError::TimedOut));
         assert_eq!(lone.await.unwrap(), Err(HandleError::TimedOut));
         // A third carrier with a used token is refused.
         let (client, up, down) = carriers();
@@ -228,8 +246,8 @@ async fn bad_pairs_are_refused() {
 async fn refused_split_join_retains_token_through_reply_drain() {
     let config = Config::multipath(zmux::PipeAuth::psk([9; 32]).with_end_to_end());
     let mut acceptor = config.clone();
-    acceptor.max_pipes = 2;
-    acceptor.pipe_headroom = 0;
+    acceptor.session_policy.limits.steady_attachments = 2;
+    acceptor.session_policy.limits.join_headroom = 0;
     let listener = Listener::new(acceptor, ListenerConfig::default()).unwrap();
     let ordinary = || {
         let (near, far) = duplex(1 << 16);
@@ -240,7 +258,7 @@ async fn refused_split_join_retains_token_through_reply_drain() {
     let session = Session::connect(ordinary(), config).await.unwrap();
     let _server = listener.accept().await.unwrap();
     let _first = session
-        .add_pipe(ordinary(), zmux::PipeOptions::new())
+        .test_join(ordinary(), zmux::PipeOptions::new())
         .await
         .unwrap();
     let (client, up, down) = carriers();
@@ -256,7 +274,7 @@ async fn refused_split_join_retains_token_through_reply_drain() {
         Duration::from_secs(8),
     );
     let join = session
-        .begin_add_pipe(client, zmux::PipeOptions::new())
+        .test_begin_join(client, zmux::PipeOptions::new())
         .unwrap();
     let result = tokio::join!(
         listener.handle_pipe(PipeIo::reader(up), hint()),
@@ -293,7 +311,11 @@ async fn split_bootstrap_resolves_both_exporters_before_classification() {
         io.with_exporter_async(move |q| std::future::ready(Ok(vec![value; q.length])))
     }
     let config = Config::multipath(zmux::PipeAuth::exporter());
-    let listener = Listener::new(config.clone(), ListenerConfig::default()).unwrap();
+    let mut limits = ListenerConfig::default();
+    limits.limits.max_pending_per_source = 1;
+    assert!(Listener::new(config.clone(), limits.clone()).is_err());
+    limits.limits.max_pending_per_source = 2;
+    let listener = Listener::new(config.clone(), limits).unwrap();
     let (cu, su) = duplex(1 << 16);
     let (sd, cd) = duplex(1 << 16);
     let client = PipeIo::split_bootstrap(

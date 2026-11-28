@@ -10,7 +10,7 @@ const LIMIT: Duration = Duration::from_secs(10);
 
 fn config() -> Config {
     let mut config = Config::default();
-    config.max_pipes = 8;
+    config.session_policy.limits.steady_attachments = 8;
     config.pipe_auth =
         PipeAuth::psk(b"a pre-shared key, 16 bytes or more".to_vec()).with_end_to_end();
     config
@@ -76,7 +76,7 @@ async fn shutdown_takes_joins_until_the_sessions_end() {
         let joins = listener.stats().joins;
         let (dial, arrival) = tokio::io::duplex(65536);
         let (joined, setup) = tokio::join!(
-            client.add_pipe(PipeIo::new(dial), PipeOptions::default()),
+            client.test_join(PipeIo::new(dial), PipeOptions::default()),
             listener.handle_pipe(PipeIo::new(arrival), zmux::PipeHint::default())
         );
         joined.unwrap();
@@ -183,7 +183,7 @@ async fn bootstrap_keeps_its_drain_decision_through_the_handshake() {
                 let server = listener.accept().await.unwrap();
                 let (a, b) = tokio::io::duplex(65536);
                 let (joined, handled) = tokio::join!(
-                    client.add_pipe(PipeIo::new(a), PipeOptions::default()),
+                    client.test_join(PipeIo::new(a), PipeOptions::default()),
                     listener.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
                 );
                 handled.unwrap();
@@ -370,7 +370,7 @@ async fn a_refused_bootstrap_cannot_replace_a_live_join_route() {
         assert_eq!(refused, Err(zmux::HandleError::Refused));
         let (a, b) = tokio::io::duplex(65536);
         let (joined, handled) = tokio::join!(
-            client.add_pipe(PipeIo::new(a), PipeOptions::default()),
+            client.test_join(PipeIo::new(a), PipeOptions::default()),
             listener.handle_pipe(PipeIo::new(b), zmux::PipeHint::default())
         );
         handled.unwrap();

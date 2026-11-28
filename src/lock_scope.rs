@@ -48,3 +48,60 @@ pub(crate) fn assert_none() {
 pub(crate) fn any() -> bool {
     HELD.try_with(|h| h.get() > 0).unwrap_or(false)
 }
+
+// Receipt owners may be dropped by either the core or a carrier task.
+#[cfg(all(feature = "tokio", not(loom)))]
+thread_local! {
+    static DEFERRED: std::cell::RefCell<Deferred> = const {
+        std::cell::RefCell::new(Deferred { depth: 0, callbacks: Vec::new() })
+    };
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+struct Deferred {
+    depth: usize,
+    callbacks: Vec<Box<dyn FnOnce()>>,
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) struct ReceiptScope;
+
+#[cfg(all(feature = "tokio", not(loom)))]
+impl ReceiptScope {
+    pub(crate) fn new() -> Self {
+        let _ = DEFERRED.try_with(|state| state.borrow_mut().depth += 1);
+        Self
+    }
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+impl Drop for ReceiptScope {
+    fn drop(&mut self) {
+        let callbacks = DEFERRED.try_with(|state| {
+            let mut state = state.borrow_mut();
+            state.depth -= 1;
+            (state.depth == 0).then(|| std::mem::take(&mut state.callbacks))
+        });
+        if let Ok(Some(callbacks)) = callbacks {
+            for callback in callbacks {
+                callback();
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "tokio", not(loom)))]
+pub(crate) fn outside_session(callback: impl FnOnce() + 'static) {
+    let mut callback = Some(callback);
+    let _ = DEFERRED.try_with(|state| {
+        let mut state = state.borrow_mut();
+        if state.depth != 0 {
+            state
+                .callbacks
+                .push(Box::new(callback.take().expect("pending callback")));
+        }
+    });
+    if let Some(callback) = callback {
+        callback();
+    }
+}

@@ -32,12 +32,8 @@ pub(crate) struct Faults {
     /// The client gets an earlier response of the origin instead (a cache
     /// answering what it should not); the request is not forwarded.
     pub(crate) replay: f64,
-    /// Every request waits up to this before it is forwarded, so that
-    /// requests overtake one another.
-    pub(crate) reorder: Duration,
-    /// A DOWN request (its target is under [`DOWN_PATH`]) whose response
-    /// takes longer than this is cut.
-    pub(crate) cut: Option<Duration>,
+    /// Forward the second of two overlapping requests before the first.
+    pub(crate) reorder: bool,
 }
 
 /// Counts of the faults applied.
@@ -50,9 +46,22 @@ pub(crate) struct Stats {
     pub(crate) duplicates: AtomicU64,
     pub(crate) replays: AtomicU64,
     pub(crate) cuts: AtomicU64,
+    pub(crate) reordered: AtomicU64,
+    cut_next: std::sync::atomic::AtomicBool,
+    cut_applied: tokio::sync::Notify,
+    downlink: tokio::sync::Notify,
 }
 
 impl Stats {
+    pub(crate) async fn downlink_progress(&self) {
+        self.downlink.notified().await;
+    }
+
+    pub(crate) async fn cut_next_downlink(&self) {
+        self.cut_next.store(true, Ordering::Release);
+        self.cut_applied.notified().await;
+    }
+
     pub(crate) fn get(c: &AtomicU64) -> u64 {
         c.load(Ordering::Relaxed)
     }
@@ -85,10 +94,17 @@ impl Rng {
     }
 }
 
+enum Reorder {
+    First,
+    Second(tokio::sync::oneshot::Sender<()>),
+    Done,
+}
+
 struct Shared {
     origin: String,
     faults: Faults,
     rng: Mutex<Rng>,
+    reorder: Mutex<Reorder>,
     /// Earlier 200 responses of the origin, newest last.
     cache: Mutex<Vec<Vec<u8>>>,
     stats: Arc<Stats>,
@@ -116,6 +132,11 @@ impl Proxy {
             origin: origin.to_owned(),
             faults,
             rng: Mutex::new(Rng::new(seed)),
+            reorder: Mutex::new(if faults.reorder {
+                Reorder::First
+            } else {
+                Reorder::Done
+            }),
             cache: Mutex::new(Vec::new()),
             stats: stats.clone(),
         });
@@ -179,9 +200,8 @@ async fn read_message(conn: &mut TcpStream, to_close: bool) -> Option<(String, V
     Some((head, body))
 }
 
-/// Forwards a request to the origin as HTTP/1.0; returns the response's
-/// status code and body.
-async fn forward(origin: &str, target: &str, body: &[u8]) -> Option<(u16, Vec<u8>)> {
+/// Forwards a request to the origin as HTTP/1.0.
+async fn forward(origin: &str, target: &str, body: &[u8]) -> Option<TcpStream> {
     let mut conn = TcpStream::connect(origin).await.ok()?;
     let head = format!(
         "POST {target} HTTP/1.0\r\nHost: {origin}\r\nContent-Length: {}\r\n\r\n",
@@ -189,6 +209,10 @@ async fn forward(origin: &str, target: &str, body: &[u8]) -> Option<(u16, Vec<u8
     );
     conn.write_all(head.as_bytes()).await.ok()?;
     conn.write_all(body).await.ok()?;
+    Some(conn)
+}
+
+async fn response(mut conn: TcpStream) -> Option<(u16, Vec<u8>)> {
     let (head, body) = read_message(&mut conn, true).await?;
     let code = head.split(' ').nth(1)?.parse().ok()?;
     Some((code, body))
@@ -211,15 +235,7 @@ async fn serve(shared: Arc<Shared>, mut conn: TcpStream) {
     let f = shared.faults;
     let st = &shared.stats;
     st.requests.fetch_add(1, Ordering::Relaxed);
-    let (draw, delay) = {
-        let mut rng = shared.rng.lock().unwrap();
-        let delay = if f.reorder.is_zero() {
-            Duration::ZERO
-        } else {
-            f.reorder.mul_f64(rng.unit())
-        };
-        (rng.unit(), delay)
-    };
+    let draw = shared.rng.lock().unwrap().unit();
     // The faults in order, each in its share of [0, 1).
     let mut at = 0.0;
     let mut pick = |p: f64| {
@@ -251,29 +267,44 @@ async fn serve(shared: Arc<Shared>, mut conn: TcpStream) {
             return;
         }
     }
-    tokio::time::sleep(delay).await;
+    let (wait, release) = {
+        let mut reorder = shared.reorder.lock().unwrap();
+        match std::mem::replace(&mut *reorder, Reorder::Done) {
+            Reorder::First => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                *reorder = Reorder::Second(tx);
+                (Some(rx), None)
+            }
+            Reorder::Second(tx) => (None, Some(tx)),
+            Reorder::Done => (None, None),
+        }
+    };
+    if let Some(wait) = wait {
+        let _ = wait.await;
+    }
+    let origin = forward(&shared.origin, &target, &body).await;
+    if let Some(release) = release
+        && origin.is_some()
+    {
+        st.reordered.fetch_add(1, Ordering::Relaxed);
+        let _ = release.send(());
+    }
+    let Some(origin) = origin else { return };
+    if target.starts_with(DOWN_PATH) && st.cut_next.swap(false, Ordering::AcqRel) {
+        drop(origin);
+        st.cuts.fetch_add(1, Ordering::Relaxed);
+        st.cut_applied.notify_one();
+        return;
+    }
     if dup {
         st.duplicates.fetch_add(1, Ordering::Relaxed);
         let (origin, target, body) = (shared.origin.clone(), target.clone(), body.clone());
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            let _ = tokio::time::timeout(Duration::from_secs(30), forward(&origin, &target, &body))
-                .await;
+            let duplicate = async { response(forward(&origin, &target, &body).await?).await };
+            let _ = tokio::time::timeout(Duration::from_secs(60), duplicate).await;
         });
     }
-    let fwd = forward(&shared.origin, &target, &body);
-    let resp = match f.cut.filter(|_| target.starts_with(DOWN_PATH)) {
-        Some(cut) => {
-            if let Ok(r) = tokio::time::timeout(cut, fwd).await {
-                r
-            } else {
-                st.cuts.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
-        None => fwd.await,
-    };
-    let Some((code, resp)) = resp else {
+    let Some((code, resp)) = response(origin).await else {
         return;
     };
     if code == 200 {
@@ -293,4 +324,7 @@ async fn serve(shared: Arc<Shared>, mut conn: TcpStream) {
         return;
     }
     reply(&mut conn, code, &resp).await;
+    if target.starts_with(DOWN_PATH) {
+        st.downlink.notify_one();
+    }
 }

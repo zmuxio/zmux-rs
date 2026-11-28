@@ -58,12 +58,14 @@ pub enum CoreEvent {
     /// channel's pipe changed: the driver polls the channels
     /// ([`super::SessionCore::poll_channel`]).
     ChannelDatagrams,
+    /// Observable cover acceptance, rejection or carrier completion.
+    Shaping(Box<super::shaping::Event>),
     /// [`super::SessionCore::path_datagram_size`] changed: the carrier's
     /// datagram size changed, another pipe carries the datagrams, or they
     /// moved between the carrier's datagrams and records.
     DatagramPathChanged {
-        /// The new value.
-        size: Option<usize>,
+        /// Updated original-copy payload capacities.
+        path: super::DatagramPath,
     },
     /// Received datagrams were dropped from full queues since the last
     /// event of this kind.
@@ -80,6 +82,8 @@ pub enum CoreEvent {
         /// The peer's application error code.
         code: u64,
     },
+    /// An observed member reached its byte rotation threshold.
+    MemberRotationDue,
     /// A pipe direction changed state.
     PipeState {
         /// The attachment.
@@ -93,6 +97,8 @@ pub enum CoreEvent {
         /// transition is seen even when several happen between two drains.
         previous: Option<OutboundState>,
     },
+    /// A directional health transition committed by the protocol owner.
+    PipeHealthChanged(Box<super::PipeHealthChange>),
     /// The first record arrived on a pipe's inbound direction.
     PipeReceiving {
         /// The attachment.

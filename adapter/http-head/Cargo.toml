@@ -1,0 +1,15 @@
+[package]
+name = "zmux-http-head"
+version = "1.4.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Request-head handling shared by the zmux HTTP and WebSocket adapters"
+repository = "https://github.com/zmuxio/zmux-rs"
+
+[dependencies]
+http = "1"
+zmux = { version = "1.4.0", path = "../.." }
+
+[lints]
+workspace = true

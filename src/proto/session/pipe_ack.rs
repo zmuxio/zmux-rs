@@ -88,18 +88,15 @@ impl SessionCore {
     /// acknowledges late (a large `zmux_max_ack_delay`) cannot make the
     /// state grow with the batches sent meanwhile.
     pub(super) fn single_batch_sent(&mut self, eliciting: bool, now: Instant) {
-        let peer_mad = match &self.pipe_ack {
-            Some(pa) => pa.peer_mad,
-            None if self.peer_tp.is_none()
-                && (self.local_tp().pipe_ack || self.local_tp().multipath.is_some()) =>
-            {
-                Duration::from_millis(crate::proto::params::DEFAULT_MAX_ACK_DELAY_MS)
-            }
-            None => return,
-        };
+        if self.pipe_ack.is_none()
+            && (self.peer_tp.is_some()
+                || !(self.local_tp().pipe_ack || self.local_tp().multipath.is_some()))
+        {
+            return;
+        }
         let lane = self.tx_lane;
         if let Some(o) = self.out_mut(PIPE) {
-            o.record_single_batch(lane, eliciting, SAMPLE_ENTRIES, peer_mad, now);
+            o.record_single_batch(lane, eliciting, SAMPLE_ENTRIES, now);
         }
     }
 
@@ -176,7 +173,7 @@ impl SessionCore {
             let mut entries = Vec::new();
             let complete =
                 super::ack::snapshot_of(&self.atts, &mut entries, p.complete_due(now), now);
-            if !Self::write_snapshot(&entries, w) {
+            if !Self::write_snapshot(&entries, w, true) {
                 return;
             }
             if let Some(p) = self.atts.first_mut().and_then(Attachment::inp_mut) {
@@ -249,6 +246,9 @@ impl SessionCore {
                 self.activity_acked(cum, now);
             }
             if lanes && moved {
+                if e.lane != 0 {
+                    self.cancel_lane_open(super::PipeId(PIPE).lane(e.lane));
+                }
                 self.single_lane_acked(now);
             }
         }
@@ -277,9 +277,12 @@ impl SessionCore {
         if let Some(o) = self.out_mut(PIPE) {
             o.ping_rtt_sample(rtt, now);
             o.set_paced(true, now);
-            if let Some((limiter, est)) = o.limiter_parts() {
+            let in_flight = o.limiter_in_flight(now);
+            let deadline = o.limiter_parts().and_then(|(limiter, est)| {
                 limiter.ping_sample(now, rtt, est, &p);
-            }
+                limiter.refresh(now, in_flight, est, &p)
+            });
+            self.set_pacing_deadline(PIPE, deadline);
         }
     }
 

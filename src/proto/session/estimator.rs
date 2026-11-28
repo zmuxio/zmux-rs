@@ -49,18 +49,40 @@ pub(crate) struct Batch {
     /// The lane of the pipe it went on; its
     /// positions are the pipe's send order.
     pub(crate) lane: u32,
-    /// The acknowledgement time expected at sending, the E of opportunistic
-    /// reinjection: (`unsent_ahead` + L) / `R_p` + `min_rtt_p` + the peer's
-    /// max ACK delay, with the estimates of that moment.
-    pub(crate) expect: Duration,
+    /// Scheduler ETA inputs and return-flight allowance at the actual handoff.
+    pub(super) confirmation: Option<Confirmation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::proto::session) struct Confirmation {
+    pub(super) eta: super::sched::Eta,
+    pub(super) return_flight: Duration,
+}
+
+impl Confirmation {
+    pub(in crate::proto::session) fn after(self, len: u64) -> Duration {
+        Duration::try_from_secs_f64(self.eta.of(len))
+            .unwrap_or(Duration::MAX)
+            .saturating_add(self.return_flight)
+    }
 }
 
 /// RFC 9002 initial smoothed RTT.
 pub(crate) const INITIAL_RTT: Duration = Duration::from_millis(333);
 /// The initial delivery rate, 1 MB/s.
 pub(crate) const INITIAL_RATE: u64 = 1_000_000;
-const RATE_WINDOW: Duration = Duration::from_secs(10);
+pub(super) const RATE_WINDOW: Duration = Duration::from_secs(10);
 const RATE_ROUNDS: u64 = 10;
+pub(super) const RTT_EVIDENCE_WINDOW: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReplayEstimates {
+    pub(super) srtt: Duration,
+    pub(super) rttvar: Duration,
+    pub(super) eta: Duration,
+    pub(super) deviation: Duration,
+}
 
 /// RTT and delivery-rate estimates of an outbound pipe.
 #[allow(
@@ -70,6 +92,8 @@ const RATE_ROUNDS: u64 = 10;
 #[derive(Debug, Clone)]
 pub(crate) struct Estimator {
     pub(crate) srtt: Duration,
+    #[cfg(test)]
+    pub(super) replay: Option<ReplayEstimates>,
     pub(crate) rttvar: Duration,
     pub(crate) latest: Option<Duration>,
     /// `min_rtt`: the minimum over the last 300 s, kept while no sample was
@@ -98,6 +122,9 @@ pub(crate) struct Estimator {
     /// where a spreading policy places data, which reads the estimates
     /// only.
     pub(crate) placed_from: Cell<Option<u64>>,
+    pub(super) delivery_version: u64,
+    pub(super) delivery_restricted_through: u64,
+    pub(super) ack_delivery: Option<super::AckDelivery>,
     rate_window: VecDeque<(Instant, u64, u64)>,
     pub(crate) round: u64,
     pub(crate) round_end: u64,
@@ -109,6 +136,8 @@ impl Estimator {
     pub(crate) fn new(initial_rtt: Duration, now: Instant) -> Self {
         Self {
             srtt: initial_rtt,
+            #[cfg(test)]
+            replay: None,
             rttvar: initial_rtt / 2,
             latest: None,
             min_rtt: super::filter::MinFilter::default(),
@@ -122,6 +151,9 @@ impl Estimator {
             penalized: false,
             placed_from: Cell::new(None),
             rate_window: VecDeque::new(),
+            ack_delivery: None,
+            delivery_version: 0,
+            delivery_restricted_through: 0,
             round: 0,
             round_end: 0,
             delivered_time: now,
@@ -154,6 +186,11 @@ impl Estimator {
         let prev = self.sampled.then_some((self.srtt, self.rttvar));
         (self.srtt, self.rttvar) =
             super::filter::smooth_rtt(prev.map(|p| p.0), prev.map(|p| p.1), adjusted, latest);
+        #[cfg(test)]
+        if let Some(replay) = self.replay {
+            self.srtt = replay.srtt;
+            self.rttvar = replay.rttvar;
+        }
         self.sampled = true;
         adjusted
     }
@@ -214,14 +251,20 @@ impl Estimator {
         self.bound();
     }
 
+    /// Return flight and delay allowance frozen at STREAM handoff.
+    pub(super) fn confirmation_return(&self, peer_mad: Duration) -> Duration {
+        let half_rtt = self.srtt / 2;
+        let deviation = self.rttvar;
+        #[cfg(test)]
+        let deviation = self.replay.map_or(deviation, |replay| replay.deviation);
+        half_rtt
+            .saturating_add(deviation.min(half_rtt))
+            .saturating_add(peer_mad)
+    }
+
     /// PTO without the queue term (RFC 9002 Section 6.2.1).
     pub(crate) fn pto(&self, peer_max_ack_delay: Duration) -> Duration {
         self.srtt + (self.rttvar * 4).max(Duration::from_millis(1)) + peer_max_ack_delay
-    }
-
-    /// The minimum RTT, or the smoothed RTT before the first sample.
-    pub(crate) fn min_or_srtt(&self) -> Duration {
-        self.min_rtt.get().unwrap_or(self.srtt)
     }
 }
 
@@ -247,6 +290,8 @@ pub(crate) struct RttSample {
 /// also the inputs of the carrier queue limiter.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AckSample {
+    /// This advance produced a new, nonempty ACK delivery interval.
+    pub(super) delivery: bool,
     /// The RTT sample, when the advance gave one.
     pub(crate) rtt: Option<RttSample>,
     /// The delivery-rate sample in bytes per second, and whether it is

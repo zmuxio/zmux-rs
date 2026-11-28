@@ -61,8 +61,15 @@ impl SessionCore {
         if self.state >= State::Closing {
             return false;
         }
-        self.out_mut(lane.pipe.0)
-            .is_some_and(|o| o.lane_attached(lane.lane.0, framing, now))
+        let attached = self
+            .out_mut(lane.pipe.0)
+            .is_some_and(|o| o.lane_attached(lane.lane.0, framing));
+        if attached && let Some(at) = self.now.checked_add(self.config.join_wait()) {
+            self.lane_open_timers
+                .get_or_insert_default()
+                .set(lane, Some(at));
+        }
+        attached
     }
 
     /// Whether inbound pipe `pipe` is OPEN:
@@ -200,6 +207,7 @@ impl SessionCore {
             return;
         };
         if o.refuse_lane(n) {
+            self.cancel_lane_open(super::PipeId(pipe).lane(n));
             return;
         }
         let confirmed = o
@@ -275,31 +283,35 @@ impl SessionCore {
     /// When an opening lane is due to be refused for not being confirmed
     /// within the handshake timeout.
     pub(super) fn lanes_deadline(&self) -> Option<Instant> {
-        let timeout = self.config.join_wait();
-        self.atts
-            .outs()
-            .filter_map(|o| o.lanes()?.opening_since())
-            .filter_map(|(_, t)| t.checked_add(timeout))
-            .min()
+        self.lane_open_timers.as_ref()?.next()
+    }
+
+    pub(in crate::proto::session) fn cancel_lane_open(&mut self, lane: LaneId) {
+        if let Some(timers) = &mut self.lane_open_timers {
+            timers.set(lane, None);
+        }
+    }
+
+    pub(in crate::proto::session) fn cancel_pipe_lane_open(&mut self, pipe: u64) {
+        if let Some(number) = self.out_ref(pipe).and_then(|out| out.lanes()?.opening()) {
+            self.cancel_lane_open(super::PipeId(pipe).lane(number));
+        }
     }
 
     /// Refuses the lanes not confirmed within the handshake timeout: the
     /// driver resets them.
     pub(super) fn lanes_timeouts(&mut self, now: Instant) {
-        let timeout = self.config.join_wait();
-        for i in 0..self.atts.len() {
-            let a = self.atts.at(i);
-            let pipe = a.id();
-            let Some((n, since)) = a.out().and_then(|o| o.lanes()?.opening_since()) else {
-                continue;
-            };
-            if since.checked_add(timeout).is_none_or(|t| now < t) {
-                continue;
+        while let Some((_, lane)) = self
+            .lane_open_timers
+            .as_mut()
+            .and_then(|timers| timers.take_due(now))
+        {
+            if self
+                .out_mut(lane.pipe.0)
+                .is_some_and(|o| o.refuse_lane(lane.lane.0))
+            {
+                self.push_event(CoreEvent::ResetLane(lane));
             }
-            if let Some(o) = self.atts.at_mut(i).out_mut() {
-                o.refuse_lane(n);
-            }
-            self.push_event(CoreEvent::ResetLane(super::PipeId(pipe).lane(n)));
         }
     }
 

@@ -44,7 +44,10 @@ A Close frame is the graceful end of a pipe; a connection that ends
 without one is a failure. Over plain TCP a failed pipe is aborted without a
 Close frame. For `wss://`, `dial_tls` and `connect_tls` take the
 application's `tokio_rustls::TlsConnector`; `dial_over` upgrades an
-established TLS stream. With the `wss` feature (off by default), `dial` and
+established stream with the host's `CarrierInfo`. Mark an encrypted stream
+with `with_encrypted` for a bearer ticket, or supply the connection's TLS 1.3
+exporter with `with_prefix_binding` for a bound ticket. With the `wss`
+feature (off by default), `dial` and
 `connect` also take `wss://` URLs, trusting the Mozilla roots of
 `webpki-roots` with rustls's ring provider; `tls_connector` makes a connector
 of other roots.

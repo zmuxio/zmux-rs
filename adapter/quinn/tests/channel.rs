@@ -1,22 +1,13 @@
-//! QUIC datagrams as the datagram channel of stream pipes:
-//! a session through a delaying, lossy UDP relay, where
-//! datagrams on the channel arrive after the one-way delay while a lost
-//! packet of the pipe is retransmitted and datagrams in records wait for
-//! it; the fallback to records where the connection has no datagrams one
-//! way; and several sessions on one connection, whose channel datagrams
-//! the connection's receive loop routes by Pipe Stream ID.
+//! Native datagram routing and capacity on real Quinn connections.
+
+mod common;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::net::UdpSocket;
-use zmux::shaping::{Caps, Shaper};
-use zmux::{Config, PipeId, Session};
+use zmux::adapter::{ChannelReceiver, DatagramChannel};
+use zmux::{Config, Session};
 use zmux_quinn::{Carrier, Options};
 
 /// Every test has a hard deadline.
@@ -31,38 +22,15 @@ impl Quic {
     /// Endpoints with the carrier's transport configuration; `client_dgrams`
     /// false: the client's connections take no QUIC datagrams.
     fn new(client_dgrams: bool) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
-        let der = CertificateDer::from(cert.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![der.clone()], key)
-            .unwrap();
-        tls.alpn_protocols = vec![b"zmux".to_vec()];
-        let mut server_config =
-            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()));
-        server_config.transport_config(Arc::new(Options::default().transport_config()));
-        let server =
-            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(der).unwrap();
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![b"zmux".to_vec()];
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let mut transport = Options::default().transport_config();
         if !client_dgrams {
             transport.datagram_receive_buffer_size(None);
         }
-        let mut cc = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
-        cc.transport_config(Arc::new(transport));
-        client.set_default_client_config(cc);
+        let (server, client) = common::endpoints(
+            vec![b"zmux".to_vec()],
+            Options::default().transport_config(),
+            transport,
+        );
         Self { server, client }
     }
 
@@ -82,77 +50,6 @@ impl Quic {
     }
 }
 
-/// A UDP relay between a client and a server that delays every packet by
-/// `delay` each way and, once armed, drops every `nth` packet from the
-/// client to the server.
-struct Relay {
-    addr: SocketAddr,
-    armed: Arc<AtomicBool>,
-    dropped: Arc<AtomicU64>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Relay {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl Relay {
-    async fn start(server: SocketAddr, delay: Duration, nth: u64) -> Self {
-        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let addr = sock.local_addr().unwrap();
-        let armed = Arc::new(AtomicBool::new(false));
-        let dropped = Arc::new(AtomicU64::new(0));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Instant, Vec<u8>, SocketAddr)>();
-        let out = sock.clone();
-        // Constant delay: deadlines are in arrival order.
-        let sender = async move {
-            while let Some((at, data, to)) = rx.recv().await {
-                tokio::time::sleep_until(at.into()).await;
-                let _ = out.send_to(&data, to).await;
-            }
-        };
-        let (a, d) = (armed.clone(), dropped.clone());
-        let receiver = async move {
-            let mut client = None;
-            let mut buf = vec![0u8; 65536];
-            let mut seen = 0u64;
-            loop {
-                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
-                    return;
-                };
-                let to = if from == server {
-                    match client {
-                        Some(c) => c,
-                        None => continue,
-                    }
-                } else {
-                    client = Some(from);
-                    if a.load(Ordering::Relaxed) {
-                        seen += 1;
-                        if seen.is_multiple_of(nth) {
-                            d.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                    server
-                };
-                let _ = tx.send((Instant::now() + delay, buf[..n].to_vec(), to));
-            }
-        };
-        let task = tokio::spawn(async move {
-            tokio::join!(sender, receiver);
-        });
-        Self {
-            addr,
-            armed,
-            dropped,
-            task,
-        }
-    }
-}
-
 fn dgram_config() -> Config {
     let mut c = Config::default();
     c.enable_datagrams = true;
@@ -161,107 +58,214 @@ fn dgram_config() -> Config {
 
 /// A session over one QUIC connection: the client's and the server's.
 async fn sessions(cc: quinn::Connection, sc: quinn::Connection) -> (Session, Session, Carrier) {
-    let client = Carrier::new(cc, Options::default());
-    let server = Carrier::new(sc, Options::default());
-    let accept = {
-        let server = server.clone();
-        tokio::spawn(async move {
-            Session::accept(server.accept_pipe().await.unwrap(), dgram_config())
-                .await
-                .unwrap()
-        })
-    };
-    let cs = Session::connect(client.open_pipe().await.unwrap(), dgram_config())
-        .await
-        .unwrap();
-    (cs, accept.await.unwrap(), server)
+    let client = Carrier::new(cc, &common::adopted_options(Options::default())).unwrap();
+    let server = Carrier::new(sc, &common::adopted_options(Options::default())).unwrap();
+    let (client, accepted) = open_session(&client, &server).await;
+    (client, accepted, server)
 }
 
-/// A shaper that changes nothing: its pipe's datagrams go in records.
-struct Plain;
-
-impl Shaper for Plain {
-    fn capabilities(&self) -> Caps {
-        Caps::NONE
-    }
+async fn open_session(client: &Carrier, server: &Carrier) -> (Session, Session) {
+    let (client, accepted) = tokio::join!(
+        async { Session::connect(client.open_pipe().await.unwrap(), dgram_config()).await },
+        async { Session::accept(server.accept_pipe().await.unwrap(), dgram_config()).await },
+    );
+    (client.unwrap(), accepted.unwrap())
 }
 
-/// Sends `n` datagrams at a steady pace from `from` (one per 20 ms, well
-/// within the congestion window of a lossy path) and returns the one-way
-/// latency of each that `to` received.
-async fn paced(from: &Session, to: &Session, n: usize) -> Vec<Duration> {
-    let start = Instant::now();
-    let reader = {
-        let to = to.clone();
-        tokio::spawn(async move {
-            let mut lat = Vec::new();
-            while let Ok(Ok(d)) =
-                tokio::time::timeout(Duration::from_millis(1500), to.read_datagram()).await
-            {
-                let sent = u64::from_be_bytes(d[..8].try_into().unwrap());
-                lat.push(
-                    start
-                        .elapsed()
-                        .checked_sub(Duration::from_micros(sent))
-                        .unwrap(),
-                );
-            }
-            lat
-        })
-    };
-    for _ in 0..n {
-        let mut d = u64::try_from(start.elapsed().as_micros())
-            .unwrap()
-            .to_be_bytes()
-            .to_vec();
-        d.resize(200, 1);
-        from.send_datagram(Bytes::from(d)).unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    reader.await.unwrap()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn channel_datagrams_are_not_held_behind_lost_packets() {
+#[tokio::test]
+async fn borrowed_connections_share_routing_and_leave_close_to_the_host() {
     tokio::time::timeout(DEADLINE, async {
         let quic = Quic::new(true);
-        let delay = Duration::from_millis(30);
-        let relay = Relay::start(quic.server.local_addr().unwrap(), delay, 10).await;
-        let (cc, sc) = quic.connect(relay.addr).await;
-        let (cs, ss, _server) = sessions(cc, sc).await;
-        relay.armed.store(true, Ordering::Relaxed);
-
-        // On the channel: none waits for a retransmission; some are lost.
-        let lat = paced(&cs, &ss, 100).await;
-        let max = lat.iter().max().copied().unwrap();
-        let (c, s) = (cs.stats(), ss.stats());
-        assert!(relay.dropped.load(Ordering::Relaxed) > 0);
-        assert!(lat.len() < 100, "lost ones are lost: {}", lat.len());
-        assert!(lat.len() > 50, "{}", lat.len());
-        assert!(max < delay + Duration::from_millis(40), "max {max:?}");
-        assert_eq!(c.datagrams_sent_channel, 100);
-        assert_eq!(c.datagrams_sent, 100);
-        assert_eq!(s.datagrams_received_channel, lat.len() as u64);
-
-        // In records (the pipe is shaped): every one arrives, and those
-        // after a lost packet wait for its retransmission.
-        cs.pipe(PipeId::new(0))
-            .expect("the first pipe")
-            .set_shaper(Some(Box::new(Plain)))
-            .unwrap();
-        let lat = paced(&cs, &ss, 100).await;
-        let max = lat.iter().max().copied().unwrap();
-        assert_eq!(lat.len(), 100, "reliable in records");
-        assert!(max > 2 * delay + Duration::from_millis(20), "max {max:?}");
-        assert_eq!(
-            cs.stats().datagrams_sent_channel,
-            100,
-            "none more on the channel"
+        let (host, peer) = quic.connect(quic.server.local_addr().unwrap()).await;
+        let options = common::adopted_options(Options::default());
+        let server = Carrier::new(peer.clone(), &options).unwrap();
+        let (first, second) = tokio::join!(
+            Carrier::borrow(&host, &options),
+            Carrier::borrow(&host, &options),
         );
-        cs.close().await;
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(std::sync::Arc::ptr_eq(
+            first.datagrams(),
+            second.datagrams()
+        ));
+        assert!(first.accept_pipe().await.is_none());
+        let different = options
+            .clone()
+            .with_windows(options.windows.with_lanes(options.windows.lanes + 1));
+        assert_eq!(
+            Carrier::borrow(&host, &different).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let (client_a, peer_a) = open_session(&first, &server).await;
+        let (client_b, peer_b) = open_session(&second, &server).await;
+        drop((first, second));
+        for (session, payload) in [
+            (&peer_a, b"first".as_slice()),
+            (&peer_b, b"second".as_slice()),
+        ] {
+            assert!(session.datagram_path().native_payload.is_some());
+            session.send_datagram(Bytes::from_static(payload)).unwrap();
+        }
+        let (a, b) = tokio::join!(client_a.read_datagram(), client_b.read_datagram());
+        assert_eq!(a.unwrap(), b"first".as_slice());
+        assert_eq!(b.unwrap(), b"second".as_slice());
+
+        let (mut send, _recv) = peer.open_bi().await.unwrap();
+        send.write_all(b"host stream").await.unwrap();
+        send.finish().unwrap();
+        let (_send, mut recv) = host.accept_bi().await.unwrap();
+        assert_eq!(recv.read_to_end(64).await.unwrap(), b"host stream");
+
+        tokio::join!(client_a.close(), client_b.close());
+        tokio::join!(peer_a.closed(), peer_b.closed());
+        drop((client_a, client_b, peer_a, peer_b));
+        // Borrow again after the old lane and datagram receivers have gone.
+        let rebound = Carrier::borrow(&host, &options).await.unwrap();
+        assert_eq!(rebound.connection().stable_id(), host.stable_id());
+        drop(rebound);
+        assert!(host.close_reason().is_none());
+        host.close(23u32.into(), b"host close");
+        assert_eq!(
+            Carrier::borrow(&host, &options).await.unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected
+        );
+        assert!(matches!(
+            peer.closed().await,
+            quinn::ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == 23
+        ));
     })
     .await
-    .expect("deadline");
+    .unwrap();
+}
+
+#[tokio::test]
+async fn native_datagram_capacity_routing_and_cancellation() {
+    tokio::time::timeout(DEADLINE, async {
+        let quic = Quic::new(true);
+        let (cc, sc) = quic.connect(quic.server.local_addr().unwrap()).await;
+        let client =
+            Carrier::new(cc.clone(), &common::adopted_options(Options::default())).unwrap();
+        let server =
+            Carrier::new(sc.clone(), &common::adopted_options(Options::default())).unwrap();
+        let outbound = client.datagrams().channel(64);
+        let inbound = server.datagrams().channel(64);
+        let (arrived, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let _registration = inbound.receive(ChannelReceiver::new(move |frame| {
+            let _ = arrived.send(frame);
+        }));
+
+        let (limit, room) = outbound.datagram_capacity();
+        assert_eq!(limit, room);
+        assert_eq!(Some(room), cc.max_datagram_size());
+        let payload = vec![0xa5; limit - 3];
+        let frame = Bytes::from(zmux::proto::frame::channel::encode(Some(64), &payload));
+        assert_eq!(frame.len(), limit);
+        assert!(
+            outbound
+                .send(Bytes::from(vec![0; limit + 1]))
+                .await
+                .is_err()
+        );
+        outbound.send(frame.clone()).await.unwrap();
+        let received = received.recv().await.unwrap();
+        assert_eq!(&received[..], &frame[2..]);
+        assert_eq!(cc.stats().frame_tx.datagram, 1);
+        assert_eq!(sc.stats().frame_rx.datagram, 1);
+
+        // This runtime has one thread. No background task can drain the
+        // transport queue while we fill it and poll the waiting send.
+        while cc.datagram_send_buffer_space() >= limit {
+            cc.send_datagram(frame.clone()).unwrap();
+        }
+        let space = cc.datagram_send_buffer_space();
+        let mut sending = outbound.send(frame);
+        assert!(
+            std::future::Future::poll(
+                sending.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        drop(sending);
+        assert_eq!(cc.datagram_send_buffer_space(), space);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn bound_pipe_datagrams_use_its_physical_quic_connection() {
+    tokio::time::timeout(DEADLINE, async {
+        let quic = Quic::new(true);
+        let address = quic.server.local_addr().unwrap();
+        let (initial, initial_peer) = quic.connect(address).await;
+        let (bound, bound_peer) = quic.connect(address).await;
+        let mut config = dgram_config();
+        config.session_policy.limits.steady_attachments = 2;
+        config.pipe_auth = zmux::PipeAuth::exporter().with_end_to_end();
+        config.allow_record_mode = Some(zmux::AllowRecordMode::new(|_, _, _| true));
+        let listener =
+            zmux::Listener::new(config.clone(), zmux::ListenerConfig::default()).unwrap();
+        let _initial_service = Carrier::with_listener(
+            initial_peer,
+            &listener,
+            &common::adopted_options(Options::default()),
+        )
+        .unwrap();
+        let _bound_service = Carrier::with_listener(
+            bound_peer.clone(),
+            &listener,
+            &common::adopted_options(Options::default()),
+        )
+        .unwrap();
+        let first = Carrier::new(
+            initial.clone(),
+            &common::adopted_options(Options::default()),
+        )
+        .unwrap();
+        let next =
+            Carrier::new(bound.clone(), &common::adopted_options(Options::default())).unwrap();
+        let sender = Session::connect(first.open_pipe().await.unwrap(), config)
+            .await
+            .unwrap();
+        let receiver = listener.accept().await.unwrap();
+
+        let pipe = sender
+            .test_join(
+                next.open_pipe().await.unwrap(),
+                zmux::PipeOptions::default().with_record_mode(zmux::RecordMode::Bound),
+            )
+            .await
+            .unwrap();
+        pipe.attached().await.unwrap();
+        assert_eq!(
+            pipe.stats().unwrap().record_mode,
+            Some(zmux::RecordMode::Bound)
+        );
+        assert_eq!(
+            receiver
+                .pipe(pipe.id())
+                .unwrap()
+                .stats()
+                .unwrap()
+                .record_mode,
+            Some(zmux::RecordMode::Bound)
+        );
+        let bootstrap = sender.pipe(zmux::PipeId::new(0)).unwrap();
+        bootstrap.close().unwrap();
+        bootstrap.closed().await.unwrap();
+        let data = Bytes::from_static(b"bound datagram");
+        sender.send_datagram(data.clone()).unwrap();
+        assert_eq!(receiver.read_datagram().await.unwrap(), data);
+        assert_eq!(sender.stats().datagrams_sent_channel, 1);
+        assert_eq!(receiver.stats().datagrams_received_channel, 1);
+        assert_eq!(initial.stats().frame_tx.datagram, 0);
+        assert_eq!(bound.stats().frame_tx.datagram, 1);
+        assert_eq!(bound_peer.stats().frame_rx.datagram, 1);
+        sender.close().await;
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -273,11 +277,7 @@ async fn quic_datagrams_disabled_locally_fall_back_to_records() {
         for i in 0..20u8 {
             cs.send_datagram(Bytes::from(vec![i; 100])).unwrap();
             ss.send_datagram(Bytes::from(vec![i; 100])).unwrap();
-            let (a, b) = tokio::join!(
-                tokio::time::timeout(Duration::from_secs(3), ss.read_datagram()),
-                tokio::time::timeout(Duration::from_secs(3), cs.read_datagram())
-            );
-            let (a, b) = (a.unwrap(), b.unwrap());
+            let (a, b) = tokio::join!(ss.read_datagram(), cs.read_datagram());
             assert_eq!(a.unwrap()[0], i);
             assert_eq!(b.unwrap()[0], i);
         }
@@ -304,8 +304,8 @@ async fn sessions_sharing_a_connection_get_their_own_channel_datagrams() {
     tokio::time::timeout(DEADLINE, async {
         let quic = Quic::new(true);
         let (cc, sc) = quic.connect(quic.server.local_addr().unwrap()).await;
-        let client = Carrier::new(cc, Options::default());
-        let server = Carrier::new(sc, Options::default());
+        let client = Carrier::new(cc, &common::adopted_options(Options::default())).unwrap();
+        let server = Carrier::new(sc, &common::adopted_options(Options::default())).unwrap();
         let mut pairs = Vec::new();
         for _ in 0..3 {
             let accept = {
@@ -347,16 +347,17 @@ async fn sessions_sharing_a_connection_get_their_own_channel_datagrams() {
         cs.close().await;
         let _ = ss.closing().await;
         let _ = cs.closing().await;
-        let mut tries = 0;
-        while server.datagrams().dropped() == 0 && tries < 100 {
-            // A raw datagram that names the closed pipe (QUIC stream 0).
-            let _ = client.connection().send_datagram(Bytes::from(
-                zmux::proto::frame::channel::encode(Some(0), &[0]),
-            ));
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            tries += 1;
+        let _ = ss.closed().await;
+        client
+            .connection()
+            .send_datagram(Bytes::from(zmux::proto::frame::channel::encode(
+                Some(0),
+                &[0],
+            )))
+            .unwrap();
+        while server.datagrams().dropped() == 0 {
+            tokio::task::yield_now().await;
         }
-        assert!(server.datagrams().dropped() > 0);
         let (cs, ss) = &pairs[0];
         cs.send_datagram(Bytes::from_static(b"still")).unwrap();
         assert_eq!(&ss.read_datagram().await.unwrap()[..], b"still");

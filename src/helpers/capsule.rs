@@ -15,145 +15,112 @@ pub(crate) const MAX_HEADER: usize = 1 + 8 + 8;
 /// How much a receiver reads at once while it is between payloads.
 const READ: usize = 64 * 1024;
 
-/// Writes the header of a DATAGRAM capsule with Context ID `context` and a
-/// payload of `payload` bytes; its length. `context` is below 2^62.
-pub(crate) fn datagram_header(context: u64, payload: usize, out: &mut [u8; MAX_HEADER]) -> usize {
-    let value = varint::len(context) as u64 + payload as u64;
+/// Largest possible Type, Length, and Context encoding received from a peer.
+pub(crate) const MAX_WIRE_HEADER: usize = 24;
+
+/// Bound for opaque capsule Values, independent of negotiated record size.
+pub(crate) fn unknown_limit(packet_max: usize) -> usize {
+    packet_max.saturating_add(8).min(crate::util::usize_sat(
+        crate::proto::params::ZMUX_MAX_RECORD_SIZE,
+    ))
+}
+
+/// Writes an encoded capsule header. Context, if present, is part of Value.
+pub(crate) fn encode_header(
+    ty: u64,
+    context: Option<u64>,
+    payload: usize,
+    out: &mut [u8],
+) -> usize {
+    let value = context.map_or(0, |value| varint::len(value) as u64) + payload as u64;
     let mut n = 0;
-    for v in [DATAGRAM, value, context] {
-        // In range: `context` is checked by the callers, `value` is bounded
-        // by the packet bound.
-        n += varint::encode(v, &mut out[n..]).unwrap_or(0);
+    for v in [Some(ty), Some(value), context].into_iter().flatten() {
+        n += varint::encode(v, &mut out[n..]).expect("capsule header fields are bounded");
     }
     n
 }
 
-/// The largest capsule Type and Length together.
-pub(crate) const MAX_TYPE_LENGTH: usize = 8 + 8;
-
-/// Where the Type and Length at the start of `b` stand: `Err(k)` while
-/// `k` more bytes are needed to know more (at least 1), `Ok(length)` once
-/// both are in.
-pub(crate) fn type_length(b: &[u8]) -> Result<u64, usize> {
-    let field = |b: &[u8]| match b.first() {
-        None => Err(1),
-        Some(&f) => {
-            let w = varint::width(f);
-            varint::decode(b)
-                .ok_or_else(|| w - b.len())
-                .map(|(v, _)| (v, w))
-        }
-    };
-    let (_, t) = field(b)?;
-    field(&b[t..]).map(|(len, _)| len)
+/// Writes a minimally encoded DATAGRAM capsule header and returns its length.
+pub(crate) fn datagram_header(context: u64, payload: usize, out: &mut [u8; MAX_HEADER]) -> usize {
+    encode_header(DATAGRAM, Some(context), payload, out)
 }
 
-/// A varint read across chunks.
-#[derive(Debug, Default, Clone, Copy)]
-struct Field {
-    buf: [u8; 8],
-    have: u8,
+/// A complete capsule header with the Context ID factored out of the Value.
+pub(crate) struct Header {
+    pub(crate) ty: u64,
+    pub(crate) context: Option<u64>,
+    pub(crate) payload: usize,
 }
 
-impl Field {
-    /// Takes the field's bytes from `data`; the value and its encoded
-    /// width once complete (a varint need not be minimally encoded).
-    fn take(&mut self, data: &mut &[u8]) -> Option<(u64, usize)> {
-        while let Some((&b, rest)) = data.split_first() {
-            if self.have == 0 && varint::width(b) == 1 {
-                *data = rest;
-                return Some((u64::from(b), 1));
-            }
-            self.buf[usize::from(self.have)] = b;
-            self.have += 1;
-            *data = rest;
-            let width = varint::width(self.buf[0]);
-            if usize::from(self.have) == width {
-                self.have = 0;
-                return varint::decode(&self.buf[..width]).map(|(v, _)| (v, width));
-            }
-        }
-        None
-    }
-
-    /// The width of a field whose first byte is in, 0 before.
-    fn width(&self) -> usize {
-        if self.have == 0 {
-            0
-        } else {
-            varint::width(self.buf[0])
-        }
-    }
+pub(crate) enum HeaderState {
+    Need(usize),
+    Complete(Header),
+    Fault(Fault),
 }
 
-/// Where a capsule sequence is, for a relay that passes it through: only
-/// the headers are parsed.
+/// A bounded incremental header cursor. It never takes bytes from the next
+/// capsule to finish a Context ID or any bytes past a complete header.
 #[derive(Debug, Default)]
-pub(crate) struct Scanner {
-    field: Field,
-    state: Scan,
+pub(crate) struct HeaderCursor {
+    bytes: [u8; MAX_WIRE_HEADER],
+    have: usize,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-enum Scan {
-    /// At a Type: on a capsule boundary when no byte of it was read.
-    #[default]
-    Type,
-    Length,
-    Value(u64),
+impl HeaderCursor {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.have]
+    }
+
+    pub(crate) fn append(&mut self, bytes: &[u8]) {
+        let end = self.have + bytes.len();
+        self.bytes[self.have..end].copy_from_slice(bytes);
+        self.have = end;
+    }
+
+    pub(crate) fn state(&self, packet_max: usize, opaque_max: usize) -> HeaderState {
+        let bytes = self.bytes();
+        let Some((ty, t)) = varint::decode(bytes) else {
+            return HeaderState::Need(missing(bytes));
+        };
+        let bytes = &bytes[t..];
+        let Some((value, l)) = varint::decode(bytes) else {
+            return HeaderState::Need(missing(bytes));
+        };
+        if ty != DATAGRAM {
+            return bounded_header(ty, None, value, opaque_max);
+        }
+        if value == 0 {
+            return HeaderState::Fault(Fault::Truncated);
+        }
+        if value > (packet_max as u64).saturating_add(8) {
+            return HeaderState::Fault(Fault::Oversized);
+        }
+        let bytes = &bytes[l..];
+        if bytes
+            .first()
+            .is_some_and(|&b| varint::width(b) as u64 > value)
+        {
+            return HeaderState::Fault(Fault::Truncated);
+        }
+        let Some((context, width)) = varint::decode(bytes) else {
+            return HeaderState::Need(missing(bytes));
+        };
+        bounded_header(ty, Some(context), value - width as u64, packet_max)
+    }
 }
 
-impl Scanner {
-    /// Whether the bytes so far end on a capsule boundary.
-    pub(crate) fn at_boundary(&self) -> bool {
-        matches!(self.state, Scan::Type) && self.field.have == 0
-    }
+fn missing(bytes: &[u8]) -> usize {
+    bytes.first().map_or(1, |&b| varint::width(b) - bytes.len())
+}
 
-    /// The Value bytes left of the capsule being passed over; `None` while
-    /// at a Type or Length.
-    pub(crate) fn value_left(&self) -> Option<u64> {
-        match self.state {
-            Scan::Value(left) => Some(left),
-            Scan::Type | Scan::Length => None,
-        }
-    }
-
-    /// Passes over `data`: all of it, or with `stop`, up to the first
-    /// boundary after at least one byte. The bytes passed over.
-    pub(crate) fn scan(&mut self, data: &[u8], stop: bool) -> usize {
-        let mut rest = data;
-        while !rest.is_empty() {
-            match self.state {
-                Scan::Type => {
-                    if self.field.take(&mut rest).is_some() {
-                        self.state = Scan::Length;
-                    }
-                }
-                Scan::Length => {
-                    if let Some((len, _)) = self.field.take(&mut rest) {
-                        self.state = if len == 0 {
-                            Scan::Type
-                        } else {
-                            Scan::Value(len)
-                        };
-                    }
-                }
-                Scan::Value(left) => {
-                    let n = usize::try_from(left).unwrap_or(usize::MAX).min(rest.len());
-                    rest = &rest[n..];
-                    let left = left - n as u64;
-                    self.state = if left == 0 {
-                        Scan::Type
-                    } else {
-                        Scan::Value(left)
-                    };
-                }
-            }
-            if stop && self.at_boundary() {
-                break;
-            }
-        }
-        data.len() - rest.len()
+fn bounded_header(ty: u64, context: Option<u64>, n: u64, max: usize) -> HeaderState {
+    match usize::try_from(n) {
+        Ok(payload) if payload <= max => HeaderState::Complete(Header {
+            ty,
+            context,
+            payload,
+        }),
+        _ => HeaderState::Fault(Fault::Oversized),
     }
 }
 
@@ -173,8 +140,7 @@ pub(crate) enum Decoded {
 /// How the bytes of a packet stream are malformed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fault {
-    /// A Length above the bound plus 8 (any type), or a DATAGRAM payload
-    /// above the bound.
+    /// The Value length or DATAGRAM payload exceeded its corresponding cap.
     Oversized,
     /// A DATAGRAM Value that ends inside its Context ID; also, a stream
     /// that ends inside a capsule ([`Decoder::at_boundary`]).
@@ -186,19 +152,14 @@ pub(crate) enum Fault {
 #[derive(Debug)]
 pub(crate) struct Decoder {
     max: usize,
-    field: Field,
+    header: HeaderCursor,
     state: State,
 }
 
 #[derive(Debug, Default)]
 enum State {
     #[default]
-    Type,
-    Length(u64),
-    /// The Context ID of a DATAGRAM capsule whose Value has `value` bytes.
-    Context {
-        value: u64,
-    },
+    Header,
     /// `left` payload bytes to come; a payload that spans chunks is
     /// gathered in `acc`.
     Payload {
@@ -214,15 +175,15 @@ impl Decoder {
     pub(crate) fn new(max: usize) -> Self {
         Self {
             max,
-            field: Field::default(),
-            state: State::Type,
+            header: HeaderCursor::default(),
+            state: State::Header,
         }
     }
 
     /// Whether the bytes so far end on a capsule boundary: where the
     /// stream may end.
     pub(crate) fn at_boundary(&self) -> bool {
-        matches!(self.state, State::Type) && self.field.have == 0
+        matches!(self.state, State::Header) && self.header.bytes().is_empty()
     }
 
     /// The most bytes worth reading next.
@@ -244,7 +205,7 @@ impl Decoder {
                 return match acc {
                     None if buf.len() >= *left => {
                         let payload = buf.split_to(*left);
-                        self.state = State::Type;
+                        self.state = State::Header;
                         Decoded::Packet { context, payload }
                     }
                     None => {
@@ -267,7 +228,7 @@ impl Decoder {
                             Decoded::More
                         } else {
                             let payload = std::mem::take(a).freeze();
-                            self.state = State::Type;
+                            self.state = State::Header;
                             Decoded::Packet { context, payload }
                         }
                     }
@@ -281,61 +242,31 @@ impl Decoder {
                     self.state = State::Skip(left);
                     return Decoded::More;
                 }
-                self.state = State::Type;
+                self.state = State::Header;
                 return Decoded::Skipped;
             }
-            if buf.is_empty() {
-                return Decoded::More;
-            }
-            let mut data: &[u8] = buf;
-            let before = data.len();
-            if let State::Context { value } = self.state {
-                // The Context ID lies within the Value.
-                let first = self.field.width().max(varint::width(data[0]));
-                if self.field.have == 0 && first as u64 > value {
-                    return self.malformed(Fault::Truncated);
-                }
-            }
-            let got = self.field.take(&mut data);
-            let used = before - data.len();
-            buf.advance(used);
-            let Some((v, width)) = got else {
-                return Decoded::More;
-            };
-            match self.state {
-                State::Type => self.state = State::Length(v),
-                // The bound holds for capsules of every type: an 8-byte
-                // Context ID and the largest payload.
-                State::Length(_) if v > (self.max as u64).saturating_add(8) => {
-                    return self.malformed(Fault::Oversized);
-                }
-                State::Length(DATAGRAM) => {
-                    // At least the Context ID.
-                    if v == 0 {
-                        return self.malformed(Fault::Truncated);
+            match self.header.state(self.max, unknown_limit(self.max)) {
+                HeaderState::Need(n) => {
+                    if buf.is_empty() {
+                        return Decoded::More;
                     }
-                    self.state = State::Context { value: v };
+                    let n = n.min(buf.len());
+                    self.header.append(&buf[..n]);
+                    buf.advance(n);
                 }
-                State::Length(_) => {
-                    if v == 0 {
-                        self.state = State::Type;
-                        return Decoded::Skipped;
-                    }
-                    self.state = State::Skip(v);
-                }
-                State::Context { value } => {
-                    // The width read, not the shortest one.
-                    let left = value - width as u64;
-                    if left > self.max as u64 {
-                        return self.malformed(Fault::Oversized);
-                    }
-                    self.state = State::Payload {
-                        context: v,
-                        left: crate::util::usize_sat(left),
-                        acc: None,
+                HeaderState::Fault(fault) => return self.malformed(fault),
+                HeaderState::Complete(header) => {
+                    self.header = HeaderCursor::default();
+                    self.state = if let Some(context) = header.context {
+                        State::Payload {
+                            context,
+                            left: header.payload,
+                            acc: None,
+                        }
+                    } else {
+                        State::Skip(header.payload as u64)
                     };
                 }
-                State::Payload { .. } | State::Skip(_) => unreachable!("handled above"),
             }
         }
     }
@@ -592,29 +523,5 @@ mod tests {
                 assert_eq!(enc, bytes, "{id} encoding");
             }
         }
-    }
-
-    #[test]
-    fn the_scanner_finds_boundaries() {
-        let mut bytes = capsule(0, b"abc");
-        let first = bytes.len();
-        bytes.extend([0x05, 0x00]);
-        bytes.extend(capsule(3, &[1; 70]));
-        let mut s = Scanner::default();
-        assert_eq!(s.scan(&bytes, true), first);
-        assert!(s.at_boundary());
-        assert_eq!(s.scan(&bytes[first..], true), 2);
-        assert_eq!(s.scan(&bytes[first + 2..], false), bytes.len() - first - 2);
-        assert!(s.at_boundary());
-        // Byte by byte, the same boundaries.
-        let mut s = Scanner::default();
-        let ends: Vec<usize> = (0..bytes.len())
-            .filter(|&i| {
-                s.scan(&bytes[i..=i], false);
-                s.at_boundary()
-            })
-            .map(|i| i + 1)
-            .collect();
-        assert_eq!(ends, [first, first + 2, bytes.len()]);
     }
 }

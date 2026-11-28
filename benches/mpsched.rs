@@ -29,14 +29,14 @@ use std::time::{Duration, Instant};
 #[path = "../tests/common/join.rs"]
 mod join;
 
-use bytes::BytesMut;
 use join::{Joined, join_at_once};
+use zmux::ChunkBuffer;
 use zmux::proto::frame::{Dir, Frame, Gates};
 use zmux::proto::listener::{ListenerConfig, ListenerCore};
 use zmux::proto::record::{Event as R, Framing, RecordReader};
 use zmux::proto::session::{
-    Backing, Config, PipeAuth, PipeId, PipeOptions, PipeWrite, Role, Scheduler, SessionCore,
-    StreamKey, TransmitBuf,
+    Config, PipeAuth, PipeId, PipeOptions, PipeWrite, Role, Scheduler, SessionCore, StreamKey,
+    TransmitBuf,
 };
 
 const BS: Framing = Framing::ByteStream;
@@ -104,8 +104,7 @@ struct Pipe {
     reader: RecordReader,
     rev_reader: RecordReader,
     /// The receiver's read buffer and its identity.
-    rbuf: BytesMut,
-    rid: u64,
+    rbuf: ChunkBuffer,
 }
 
 /// The receiver's read buffer (the driver's `READ_BUFFER`).
@@ -138,12 +137,11 @@ struct Net {
     cost: Cost,
     /// Received data copied instead of referenced.
     copy: bool,
-    next_buffer: u64,
 }
 
 fn config(policy: &Scheduler) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 8;
+    c.session_policy.limits.steady_attachments = 8;
     c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     c.scheduler = policy.clone();
     c.max_idle_timeout = Some(Duration::from_secs(600));
@@ -169,8 +167,7 @@ impl Net {
             b_attached,
             reader: RecordReader::new(1 << 20),
             rev_reader: RecordReader::new(1 << 20),
-            rbuf: BytesMut::new(),
-            rid: 0,
+            rbuf: ChunkBuffer::default(),
         };
         let mut n = Self {
             a,
@@ -185,7 +182,6 @@ impl Net {
             chunk: vec![0x5a; 64 * 1024],
             cost: Cost::default(),
             copy: std::env::var("MPSCHED_RECV").is_ok_and(|v| v == "copy"),
-            next_buffer: 1,
         };
         n.run(200);
         assert!(n.a.is_multipath(), "multipath negotiated");
@@ -322,23 +318,19 @@ impl Net {
                 // fresh one when it has no room; an incomplete record stays
                 // for the next read.
                 for part in bytes.chunks(64 * 1024) {
-                    if p.rbuf.capacity() - p.rbuf.len() < part.len() {
-                        let mut fresh = BytesMut::with_capacity(READ_BUFFER);
-                        fresh.extend_from_slice(&p.rbuf);
+                    if p.rbuf.remaining_capacity() < part.len() {
+                        let mut fresh = ChunkBuffer::with_capacity(READ_BUFFER);
+                        fresh.extend_from_slice(p.rbuf.as_ref());
                         p.rbuf = fresh;
-                        p.rid = self.next_buffer;
-                        self.next_buffer += 1;
                     }
                     p.rbuf.extend_from_slice(part);
-                    let data = p.rbuf.split().freeze();
-                    let backing = Backing {
-                        id: p.rid,
-                        size: READ_BUFFER,
-                    };
-                    let used = self
-                        .b
-                        .receive_shared(PipeId::new(p.id), &data, backing, now);
-                    p.rbuf.extend_from_slice(&data[used..]);
+                    let data = p.rbuf.publish();
+                    let used = self.b.receive_shared(PipeId::new(p.id), &data, now);
+                    let remaining = &data[used..];
+                    if p.rbuf.remaining_capacity() < remaining.len() {
+                        p.rbuf = ChunkBuffer::with_capacity(READ_BUFFER);
+                    }
+                    p.rbuf.extend_from_slice(remaining);
                 }
             }
             self.cost.recv += cpu().checked_sub(t).unwrap();

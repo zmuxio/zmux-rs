@@ -357,15 +357,14 @@ fn transport() -> Arc<quinn::TransportConfig> {
 }
 
 fn options() -> Options {
-    let mut o = Options::default();
     // As the simulated rows (16 lanes).
-    o.windows.lanes = 16;
-    o
+    let windows = zmux_quinn::LaneWindows::new().with_lanes(16);
+    Options::new().with_windows(windows.with_established_receive_window(windows.receive_window()))
 }
 
 fn mp_config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"quicnet-bench-psk-0123456789abcd").with_end_to_end();
     c.scheduler = Scheduler::SpreadEta;
     c
@@ -489,7 +488,7 @@ async fn flows(s: Session, t0: Instant, end: f64, load: f64, seed: u64) {
             };
             let mut data = header(FLOW, t0);
             data.resize(size, 0x46);
-            let _ = stream.write_chunk(Bytes::from(data)).await;
+            let _ = stream.write_chunk(zmux::Chunk::from(data)).await;
             let _ = stream.finish();
         });
         next += -rng.unit().max(1e-12).ln() / rate;
@@ -498,7 +497,7 @@ async fn flows(s: Session, t0: Instant, end: f64, load: f64, seed: u64) {
 
 /// `n` bulk streams writing until `end`.
 async fn bulk(s: Session, t0: Instant, end: f64, n: usize) {
-    let chunk = Bytes::from(vec![0x42u8; 64 * 1024]);
+    let chunk = zmux::Chunk::from(vec![0x42u8; 64 * 1024]);
     let mut tasks = Vec::new();
     for _ in 0..n {
         let (s, chunk) = (s.clone(), chunk.clone());
@@ -582,8 +581,8 @@ async fn quic_pair(loss: f64, lanes: bool, seed: u64) -> (Session, Session, Quic
         sc.set_send_window(w);
     }
     *CLIENT_CONN.lock().unwrap() = Some(cc.clone());
-    let client = Carrier::new(cc, options());
-    let server = Carrier::new(sc, options());
+    let client = Carrier::new(cc, &options()).unwrap();
+    let server = Carrier::new(sc, &options()).unwrap();
     let accept = tokio::spawn(async move {
         let io = server.accept_pipe().await.unwrap().with_lanes(lanes);
         Session::accept(io, mp_config()).await.unwrap()
@@ -761,10 +760,10 @@ async fn run_failover(loss: f64, seed: u64, secs: f64) {
     )
     .await;
     let (cc, sc) = quic.connect(relay).await;
-    let _server_quic = Carrier::with_listener(sc, &listener, options());
-    let client_quic = Carrier::new(cc, options());
+    let _server_quic = Carrier::with_listener(sc, &listener, &options()).unwrap();
+    let client_quic = Carrier::new(cc, &options()).unwrap();
     let pipe = client
-        .begin_add_pipe(
+        .test_begin_join(
             client_quic.open_pipe().await.unwrap(),
             PipeOptions::default().with_record_mode(zmux::RecordMode::Bound),
         )

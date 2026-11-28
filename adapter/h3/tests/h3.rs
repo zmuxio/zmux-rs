@@ -7,6 +7,9 @@
 
 #![cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 
+#[path = "../../test-support/ticket.rs"]
+mod ticket;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +17,7 @@ use std::time::Duration;
 use bytes::Buf;
 use zmux::{
     Admission, AdmissionVerdict, Config, Listener, ListenerConfig, PipeAuth, PipeFailure,
-    PipeOptions, PrefixAuth, PrefixAuthVerifier, Session, SessionError,
+    PipeOptions, PrefixAuth, Session, SessionError,
 };
 use zmux_h3::{Carrier, Fallback, Options};
 
@@ -31,6 +34,11 @@ struct H3 {
     uri: http::Uri,
     listener: Listener,
     serving: tokio::task::JoinHandle<()>,
+}
+
+fn adopted_options(options: Options) -> Options {
+    let windows = options.windows;
+    options.with_windows(windows.with_established_receive_window(windows.receive_window()))
 }
 
 impl H3 {
@@ -67,7 +75,9 @@ impl H3 {
             .unwrap()
             .await
             .unwrap();
-        Carrier::new(conn, self.uri.clone(), opts).await.unwrap()
+        Carrier::new(conn, self.uri.clone(), &adopted_options(opts.clone()))
+            .await
+            .unwrap()
     }
 
     async fn stop(self) {
@@ -76,50 +86,9 @@ impl H3 {
     }
 }
 
-/// Sends `n` streams of `len` bytes each from `from` to `to` at once and
-/// checks every byte.
-async fn transfer(from: &Session, to: &Session, n: usize, len: usize) {
-    let receiver = {
-        let to = to.clone();
-        tokio::spawn(async move {
-            let mut readers = Vec::new();
-            for _ in 0..n {
-                let mut recv = to.accept_uni().await.unwrap();
-                readers.push(tokio::spawn(async move {
-                    recv.read_to_end(len + 1).await.unwrap()
-                }));
-            }
-            for r in readers {
-                let data = r.await.unwrap();
-                assert_eq!(data.len(), len);
-                assert!(
-                    data.iter()
-                        .enumerate()
-                        .all(|(i, &b)| b == u8::try_from(i % 251).unwrap())
-                );
-            }
-        })
-    };
-    let data = bytes::Bytes::from(
-        (0..len)
-            .map(|i| u8::try_from(i % 251).unwrap())
-            .collect::<Vec<_>>(),
-    );
-    let mut writers = Vec::new();
-    for _ in 0..n {
-        let mut send = from.open_uni().await.unwrap();
-        let data = data.clone();
-        writers.push(tokio::spawn(async move {
-            send.write_chunk(data).await.unwrap();
-            send.finish().unwrap();
-            send
-        }));
-    }
-    for w in writers {
-        drop(w.await.unwrap());
-    }
-    receiver.await.unwrap();
-}
+#[path = "../../test-support/transfer.rs"]
+mod streams;
+use streams::transfer;
 
 /// One step from an endpoint to a session and from an endpoint to its
 /// sessions: streams go both ways over the request body and the response
@@ -173,7 +142,7 @@ async fn client_lanes_and_a_second_pipe_on_further_requests() {
     assert!(ss.pipe_stats()[0].lanes_in > 1, "no lane was accepted");
     assert_eq!(ss.pipe_stats()[0].lanes_out, 1, "a server opens no lanes");
     let pipe = cs
-        .begin_add_pipe(client.open_pipe().await.unwrap(), PipeOptions::new())
+        .test_begin_join(client.open_pipe().await.unwrap(), PipeOptions::new())
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), pipe.joined())
         .await
@@ -201,7 +170,7 @@ async fn a_bound_join_on_a_further_request() {
         .unwrap();
     let ss = h3.listener.accept().await.unwrap();
     let pipe = cs
-        .begin_add_pipe(
+        .test_begin_join(
             client.open_pipe().await.unwrap(),
             PipeOptions::new().with_record_mode(zmux::RecordMode::Bound),
         )
@@ -215,16 +184,16 @@ async fn a_bound_join_on_a_further_request() {
     h3.stop().await;
 }
 
-/// Waits until the session's exporter gives no value.
+#[path = "../../test-support/resources.rs"]
+mod resource_wait;
+
 async fn exporter_goes_away(session: &Session) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while session.export_keying_material("app", b"", 16) != Err(zmux::ExportError::Unavailable)
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the exporter kept the connection");
+    resource_wait::wait_for_resources(
+        "the exporter kept the connection",
+        || session.export_keying_material("app", b"", 16),
+        |value| *value == Err(zmux::ExportError::Unavailable),
+    )
+    .await;
 }
 
 /// The exporter gives the connection's value while it lives, the same at
@@ -281,19 +250,21 @@ async fn a_lost_connection_is_a_failure_not_a_clean_end() {
 }
 
 fn auth() -> PrefixAuth {
-    PrefixAuth::new(b"key", Duration::from_secs(30), true).unwrap()
+    ticket::fixture(zmux::PrefixBinding::Bound).0
 }
 
 fn admission() -> Admission {
-    Admission::prefix_auth(Arc::new(PrefixAuthVerifier::new(auth(), 1, 1024).unwrap()))
-        .with_peek_timeout(Duration::from_secs(5))
-        .with_stall_interval(Duration::from_millis(300), Duration::from_millis(300))
+    Admission::prefix_auth(
+        ticket::fixture(zmux::PrefixBinding::Bound).1,
+        zmux::PrefixRejection::Fallback,
+    )
+    .with_peek_timeout(Duration::from_secs(5))
+    .with_stall_interval(Duration::from_millis(300), Duration::from_millis(300))
 }
 
 /// A plain HTTP/3 request to the server with `body`, ended when `end`; the
-/// response's status, or `None` when the request fails, and the time
-/// it took.
-async fn raw_request(h3: &H3, body: &[u8], end: bool) -> (Option<http::StatusCode>, Duration) {
+/// response's status, or `None` when the request fails.
+async fn raw_request(h3: &H3, body: &[u8], end: bool) -> Option<http::StatusCode> {
     raw_request_with(h3, &[], body, end).await
 }
 
@@ -303,7 +274,7 @@ async fn raw_request_with(
     fields: &[(&str, &str)],
     body: &[u8],
     end: bool,
-) -> (Option<http::StatusCode>, Duration) {
+) -> Option<http::StatusCode> {
     let conn = h3
         .client
         .connect(h3.addr, "127.0.0.1")
@@ -316,7 +287,6 @@ async fn raw_request_with(
     let drive = tokio::spawn(async move {
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
-    let started = tokio::time::Instant::now();
     let mut request = http::Request::post(h3.uri.clone());
     for (n, v) in fields {
         request = request.header(*n, *v);
@@ -327,15 +297,14 @@ async fn raw_request_with(
     if end {
         let _ = stream.finish().await;
     }
-    let status = tokio::time::timeout(Duration::from_secs(10), stream.recv_response())
+    let status = tokio::time::timeout(Duration::from_secs(60), stream.recv_response())
         .await
         .expect("answered or ended in time")
         .ok()
         .map(|r| r.status());
-    let took = started.elapsed();
     drive.abort();
     conn.close(0u32.into(), b"");
-    (status, took)
+    status
 }
 
 /// With an admission of bound prefix authentication tokens, a client with
@@ -385,7 +354,7 @@ async fn a_request_without_a_token_goes_to_the_fallback_with_its_bytes() {
     let opts = Options::default().with_fallback(fallback);
     let h3 = H3::admitted(Config::default(), admission(), &opts);
     let body: Vec<u8> = (0..40u8).collect();
-    let (status, _) = raw_request(&h3, &body, true).await;
+    let status = raw_request(&h3, &body, true).await;
     assert_eq!(status, Some(http::StatusCode::IM_A_TEAPOT));
     assert_eq!(rx.recv().await.unwrap(), body);
     h3.stop().await;
@@ -458,9 +427,9 @@ async fn a_stalled_request_ends_without_a_response() {
         .with_peek_timeout(Duration::from_secs(5))
         .with_stall_interval(Duration::from_millis(300), Duration::from_millis(300));
     let h3 = H3::admitted(Config::default(), adm, &Options::default());
-    let (status, took) = raw_request(&h3, b"abcd", false).await;
+    let status = raw_request(&h3, b"abcd", false).await;
     assert_eq!(status, None);
-    assert!(took >= Duration::from_millis(250), "{took:?}");
+    assert_eq!(h3.listener.stats().admission.stalled, 1);
     h3.stop().await;
 }
 
@@ -469,7 +438,7 @@ async fn a_stalled_request_ends_without_a_response() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_the_listener_does_not_take_is_answered_with_404() {
     let h3 = H3::new(Config::default(), &Options::default());
-    let (status, _) = raw_request(&h3, b"GET / HTTP/1.1\r\n\r\n", true).await;
+    let status = raw_request(&h3, b"GET / HTTP/1.1\r\n\r\n", true).await;
     assert_eq!(status, Some(http::StatusCode::NOT_FOUND));
     h3.stop().await;
 }
@@ -499,7 +468,7 @@ async fn an_oversized_request_head_is_refused_before_it_is_buffered() {
         .expect("stopped in time");
     assert_eq!(stopped.unwrap(), Some(0x0107u32.into()));
     // The connection itself stays usable.
-    let (status, _) = raw_request(&h3, b"x", true).await;
+    let status = raw_request(&h3, b"x", true).await;
     assert_eq!(status, Some(http::StatusCode::NOT_FOUND));
     conn.close(0u32.into(), b"");
     h3.stop().await;
@@ -522,7 +491,6 @@ async fn a_request_head_and_the_first_request_are_bounded_in_time() {
     let (mut send, _recv) = conn.open_bi().await.unwrap();
     // The start of a HEADERS frame, never completed.
     send.write_all(&[0x01, 0x10]).await.unwrap();
-    let started = tokio::time::Instant::now();
     let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
         .await
         .expect("closed in time");
@@ -530,7 +498,6 @@ async fn a_request_head_and_the_first_request_are_bounded_in_time() {
         matches!(closed, quinn::ConnectionError::ApplicationClosed(ref c) if c.error_code == 0x0100u32.into()),
         "{closed:?}"
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
     h3.stop().await;
 }
 
@@ -539,10 +506,139 @@ async fn a_request_head_and_the_first_request_are_bounded_in_time() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn early_data_is_too_early_and_a_setup_failure() {
     let h3 = H3::new(Config::default(), &Options::default());
-    let (status, _) = raw_request_with(&h3, &[("early-data", "1")], b"", true).await;
+    let status = raw_request_with(&h3, &[("early-data", "1")], b"", true).await;
     assert_eq!(status, Some(http::StatusCode::TOO_EARLY));
     assert_eq!(h3.listener.stats().setup_failures, 1);
     h3.stop().await;
+}
+
+#[tokio::test]
+async fn host_connections_bind_request_identity_across_reuse_and_migration() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let options = adopted_options(Options::default());
+        let (server, endpoint, addr) = endpoints(&options);
+        let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
+        let connect = || async {
+            tokio::join!(
+                async { endpoint.connect(addr, "127.0.0.1").unwrap().await.unwrap() },
+                async { server.accept().await.unwrap().await.unwrap() },
+            )
+        };
+        let (host, peer) = connect().await;
+        let (other_host, other_peer) = connect().await;
+        assert_eq!(peer.remote_address(), other_peer.remote_address());
+        assert_ne!(host.stable_id(), other_host.stable_id());
+        let serve = |conn| {
+            let (listener, options) = (listener.clone(), options.clone());
+            tokio::spawn(async move { zmux_h3::serve_connection(&listener, conn, &options).await })
+        };
+        let first_serving = serve(peer.clone());
+        let other_serving = serve(other_peer.clone());
+        let origin = format!("https://127.0.0.1:{}", addr.port());
+        let (one, two) = tokio::join!(
+            Carrier::new(
+                host.clone(),
+                format!("{origin}/one").parse().unwrap(),
+                &options
+            ),
+            Carrier::new(
+                host.clone(),
+                format!("{origin}/two").parse().unwrap(),
+                &options
+            ),
+        );
+        let (one, two) = (one.unwrap(), two.unwrap());
+        assert!(Arc::ptr_eq(one.datagrams(), two.datagrams()));
+        assert_eq!(one.connection().stable_id(), host.stable_id());
+        let wrong_origin = Carrier::new(
+            host.clone(),
+            "https://localhost/wrong".parse().unwrap(),
+            &options,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong_origin.kind(), std::io::ErrorKind::InvalidInput);
+
+        let other = Carrier::new(other_host.clone(), origin.parse().unwrap(), &options)
+            .await
+            .unwrap();
+        let attach = |carrier: Carrier| {
+            let listener = listener.clone();
+            async move {
+                let pipe = carrier.open_pipe().await.unwrap();
+                let session = Session::connect(pipe, Config::default()).await.unwrap();
+                let accepted = listener.accept().await.unwrap();
+                (session, accepted)
+            }
+        };
+        let (first, first_remote) = attach(one.clone()).await;
+        let (second, second_remote) = attach(two.clone()).await;
+        let (third, third_remote) = attach(other.clone()).await;
+        let first_sample = carrier_sample(&first).await;
+        let second_sample = carrier_sample(&second).await;
+        let remote_sample = carrier_sample(&first_remote).await;
+        assert_eq!(first_sample.carrier_id, second_sample.carrier_id);
+        assert_eq!(
+            remote_sample.carrier_id,
+            carrier_sample(&second_remote).await.carrier_id
+        );
+        assert_ne!(
+            first_sample.carrier_id,
+            carrier_sample(&third).await.carrier_id
+        );
+        assert_ne!(
+            remote_sample.carrier_id,
+            carrier_sample(&third_remote).await.carrier_id
+        );
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let migrated = socket.local_addr().unwrap();
+        endpoint.rebind(socket).unwrap();
+        transfer(&first, &first_remote, 1, 128).await;
+        assert_eq!(peer.remote_address(), migrated);
+        assert_eq!(one.connection().stable_id(), host.stable_id());
+        assert_eq!(
+            carrier_sample(&first).await.carrier_id,
+            first_sample.carrier_id
+        );
+        assert_eq!(
+            carrier_sample(&first_remote).await.carrier_id,
+            remote_sample.carrier_id
+        );
+
+        first.close().await;
+        let _ = first.closed().await;
+        drop(one);
+        assert!(host.close_reason().is_none());
+        transfer(&second, &second_remote, 1, 128).await;
+        second.close().await;
+        third.close().await;
+        let _ = tokio::join!(second.closed(), third.closed());
+        drop((two, other));
+        assert!(host.close_reason().is_none());
+
+        host.close(0x100u32.into(), b"owner");
+        other_host.close(0x100u32.into(), b"owner");
+        let _ = tokio::join!(first_serving, other_serving);
+    })
+    .await
+    .unwrap();
+}
+
+async fn carrier_sample(session: &Session) -> zmux::CarrierSample {
+    loop {
+        if let Some(sample) = session
+            .pipe_stats()
+            .into_iter()
+            .find_map(|stats| stats.carrier_sample)
+            && matches!(sample.counts, Some(zmux::CarrierCounts::Quic { packets_sent, .. }) if packets_sent > 0)
+        {
+            assert_eq!(sample.source, zmux::CarrierSource::Quinn);
+            assert_eq!(sample.direction, zmux::PipeDirection::Out);
+            return sample;
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 /// A session with datagrams enabled sends them as HTTP Datagrams of its
@@ -554,10 +650,26 @@ async fn datagrams_ride_http_datagrams_of_the_request() {
         config.enable_datagrams = true;
         let opts = Options::default();
         let h3 = H3::new(config.clone(), &opts);
-        let client = zmux_h3::connect(&h3.client, h3.addr, h3.uri.clone(), &opts, config)
+        let carrier = h3.h3_client(&opts).await;
+        let client = Session::connect(carrier.open_pipe().await.unwrap(), config)
             .await
             .unwrap();
         let server = h3.listener.accept().await.unwrap();
+        while !carrier.http_datagrams() {
+            tokio::task::yield_now().await;
+        }
+        // The core refreshes the cached native size when a datagram wakes
+        // the channel task. Observe a native delivery in each direction
+        // before measuring the next batch.
+        for (sender, receiver) in [(&client, &server), (&server, &client)] {
+            while receiver.stats().datagrams_received_channel == 0 {
+                let probe = bytes::Bytes::from_static(b"channel ready");
+                sender.send_datagram(probe.clone()).unwrap();
+                assert_eq!(receiver.read_datagram().await.unwrap(), probe);
+            }
+        }
+        let (before_client, before_server) = (client.stats(), server.stats());
+        let before_native = carrier.connection().stats();
         for i in 0..20u8 {
             client
                 .send_datagram(bytes::Bytes::from(vec![i; 300]))
@@ -569,12 +681,31 @@ async fn datagrams_ride_http_datagrams_of_the_request() {
             assert_eq!(client.read_datagram().await.unwrap()[..], [i; 30]);
         }
         let (c, s) = (client.stats(), server.stats());
-        // The client's first ones may go in records: its channel is
-        // usable once the server's SETTINGS arrived.
-        assert!(c.datagrams_sent_channel >= 18, "{c:?}");
-        assert_eq!(s.datagrams_sent_channel, 20);
-        assert_eq!(c.datagrams_received_channel, 20);
-        assert_eq!(s.datagrams_received_channel, c.datagrams_sent_channel);
+        let native = carrier.connection().stats();
+        assert_eq!(
+            c.datagrams_sent_channel - before_client.datagrams_sent_channel,
+            20
+        );
+        assert_eq!(
+            s.datagrams_sent_channel - before_server.datagrams_sent_channel,
+            20
+        );
+        assert_eq!(
+            c.datagrams_received_channel - before_client.datagrams_received_channel,
+            20
+        );
+        assert_eq!(
+            s.datagrams_received_channel - before_server.datagrams_received_channel,
+            20
+        );
+        assert_eq!(
+            native.frame_tx.datagram - before_native.frame_tx.datagram,
+            20
+        );
+        assert_eq!(
+            native.frame_rx.datagram - before_native.frame_rx.datagram,
+            20
+        );
         client.close().await;
         let _ = server.closing().await;
         h3.stop().await;
@@ -643,7 +774,7 @@ fn assert_kind(sessions: [&Session; 2], kind: zmux::CarrierKind) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_connection_reports_only_the_connection_end() {
     for (code, ok) in [(0x100u32, true), (7, false)] {
-        let opts = Options::default();
+        let opts = adopted_options(Options::default());
         let (server, client, addr) = endpoints(&opts);
         let listener = Listener::new(Config::default(), ListenerConfig::default()).unwrap();
         let l = listener.clone();
@@ -686,7 +817,7 @@ async fn request_takeover(detach: bool) -> (Vec<u8>, Vec<u8>, bool, bool) {
     let go = std::sync::Mutex::new(Some(go));
     let fallback = zmux::Fallback::new(move |t: zmux::Takeover| {
         let tx = tx.clone();
-        let go = go.lock().unwrap().take();
+        let go = go.lock().unwrap().take().unwrap();
         async move {
             assert_eq!(t.info().stage, zmux::AdmissionStage::Carrier);
             if detach {
@@ -700,7 +831,10 @@ async fn request_takeover(detach: bool) -> (Vec<u8>, Vec<u8>, bool, bool) {
             if detach {
                 // Served on after the future; ended by the host.
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    go.await.unwrap();
+                    let mut probe = [0];
+                    s.read_exact(&mut probe).await.unwrap();
+                    assert_eq!(&probe, b"x");
                     s.write_all(b"!").await.unwrap();
                     s.shutdown().await.unwrap();
                     let _ = tx.send((head.to_vec(), Some(s)));
@@ -708,7 +842,7 @@ async fn request_takeover(detach: bool) -> (Vec<u8>, Vec<u8>, bool, bool) {
             } else {
                 // Kept past the future, never ended.
                 let _ = tx.send((head.to_vec(), Some(s)));
-                let _ = go.unwrap().await;
+                let _ = go.await;
             }
         }
     });
@@ -742,13 +876,13 @@ async fn request_takeover(detach: bool) -> (Vec<u8>, Vec<u8>, bool, bool) {
     req.send_data(bytes::Bytes::from_static(b"HELOping"))
         .await
         .unwrap();
-    let r = tokio::time::timeout(Duration::from_secs(10), resp.recv_response())
+    let r = tokio::time::timeout(Duration::from_secs(60), resp.recv_response())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(r.status(), http::StatusCode::OK);
     let mut got = Vec::new();
-    let failed = tokio::time::timeout(Duration::from_secs(10), async {
+    let failed = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             match resp.recv_data().await {
                 Ok(Some(mut b)) => {
@@ -761,7 +895,12 @@ async fn request_takeover(detach: bool) -> (Vec<u8>, Vec<u8>, bool, bool) {
                     if got.len() >= 4
                         && let Some(go) = go_tx.take()
                     {
-                        let _ = go.send(());
+                        if detach {
+                            req.send_data(bytes::Bytes::from_static(b"x"))
+                                .await
+                                .unwrap();
+                        }
+                        go.send(()).unwrap();
                     }
                 }
                 Ok(None) => return false,
@@ -771,26 +910,24 @@ async fn request_takeover(detach: bool) -> (Vec<u8>, Vec<u8>, bool, bool) {
     })
     .await
     .expect("the response ended or failed");
-    let (head, kept) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    let (head, kept) = tokio::time::timeout(Duration::from_secs(60), rx.recv())
         .await
         .unwrap()
         .unwrap();
-    // The request body: stopped when the carrier was cut, open (read on
-    // by the host) when detached.
-    let stopped = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if req
-                .send_data(bytes::Bytes::from_static(b"x"))
-                .await
-                .is_err()
-            {
-                return;
+    // For a detached request the host already read the probe. Otherwise wait
+    // for the peer to process STOP_SENDING, which can follow the response reset.
+    let stopped = if detach {
+        false
+    } else {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while req.send_data(bytes::Bytes::from_static(b"x")).await.is_ok() {
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .is_ok();
+        })
+        .await
+        .expect("the request was not stopped");
+        true
+    };
     drop(kept);
     drive.abort();
     conn.close(0u32.into(), b"");

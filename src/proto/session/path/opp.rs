@@ -1,27 +1,17 @@
-//! Opportunistic reinjection: when flow control holds new data back and the
-//! data that blocks it sits on a slower pipe for longer than expected, one
-//! copy of it goes on the pipe with the earliest arrival, and the slow pipe
-//! is penalized.
+//! Repairs a blocked STREAM prefix through the existing opportunistic
+//! reinjection scheduler and reliable send ranges.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::proto::session::ledger::{Blocking, Held};
 use crate::proto::session::mpath::Mp;
 use crate::proto::session::output::Records;
-use crate::proto::session::pipes::{OutPipe, SentFrame};
+use crate::proto::session::pipes::{OutPipe, OutState};
 use crate::proto::session::stream::{Carry, SendPart};
 use crate::proto::session::tier::Gate;
 use crate::proto::session::{SessionCore, StreamKey};
-
-/// What holds new stream data back (the trigger of opportunistic
-/// reinjection).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Trigger {
-    /// Session flow control.
-    Session,
-    /// Stream flow control of at least one stream direction.
-    Streams,
-}
 
 /// The stream directions held back by stream credit, for opportunistic
 /// reinjection, and the next place in that list.
@@ -29,9 +19,50 @@ enum Trigger {
 pub(crate) struct CreditBlocked {
     list: Vec<StreamKey>,
     seq: u64,
+    // poll_timeout and wants_write both observe the same range and may
+    // tighten its deadline. Only the session owner accesses this index.
+    work: RefCell<BTreeMap<StreamKey, PrefixWork>>,
+    copies: BTreeMap<StreamKey, Vec<RepairCopy>>,
+}
+
+#[derive(Debug, Default)]
+struct PrefixWork {
+    opening: bool,
+    cap: Option<(Blocking, Instant)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RepairCopy {
+    pub(super) target: u64,
+    pub(super) start: u64,
+    pub(super) end: u64,
+}
+
+struct Opportunity {
+    range: Blocking,
+    penalize: bool,
+}
+
+#[derive(Default)]
+struct RepairPlan {
+    due: Option<Opportunity>,
+    next: Option<Instant>,
 }
 
 impl CreditBlocked {
+    pub(super) fn note_opening(&mut self, key: StreamKey) {
+        self.work.get_mut().entry(key).or_default().opening = true;
+    }
+
+    pub(super) fn forget(&mut self, key: StreamKey) {
+        self.work.get_mut().remove(&key);
+        self.copies.remove(&key);
+    }
+
+    pub(super) fn copies(&self, key: StreamKey) -> &[RepairCopy] {
+        self.copies.get(&key).map_or(&[], Vec::as_slice)
+    }
+
     /// The directions listed; a stream gone since stays until the next
     /// prune (`prune_credit_blocked`, every batch of new data), and readers
     /// skip it.
@@ -41,25 +72,9 @@ impl CreditBlocked {
 }
 
 impl SessionCore {
-    /// The trigger that holds now, if any.
-    fn opp_trigger(&self) -> Option<Trigger> {
-        self.mp.as_deref()?;
-        if self.streams.send_flow().used >= self.streams.send_flow().max
+    fn connection_credit_blocked(&self) -> bool {
+        self.streams.send_flow().used >= self.streams.send_flow().max
             && !self.streams.queue().is_empty()
-        {
-            return Some(Trigger::Session);
-        }
-        self.ledger()?.credit_blocked().then_some(Trigger::Streams)
-    }
-
-    /// The blocking data: for session flow control the unacknowledged
-    /// stream data sent first, for stream flow control the blocking data
-    /// sent first of the directions it holds back (kept by the ledger).
-    fn opp_blocking(&self) -> Option<Blocking> {
-        match self.opp_trigger()? {
-            Trigger::Session => self.session_blocking(),
-            Trigger::Streams => self.ledger()?.blocking(),
-        }
     }
 
     /// What a direction listed as held back by stream credit contributes
@@ -74,83 +89,39 @@ impl SessionCore {
         let blocked = send.held_back();
         Some(Held {
             seq,
-            blocked,
             blocking: blocked.then(|| self.stream_blocking(key, send)).flatten(),
         })
     }
 
-    /// The first part of a direction's data not yet acknowledged, not re-sent
-    /// opportunistically and not waiting for reinjection, with the frame
-    /// that last carried it (the first of those sent at that time, by pipe
-    /// and position).
+    /// The lowest unacknowledged range of the first transmission.
+    /// A partial repair continues in that same frame, while an already
+    /// copied frame awaits ACK or ordinary reinjection.
     fn stream_blocking(&self, key: StreamKey, send: &SendPart) -> Option<Blocking> {
-        let x = send.first_unacked(send.mp().opportunistic_to);
-        if x >= send.offset || send.mp().lost.contains(x, x + 1) {
+        let lowest = send.first_unacked(0);
+        if lowest >= send.offset || send.mp().lost.contains(lowest, lowest + 1) {
             return None;
         }
-        let mut best: Option<(Blocking, u64)> = None;
-        for c in send.mp().carriers(x) {
-            // Frames of the live pipes' logs.
-            let Some(o) = self
-                .out_ref(c.pipe)
-                .filter(|o| o.is_live() && !o.covered_at(c.pos))
-            else {
-                continue;
-            };
-            if let Some(b) = Self::blocking_at(o, c, key, send, x)
-                && best.is_none_or(|(d, pos)| {
-                    b.sent > d.sent || (b.sent == d.sent && (b.pipe, c.pos) < (d.pipe, pos))
-                })
-            {
-                best = Some((b, c.pos));
-            }
+        let c = send.mp().carriers(lowest).next()?;
+        let o = self.out_ref(c.pipe)?;
+        if o.state() != OutState::Active || !o.confirmed() || o.covered_at(c.pos) {
+            return None;
         }
-        best.map(|(b, _)| b)
-    }
-
-    /// The unacknowledged stream data sent first, over every pipe.
-    fn session_blocking(&self) -> Option<Blocking> {
-        let mut best: Option<Blocking> = None;
-        for a in &self.atts {
-            let Some(o) = a.out().filter(|o| o.is_live()) else {
-                continue;
-            };
-            // Each lane's frames in the order sent: its first one that
-            // blocks is its oldest.
-            for lane in o.retained() {
-                for (pos, f) in lane {
-                    let SentFrame::Stream { key, off, len, .. } = f else {
-                        continue;
-                    };
-                    let Some(send) = self.streams.send(key) else {
-                        continue;
-                    };
-                    let x = send.first_unacked(off.max(send.mp().opportunistic_to));
-                    if x >= off + len || x >= send.offset || send.mp().lost.contains(x, x + 1) {
-                        continue;
-                    }
-                    let c = Carry {
-                        off,
-                        end: off + len,
-                        pipe: a.id(),
-                        pos,
-                    };
-                    if let Some(b) = Self::blocking_at(o, c, key, send, x)
-                        && best.is_none_or(|c| b.sent < c.sent)
-                    {
-                        best = Some(b);
-                    }
-                    // The lane's later frames were sent later.
-                    break;
-                }
-            }
+        let mut b = self.blocking_at(o, c, key, send, lowest)?;
+        let start = b.start.max(send.mp().opportunistic_to);
+        // A proactive copy may already own the range in the shared budget.
+        let (first, end) = send.mp().copied.gaps(start.min(b.end), b.end).next()?;
+        if first != start || (start < send.base && end < send.base.min(b.end)) {
+            return None;
         }
-        best
+        b.start = start;
+        b.end = end;
+        Some(b)
     }
 
     /// Describes the part from `x` to the end of the frame `c` of pipe
     /// `o`.
     fn blocking_at(
+        &self,
         o: &OutPipe,
         c: Carry,
         key: StreamKey,
@@ -173,7 +144,10 @@ impl SessionCore {
             .find(|&(s, _)| s > x)
             .map_or(frame_end, |(s, _)| s.min(frame_end))
             .min(send.offset)
-            .min(reliable);
+            .min(reliable)
+            .min(x.saturating_add(
+                (self.config.spread_chunk as u64).max(send.base.saturating_sub(x)),
+            ));
         if end <= x {
             return None;
         }
@@ -183,78 +157,166 @@ impl SessionCore {
             end,
             pipe,
             sent: batch.time,
-            expect: batch.expect,
+            source_wait: batch
+                .confirmation?
+                .after(end - if x < send.base { 0 } else { x }),
+            original: (c.pos, c.off),
         })
     }
 
-    /// The pipe a copy of `len` bytes would reach first under `gate` (the
-    /// gate now): the usable pipe with the smallest ETA that takes new
-    /// data (not penalized).
-    fn opp_target(&self, gate: Option<Gate>, len: u64) -> Option<u64> {
-        self.fastest_eligible(&gate?, len)
-    }
-
-    /// When the copy of `b` becomes allowed: max(2 x `srtt_f` + peer max ACK
-    /// delay, `min(PTO_p`, 2E)) after its last send.
-    fn opp_due_at(&self, b: &Blocking, f: u64) -> Option<Instant> {
-        let fo = self.out_ref(f)?;
-        Some(
-            self.opp_earliest(b)?
-                .max(b.sent + fo.est().srtt * 2 + self.mp().peer_mad()),
-        )
-    }
-
-    /// The earliest a copy of `b` can become allowed on any pipe:
-    /// max(peer max ACK delay, `min(PTO_p`, 2E)) after its last send, which
-    /// the threshold of [`Self::opp_due_at`] never undercuts.
-    fn opp_earliest(&self, b: &Blocking) -> Option<Instant> {
+    // Choose the minimum ETA over destinations that can admit this exact
+    // range. The ACK detector independently chooses by PTO plus queue.
+    fn opp_target(&self, b: &Blocking, gate: Gate, now: Instant) -> Option<(u64, Duration)> {
+        let source = self.att(b.pipe)?;
+        let out = source.out()?;
+        let inbound_live = self.atts.any_in_live();
+        if self
+            .suspect_deadline(b.pipe, out, inbound_live, now)
+            .is_some_and(|(due, _)| due <= now)
+        {
+            return None;
+        }
+        let len = b.end - b.start;
+        let source_arrival = self.eta(source, out, len) + (out.est().srtt / 2).as_secs_f64();
         let mad = self.mp().peer_mad();
-        let p = self.out_ref(b.pipe)?;
-        Some(b.sent + mad.max(p.est().pto(mad).min(b.expect.saturating_mul(2))))
+        self.atts
+            .iter()
+            .filter(|a| a.id() != b.pipe && gate.admits(a))
+            .filter_map(|a| {
+                let o = a.out()?;
+                let (proof, _) = self.delivery_reference(a, inbound_live, now)?;
+                if proof <= b.sent
+                    || !o.open()
+                    || !o.write_idle()
+                    || o.limiter_held()
+                    || self.reinject_room(a.id()) < len
+                    || self.shape_held(a.id())
+                    || self.shape_delayed(a.id())
+                    || self
+                        .suspect_deadline(a.id(), o, inbound_live, now)
+                        .is_some_and(|(due, _)| due <= now)
+                {
+                    return None;
+                }
+                let eta = self.eta(a, o, len);
+                let margin = Duration::from_millis(50).max(o.est().srtt / 2 + mad);
+                (eta + margin.as_secs_f64() < source_arrival).then_some((eta, a.id(), margin))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+            .and_then(|(eta, id, margin)| {
+                Some((
+                    id,
+                    Duration::try_from_secs_f64(eta)
+                        .ok()?
+                        .saturating_add(margin),
+                ))
+            })
     }
 
-    /// The blocking data to copy on pipe `id` now, if the conditions hold;
-    /// `gate` is the gate now, when the caller has it.
-    #[allow(
-        clippy::option_option,
-        reason = "outer None: the caller has no gate at hand; Some(None): the gate now is none"
-    )]
-    pub(in crate::proto::session) fn opp_due(
+    fn opening_unacked(send: &SendPart) -> bool {
+        let lowest = send.first_unacked(0);
+        send.mp()
+            .carried
+            .front()
+            .is_some_and(|head| head.off == 0 && lowest < head.end.min(send.owed_end()))
+    }
+
+    fn repair_plan(
         &self,
-        id: u64,
         now: Instant,
-        gate: Option<Option<Gate>>,
-    ) -> Option<Blocking> {
-        let b = self.opp_blocking()?;
-        // Not due on any pipe yet: the usual case, decided before the
-        // target (a gate and the ETA of every eligible pipe).
-        if now <= self.opp_earliest(&b)? {
-            return None;
+        gate: impl FnOnce() -> Option<Gate>,
+        writer: Option<u64>,
+    ) -> RepairPlan {
+        let mut result = RepairPlan::default();
+        let Some(mp) = self.mp.as_deref().filter(|_| self.atts.len() > 1) else {
+            return result;
+        };
+        let connection_blocked = self.connection_credit_blocked();
+        let mut work = mp.blocked().work.borrow_mut();
+        if work.is_empty() && !connection_blocked && mp.blocked().keys().is_empty() {
+            return result;
         }
-        let chunk = (b.end - b.start).min(self.config.spread_chunk as u64);
-        let f = self.opp_target(gate.unwrap_or_else(|| self.gate()), chunk)?;
-        if f != id || b.pipe == f {
-            return None;
+        let ledger = self.ledger();
+        if connection_blocked {
+            for key in self.streams.keys() {
+                if self
+                    .streams
+                    .send(key)
+                    .is_some_and(|send| send.first_unacked(0) < send.offset)
+                {
+                    work.entry(key).or_default();
+                }
+            }
+        } else if let Some(ledger) = ledger.as_ref() {
+            for b in ledger.blocking() {
+                work.entry(b.key).or_default();
+            }
         }
-        (now > self.opp_due_at(&b, f)?).then_some(b)
+        if work.is_empty() {
+            return result;
+        }
+        let budget = self
+            .copy_bound()
+            .saturating_sub(ledger.map_or(0, |l| l.copies()));
+        let gate = gate();
+        work.retain(|&key, item| {
+            let Some(send) = self.streams.send(key) else {
+                return false;
+            };
+            item.opening &= Self::opening_unacked(send);
+            let blocked_credit =
+                connection_blocked || (send.mp().listed.is_some() && send.held_back());
+            let Some(b) = self.stream_blocking(key, send) else {
+                item.cap = None;
+                return item.opening;
+            };
+            if !blocked_credit && !item.opening {
+                return item.cap.is_some();
+            }
+            let start = if b.start < send.base { 0 } else { b.start };
+            // Split writes share the cap of the original frame.
+            let prior = item
+                .cap
+                .filter(|(old, _)| old.pipe == b.pipe && old.original == b.original)
+                .map(|(_, due)| due);
+            let target = gate.and_then(|gate| self.opp_target(&Blocking { start, ..b }, gate, now));
+            let cap = target.and_then(|(_, after)| b.sent.checked_add(after.min(b.source_wait)));
+            let due = prior.into_iter().chain(cap).min();
+            item.cap = due.map(|t| (b, t));
+            if let Some(due) = due {
+                if due > now {
+                    result.next = Some(result.next.map_or(due, |t: Instant| t.min(due)));
+                } else if let Some((target, _)) = target
+                    && writer == Some(target)
+                    && b.end - start <= budget
+                    && result
+                        .due
+                        .as_ref()
+                        .is_none_or(|copy| (b.sent, b.key) < (copy.range.sent, copy.range.key))
+                {
+                    result.due = Some(Opportunity {
+                        range: Blocking { start, ..b },
+                        penalize: blocked_credit,
+                    });
+                }
+            }
+            true
+        });
+        result
     }
 
-    /// The time an opportunistic copy becomes allowed, while in the future.
+    pub(in crate::proto::session) fn opp_due(&self, writer: u64, now: Instant) -> bool {
+        self.repair_plan(now, || self.gate(), Some(writer))
+            .due
+            .is_some()
+    }
+
+    /// Only a future deadline wakes the timer. Past-due work waits for an
+    /// input that changes delivery proof or scheduler admission.
     pub(in crate::proto::session) fn opp_deadline(&self) -> Option<Instant> {
-        let b = self.opp_blocking()?;
-        let chunk = (b.end - b.start).min(self.config.spread_chunk as u64);
-        let f = self.opp_target(self.gate(), chunk)?;
-        if b.pipe == f {
-            return None;
-        }
-        // "More than" the threshold ago.
-        let t = self.opp_due_at(&b, f)? + Duration::from_micros(1);
-        (t > self.now).then_some(t)
+        self.repair_plan(self.now, || self.gate(), None).next
     }
 
-    /// Writes the opportunistic copies due on pipe `id`, one chunk at a
-    /// time while the conditions hold; `gate` is the gate now. `false`
-    /// when the batch filled up.
     pub(in crate::proto::session) fn write_opportunistic(
         &mut self,
         id: u64,
@@ -262,32 +324,96 @@ impl SessionCore {
         gate: Option<Gate>,
         w: &mut Records<'_>,
     ) -> bool {
-        let mut gate = Some(gate);
-        while let Some(b) = self.opp_due(id, now, gate) {
-            let end = b.end.min(b.start + self.config.spread_chunk as u64);
-            let (start, end) = match self.streams.send(b.key) {
-                // The frame at offset 0 carries the whole preamble.
-                Some(s) if b.start < s.base => (0, end.max(s.base)),
-                _ => (b.start, end),
-            };
-            let Ok((n, _)) = self.write_copy(b.key, start, end, false, w) else {
-                return false;
-            };
-            if n == 0 {
-                return true;
-            }
-            if let Some(send) = self.streams.send_mut(b.key) {
-                send.mp_mut().opportunistic_to = send.mp().opportunistic_to.max(start + n);
-            }
-            self.stats.bytes_opportunistic += n;
-            if let Some(o) = self.out_mut(id) {
-                o.opportunistic(n);
-            }
-            // The penalty changes the pipes the gate depends on.
+        if self.tx_lane != 0 {
+            return true;
+        }
+        let Some(copy) = self.repair_plan(now, || gate, Some(id)).due else {
+            return true;
+        };
+        let b = copy.range;
+        let Ok((n, _)) = self.write_copy(b.key, b.start, b.end, false, w) else {
+            return false;
+        };
+        if n == 0 {
+            return true;
+        }
+        let end = b.start + n;
+        if let Some(send) = self.streams.send_mut(b.key) {
+            send.mp_mut().opportunistic_to = end;
+            send.mp_mut().copy(b.start, end);
+        }
+        self.mp_mut()
+            .blocked_mut()
+            .copies
+            .entry(b.key)
+            .or_default()
+            .push(RepairCopy {
+                target: id,
+                start: b.start,
+                end,
+            });
+        self.mp_mut().counters.bytes_opportunistic += n;
+        if let Some(o) = self.out_mut(id) {
+            o.opportunistic(n);
+        }
+        if copy.penalize {
             self.penalize(b.pipe);
-            gate = None;
         }
         true
+    }
+
+    /// Acknowledgement on any transmission releases the corresponding
+    /// repair reservation through the stream's normal copy accounting.
+    pub(super) fn acknowledge_repair(&mut self, key: StreamKey) {
+        let send = self.streams.send(key);
+        if let Some(work) = self
+            .mp
+            .as_deref_mut()
+            .map(|mp| mp.blocked_mut().work.get_mut())
+            && let Some(item) = work.get_mut(&key)
+        {
+            item.opening &= send.is_some_and(Self::opening_unacked);
+            item.cap = item.cap.filter(|(b, _)| {
+                send.is_some_and(|send| send.first_unacked(b.start) < b.end.min(send.owed_end()))
+            });
+            if !item.opening && item.cap.is_none() {
+                work.remove(&key);
+            }
+        }
+        if let Some(copies) = self
+            .mp
+            .as_deref_mut()
+            .and_then(|mp| mp.blocked_mut().copies.get_mut(&key))
+        {
+            copies.retain(|c| {
+                self.streams
+                    .send(key)
+                    .is_some_and(|send| send.first_unacked(c.start) < c.end.min(send.owed_end()))
+            });
+            if copies.is_empty() {
+                self.mp_mut().blocked_mut().copies.remove(&key);
+            }
+        }
+    }
+
+    /// Release optional copy reservations on a departing writer. Its
+    /// retained frames are still handled by ordinary reinjection.
+    pub(super) fn release_repair_copies(&mut self, id: u64) {
+        let Some(mp) = self.mp.as_deref_mut() else {
+            return;
+        };
+        mp.blocked_mut().copies.retain(|&key, copies| {
+            copies.retain(|copy| {
+                if copy.target != id {
+                    return true;
+                }
+                if let Some(send) = self.streams.send_mut(key) {
+                    send.mp_mut().uncopy(copy.start, copy.end);
+                }
+                false
+            });
+            !copies.is_empty()
+        });
     }
 
     /// The opportunistic-reinjection penalty, once per episode: the
@@ -306,7 +432,7 @@ impl SessionCore {
         self.advance_pick_generation();
         self.check_standby_takeover();
         if first {
-            self.stats.penalties += 1;
+            self.mp_mut().counters.penalties += 1;
         }
         self.quality_sample(id, self.now);
     }

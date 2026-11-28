@@ -44,7 +44,11 @@ pub(in crate::proto::session) struct Class {
 impl Class {
     /// Whether the attachment's outbound pipe is usable in this class.
     pub(in crate::proto::session) fn usable(self, a: &Attachment) -> bool {
-        a.standby() == self.standby && a.out().is_some_and(|o| o.usable(self.probation_ok))
+        a.standby() == self.standby
+            && a.health().is_none_or(|health| {
+                !health.exclusion.send && (self.probation_ok || !health.outbound_held())
+            })
+            && a.out().is_some_and(|o| o.usable(self.probation_ok))
     }
 
     /// Failover: the usable pipes are standby ones.
@@ -358,6 +362,10 @@ impl SessionCore {
         if let Some(mp) = self.mp.as_deref_mut() {
             mp.tiers_mut().view_generation += 1;
         }
+        self.prune_datagram_replicas();
+        if self.datagrams_pending() {
+            self.channel_kick();
+        }
     }
 
     /// The pipe views, rebuilt when the generation moved on.
@@ -500,13 +508,14 @@ impl SessionCore {
         let marks = marks
             .filter(|_| session_room > 0)
             .map(|t| self.streams.send_flow().credit_at.map_or(t, |c| c.max(t)));
-        let oldest = match (marks, waits) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let datagrams = &self.dgram().send;
         Backlog {
-            bytes: fresh + l.lost(),
-            oldest,
+            bytes: (fresh + l.lost()).saturating_add(datagrams.bytes()),
+            oldest: marks
+                .into_iter()
+                .chain(waits)
+                .chain(datagrams.iter().map(|d| d.at))
+                .min(),
         }
     }
 
@@ -577,7 +586,11 @@ impl SessionCore {
     /// instead of a pass over the pipes. `inputs` must be
     /// [reset](GateInputs::reset) whenever anything else may have changed
     /// (the time, the carriers' queues, the rates).
-    pub(in crate::proto::session) fn gate_from(&self, inputs: &mut GateInputs) -> Option<Gate> {
+    pub(in crate::proto::session) fn gate_from(
+        &self,
+        inputs: &mut GateInputs,
+        backlog: Backlog,
+    ) -> Option<Gate> {
         let generation = self.mp().tiers().view_generation;
         if inputs.generation != Some(generation) {
             let views = self.views();
@@ -590,7 +603,7 @@ impl SessionCore {
         }
         let gate = match inputs.class {
             Some(class) => {
-                let mut c = self.cascade(self.waiting_data());
+                let mut c = self.cascade(backlog);
                 Gate::of(class, inputs.loads.iter().map(|t| c.next(t)))
             }
             None => None,
@@ -818,6 +831,78 @@ impl SessionCore {
         self.att_index(pipe.0).ok_or(PipeError::UnknownPipe)
     }
 
+    #[cfg(all(any(feature = "blocking", feature = "tokio"), not(loom)))]
+    pub(crate) fn set_local_path_preference(
+        &mut self,
+        pipe: PipeId,
+        send: crate::PathPreference,
+        receive: crate::PathPreference,
+    ) -> bool {
+        let Ok(i) = self.tier_att(pipe) else {
+            return false;
+        };
+        let a = self.atts.at(i);
+        let outbound = a.out().is_some();
+        let inbound = a.inp().is_some();
+        if outbound && effective(a) != (send.tier, send.standby, send.weight) {
+            self.change_tier(i, |tier| {
+                tier.set_send_priority(Some(send.tier));
+                tier.set_send_standby(Some(send.standby));
+                tier.set_weight(send.weight);
+            });
+        }
+        inbound
+            && self
+                .set_local_receive_preference(pipe, Some(receive))
+                .unwrap_or(false)
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn set_local_receive_preference(
+        &mut self,
+        pipe: PipeId,
+        preference: Option<crate::PathPreference>,
+    ) -> Result<bool, PipeError> {
+        let i = self.tier_att(pipe)?;
+        if self.atts.at(i).inp().is_none() {
+            return Err(PipeError::InvalidArgument);
+        }
+        let mp = self.mp_mut();
+        if preference.is_none() && mp.join_control.is_none() {
+            return Ok(false);
+        }
+        let control = mp.join_control.get_or_insert_default();
+        let changed = control.receive.get(&pipe) != preference.as_ref();
+        if changed {
+            if let Some(preference) = preference {
+                control.receive.insert(pipe, preference);
+            } else {
+                control.receive.remove(&pipe);
+            }
+            control.receive_changed = true;
+        }
+        Ok(changed)
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn local_receive_preference(&self, pipe: PipeId) -> Option<crate::PathPreference> {
+        self.mp
+            .as_ref()?
+            .join_control
+            .as_ref()?
+            .receive
+            .get(&pipe)
+            .copied()
+    }
+
+    #[cfg(all(feature = "tokio", not(loom)))]
+    pub(crate) fn take_receive_order(
+        &mut self,
+    ) -> Option<&std::collections::HashMap<PipeId, crate::PathPreference>> {
+        let control = self.mp.as_mut()?.join_control.as_mut()?;
+        std::mem::take(&mut control.receive_changed).then_some(&control.receive)
+    }
+
     /// Sets the priority of the local outbound direction of a pipe (lower
     /// preferred); `None` clears the local setting, returning to the peer's
     /// request, else 0. Used from the next scheduling decision; nothing is
@@ -1011,8 +1096,11 @@ impl SessionCore {
         };
         let mut started = false;
         for i in named {
-            if let Some(o) = self.atts.at_mut(i).out_mut() {
-                started |= o.revalidate(now);
+            if let Some(o) = self.atts.at_mut(i).out_mut()
+                && o.revalidate(now)
+            {
+                started = true;
+                self.sync_pipe_health(self.atts.at(i).id());
             }
         }
         if started {
@@ -1027,6 +1115,7 @@ impl SessionCore {
     /// or the pipe became suspect, failed, started draining or went away.
     pub(in crate::proto::session) fn end_revalidation(&mut self, id: u64) {
         if self.out_mut(id).is_some_and(OutPipe::end_revalidation) {
+            self.sync_pipe_health(id);
             self.advance_pick_generation();
             self.check_standby_takeover();
         }
@@ -1300,6 +1389,7 @@ impl SessionCore {
             o.end_probation();
         }
         self.update_history(i, |h| h.probation_ended(end, base));
+        self.sync_pipe_health(self.atts.at(i).id());
         // Eligibility changed.
         self.advance_pick_generation();
         self.check_standby_takeover();
@@ -1377,7 +1467,7 @@ impl SessionCore {
 
     /// Forgets the probation history of fate groups that no attachment
     /// uses any more once it no longer matters (a suspicion would start
-    /// over at k = 0), and keeps at most `max_pipes` + H such groups (the
+    /// over at k = 0), and keeps at most the attachment envelope such groups (the
     /// most recent), so that a peer cycling through fate groups cannot
     /// grow the state.
     fn prune_fate_history(&mut self, now: Instant) {

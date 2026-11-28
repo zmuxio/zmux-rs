@@ -3,19 +3,23 @@ use std::task::{Context, Waker};
 use std::time::Duration;
 
 use super::{Carrier, Options, Url};
+use crate as wt;
 use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, watch};
 use zmux::{Config, PipeId, PipeIo, Session};
 
 #[path = "../tests/common/mod.rs"]
-mod common;
+pub(crate) mod common;
+
+#[path = "../../test-support/transfer.rs"]
+mod streams;
 
 /// The main pipe runs in memory. Only the actual WebTransport lanes go
 /// through the relay, so withholding their ACK cannot block session close.
 #[tokio::test]
 // HS-51
 async fn closed_waits_for_the_webtransport_lane_ack() {
-    let opts = Options::default();
+    let opts = common::adopted_options(Options::default());
     let mut wt = common::Wt::new(&opts);
     let server_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, wt.url.port().unwrap()));
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -49,8 +53,8 @@ async fn closed_waits_for_the_webtransport_lane_ack() {
     });
     tokio::time::timeout(Duration::from_secs(10), async {
         let (cw, sw) = wt.pair().await;
-        let client = Carrier::new(cw, opts.clone());
-        let server = Carrier::new(sw, opts);
+        let client = Carrier::new(cw, &opts).unwrap();
+        let server = Carrier::new(sw, &opts).unwrap();
         let (a, b) = tokio::io::duplex(1 << 16);
         let a = client
             .inner
@@ -63,7 +67,7 @@ async fn closed_waits_for_the_webtransport_lane_ack() {
             Session::accept(b, Config::default())
         );
         let (cs, ss) = (cs.unwrap(), ss.unwrap());
-        common::transfer(&cs, &ss, 3, 512 << 10).await;
+        streams::transfer(&cs, &ss, 3, 512 << 10).await;
         assert!(cs.pipe_stats()[0].lanes_out > 1);
         let pipe = cs.pipe(PipeId::new(0)).unwrap();
         gate.send(true).unwrap();

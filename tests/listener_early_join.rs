@@ -2,41 +2,60 @@
 //! carrier's handshake completed; one whose handshake does not complete in
 //! time is a setup failure and counted nowhere else in the statistics.
 
+#[path = "common/clock.rs"]
+mod clock;
+
+use std::sync::Arc;
 use std::time::Duration;
 
-use zmux::{Config, HandleError, Listener, ListenerConfig, PipeAuth, PipeHint, PipeIo, Session};
+use tokio::sync::Notify;
+
+use clock::ManualClock;
+use zmux::{
+    ClockDomain, Config, HandleError, Listener, ListenerConfig, MonotonicClock, PipeAuth, PipeHint,
+    PipeIo, Session,
+};
 
 fn config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"early-join-test-psk-0123456789ab").with_end_to_end();
     c
 }
 
-fn limits() -> ListenerConfig {
-    let mut l = ListenerConfig::default();
-    l.handshake_timeout = Duration::from_millis(300);
-    l
-}
+const WATCHDOG: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn an_early_join_whose_handshake_never_completes_is_a_setup_failure() {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        let listener = Listener::new(config(), limits()).expect("valid listener configuration");
+    tokio::time::timeout(WATCHDOG, async {
+        let wait = Duration::from_secs(41);
+        let (clock, domain) = ManualClock::domain(Duration::from_secs(120));
+        let mut accepting = config();
+        accepting.clock_domain = domain.clone();
+        accepting.join_timeout = wait;
+        let listener = Listener::new(accepting, ListenerConfig::default()).unwrap();
         let (c0, s0) = tokio::io::duplex(1 << 16);
         let l = listener.clone();
         tokio::spawn(async move { l.handle_pipe(PipeIo::new(s0), PipeHint::default()).await });
-        let client = Session::connect(PipeIo::new(c0), config()).await.unwrap();
+        let mut dialing = config();
+        dialing.join_timeout = Duration::from_secs(60);
+        let client = Session::connect(PipeIo::new(c0), dialing).await.unwrap();
         let _server = listener.accept().await.unwrap();
+        let mut timers = clock.registrations();
+        let deadline = domain.now() + wait;
         let (c1, s1) = tokio::io::duplex(1 << 16);
         let _pipe = client
-            .begin_add_pipe(PipeIo::new(c1), zmux::PipeOptions::new())
+            .test_begin_join(PipeIo::new(c1), zmux::PipeOptions::new())
             .unwrap();
         // The server's carrier took the join as early data, and its
         // handshake never completes.
         let io = PipeIo::new(s1).with_early_data_in(std::future::pending::<()>);
-        let r = listener.handle_pipe(io, PipeHint::default()).await;
-        assert_eq!(r, Err(HandleError::SetupFailed));
+        let accepting = listener.clone();
+        let handling =
+            tokio::spawn(async move { accepting.handle_pipe(io, PipeHint::default()).await });
+        while timers.recv().await.unwrap() != deadline {}
+        clock.advance(wait);
+        assert_eq!(handling.await.unwrap(), Err(HandleError::SetupFailed));
         let st = listener.stats();
         assert_eq!(st.setup_failures, 1);
         assert_eq!(
@@ -52,8 +71,9 @@ async fn an_early_join_whose_handshake_never_completes_is_a_setup_failure() {
 
 #[tokio::test]
 async fn an_early_join_goes_on_once_the_handshake_completed() {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        let listener = Listener::new(config(), limits()).expect("valid listener configuration");
+    tokio::time::timeout(WATCHDOG, async {
+        let listener = Listener::new(config(), ListenerConfig::default())
+            .expect("valid listener configuration");
         let (c0, s0) = tokio::io::duplex(1 << 16);
         let l = listener.clone();
         tokio::spawn(async move { l.handle_pipe(PipeIo::new(s0), PipeHint::default()).await });
@@ -61,13 +81,26 @@ async fn an_early_join_goes_on_once_the_handshake_completed() {
         let _server = listener.accept().await.unwrap();
         let (c1, s1) = tokio::io::duplex(1 << 16);
         let pipe = client
-            .begin_add_pipe(PipeIo::new(c1), zmux::PipeOptions::new())
+            .test_begin_join(PipeIo::new(c1), zmux::PipeOptions::new())
             .unwrap();
-        let io =
-            PipeIo::new(s1).with_early_data_in(|| tokio::time::sleep(Duration::from_millis(50)));
-        let l = listener.clone();
-        tokio::spawn(async move { l.handle_pipe(io, PipeHint::default()).await });
+        let started = Arc::new(Notify::new());
+        let complete = Arc::new(Notify::new());
+        let (entered, finish) = (started.clone(), complete.clone());
+        let io = PipeIo::new(s1).with_early_data_in(move || {
+            let (entered, finish) = (entered.clone(), finish.clone());
+            async move {
+                entered.notify_one();
+                finish.notified().await;
+            }
+        });
+        let accepting = listener.clone();
+        let handling =
+            tokio::spawn(async move { accepting.handle_pipe(io, PipeHint::default()).await });
+        started.notified().await;
+        assert_eq!(listener.stats().joins, 0);
+        complete.notify_one();
         pipe.joined().await.unwrap();
+        handling.await.unwrap().unwrap();
         assert_eq!(listener.stats().joins, 1);
         assert_eq!(listener.stats().setup_failures, 0);
         client.close().await;
@@ -79,7 +112,7 @@ async fn an_early_join_goes_on_once_the_handshake_completed() {
 
 #[tokio::test(start_paused = true)]
 async fn listener_close_interrupts_named_early_join() {
-    let listener = Listener::new(config(), limits()).unwrap();
+    let listener = Listener::new(config(), ListenerConfig::default()).unwrap();
     let (c0, s0) = tokio::io::duplex(1 << 16);
     let l = listener.clone();
     tokio::spawn(async move { l.handle_pipe(PipeIo::new(s0), PipeHint::default()).await });
@@ -87,9 +120,9 @@ async fn listener_close_interrupts_named_early_join() {
     let _server = listener.accept().await.unwrap();
     let (near, far) = tokio::io::duplex(1 << 16);
     let _pipe = client
-        .begin_add_pipe(PipeIo::new(near), zmux::PipeOptions::new())
+        .test_begin_join(PipeIo::new(near), zmux::PipeOptions::new())
         .unwrap();
-    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(Notify::new());
     let entered = started.clone();
     let io = PipeIo::new(far).with_early_data_in(move || {
         entered.notify_one();

@@ -1,10 +1,11 @@
 //! QUIC connections as zmux carriers over quinn: zmux
 //! sessions whose pipes and lanes are streams of QUIC connections, and whose
 //! datagrams may go as QUIC datagrams of the connection, the pipes'
-//! datagram channel. The carrier owns the connection: it is closed once no
-//! [`Carrier`] clone and no pipe made from it is left, so keep the carrier
-//! while the connection is to stay open. Its statistics and path stay
-//! readable through the raw [`Connection`] ([`Carrier::connection`]).
+//! datagram channel. A carrier made with [`Carrier::new`] owns its
+//! connection, and closes it once the last carrier handle and pipe are
+//! gone. [`Carrier::borrow`] lets the host manage the connection's lifetime.
+//! The raw [`Connection`] exposes its statistics and path
+//! ([`Carrier::connection`]).
 //!
 //! One step from an endpoint to a session, and from an endpoint to the
 //! sessions it accepts: [`connect`] and [`serve`]. With the `rustls-ring`
@@ -103,10 +104,21 @@
 
 #![forbid(unsafe_code)]
 
-use std::future::{Future, poll_fn};
+use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::pin::{Pin, pin};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, Weak};
+
+mod early_data;
+pub use early_data::ServerHandshake;
+
+/// Enables 0-RTT provenance for prefix admission on a host's QUIC endpoint.
+/// Apply before accepting connections. Tracks streams actually carrying
+/// 0-RTT bytes, including streams first accepted after the handshake.
+pub fn track_server_early_data(config: &mut quinn::ServerConfig) {
+    config.crypto = early_data::track(config.crypto.clone());
+}
 
 pub mod parts;
 use std::task::{Context, Poll};
@@ -116,7 +128,7 @@ use bytes::Bytes;
 use quinn::rustls;
 use quinn::{Connection, Endpoint, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use zmux::adapter::{AdmitIo, Admitted, Entry};
+use zmux::adapter::Entry;
 use zmux::adapter::{CarrierConnId, ChannelDemux, MemoryCharge};
 use zmux::proto::ApplicationErrorCode;
 use zmux::{
@@ -140,6 +152,7 @@ pub struct LaneWindows {
     /// with from the moment the carrier is made, before any join on it is
     /// authenticated.
     pub lanes: u32,
+    established_receive_window: Option<u64>,
 }
 
 impl Default for LaneWindows {
@@ -147,6 +160,7 @@ impl Default for LaneWindows {
         Self {
             stream_window: 1_250_000,
             lanes: 4,
+            established_receive_window: None,
         }
     }
 }
@@ -170,6 +184,31 @@ impl LaneWindows {
     pub fn with_lanes(mut self, lanes: u32) -> Self {
         self.lanes = lanes;
         self
+    }
+
+    /// Supplies the actual connection receive window of a host-established
+    /// QUIC connection. The value must match the host's transport configuration.
+    #[must_use]
+    pub fn with_established_receive_window(mut self, bytes: u64) -> Self {
+        self.established_receive_window = Some(bytes);
+        self
+    }
+
+    /// Returns the window to charge when taking over a host connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if the window is missing or exceeds a QUIC varint.
+    pub fn established_receive_window(&self) -> io::Result<u64> {
+        self.established_receive_window
+            .filter(|&bytes| bytes <= VarInt::MAX.into_inner())
+            .ok_or_else(|| {
+                zmux::InvalidConfig::new(
+                    "established_receive_window",
+                    "an established QUIC connection requires its actual receive window",
+                )
+                .into()
+            })
     }
 
     /// The connection receive window these windows ask for: a stream
@@ -238,11 +277,10 @@ impl Default for Options {
     }
 }
 
-/// The servers' transport parameters a client keeps for QUIC 0-RTT, by
-/// server name: each session [`connect`] establishes leaves the server's
-/// parameters stored for 0-RTT here, and the next connection to that name
-/// that resumes its TLS session sends its first records as 0-RTT data under
-/// them. Cheap to clone; share one between the connections to a server.
+/// Transport parameters from plain QMux peers, indexed by server name.
+/// Share this memory with connections using the same plain QMux TLS
+/// resumption context. A resuming connection can send its first records in
+/// 0-RTT under those parameters.
 /// (quinn keeps no data of the application with its tickets: this stands
 /// for it, and relies on the server obligation described at
 #[cfg_attr(
@@ -531,6 +569,7 @@ pub fn server_config(
     };
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)?;
     let mut c = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    track_server_early_data(&mut c);
     c.transport_config(Arc::new(options.transport_config()));
     Ok(c)
 }
@@ -539,7 +578,7 @@ pub fn server_config(
 /// configuration) to `addr`, verified for `server_name`: a stream of the
 /// connection, which carries the pipe's lanes and stays open while the
 /// pipe is used, starting with the prefix of [`Options::carrier_credential`]. For
-/// [`zmux::helpers::PipePool`] and [`Session::add_pipe`]; to reach the
+/// [`zmux::SessionController`] and [`Session::begin_change`]; to reach the
 /// connection itself, make it and its carrier ([`Carrier::new`])
 /// instead.
 ///
@@ -572,7 +611,7 @@ async fn first_pipe(conn: Connection, options: &Options) -> io::Result<PipeIo> {
         Some(c) => Some(c.prefix(&Handshake::of(&conn).carrier_info(&conn))?),
         None => None,
     };
-    let carrier = Carrier::new(conn, options.clone());
+    let carrier = Carrier::start(conn, None, options, None, options.windows.receive_window());
     match prefix {
         Some(p) => carrier.open_pipe_with_prefix(&p).await,
         None => carrier.open_pipe().await,
@@ -581,13 +620,13 @@ async fn first_pipe(conn: Connection, options: &Options) -> io::Result<PipeIo> {
 
 /// Establishes a session over a new connection ([`dial`], then
 /// [`Session::connect`]). With [`Options::with_zero_rtt`], no
-/// [`Options::carrier_credential`] and carrier
-/// early data allowed in `config`, a connection that resumes a TLS session
-/// with a server whose parameters the memory holds sends the session's
+/// [`Options::carrier_credential`] and carrier early data allowed in
+/// `config`, a connection that resumes a plain QMux TLS session whose
+/// parameters the memory holds sends the session's
 /// first records as 0-RTT data and returns at once; if the server rejects
 /// 0-RTT, the session writes everything again on a new stream once the
-/// handshake completed, and no stream fails. Every session it establishes
-/// leaves the server's parameters in the memory. [`connect_with_report`]
+/// handshake completed. A session with a plain QMux peer stores the
+/// server's parameters in the memory. [`connect_with_report`]
 /// also tells whether 0-RTT was used.
 ///
 /// The whole 0-RTT flow (a client that both sends and allows replay):
@@ -597,12 +636,11 @@ async fn first_pipe(conn: Connection, options: &Options) -> io::Result<PipeIo> {
 /// use zmux::{Config, EarlyData};
 /// use zmux_quinn::{Options, ParameterMemory};
 ///
-/// // One memory for the process; the endpoint's client configuration
-/// // comes from `client_config` with the same options (TLS resumption).
+/// // Use an endpoint and TLS resumption store dedicated to plain QMux peers.
 /// let options = Options::new().with_zero_rtt(ParameterMemory::with_capacity(1024));
 /// let mut config = Config::default();
 /// // Only for requests whose effect may happen twice: 0-RTT can be replayed.
-/// config.early_data = EarlyData::for_zmux_peer().with_carrier_early_data(true);
+/// config.early_data = EarlyData::default().with_carrier_early_data(true);
 ///
 /// // The first connection learns the server's parameters (1-RTT); later
 /// // ones resume TLS and send their first records in 0-RTT.
@@ -613,13 +651,6 @@ async fn first_pipe(conn: Connection, options: &Options) -> io::Result<PipeIo> {
 /// // ... write the request, read the response ...
 /// # drop((send, recv));
 /// println!("0-RTT sent {}, rewritten {}", zero_rtt.sent(), zero_rtt.rewritten());
-///
-/// // A peer that is not a zmux endpoint processed none of it: retry
-/// // without declaring it one.
-/// if session.closing().await.is_early_data_rejected() {
-///     config.early_data = EarlyData::default();
-///     let _again = zmux_quinn::connect(&endpoint, addr, "example.com", &options, config).await?;
-/// }
 /// # Ok(()) }
 /// ```
 ///
@@ -662,12 +693,17 @@ pub async fn connect_with_report(
     let mut connecting = endpoint
         .connect(addr, server_name)
         .map_err(|e| io_err(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
-    if let Some(remembered) = memory.as_ref().and_then(|m| m.get(server_name)) {
+    if let Some(remembered) = memory
+        .as_ref()
+        .and_then(|m| m.get(server_name))
+        .filter(zmux::proto::params::TransportParameters::is_plain_qmux)
+    {
         match connecting.into_0rtt() {
             Ok((conn, accepted)) => {
-                let carrier = Carrier::new(conn.clone(), options.clone());
+                let carrier =
+                    Carrier::start(conn, None, options, None, options.windows.receive_window());
                 let (send, recv) = zmux::adapter::within(options.timeout, async {
-                    conn.open_bi().await.map_err(io::Error::other)
+                    carrier.inner.conn.open_bi().await.map_err(io::Error::other)
                 })
                 .await
                 .map_err(io_err)?;
@@ -698,6 +734,7 @@ pub async fn connect_with_report(
                     .datagrams
                     .channel(send.get_ref().stream.id().into());
                 let rekeyed = channel.clone();
+                let conn = carrier.inner.conn.clone();
                 let settled = async move {
                     let ok = accepted.await;
                     // After a rejection the pipe goes on on a 1-RTT stream,
@@ -715,7 +752,7 @@ pub async fn connect_with_report(
                         if let Some(id) = retry.switch()? {
                             rekeyed.rekey(id);
                         }
-                        Ok(())
+                        Ok(None)
                     });
                 let session = establish(pipe, config, memory, server_name).await?;
                 return Ok((session, report));
@@ -830,14 +867,22 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
     let l = listener.clone();
     let endpoint = &endpoint;
     let options = Arc::new(options);
+    let window = options.windows.receive_window();
     l.serve_connections(
         move || async move { endpoint.accept().await.map(Ok) },
         move |incoming: quinn::Incoming| {
             let entry = listener.adapter().enter(incoming.remote_address(), None);
+            let charge = entry
+                .as_ref()
+                .and_then(|_| listener.adapter().reserve_memory(window).ok());
             async move {
                 // Refused at its source's limit: dropped, the incoming
                 // connection is refused.
                 let entry = entry.ok_or(())?;
+                let Some(charge) = charge else {
+                    entry.release();
+                    return Err(());
+                };
                 let connecting = incoming.accept().map_err(drop)?;
                 if zero_rtt {
                     return match connecting.into_0rtt() {
@@ -851,18 +896,21 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
                                     let _ = tx.send(true);
                                 }
                             });
-                            Ok::<_, ()>((conn, Some(rx), entry))
+                            Ok::<_, ()>((conn, Some(rx), entry, charge))
                         }
-                        Err(connecting) => Ok((connecting.await.map_err(drop)?, None, entry)),
+                        Err(connecting) => {
+                            Ok((connecting.await.map_err(drop)?, None, entry, charge))
+                        }
                     };
                 }
-                Ok::<_, ()>((connecting.await.map_err(drop)?, None, entry))
+                Ok::<_, ()>((connecting.await.map_err(drop)?, None, entry, charge))
             }
         },
-        move |listener, (conn, handshake, entry): (Connection, _, Entry)| {
+        move |listener, (conn, handshake, entry, charge): (Connection, _, Entry, _)| {
             let options = options.clone();
             async move {
-                serve_entered(conn, handshake, entry, listener, &options).await;
+                let mut service = start_service(conn, handshake, entry, listener, &options, charge);
+                let _ = service.wait().await;
             }
         },
     )
@@ -886,97 +934,154 @@ pub async fn serve(listener: Listener, endpoint: Endpoint, options: Options) {
 /// # Errors
 ///
 /// `NotConnected` when the listener is closed; the connection is closed
-/// then.
+/// then. `InvalidInput` if the actual receive window is missing or invalid.
+/// A ticket-protected listener also requires [`track_server_early_data`].
 pub async fn serve_connection(
     listener: &Listener,
     conn: Connection,
     options: &Options,
 ) -> io::Result<()> {
+    if let Some(mut service) = adopt_connection(listener, conn, options)? {
+        service.wait().await?;
+    }
+    Ok(())
+}
+
+/// Starts serving a host's established QUIC connection. The returned control
+/// owns new pipe admission; attached pipes own the lifetime of their lanes.
+///
+/// Returns `Ok(None)` if the listener refused the connection at its limit.
+///
+/// # Errors
+///
+/// Returns `NotConnected` if the listener is closed or `InvalidInput` if the
+/// actual receive window is missing or invalid, or ticket admission lacks
+/// 0-RTT provenance tracking.
+pub fn adopt_connection(
+    listener: &Listener,
+    conn: Connection,
+    options: &Options,
+) -> io::Result<Option<ConnService>> {
+    let window = options.windows.established_receive_window()?;
+    if let Err(error) = Handshake::of(&conn).require_ticket_provenance(listener) {
+        conn.close(VarInt::from_u32(0), b"");
+        return Err(error);
+    }
     let Some(entry) = listener.adapter().enter(conn.remote_address(), None) else {
         conn.close(VarInt::from_u32(0), b"");
         return if listener.adapter().is_closed() {
             Err(io::ErrorKind::NotConnected.into())
         } else {
-            Ok(())
+            Ok(None)
         };
     };
-    serve_entered(conn, None, entry, listener.clone(), options).await;
-    Ok(())
+    let Ok(charge) = listener.adapter().reserve_memory(window) else {
+        entry.release();
+        conn.close(VarInt::from_u32(0), b"");
+        return Ok(None);
+    };
+    Ok(Some(start_service(
+        conn,
+        None,
+        entry,
+        listener.clone(),
+        options,
+        charge,
+    )))
 }
 
-/// A connection that entered the listener, once its handshake completed
-/// (`handshake`: the end of a 0-RTT one): admitted, then served until it
-/// closes.
-async fn serve_entered(
+pub use parts::ConnectionService as ConnService;
+
+fn start_service(
     conn: Connection,
     handshake: Option<tokio::sync::watch::Receiver<bool>>,
-    mut entry: Entry,
+    entry: Entry,
     listener: Listener,
     options: &Options,
-) {
-    // The carrier is made once the first stream is accepted, for its
-    // first pipe; the rest of its streams reach the listener after that.
-    let made = Arc::new(Mutex::new(None::<Carrier>));
-    let first = {
-        let (conn, made, l, options) = (
-            conn.clone(),
-            made.clone(),
-            listener.clone(),
-            options.clone(),
-        );
-        async move {
-            let (send, recv) = conn.accept_bi().await.map_err(io::Error::other)?;
-            let c = conn.clone();
-            let io = AdmitIo::stream(tokio::io::join(recv, send), move |streams| {
-                let (recv, send) = streams.into_inner();
-                let carrier = Carrier::make(&c, Some(&l), &options, handshake);
-                let pipe = carrier.inner.pipe(
-                    Send::new(QuinnSend::new(send)),
-                    Recv::new(QuinnRecv::new(recv)),
-                );
-                *made.lock().unwrap_or_else(PoisonError::into_inner) = Some(carrier);
-                pipe
+    charge: MemoryCharge,
+) -> ConnService {
+    let options = options.clone();
+    ConnService::start(move |delivery| async move {
+        let closing = conn.clone();
+        let metadata = Handshake::of(&conn);
+        let provenance = metadata.require_ticket_provenance(&listener);
+        delivery
+            .admit(
+                listener,
+                entry,
+                move |first| async move {
+                    provenance?;
+                    let (send, recv) = conn.accept_bi().await.map_err(io::Error::other)?;
+                    let stream_id = u64::from(recv.id());
+                    let info = metadata.server_carrier_info_before(
+                        &conn,
+                        Some(stream_id),
+                        zmux::PREFIX_TOKEN_LEN as u64,
+                    );
+                    let carrier_conn = conn.clone();
+                    let returned = conn.clone();
+                    let io = first
+                        .prepare(QuinnSend::new(send), QuinnRecv::new(recv), move || {
+                            let carrier = Carrier::make(
+                                &carrier_conn,
+                                Some(charge),
+                                options.windows.lanes,
+                                0,
+                                handshake,
+                                None,
+                            );
+                            (QuinnStreams(carrier_conn), carrier.inner)
+                        })
+                        .with_connection(Arc::new(conn))
+                        .with_on_return(move || returned.close(VarInt::from_u32(0), b""));
+                    Ok((info, io))
+                },
+                move || closing.close(VarInt::from_u32(0), b""),
+            )
+            .await;
+    })
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn stopping_before_the_first_stream_releases_the_entry() {
+        use tokio::sync::oneshot;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let mut limits = zmux::ListenerConfig::default();
+            limits.limits.max_pending_per_source = 2;
+            let listener = Listener::new(zmux::Config::default(), limits).unwrap();
+            let peer = "127.0.0.1:0".parse().unwrap();
+            let entry = listener.adapter().enter(peer, None).unwrap();
+            let _other_entry = listener.adapter().enter(peer, None).unwrap();
+            let (entered, pending) = oneshot::channel();
+            let (close, closed) = oneshot::channel();
+            let owner = listener.clone();
+            let mut service = ConnService::start(|delivery| {
+                delivery.admit::<QuinnStreams, Inner, _>(
+                    owner,
+                    entry,
+                    |_| async {
+                        entered.send(()).unwrap();
+                        std::future::pending().await
+                    },
+                    || close.send(()).unwrap(),
+                )
             });
-            // Closed once a fallback's future returned it, also when this
-            // admission is dropped meanwhile.
-            let closing = conn.clone();
-            Ok(io
-                .with_connection(Arc::new(conn))
-                .with_on_return(move || closing.close(VarInt::from_u32(0), b"")))
-        }
-    };
-    let info = Handshake::of(&conn).carrier_info(&conn);
-    let accepted = entry.admit_first(info, first).await;
-    let carrier = made.lock().unwrap_or_else(PoisonError::into_inner).take();
-    let (Some(first), Some(carrier)) = (accepted, carrier) else {
-        entry.end_unclaimed_connection(|| conn.close(VarInt::from_u32(0), b""));
-        return;
-    };
-    let admitted = entry.admitted();
-    let hint = PipeHint::from_entry(entry);
-    let l = listener.clone();
-    tokio::spawn(async move { l.handle_pipe(first, hint).await });
-    // The other streams from here on.
-    carrier.inner.listen(Some(listener), admitted);
-    delivering(carrier, &conn).await;
-}
-
-/// Holds `carrier` while its connection is open (its accept loop serves
-/// it); cancelling this stops the accept loop, which pipes already made
-/// from the connection would otherwise keep running.
-async fn delivering(carrier: Carrier, conn: &Connection) {
-    let _stop = StopDelivery(carrier);
-    conn.closed().await;
-}
-
-/// Stops a carrier's accept loop when dropped.
-struct StopDelivery(Carrier);
-
-impl Drop for StopDelivery {
-    fn drop(&mut self) {
-        if let Some(t) = self.0.inner.accept_task.get() {
-            t.abort();
-        }
+            pending.await.unwrap();
+            assert!(listener.adapter().enter(peer, None).is_none());
+            service.stop_admission();
+            service.admission_stopped().await;
+            closed.await.unwrap();
+            service.wait().await.unwrap();
+            assert!(listener.adapter().enter(peer, None).is_some());
+        })
+        .await
+        .expect("admission did not stop");
     }
 }
 
@@ -993,10 +1098,9 @@ pub fn takeover_connection(takeover: &Takeover) -> Option<Connection> {
 }
 
 /// A QUIC connection whose streams carry zmux pipes and lanes (see the
-/// crate documentation). Cheap to clone; the accept loop runs while the
-/// connection is open and any clone, or any pipe made from it, is alive.
-/// Once none is, the loop stops and the connection is closed: keep a clone
-/// while the peer may still open pipes on it.
+/// crate documentation). Cheap to clone; receivers run while the connection
+/// is open and a clone or pipe is alive. [`Carrier::borrow`] leaves close
+/// authority with the host.
 ///
 /// A pipe holds the connection until its session is done with it: every
 /// pipe's inbound side ended (the peer read the zmux `CONNECTION_CLOSE` and
@@ -1038,29 +1142,48 @@ struct Inner {
     /// Streams of pipes the peer opened, without a listener (made pipes
     /// when taken, so that the queue holds no reference to this state).
     accepted: parts::AcceptQueue<(Send, Recv)>,
-    /// Stops the accept loop when the last handle is gone.
-    accept_task: OnceLock<tokio::task::AbortHandle>,
     _charge: Option<MemoryCharge>,
     /// A server connection taken in 0-RTT: true once its handshake
     /// completed; pipes opened before carry replayable data.
     handshake: Option<tokio::sync::watch::Receiver<bool>>,
     /// The connection's QUIC datagrams, the channels of its pipes.
     datagrams: Arc<ConnectionDatagrams>,
-    /// The application error code of the last session on the connection
-    /// that ended, which the connection's close carries.
-    close_code: std::sync::atomic::AtomicU64,
+    close: parts::ConnectionClose,
+    /// The borrowed lane receiver stops when the last carrier or pipe drops.
+    _stop_borrowed_lanes: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+static BORROWED: LazyLock<Mutex<HashMap<usize, BorrowedBinding>>> = LazyLock::new(Mutex::default);
+
+struct BorrowedBinding {
+    carrier: Weak<Inner>,
+    windows: LaneWindows,
+    released: tokio::sync::watch::Receiver<()>,
+}
+
+/// Holds the binding's slot until both receive loops relinquish their queues.
+struct BorrowedReceiver {
+    id: usize,
+    _released: tokio::sync::watch::Sender<()>,
+}
+
+impl Drop for BorrowedReceiver {
+    fn drop(&mut self) {
+        BORROWED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
 }
 
 impl Drop for Inner {
     /// No carrier and no pipe holds the connection any more: it closes with
     /// the last session's code (a no-op on one already closed).
     fn drop(&mut self) {
-        if let Some(t) = self.accept_task.get() {
-            t.abort();
-        }
-        let code = self.close_code.load(std::sync::atomic::Ordering::Relaxed);
-        self.conn
-            .close(VarInt::from_u64(code).unwrap_or(VarInt::from_u32(0)), b"");
+        self.close.close(|code| {
+            self.conn
+                .close(VarInt::from_u64(code).unwrap_or(VarInt::from_u32(0)), b"");
+        });
     }
 }
 
@@ -1071,67 +1194,167 @@ impl Carrier {
     /// connection's receive window is charged to the session its pipes
     /// carry. Make one carrier per connection: its lanes are recognised by
     /// it.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "public constructor API that takes its arguments by value"
-    )]
-    pub fn new(conn: Connection, options: Options) -> Self {
-        Self::start(&conn, None, &options, None)
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` if the actual receive window is missing or invalid.
+    pub fn new(conn: Connection, options: &Options) -> io::Result<Self> {
+        let window = options.windows.established_receive_window()?;
+        Ok(Self::start(conn, None, options, None, window))
+    }
+
+    /// Binds zmux to an established client-side connection managed by the host.
+    /// Open zmux pipes with [`Self::open_pipe`] or [`Self::open_pipe_with_prefix`].
+    /// Reserve incoming unidirectional streams and QUIC datagrams for this
+    /// binding. Use the same entry point for all bindings of the connection.
+    /// Incoming bidirectional streams and connection shutdown remain with
+    /// the host. Live bindings on the same connection share one lane
+    /// receiver, datagram router and carrier identity. A new binding may
+    /// wait for the previous receiver to stop. Clones of its
+    /// [`Self::datagrams`] keep that receiver's binding alive.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` if the connection has ended or `InvalidInput`
+    /// if the actual receive window is missing or invalid or a live binding
+    /// uses different lane windows.
+    pub async fn borrow(conn: &Connection, options: &Options) -> io::Result<Self> {
+        let window = options.windows.established_receive_window()?;
+        let key = conn.stable_id();
+        loop {
+            // The registration must outlive the mutex guard during setup.
+            let receiver;
+            let mut released = {
+                if conn.close_reason().is_some() {
+                    return Err(io::ErrorKind::NotConnected.into());
+                }
+                let mut bindings = BORROWED.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(binding) = bindings.get(&key) {
+                    if let Some(inner) = binding.carrier.upgrade() {
+                        // Drop the lock first: this could be the last reference.
+                        let same_windows = binding.windows == options.windows;
+                        drop(bindings);
+                        if !same_windows {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "QUIC connection binding uses different lane windows",
+                            ));
+                        }
+                        return Ok(Self { inner });
+                    }
+                    binding.released.clone()
+                } else {
+                    let (released, watch) = tokio::sync::watch::channel(());
+                    receiver = Arc::new(BorrowedReceiver {
+                        id: key,
+                        _released: released,
+                    });
+                    let (stop, stopped) = tokio::sync::oneshot::channel();
+                    let carrier = Self::make(
+                        conn,
+                        None,
+                        options.windows.lanes,
+                        window,
+                        None,
+                        Some((stop, receiver.clone())),
+                    );
+                    let weak = Arc::downgrade(&carrier.inner);
+                    bindings.insert(
+                        key,
+                        BorrowedBinding {
+                            carrier: weak.clone(),
+                            windows: options.windows,
+                            released: watch,
+                        },
+                    );
+                    drop(bindings);
+                    let streams = QuinnStreams(conn.clone());
+                    tokio::spawn(async move {
+                        parts::accept_lanes(&streams, &weak, None, &PipeHint::default, async {
+                            let _ = stopped.await;
+                        })
+                        .await;
+                        drop(receiver);
+                    });
+                    return Ok(carrier);
+                }
+            };
+            tokio::select! {
+                _ = released.changed() => {}
+                _ = conn.closed() => return Err(io::ErrorKind::NotConnected.into()),
+            }
+        }
     }
 
     /// The carrier of `conn` for `listener`: every stream the peer opens
     /// goes to [`Listener::handle_pipe`], and the connection's receive
     /// window is charged to the listener's budget while the carrier lives.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "public constructor API that takes its arguments by value"
-    )]
-    pub fn with_listener(conn: Connection, listener: &Listener, options: Options) -> Self {
-        Self::start(&conn, Some(listener.clone()), &options, None)
+    ///
+    /// # Errors
+    ///
+    /// The actual receive window is missing or invalid, or the listener's
+    /// budget cannot cover it.
+    pub fn with_listener(
+        conn: Connection,
+        listener: &Listener,
+        options: &Options,
+    ) -> io::Result<Self> {
+        let window = options.windows.established_receive_window()?;
+        let charge = listener.adapter().reserve_memory(window)?;
+        Ok(Self::start(
+            conn,
+            Some(listener.clone()),
+            options,
+            Some(charge),
+            0,
+        ))
     }
 
-    /// The carrier with its accept loop started.
+    /// The independently owned carrier with its receivers started.
     fn start(
-        conn: &Connection,
+        conn: Connection,
         listener: Option<Listener>,
         options: &Options,
-        handshake: Option<tokio::sync::watch::Receiver<bool>>,
+        charge: Option<MemoryCharge>,
+        own_charge: u64,
     ) -> Self {
-        let carrier = Self::make(conn, listener.as_ref(), options, handshake);
-        carrier.inner.listen(listener, None);
+        let carrier = Self::make(&conn, charge, options.windows.lanes, own_charge, None, None);
+        parts::start_receivers(QuinnStreams(conn), &carrier.inner, listener);
         carrier
     }
 
-    /// The carrier, its accept loop not started yet ([`Inner::listen`]).
+    /// Prepares a carrier before its streams or close authority are assigned.
     fn make(
         conn: &Connection,
-        listener: Option<&Listener>,
-        options: &Options,
+        charge: Option<MemoryCharge>,
+        lanes: u32,
+        own_charge: u64,
         handshake: Option<tokio::sync::watch::Receiver<bool>>,
+        borrowed: Option<(tokio::sync::oneshot::Sender<()>, Arc<BorrowedReceiver>)>,
     ) -> Self {
-        let window = options.windows.receive_window();
-        conn.set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
-        conn.set_max_concurrent_uni_streams(VarInt::from_u32(options.windows.lanes));
-        let own_charge = if listener.is_some() { 0 } else { window };
+        conn.set_max_concurrent_uni_streams(VarInt::from_u32(lanes));
+        let (stop_borrowed_lanes, receiver) = borrowed.unzip();
+        let accepted = parts::AcceptQueue::default();
+        if receiver.is_some() {
+            // This binding leaves peer-opened bidirectional streams to the host.
+            accepted.close();
+        }
         let inner = Arc::new(Inner {
             conn: conn.clone(),
             id: OnceLock::new(),
             own_charge,
             alpn: alpn(conn),
-            accepted: parts::AcceptQueue::default(),
-            accept_task: OnceLock::new(),
-            _charge: listener.map(|l| l.adapter().charge_memory(window)),
+            accepted,
+            _charge: charge,
             handshake,
-            datagrams: ConnectionDatagrams::new(conn.clone()),
-            close_code: std::sync::atomic::AtomicU64::new(0),
+            datagrams: ConnectionDatagrams::with_receiver(conn.clone(), receiver),
+            close: parts::ConnectionClose::default(),
+            _stop_borrowed_lanes: stop_borrowed_lanes,
         });
         let _ = inner.id.set(CarrierConnId::new(&inner));
         Self { inner }
     }
 
-    /// The QUIC connection, for its statistics and path. The carrier owns
-    /// it: its streams and datagrams belong to zmux, and it is closed once
-    /// no carrier clone and no pipe made from it is left.
+    /// The QUIC connection, for its statistics and path.
     #[must_use]
     pub fn connection(&self) -> &Connection {
         &self.inner.conn
@@ -1168,14 +1391,16 @@ impl Carrier {
     ///
     /// `Other` when the stream cannot be opened or the prefix written.
     pub async fn open_pipe_with_prefix(&self, prefix: &[u8]) -> io::Result<PipeIo> {
-        let (mut send, recv) = self.inner.conn.open_bi().await.map_err(io::Error::other)?;
+        let (send, recv) = self.inner.conn.open_bi().await.map_err(io::Error::other)?;
+        let mut send = Send::new(QuinnSend::new(send));
         if !prefix.is_empty() {
-            send.write_all(prefix).await.map_err(io::Error::other)?;
+            send.get_mut()
+                .stream
+                .write_all(prefix)
+                .await
+                .map_err(io::Error::other)?;
         }
-        Ok(self.inner.pipe(
-            Send::new(QuinnSend::new(send)),
-            Recv::new(QuinnRecv::new(recv)),
-        ))
+        Ok(self.inner.pipe(send, Recv::new(QuinnRecv::new(recv))))
     }
 
     /// The next pipe the peer opened, on a carrier without a listener (for
@@ -1191,23 +1416,6 @@ impl Carrier {
 }
 
 impl Inner {
-    /// Starts the accept loop, which hands the peer's streams to
-    /// `listener`, or else keeps them for [`Carrier::accept_pipe`].
-    fn listen(self: &Arc<Self>, listener: Option<Listener>, admitted: Option<Admitted>) {
-        let peer = self.conn.remote_address();
-        let hint = move || match &admitted {
-            Some(a) => PipeHint::from_admitted(a.clone()),
-            None => PipeHint::from_peer(peer),
-        };
-        let task = tokio::spawn(parts::accept_loop(
-            QuinnStreams(self.conn.clone()),
-            Arc::downgrade(self),
-            listener,
-            hint,
-        ));
-        let _ = self.accept_task.set(task.abort_handle());
-    }
-
     fn id(&self) -> CarrierConnId {
         self.id.get().expect("set at creation").clone()
     }
@@ -1233,14 +1441,11 @@ impl Inner {
         let io = with_packet_counters(parts::pipe(send, recv, self.clone()), self, |inner| {
             &inner.conn
         })
-        .with_carrier(zmux::CarrierKind::Quic)
-        .with_carrier_conn(self.id())
+        .with_carrier_transport(zmux::CarrierKind::Quic, self.id())
         .with_connection_memory(self.own_charge)
         .with_datagram_channel(channel)
         .with_close_code(move |code| {
-            closer
-                .close_code
-                .store(code.into_inner(), std::sync::atomic::Ordering::Relaxed);
+            closer.close.set_code(code.into_inner());
         });
         let done = self.handshake.clone();
         let state = zmux::TlsState::new(self.alpn.clone().map(String::into_bytes), None);
@@ -1297,24 +1502,81 @@ pub struct Handshake {
     pub alpn: Option<Vec<u8>>,
     /// The server name the client sent.
     pub server_name: Option<String>,
+    early: Option<Arc<early_data::EarlyStreams>>,
 }
 
 impl Handshake {
     /// The handshake of `conn`.
     #[must_use]
     pub fn of(conn: &Connection) -> Self {
+        let (data, early) = match conn.handshake_data() {
+            Some(data) => match data.downcast::<ServerHandshake>() {
+                Ok(tracked) => (tracked.inner, Some(tracked.early)),
+                Err(data) => (Some(data), None),
+            },
+            None => (None, None),
+        };
         #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
-        if let Some(data) = conn
-            .handshake_data()
-            .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        if let Some(data) =
+            data.and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
         {
             return Self {
                 alpn: data.protocol,
                 server_name: data.server_name,
+                early,
             };
         }
-        let _ = conn;
-        Self::default()
+        #[cfg(not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")))]
+        let _ = data;
+        Self {
+            early,
+            ..Self::default()
+        }
+    }
+
+    /// Validates a server connection's metadata for this listener.
+    ///
+    /// # Errors
+    ///
+    /// Ticket admission requires [`track_server_early_data`] on the endpoint.
+    pub fn require_ticket_provenance(&self, listener: &Listener) -> io::Result<()> {
+        if self.early.is_none()
+            && listener
+                .adapter()
+                .admission()
+                .is_some_and(zmux::Admission::requires_prefix_ticket)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "QUIC prefix ticket admission requires track_server_early_data on the server configuration",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Server-side metadata for a request stream. Use its QUIC stream ID when
+    /// available. Without one, any observed 0-RTT request stream is ambiguous.
+    /// Missing tracking is treated as early data. Set up host endpoints with
+    /// [`track_server_early_data`].
+    #[must_use]
+    pub fn server_carrier_info(&self, conn: &Connection, stream: Option<u64>) -> CarrierInfo {
+        self.server_carrier_info_before(conn, stream, u64::MAX)
+    }
+
+    fn server_carrier_info_before(
+        &self,
+        conn: &Connection,
+        stream: Option<u64>,
+        before: u64,
+    ) -> CarrierInfo {
+        let info = self.carrier_info(conn);
+        match &self.early {
+            Some(early) => {
+                let early = early.clone();
+                info.with_early_data_check(move || early.contains(stream, before))
+            }
+            None => info.with_early_data(),
+        }
     }
 
     /// The admission metadata of a carrier of `conn` ([`CarrierInfo`]):
@@ -1330,7 +1592,7 @@ impl Handshake {
             .with_peer(remote)
             .with_alpn(self.alpn.as_deref())
             .with_server_name(self.server_name.as_deref())
-            .with_exporter(zmux::CarrierExporter::new(move |label, context, out| {
+            .with_prefix_binding(zmux::CarrierExporter::new(move |label, context, out| {
                 conn.export_keying_material(out, label.as_bytes(), context)
                     .is_ok()
             }))
@@ -1344,28 +1606,25 @@ fn alpn(conn: &Connection) -> Option<String> {
         .map(|p| String::from_utf8_lossy(&p).into_owned())
 }
 
-/// A quinn connection's streams the peer opens ([`parts::accept_loop`]).
+/// A quinn connection's streams the peer opens (the shared QUIC receivers).
 struct QuinnStreams(Connection);
 
 impl parts::StreamConn for QuinnStreams {
     type Send = QuinnSend;
     type Recv = QuinnRecv;
 
-    async fn accept(&self) -> Option<parts::Accepted<QuinnSend, QuinnRecv>> {
-        let mut bi = pin!(self.0.accept_bi());
-        let mut uni = pin!(self.0.accept_uni());
-        poll_fn(|cx| {
-            if let Poll::Ready(r) = bi.as_mut().poll(cx) {
-                return Poll::Ready(
-                    r.ok()
-                        .map(|(s, r)| parts::Accepted::Bi(QuinnSend::new(s), QuinnRecv::new(r))),
-                );
-            }
-            uni.as_mut()
-                .poll(cx)
-                .map(|r| r.ok().map(|r| parts::Accepted::Uni(QuinnRecv::new(r))))
-        })
-        .await
+    fn hints(&self, _: Option<&Listener>) -> impl Fn() -> PipeHint {
+        let conn = self.0.clone();
+        move || PipeHint::from_peer(conn.remote_address())
+    }
+
+    async fn accept_bi(&self) -> Option<(QuinnSend, QuinnRecv)> {
+        let (send, recv) = self.0.accept_bi().await.ok()?;
+        Some((QuinnSend::new(send), QuinnRecv::new(recv)))
+    }
+
+    async fn accept_uni(&self) -> Option<QuinnRecv> {
+        self.0.accept_uni().await.ok().map(QuinnRecv::new)
     }
 }
 
@@ -1376,6 +1635,10 @@ impl parts::CarrierState<QuinnSend, QuinnRecv> for Inner {
 
     fn conn_id(&self) -> CarrierConnId {
         self.id()
+    }
+
+    fn close(&self) -> &parts::ConnectionClose {
+        &self.close
     }
 
     fn kind(&self) -> zmux::CarrierKind {
@@ -1424,9 +1687,14 @@ impl parts::Datagrams<QuinnDatagrams> {
     /// takes every datagram of the connection.
     #[must_use]
     pub fn new(conn: Connection) -> Arc<Self> {
+        Self::with_receiver(conn, None)
+    }
+
+    fn with_receiver(conn: Connection, receiver: Option<Arc<BorrowedReceiver>>) -> Arc<Self> {
         Self::with(QuinnDatagrams {
             conn,
             disabled: OnceLock::new(),
+            receiver,
         })
     }
 }
@@ -1437,6 +1705,7 @@ pub struct QuinnDatagrams {
     /// The connection's configuration disables QUIC datagrams (no receive
     /// buffer): quinn then sends none either.
     disabled: OnceLock<bool>,
+    receiver: Option<Arc<BorrowedReceiver>>,
 }
 
 impl std::fmt::Debug for QuinnDatagrams {
@@ -1481,10 +1750,12 @@ impl parts::DatagramConn for QuinnDatagrams {
         demux: ChannelDemux,
     ) -> impl Future<Output = ()> + std::marker::Send + 'static {
         let conn = self.conn.clone();
+        let receiver = self.receiver.clone();
         async move {
             while let Ok(d) = conn.read_datagram().await {
                 demux.deliver(d);
             }
+            drop(receiver);
         }
     }
 }
@@ -1538,9 +1809,14 @@ impl QuinnSend {
 }
 
 impl parts::SendPart for QuinnSend {
+    fn poll_write(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        self.follow();
+        AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, bytes)
+    }
+
     /// One write of owned buffers (one lock of the connection), moving to
     /// the 1-RTT stream after a 0-RTT rejection.
-    fn poll_write_chunks(
+    fn poll_send_bytes(
         &mut self,
         cx: &mut Context<'_>,
         chunks: &mut [Bytes],

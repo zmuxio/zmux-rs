@@ -1,7 +1,6 @@
 # zmux-webtransport
 
-WebTransport sessions as [zmux](../../README.md) carriers over
-`web-transport-quinn`.
+WebTransport sessions as [zmux](../../README.md) carriers over Quinn and HTTP/3.
 
 A `Carrier` takes a whole established WebTransport session. A
 pipe is one bidirectional stream of it (`open_pipe`, `accept_pipe`); the
@@ -27,10 +26,15 @@ listener's fallback (`ListenerConfig::fallback`, a `zmux::Takeover`;
 `takeover_session` gives the session), which is closed once the fallback
 completed. A client's `zmux::CarrierCredential`
 (`Options::with_carrier_credential`) travels in a request header field, such as a
-`zmux::PrefixAuth` token in `Zmux-Prefix-Auth`; `dial_over` makes the
-session on a QUIC connection of the application's, whose exporter binds
-the token. `candidate(client, url, &options)` is a `zmux::Candidate` for
+`zmux::PrefixAuth` ticket in `Zmux-Prefix-Auth`. Apply `zmux_quinn::track_server_early_data`
+to the server's Quinn configuration before using ticket admission.
+The client's `dial` presents an encrypted bearer ticket. For a bound ticket,
+`dial_over` makes the session on the application's QUIC connection and
+uses its exporter. `candidate(client, url, &options)` is a `zmux::Candidate` for
 carrier modes.
+
+For an established QUIC connection or WebTransport session, pass the host
+transport's configured receive window with `LaneWindows::with_established_receive_window`.
 
 The carrier wires:
 
@@ -47,13 +51,29 @@ The carrier wires:
   stopped) with `ZMUX_CARRIER_FAILED`, and a session that ends under a pipe
   is a failure of the pipe.
 
-This adapter omits the `reset_stream_at` transport parameter. A client that
-requires the server to offer it refuses the connection before the session starts.
-When acting as a client, this adapter connects to servers for which the
-parameter is optional.
+Each QUIC connection carries one WebTransport session. The adapter sends the
+[draft-16](https://www.ietf.org/archive/id/draft-ietf-webtrans-http3-16.html)
+`webtransport-h3` token and `SETTINGS_WT_ENABLED`, with HTTP/3 DATAGRAM and
+the server's Extended CONNECT setting. Both roles also advertise and recognize
+the four historical WT settings. The server accepts the legacy
+`webtransport` token and validates any Origin against the target authority. A client accepts any final 2xx and exposes other final
+statuses as `zmux_webtransport::ConnectRejected`.
+
+The WT stream header carries the full CONNECT stream ID. Native datagrams
+use its Quarter Stream ID under [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297).
+The adapter handles peer CLOSE and DRAIN. DRAIN leaves existing streams
+and datagrams active while notifying the application to finish gracefully. Unknown extensions and
+unused flow control capsules are ignored. QUIC enforces stream and connection
+credit. The adapter omits WT initial credit settings and flow-control capsules. HTTP routing, WT application
+subprotocol negotiation and additional response headers are outside the
+carrier API.
+
+Quinn uses ordinary `RESET_STREAM` and `STOP_SENDING` with mapped WebTransport
+application error codes. Clients that require `RESET_STREAM_AT` can reject
+the connection during negotiation.
 
 ```rust,no_run
-# async fn example(client: web_transport_quinn::Client) -> Result<(), Box<dyn std::error::Error>> {
+# async fn example(client: zmux_webtransport::Client) -> Result<(), Box<dyn std::error::Error>> {
 let url: zmux_webtransport::Url = "https://example.com/zmux".parse()?;
 let mut config = zmux::Config::default();
 config.pipe_auth = zmux::PipeAuth::exporter();

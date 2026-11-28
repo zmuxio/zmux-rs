@@ -10,12 +10,12 @@
 )]
 #![cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
 
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use zmux::{Admission, AdmissionVerdict, Config, Listener, ListenerConfig, Session};
-use zmux_quinn::{Carrier, Options, serve_connection};
+use zmux_quinn::{Carrier, Options, adopt_connection, serve_connection};
 
 const LIMIT: Duration = Duration::from_secs(20);
 
@@ -29,38 +29,21 @@ struct Rig {
 
 impl Rig {
     fn new(admission: Option<Admission>, per_source: usize) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let cert = zmux_testcert::self_signed(vec!["localhost".into()]).unwrap();
-        let der = CertificateDer::from(cert.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![der.clone()], key)
-            .unwrap();
-        tls.alpn_protocols = zmux::alpn_protocols(&[]);
-        let opts = Options::default();
-        let server = quinn::Endpoint::server(
-            zmux_quinn::server_config(tls, &opts).unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
-        let addr = server.local_addr().unwrap();
         let mut lc = ListenerConfig::default();
         lc.admission = admission;
         lc.limits.max_pending_per_source = per_source;
+        Self::with_listener(lc)
+    }
+
+    fn with_listener(lc: ListenerConfig) -> Self {
+        let opts = common::adopted_options(Options::default());
+        let (server, client) = common::endpoints(
+            zmux::alpn_protocols(&[]),
+            opts.transport_config(),
+            opts.transport_config(),
+        );
+        let addr = server.local_addr().unwrap();
         let listener = Listener::new(Config::default(), lc).expect("valid listener configuration");
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(der).unwrap();
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls.alpn_protocols = zmux::alpn_protocols(&[]);
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client.set_default_client_config(zmux_quinn::client_config(tls, &opts).unwrap());
         Self {
             server,
             client,
@@ -77,6 +60,43 @@ impl Rig {
         let (c, s) = tokio::join!(connecting, incoming);
         (c.unwrap(), s.unwrap())
     }
+}
+
+#[tokio::test]
+async fn adopting_requires_the_hosts_actual_window() {
+    let mut limits = ListenerConfig::default();
+    let options = Options::default();
+    let window = options.windows.receive_window();
+    limits.limits.memory_budget = Some(window);
+    let rig = Rig::with_listener(limits);
+    let (_client, host) = tokio::time::timeout(LIMIT, rig.connect()).await.unwrap();
+    for options in [
+        options.clone(),
+        options
+            .clone()
+            .with_windows(options.windows.with_established_receive_window(u64::MAX)),
+    ] {
+        let err = adopt_connection(&rig.listener, host.clone(), &options)
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    assert!(host.close_reason().is_none());
+    let options = options.clone().with_windows(
+        options
+            .windows
+            .with_lanes(1)
+            .with_established_receive_window(window),
+    );
+    let service = adopt_connection(&rig.listener, host, &options)
+        .unwrap()
+        .unwrap();
+    assert!(rig.listener.adapter().reserve_memory(1).is_err());
+    service.stop_admission();
+    tokio::time::timeout(LIMIT, service.admission_stopped())
+        .await
+        .unwrap();
+    assert!(rig.listener.adapter().reserve_memory(window).is_ok());
 }
 
 /// A listener at a limit closes the connection, counts it as refused and
@@ -127,43 +147,100 @@ async fn the_call_resolves_when_the_connection_ends() {
         .unwrap();
 }
 
-/// Dropping the call stops handing streams to the listener; the connection
-/// and the session it carried go on.
+/// A blocked new pipe and an authenticated lane belong to different lifetimes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dropping_the_call_stops_the_delivery_and_keeps_the_connection() {
-    let rig = Rig::new(None, 8);
-    let (c, s) = rig.connect().await;
-    let (l, o) = (rig.listener.clone(), rig.opts.clone());
-    let call = tokio::spawn(async move { serve_connection(&l, s, &o).await });
-    let carrier = Carrier::new(c.clone(), Options::default());
-    let client = Session::connect(carrier.open_pipe().await.unwrap(), Config::default())
-        .await
-        .unwrap();
-    let accepted = tokio::time::timeout(LIMIT, rig.listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    call.abort();
-    let _ = call.await;
-    // The session of the connection goes on.
-    let (mut send, _r) = client.open_bi().await.unwrap();
-    send.write_all(b"x").await.unwrap();
-    let (_s, mut recv) = accepted.accept_bi().await.unwrap();
-    let mut b = [0u8; 1];
-    recv.read_exact(&mut b).await.unwrap();
-    // A further session on the connection is not delivered: nobody
-    // answers its pipe.
-    assert!(c.close_reason().is_none());
-    let stray = carrier.open_pipe().await.unwrap();
-    let r = tokio::time::timeout(
-        Duration::from_millis(300),
-        Session::connect(stray, Config::default()),
-    )
-    .await;
-    assert!(r.is_err(), "no listener took the pipe");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), rig.listener.accept())
+async fn stopping_admission_reaps_setup_and_keeps_existing_lanes() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (entered, mut pending) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = ListenerConfig::default();
+        config.inbound_transform = Some(zmux::InboundTransform::new({
+            let count = std::sync::atomic::AtomicUsize::new(0);
+            move |pipe, _| {
+                let block = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1;
+                let entered = entered.clone();
+                async move {
+                    if block {
+                        let (held, released) = tokio::sync::oneshot::channel::<()>();
+                        entered.send(released).unwrap();
+                        std::future::pending::<()>().await;
+                        drop(held);
+                    }
+                    Ok(pipe)
+                }
+            }
+        }));
+        let rig = Rig::with_listener(config);
+        let (connection, server) = rig.connect().await;
+        let mut service = adopt_connection(&rig.listener, server, &rig.opts)
+            .unwrap()
+            .unwrap();
+        let carrier = Carrier::new(connection.clone(), &rig.opts).unwrap();
+        let client = Session::connect(carrier.open_pipe().await.unwrap(), Config::default())
             .await
-            .is_err()
-    );
+            .unwrap();
+        let accepted = rig.listener.accept().await.unwrap();
+        assert_eq!(accepted.pipe_stats()[0].lanes_in, 1);
+
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(b"blocked setup").await.unwrap();
+        let released = pending.recv().await.unwrap();
+        service.stop_admission();
+        service.stop_admission();
+        service.admission_stopped().await;
+        assert!(released.await.is_err());
+        assert!(matches!(
+            recv.read(&mut [0]).await,
+            Err(quinn::ReadError::Reset(_))
+        ));
+        assert!(connection.close_reason().is_none());
+
+        // Exercise QUIC stream flow control so the sender opens a real lane.
+        let data = zmux::Chunk::from(vec![0xa7; 4 << 20]);
+        let transfer = async {
+            let mut streams = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let mut send = client.open_uni().await.unwrap();
+                let data = data.clone();
+                streams.spawn(async move {
+                    send.write_chunk(data).await.unwrap();
+                    send.finish().unwrap();
+                });
+            }
+            while let Some(result) = streams.join_next().await {
+                result.unwrap();
+            }
+        };
+        let receive = async {
+            let mut streams = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let mut recv = accepted.accept_uni().await.unwrap();
+                streams.spawn(async move { recv.read_to_end((4 << 20) + 1).await.unwrap() });
+            }
+            while let Some(result) = streams.join_next().await {
+                assert_eq!(result.unwrap().as_slice(), data.as_ref());
+            }
+        };
+        tokio::join!(transfer, receive);
+        assert!(accepted.pipe_stats()[0].lanes_in > 1);
+
+        // A later bidirectional stream can reach QUIC's bounded queue. It
+        // never reaches the listener, and closing the final pipe reaps it.
+        let (mut late, _recv) = connection.open_bi().await.unwrap();
+        late.write_all(b"after admission").await.unwrap();
+        let mut next = std::pin::pin!(rig.listener.accept());
+        assert!(
+            std::future::Future::poll(
+                next.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            )
+            .is_pending()
+        );
+        assert_eq!(rig.listener.stats().sessions, 1);
+        client.close().await;
+        let _ = accepted.closed().await;
+        service.wait().await.unwrap();
+        let _ = connection.closed().await;
+    })
+    .await
+    .unwrap();
 }

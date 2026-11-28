@@ -11,79 +11,73 @@ fn refill(d: u64, per: u64, rem: &mut u64) -> u64 {
     q.saturating_mul(per).saturating_add(x / 1_000_000)
 }
 
-/// The session's allowance for spontaneous actions and the meter of all added wire bytes.
-/// Its level never goes below zero.
+/// The session's allowance for cover and the meter of committed overhead.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct WireAccount {
-    p: Account,
-    on: bool,
-    /// At most `i64::MAX`.
+    params: Option<Account>,
+    initialized: bool,
     level: u64,
-    rem_mb: u64,
-    rem_s: u64,
+    remainder: u64,
     pub(super) last_us: u64,
-    earn: u64,
     pub(super) spent: u64,
 }
 
 impl WireAccount {
-    pub(super) fn accrue(&mut self, us: u64, earn: u64) {
-        let us = us.max(self.last_us);
-        let earn = earn.max(self.earn);
-        if self.on {
-            let add = refill(earn - self.earn, self.p.per_mb, &mut self.rem_mb)
-                .saturating_add(refill(us - self.last_us, self.p.per_sec, &mut self.rem_s));
-            self.level = self.level.saturating_add(add).min(i64::MAX as u64);
+    pub(super) fn accrue(&mut self, us: u64, confirmed: u64) {
+        let elapsed = us.saturating_sub(self.last_us);
+        self.last_us = self.last_us.max(us);
+        let Some(p) = self.params else { return };
+        let room = p.ceiling - self.level;
+        if room == 0 {
+            return;
         }
-        self.last_us = us;
-        self.earn = earn;
+        let scale = 1_000_000;
+        let refill = u128::from(confirmed) * u128::from(p.per_mb)
+            + u128::from(elapsed) * u128::from(p.per_sec)
+            + u128::from(self.remainder);
+        if refill >= u128::from(room) * scale {
+            self.level = p.ceiling;
+            self.remainder = 0;
+        } else {
+            self.level += u64::try_from(refill / scale).expect("refill bounded by ceiling");
+            self.remainder = u64::try_from(refill % scale).expect("fraction bounded by scale");
+        }
     }
 
     pub(super) const fn left(&self) -> u64 {
-        if self.on { self.level } else { u64::MAX }
+        if self.params.is_some() { self.level } else { 0 }
     }
 
-    /// Meters an accompanying action; it never fails and takes nothing.
-    pub(super) const fn spend(&mut self, c: u64) {
-        self.spent = self.spent.saturating_add(c);
+    pub(super) const fn spend(&mut self, cost: u64) {
+        self.spent = self.spent.saturating_add(cost);
     }
 
-    /// Takes `c` for a spontaneous action if the account has it.
-    pub(super) fn charge(&mut self, us: u64, earn: u64, c: u64) -> bool {
-        self.accrue(us, earn);
-        if self.on {
-            if c > self.level {
-                return false;
-            }
-            self.level -= c;
+    pub(super) fn charge(&mut self, us: u64, cost: u64) -> bool {
+        self.accrue(us, 0);
+        if cost == 0 || cost > self.left() {
+            return false;
         }
-        self.spend(c);
+        self.level -= cost;
+        self.spend(cost);
         true
     }
 
-    /// Replaces the parameters; what was spent stays, and the level moves by the
-    /// difference of the initial amounts.
-    pub(super) fn set(&mut self, us: u64, earn: u64, p: Account) {
-        self.accrue(us, earn);
-        if p.is_unset() {
-            self.on = false;
-            self.level = 0;
-            self.rem_mb = 0;
-            self.rem_s = 0;
-        } else if !self.on {
-            self.on = true;
-            self.level = p.initial;
-            self.rem_mb = 0;
-            self.rem_s = 0;
-        } else if p.initial >= self.p.initial {
-            self.level = self
-                .level
-                .saturating_add(p.initial - self.p.initial)
-                .min(i64::MAX as u64);
-        } else {
-            self.level = self.level.saturating_sub(self.p.initial - p.initial);
+    pub(super) fn set(&mut self, us: u64, params: Option<Account>) {
+        self.accrue(us, 0);
+        match params {
+            Some(p) => {
+                if !self.initialized && p.ceiling > 0 {
+                    self.level = p.initial;
+                    self.initialized = true;
+                }
+                if self.level >= p.ceiling {
+                    self.level = p.ceiling;
+                    self.remainder = 0;
+                }
+            }
+            None => self.remainder = 0,
         }
-        self.p = p;
+        self.params = params;
     }
 }
 
@@ -142,53 +136,69 @@ impl TokenBucket {
 }
 
 #[cfg(test)]
+#[path = "../../../shaping/tests/common/fixture.rs"]
+mod fixture;
+
+#[cfg(test)]
 mod tests {
-    use super::super::shaping::{Budget, Limits, burst_floor, rate_floor, wire_ppm};
+    use super::super::shaping::{burst_floor, wire_ppm};
     use super::*;
     use serde_json::Value as J;
-    use std::time::Duration;
+    use std::path::Path;
 
-    fn vectors() -> J {
+    fn vectors() -> Option<J> {
         let dir = std::env::var("ZMUX_SHAPING_VECTORS")
             .unwrap_or_else(|_| format!("{}/testdata/shaping", env!("CARGO_MANIFEST_DIR")));
-        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/budget.json")).unwrap())
-            .unwrap()
-    }
-
-    fn acct(v: &J) -> Account {
-        let f = |k: &str| v[k].as_u64().unwrap_or(0);
-        Account::new(f("initial"), f("per_mb"), f("per_sec"))
+        let bytes = fixture::read_fixture(&Path::new(&dir).join("machine.json"))?;
+        Some(serde_json::from_slice(&bytes).unwrap())
     }
 
     #[test]
     fn account_vectors() {
-        for c in vectors()["account"].as_array().unwrap() {
-            let name = c["name"].as_str().unwrap();
-            let mut a = WireAccount::default();
-            a.set(0, 0, acct(&c["account"]));
-            for (i, s) in c["steps"].as_array().unwrap().iter().enumerate() {
-                let (now, earn) = (s["now"].as_u64().unwrap(), s["earn"].as_u64().unwrap());
-                let n = s["n"].as_u64().unwrap_or(0);
-                match s["op"].as_str().unwrap() {
-                    "spend" => a.spend(n),
-                    "charge" => {
-                        assert_eq!(a.charge(now, earn, n), s["granted"] == true, "{name} {i}");
-                    }
-                    "set" => a.set(now, earn, acct(&s["account"])),
-                    o => panic!("{o}"),
+        let Some(vectors) = vectors() else { return };
+        let account = |data: &J| {
+            data.as_object().map(|_| {
+                Account::new(
+                    data["ceiling"].as_u64().unwrap(),
+                    data["initial"].as_u64().unwrap_or(0),
+                    data["per_mb"].as_u64().unwrap_or(0),
+                    data["per_sec"].as_u64().unwrap_or(0),
+                )
+            })
+        };
+        for case in vectors["account"].as_array().unwrap() {
+            let mut state = WireAccount::default();
+            state.set(0, account(&case["account"]));
+            let mut earned = 0;
+            for step in case["steps"].as_array().unwrap() {
+                let now = step["now"].as_u64().unwrap();
+                let total = step["earn"].as_u64().unwrap();
+                state.accrue(now, total - earned);
+                earned = total;
+                if step["op"] == "set" {
+                    state.set(now, account(&step["account"]));
+                } else {
+                    let accepted = state.charge(now, step["n"].as_u64().unwrap());
+                    assert_eq!(accepted, step["granted"] == true, "{case} {step}");
                 }
-                a.accrue(now, earn);
-                assert_eq!(a.left(), s["left"].as_u64().unwrap(), "{name} {i}");
-                assert_eq!(a.spent, s["spent"].as_u64().unwrap(), "{name} {i}");
-                let level = a.on.then_some(a.level);
-                assert_eq!(level, s["level"].as_u64(), "{name} {i}");
+                assert_eq!(
+                    state.left(),
+                    step["left"].as_u64().unwrap(),
+                    "{case} {step}"
+                );
+                assert_eq!(
+                    state.spent,
+                    step["spent"].as_u64().unwrap(),
+                    "{case} {step}"
+                );
             }
         }
     }
 
     #[test]
     fn gate_vectors() {
-        for c in vectors()["gate"].as_array().unwrap() {
+        let Some(d) = vectors() else { return };
+        for c in d["gate"].as_array().unwrap() {
             let name = c["name"].as_str().unwrap();
             let mut b = TokenBucket {
                 rate: c["rate"].as_u64().unwrap(),
@@ -196,6 +206,21 @@ mod tests {
                 ..TokenBucket::default()
             };
             b.reset(0);
+            if let Some(recovery) = c["recovery"].as_object() {
+                b.tokens = recovery["min_tokens"].as_i64().unwrap();
+                let wait = if b.rate != 0 && b.held() {
+                    b.release().unwrap()
+                } else {
+                    0
+                };
+                assert_eq!(wait, recovery["wait_us"].as_u64().unwrap(), "{name}");
+                assert_eq!(
+                    wait > recovery["max_added_delay"].as_u64().unwrap(),
+                    recovery.contains_key("error"),
+                    "{name}",
+                );
+                continue;
+            }
             for (i, s) in c["steps"].as_array().unwrap().iter().enumerate() {
                 b.fill(s["now"].as_u64().unwrap());
                 assert_eq!(b.held(), s["held"] == true, "{name} {i}");
@@ -207,48 +232,9 @@ mod tests {
         }
     }
 
-    /// A side of a vector: its `max_delay` of 0 is the default (the local
-    /// limits') or none (the configuration's), a negative one no bound.
-    fn side(v: &J, default: Option<Duration>) -> (Account, Option<Duration>) {
-        let d = match v["max_delay"].as_i64().unwrap_or(0) {
-            0 => default,
-            d if d < 0 => None,
-            d => Some(Duration::from_micros(d.cast_unsigned())),
-        };
-        (acct(&v["wire"]), d)
-    }
-
     #[test]
-    fn merge_vectors() {
-        for c in vectors()["merge"].as_array().unwrap() {
-            let (wire, max_delay) = side(&c["local"], Limits::default().max_delay);
-            let l = Limits {
-                wire,
-                max_delay,
-                ..Limits::default()
-            };
-            let (wire, max_delay) = side(&c["config"], None);
-            let set = !l.wire.is_unset() && !wire.is_unset();
-            let e = l.under(&Budget::new(wire, max_delay, false));
-            assert_eq!(e.no_injection, set && e.wire.is_unset(), "{c}");
-            assert_eq!(e.wire, acct(&c["want"]["wire"]), "{c}");
-            let want = c["want"]["max_delay"].as_i64().unwrap();
-            let got = e
-                .max_delay
-                .map_or(-1, |d| i64::try_from(d.as_micros()).unwrap());
-            assert_eq!(got, want, "{c}");
-        }
-    }
-
-    #[test]
-    fn rate_floor_and_ppm_vectors() {
-        let d = vectors();
-        for c in d["rate_floor"].as_array().unwrap() {
-            let md = u64::try_from(c["max_delay"].as_i64().unwrap()).ok();
-            let (got, clamped) = rate_floor(c["rate"].as_u64().unwrap(), md);
-            assert_eq!(got, c["want"].as_u64().unwrap(), "{c}");
-            assert_eq!(clamped, c["clamped"] == true, "{c}");
-        }
+    fn burst_floor_and_ppm_vectors() {
+        let Some(d) = vectors() else { return };
         for c in d["burst_floor"].as_array().unwrap() {
             let (got, clamped) = burst_floor(
                 c["burst"].as_u64().unwrap(),

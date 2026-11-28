@@ -107,14 +107,16 @@ impl TpValues {
     /// stand for all of them when set) with the session's own `own`.
     pub(super) fn local(config: &Config, own: &LocalTp) -> Self {
         if let Some(tp) = &config.hooks.transport_parameters {
-            return Self::of(tp);
+            let mut values = Self::of(tp);
+            values.streams_bidi = own.receive_streams[super::BIDI];
+            return values;
         }
         let window = config.initial_stream_receive_window;
         Self {
             window_bidi_local: window,
             window_bidi_remote: window,
             window_uni: window,
-            streams_bidi: config.max_incoming_streams,
+            streams_bidi: own.receive_streams[super::BIDI],
             max_idle_timeout: config.max_idle_timeout,
             role_nonce: own.role_nonce,
             multipath: own.multipath.as_ref().map(MultipathValues::of),
@@ -180,6 +182,9 @@ pub(super) struct LocalTp {
     /// `zmux_carrier_datagrams` is sent although the configuration alone
     /// does not send it: the bootstrap carrier has a datagram channel.
     pub(super) carrier_datagrams: bool,
+    /// The receive credit and stream counts funded during admission.
+    pub(super) receive_data: u64,
+    pub(super) receive_streams: [u64; 2],
 }
 
 impl LocalTp {
@@ -191,6 +196,11 @@ impl LocalTp {
             role_nonce: v.role_nonce,
             lane_key: v.lane_key.unwrap_or_default(),
             carrier_datagrams: false,
+            receive_data: tp.initial_max_data.unwrap_or(0),
+            receive_streams: [
+                tp.initial_max_streams_bidi.unwrap_or(0),
+                tp.initial_max_streams_uni.unwrap_or(0),
+            ],
         }
     }
 }
@@ -206,7 +216,7 @@ mod tests {
         for (mp, datagrams, window) in [(false, false, 256 * 1024), (true, true, 1000)] {
             let mut c = Config::default();
             if mp {
-                c.max_pipes = 4;
+                c.session_policy.limits.steady_attachments = 4;
                 c.pipe_auth = super::super::PipeAuth::psk([7; 32]);
             }
             c.enable_datagrams = datagrams;

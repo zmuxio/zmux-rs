@@ -17,7 +17,9 @@ mod trust;
 pub use establish::{
     ClientConfig, DEFAULT_REPLY_TIMEOUT, NoReply, Peer, StaticKey, StaticKeySource, establish,
 };
-pub use server::{ModeCheck, ModeCheckFn, ServerConfig, ServerOptions, reject_reason};
+pub use server::{
+    HandshakeLimits, ModeCheck, ModeCheckFn, ServerConfig, ServerOptions, reject_reason,
+};
 pub use trust::{
     Admission, AppData, AppDataRequest, AppDataSource, BoxFuture, ConfigError, Credential, Gate,
     KeySigner, PinVerifier, Principal, Signer, Verifier, VerifyError, VerifyInput, VerifyVerdict,

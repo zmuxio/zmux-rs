@@ -18,14 +18,14 @@ The first record of a bootstrap pipe: QX_TRANSPORT_PARAMETERS with the recommend
 
 <!-- zmux-example tp-zmux-default -->
 ```json
-{"id": "tp-zmux-default", "record": [{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 1048576}, {"id": "initial_max_stream_data_bidi_local", "value": 262144}, {"id": "initial_max_stream_data_bidi_remote", "value": 262144}, {"id": "initial_max_stream_data_uni", "value": 262144}, {"id": "initial_max_streams_bidi", "value": 256}, {"id": "initial_max_streams_uni", "value": 256}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 4096}, {"id": "zmux_priority", "value": null}, {"id": "zmux_pipe_ack", "value": null}, {"id": "zmux_max_lanes", "value": {"max_lanes": 258, "lane_key": "8d2f6a01c7e4b35a90f1d26e4b7c0a39"}}, {"id": "max_record_size", "value": 65535}, {"id": 120, "raw": "9a7b"}]}]}
+{"id": "tp-zmux-default", "record": [{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "max_idle_timeout", "value": 30000}, {"id": "initial_max_data", "value": 1048576}, {"id": "initial_max_stream_data_bidi_local", "value": 262144}, {"id": "initial_max_stream_data_bidi_remote", "value": 262144}, {"id": "initial_max_stream_data_uni", "value": 262144}, {"id": "initial_max_streams_bidi", "value": 256}, {"id": "initial_max_streams_uni", "value": 256}, {"id": "reset_stream_at", "value": null}, {"id": "zmux_datagram_family", "value": null}, {"id": "zmux_goaway", "value": null}, {"id": "zmux_preamble", "value": 4096}, {"id": "zmux_priority", "value": null}, {"id": "zmux_pipe_ack", "value": null}, {"id": "zmux_max_lanes", "value": {"max_lanes": 258, "lane_key": "8d2f6a01c7e4b35a90f1d26e4b7c0a39"}}, {"id": "max_record_size", "value": 65535}, {"id": 120, "raw": "9a7b"}]}]}
 ```
 
 | Field | Bytes | Value |
 |---|---|---|
-| Record Size | `40 71` | 113 |
+| Record Size | `40 76` | 118 |
 | Type | `ff 51 53 30 0d 0a 0d 0a` | 0x3f5153300d0a0d0a QX_TRANSPORT_PARAMETERS |
-| Length | `40 67` | 103 |
+| Length | `40 6c` | 108 |
 |   max_idle_timeout: ID | `01` | 0x1 |
 |   max_idle_timeout: Length | `04` | 4 |
 |   max_idle_timeout: Value | `80 00 75 30` | 30000 |
@@ -49,6 +49,8 @@ The first record of a bootstrap pipe: QX_TRANSPORT_PARAMETERS with the recommend
 |   initial_max_streams_uni: Value | `41 00` | 256 |
 |   reset_stream_at: ID | `1d` | 0x1d |
 |   reset_stream_at: Length | `00` | 0 |
+|   zmux_datagram_family: ID | `a7 e7 a0 42` | 0x27e7a042 |
+|   zmux_datagram_family: Length | `00` | 0 |
 |   zmux_goaway: ID | `84 52 8a 5f` | 0x4528a5f |
 |   zmux_goaway: Length | `00` | 0 |
 |   zmux_preamble: ID | `84 39 e0 7a` | 0x439e07a |
@@ -69,10 +71,10 @@ The first record of a bootstrap pipe: QX_TRANSPORT_PARAMETERS with the recommend
 |   GREASE (31*3+27): Value | `9a 7b` | opaque |
 
 ```hex
-4071ff5153300d0a0d0a40670104800075300404801000000504800400000604
-8004000007048004000008024100090241001d0084528a5f008439e07a025000
-b1e7139d00b4b4762100a7856ef01241028d2f6a01c7e4b35a90f1d26e4b7c0a
-39c571c59429cd0845048000ffff4078029a7b
+4076ff5153300d0a0d0a406c0104800075300404801000000504800400000604
+8004000007048004000008024100090241001d00a7e7a0420084528a5f008439
+e07a025000b1e7139d00b4b4762100a7856ef01241028d2f6a01c7e4b35a90f1
+d26e4b7c0a39c571c59429cd0845048000ffff4078029a7b
 ```
 
 ### 1.2 Transport parameters of a plain QMux peer
@@ -109,14 +111,16 @@ zmux_role auto with nonce 0x0123456789abcdef; zmux_multipath with the PSK flag, 
 
 <!-- zmux-example tp-zmux-multipath -->
 ```json
-{"id": "tp-zmux-multipath", "record": [{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "zmux_role", "value": {"role": "auto", "nonce": 81985529216486895}}, {"id": "zmux_multipath", "value": {"flags": 4, "nonce": "ffeeddccbbaa99887766554433221100", "locator": "4c4f43414c"}}, {"id": "zmux_session_crypto", "value": {"suites": [1, 2], "groups": [1, 2]}}, {"id": "zmux_ack_threshold", "value": 65536}, {"id": "zmux_max_ack_delay", "value": 25}, {"id": "zmux_resume", "value": 30000}]}]}
+{"id": "tp-zmux-multipath", "record": [{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "zmux_datagram_family", "value": null}, {"id": "zmux_role", "value": {"role": "auto", "nonce": 81985529216486895}}, {"id": "zmux_multipath", "value": {"flags": 4, "nonce": "ffeeddccbbaa99887766554433221100", "locator": "4c4f43414c"}}, {"id": "zmux_session_crypto", "value": {"suites": [1, 2], "groups": [1, 2]}}, {"id": "zmux_ack_threshold", "value": 65536}, {"id": "zmux_max_ack_delay", "value": 25}, {"id": "zmux_resume", "value": 30000}]}]}
 ```
 
 | Field | Bytes | Value |
 |---|---|---|
-| Record Size | `40 57` | 87 |
+| Record Size | `40 5c` | 92 |
 | Type | `ff 51 53 30 0d 0a 0d 0a` | 0x3f5153300d0a0d0a QX_TRANSPORT_PARAMETERS |
-| Length | `40 4d` | 77 |
+| Length | `40 52` | 82 |
+|   zmux_datagram_family: ID | `a7 e7 a0 42` | 0x27e7a042 |
+|   zmux_datagram_family: Length | `00` | 0 |
 |   zmux_role: ID | `97 24 02 07` | 0x17240207 |
 |   zmux_role: Length | `09` | 9 |
 |   zmux_role: Value | `02 01 23 45 67 89 ab cd ef` | role auto, nonce 81985529216486895 |
@@ -137,9 +141,9 @@ zmux_role auto with nonce 0x0123456789abcdef; zmux_multipath with the PSK flag, 
 |   zmux_resume: Value | `80 00 75 30` | 30000 |
 
 ```hex
-4057ff5153300d0a0d0a404d9724020709020123456789abcdefb0dc29781704
-ffeeddccbbaa99887766554433221100054c4f43414c826f24b5060201020201
-02a762c7e5048001000097fa1ed601198d5778ce0480007530
+405cff5153300d0a0d0a4052a7e7a042009724020709020123456789abcdefb0
+dc29781704ffeeddccbbaa99887766554433221100054c4f43414c826f24b506
+020102020102a762c7e5048001000097fa1ed601198d5778ce0480007530
 ```
 
 ## 2. Core frames
@@ -165,37 +169,32 @@ The first frame of stream 0: a preamble with OPEN_INFO "example.com:443", PRIORI
 1f0b001c16010f6578616d706c652e636f6d3a343433020120210068656c6c6f
 ```
 
-### 2.2 First record with early data
+### 2.2 First record of plain QMux 0-RTT
 
-A client whose application declares the peer to be a zmux endpoint opens stream 0 before the peer's parameters arrive, as early data: after its QX_TRANSPORT_PARAMETERS (abbreviated here to initial_max_data) comes the PIPE_ACK fence, one entry for pipe 0, lane 0, Position 0, ACK Delay 0, then the STREAM frame with the preamble (GREASE TLV) and 3 bytes of data, within the floor of 4096 bytes. A plain QMux peer closes at the PIPE_ACK and processes nothing after it.
+A client with remembered plain QMux parameters sends STREAM data in carrier 0-RTT. Its parameter block is abbreviated here. The STREAM payload starts with application bytes.
 
 <!-- zmux-example early-data -->
 ```json
-{"id": "early-data", "record": [{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "initial_max_data", "value": 1048576}]}, {"type": "PIPE_ACK", "entries": [{"pipe": 0, "lane": 0, "position": 0, "delay": 0}]}, {"type": "STREAM", "id": 0, "off": 0, "data": "022100474554", "fin": true}]}
+{"id": "early-data", "record": [{"type": "QX_TRANSPORT_PARAMETERS", "params": [{"id": "initial_max_data", "value": 1048576}, {"id": "zmux_datagram_family", "value": null}]}, {"type": "STREAM", "id": 0, "off": 0, "data": "474554", "fin": true}]}
 ```
 
 | Field | Bytes | Value |
 |---|---|---|
-| Record Size | `21` | 33 |
+| Record Size | `1a` | 26 |
 | Type | `ff 51 53 30 0d 0a 0d 0a` | 0x3f5153300d0a0d0a QX_TRANSPORT_PARAMETERS |
-| Length | `06` | 6 |
+| Length | `0b` | 11 |
 |   initial_max_data: ID | `04` | 0x4 |
 |   initial_max_data: Length | `04` | 4 |
 |   initial_max_data: Value | `80 10 00 00` | 1048576 |
-| Type | `8b 2b 3e eb` | 0xb2b3eeb PIPE_ACK |
-| Entry Count | `01` | 1 |
-|   Pipe ID | `00` | 0 |
-|   Lane | `00` | 0 |
-|   Position | `00` | 0 |
-|   ACK Delay (us) | `00` | 0 |
+|   zmux_datagram_family: ID | `a7 e7 a0 42` | 0x27e7a042 |
+|   zmux_datagram_family: Length | `00` | 0 |
 | Type | `0b` | 0xb STREAM (LEN|FIN) |
 | Stream ID | `00` | 0 |
-| Length | `06` | 6 |
-| Stream Data | `02 21 00 47 45 54` | 6 bytes |
+| Length | `03` | 3 |
+| Stream Data | `47 45 54` | 3 bytes |
 
 ```hex
-21ff5153300d0a0d0a060404801000008b2b3eeb01000000000b000602210047
-4554
+1aff5153300d0a0d0a0b040480100000a7e7a042000b0003474554
 ```
 
 ### 2.3 Continuing a stream
@@ -471,43 +470,70 @@ Stream 4, sequence 2, urgency 0, incremental.
 07873d08cf040210
 ```
 
-### 3.3 DATAGRAM with a flow prefix
+### 3.3 Stream DATAGRAM
 
-Associated with stream 4 (Flow 5), context 0, payload "udp-payload".
+Sequence 63, stream 4 (Flow 5), context 0, payload "udp-payload".
 
 <!-- zmux-example datagram-flow -->
 ```json
-{"id": "datagram-flow", "record": [{"type": "DATAGRAM", "data": "05007564702d7061796c6f6164", "has_len": true}]}
+{"id": "datagram-flow", "record": [{"type": "DATAGRAM", "data": "3f05007564702d7061796c6f6164", "has_len": true}]}
 ```
 
 | Field | Bytes | Value |
 |---|---|---|
-| Record Size | `0f` | 15 |
+| Record Size | `10` | 16 |
 | Type | `31` | 0x31 DATAGRAM |
-| Length | `0d` | 13 |
-| Datagram Data | `05 00 75 64 70 2d 70 61 79 6c 6f 61 64` | 13 bytes |
+| Length | `0e` | 14 |
+| Datagram Data | `3f 05 00 75 64 70 2d 70 61 79 6c 6f 61 64` | 14 bytes |
 
 ```hex
-0f310d05007564702d7061796c6f6164
+10310e3f05007564702d7061796c6f6164
 ```
 
 ### 3.4 Session-wide DATAGRAM
 
-Flow 0 and no length field: the payload runs to the end of the record.
+Sequence 64 uses two bytes. Flow 0 is followed by the payload without a Context ID. The two PADDING frames precede type 0x30, which runs to the end of the record. The final zero byte belongs to the payload.
 
 <!-- zmux-example datagram-session -->
 ```json
-{"id": "datagram-session", "record": [{"type": "DATAGRAM", "data": "0070696e67", "has_len": false}]}
+{"id": "datagram-session", "record": [{"type": "PADDING", "count": 2}, {"type": "DATAGRAM", "data": "40400070696e6700", "has_len": false}]}
 ```
 
 | Field | Bytes | Value |
 |---|---|---|
-| Record Size | `06` | 6 |
+| Record Size | `0b` | 11 |
+| PADDING | `00 00` | 2 x 0x00 |
 | Type | `30` | 0x30 DATAGRAM |
-| Datagram Data | `00 70 69 6e 67` | 5 bytes |
+| Datagram Data | `40 40 00 70 69 6e 67 00` | 8 bytes |
 
 ```hex
-06300070696e67
+0b00003040400070696e6700
+```
+
+### 3.5 DATAGRAM_ACK
+
+Sequences 65 to 67 and 61 arrived on the native channel of pipe 2. The report is sent 250 microseconds after sequence 67 arrived.
+
+<!-- zmux-example datagram-ack -->
+```json
+{"id": "datagram-ack", "record": [{"type": "DATAGRAM_ACK", "pipe": 2, "channel": 1, "largest": 67, "delay": 250, "first_range": 2, "ranges": [{"gap": 2, "length": 0}]}]}
+```
+
+| Field | Bytes | Value |
+|---|---|---|
+| Record Size | `0e` | 14 |
+| Type | `a8 bb d9 9f` | 0x28bbd99f DATAGRAM_ACK |
+| Pipe ID | `02` | 2 |
+| Channel | `01` | 1 bytes |
+| Largest Sequence | `40 43` | 67 |
+| ACK Delay (us) | `40 fa` | 250 |
+| Range Count | `01` | 1 |
+| First Range | `02` | 2 |
+|   Gap | `02` | 2 |
+|   Range Length | `00` | 0 |
+
+```hex
+0ea8bbd99f0201404340fa01020200
 ```
 
 ## 4. Multipath

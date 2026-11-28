@@ -2,17 +2,24 @@
 
 QUIC connections as [zmux](../../README.md) carriers over `quinn`.
 
-A `Carrier` takes a whole established `quinn::Connection`. A pipe is one
+A `Carrier` uses an established `quinn::Connection`. A pipe is one
 bidirectional stream of it (`open_pipe`, `accept_pipe`); the pipe's lanes
 are further unidirectional streams that zmux opens as it needs them, so that
 a loss on one lane does not hold back the streams on the others. The carrier
-runs the connection's accept loop and hands every stream the peer opens to
-zmux: to a `zmux::Listener` when one is given, else lanes to
+made with `Carrier::new` runs the connection's accept loop and hands every
+stream the peer opens to zmux: to a `zmux::Listener` when one is given, else lanes to
 `zmux::adapter::handle_lane` and pipes to `accept_pipe`. The carrier owns the
 connection: its streams and datagrams belong to zmux, and once no carrier
 clone and no pipe made from it is left the connection is closed. Keep the
 `Carrier` for as long as the connection is to stay open; its statistics and
 path stay readable through `connection()`.
+
+Use `Carrier::borrow(&connection, &options).await?` for an established
+client connection whose lifetime the host manages. Open pipes on it with
+`open_pipe`. The live bindings share the lane receiver and datagram router.
+The host receives peer-opened bidirectional streams and closes the connection.
+For an established connection, pass the receive window used by the host's
+QUIC transport configuration with `LaneWindows::with_established_receive_window`.
 
 The carrier wires:
 
@@ -34,10 +41,11 @@ The carrier wires:
 carrier modes.
 
 ```rust,no_run
-# async fn example(conn: quinn::Connection) -> Result<(), Box<dyn std::error::Error>> {
-use zmux_quinn::{Carrier, Options};
+# async fn example(conn: quinn::Connection, receive_window: u64) -> Result<(), Box<dyn std::error::Error>> {
+use zmux_quinn::{Carrier, LaneWindows, Options};
 
-let quic = Carrier::new(conn, Options::default());
+let windows = LaneWindows::new().with_established_receive_window(receive_window);
+let quic = Carrier::new(conn, &Options::new().with_windows(windows))?;
 let mut config = zmux::Config::default();
 config.pipe_auth = zmux::PipeAuth::exporter();
 let session = zmux::Session::connect(quic.open_pipe().await?, config).await?;
@@ -62,8 +70,13 @@ listener. Both `serve` and `serve_connection` dispatch a first-stream
 `Fallback` or `Takeover` to the listener's byte-stream target (`ListenerConfig::fallback`, a `zmux::Takeover` of the stream with
 every byte read replayed; `takeover_connection` gives its connection), and
 the connection is closed once the fallback completed; without one it is
-stalled with its stream. An explicit `Close` ends it immediately. Admitted connections
-never take 0-RTT data: the server configuration must refuse early data. A
+stalled with its stream. An explicit `Close` ends it immediately. Ticket
+admission rejects presentations carried in 0-RTT bytes. A 1-RTT stream on
+the same connection can present a ticket. Apply
+`zmux_quinn::track_server_early_data` to a custom Quinn server configuration
+before using it for ticket admission. It is included in
+`zmux_quinn::server_config`. Without tracking, `adopt_connection` and
+`serve_connection` return `InvalidInput` for ticket-protected listeners. A
 client presents a `zmux::CarrierCredential` (such as `zmux::PrefixAuth`) with
 `Options::with_carrier_credential`: `dial` and `connect` write its prefix on the
 first stream once the handshake completed, and send no 0-RTT data; or it

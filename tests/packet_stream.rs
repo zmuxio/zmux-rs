@@ -14,10 +14,10 @@
 
 mod common;
 
+use std::future::{Future, poll_fn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 
 use bytes::Bytes;
 use common::{connect, duplex, multi_thread, watchdog};
@@ -62,6 +62,28 @@ async fn packets(a: &Session, b: &Session, opts: PacketOptions) -> (PacketStream
 async fn next(p: &mut PacketStream) -> (u64, Bytes) {
     let got = watchdog(10, "packet", p.recv()).await.unwrap().unwrap();
     (got.context, got.payload)
+}
+
+#[tokio::test]
+async fn capsule_only_rejects_inherited_require_native() {
+    let (client, _server) = pair(true).await;
+    let (send, recv) = client.open_bi().await.unwrap();
+    send.set_datagram_options(zmux::DatagramSendOptions {
+        carrier: Some(zmux::DatagramCarrier::RequireNative),
+        ..zmux::DatagramSendOptions::default()
+    })
+    .unwrap();
+    let mut packet = PacketStream::with_options(
+        send,
+        recv,
+        PacketOptions::with_policy(SendPolicy::StreamOnly),
+    );
+    assert!(matches!(
+        packet.send(Bytes::new()).await,
+        Err(PacketError::Datagram(zmux::DatagramError::InvalidOptions(error)))
+        if error.field() == "packet_policy"
+    ));
+    assert_eq!(packet.stats().sent_capsules, 0);
 }
 
 /// The DATAGRAM capsule of `payload` with Context ID `context`.
@@ -347,6 +369,7 @@ fn a_packet_relay_turns_a_datagram_too_large_for_the_next_hop_into_a_capsule() {
         let mut raw = vec![0x17, 0x02, 1, 2];
         raw.extend(capsule(9, b"first"));
         s.write_all(&raw).await.unwrap();
+        let max = s.max_datagram_size(9).unwrap();
         let mut p = PacketStream::new(s, r);
         let (fs, fr) = watchdog(10, "accept", hop.b.accept_bi()).await.unwrap();
         assert!(
@@ -354,9 +377,6 @@ fn a_packet_relay_turns_a_datagram_too_large_for_the_next_hop_into_a_capsule() {
             "the outbound Flow takes 2 bytes: {:?}",
             fs.id()
         );
-        // The DATAGRAM frame of 65535 bytes less its type, a one-byte Flow
-        // and a one-byte Context ID.
-        let max = 65535 - 3;
         let mut q = PacketStream::new(fs, fr);
         // A datagram that just fits the first hop, and with the other
         // stream ID not the second: a DATAGRAM capsule there.
@@ -388,7 +408,7 @@ fn a_packet_relay_turns_a_datagram_too_large_for_the_next_hop_into_a_capsule() {
         assert_eq!(watchdog(10, "end", q.recv()).await, Ok(None));
         assert_eq!(watchdog(10, "end", p.recv()).await, Ok(None));
         let (ab, _) = watchdog(10, "relay", hop.relay).await.unwrap();
-        assert_eq!((ab.datagrams_as_capsules, ab.datagrams_dropped), (1, 0));
+        assert_eq!((ab.datagrams_as_capsules, ab.drops.total()), (1, 0));
     });
 }
 
@@ -430,7 +450,7 @@ fn splice_counts_datagrams_too_large_for_the_next_hop() {
         let (mut s, mut r) = hop.a.open_bi().await.unwrap();
         s.write_all(b"x").await.unwrap();
         let (mut fs, mut fr) = watchdog(10, "accept", hop.b.accept_bi()).await.unwrap();
-        s.send_datagram(0, Bytes::from(vec![1u8; 65535 - 3]))
+        s.send_datagram(0, Bytes::from(vec![1u8; s.max_datagram_size(0).unwrap()]))
             .unwrap();
         s.send_datagram(0, Bytes::from_static(b"fits")).unwrap();
         let d = watchdog(10, "datagram", fr.read_datagram()).await.unwrap();
@@ -451,9 +471,9 @@ fn splice_counts_datagrams_too_large_for_the_next_hop() {
         let (ab, _) = watchdog(10, "relay", hop.relay).await.unwrap();
         assert_eq!(
             (
-                ab.datagrams_dropped,
-                ab.datagrams_too_large,
-                ab.datagrams_limited
+                ab.drops.total(),
+                ab.drops.dropped_too_large,
+                ab.drops.dropped_limiter
             ),
             (1, 1, 0)
         );
@@ -467,7 +487,7 @@ fn a_packet_relay_inserts_capsules_only_at_capsule_boundaries() {
         let hop = Hop::new(true, 20, true).await;
         let (mut s, mut r) = hop.a.open_bi().await.unwrap();
         s.pin_id().unwrap();
-        let big = 65535 - 3;
+        let big = s.max_datagram_size(2).unwrap();
         let mut far = None;
         for i in 0..30u8 {
             // Capsules that the relay reads in pieces, with datagrams that
@@ -554,28 +574,49 @@ fn datagrams_queued_before_the_end_are_delivered_before_it() {
 /// lets the far end read everything: the capsules it received and the
 /// sender's count of those sent, with the sends that returned `Ok`.
 async fn cancel_a_stalled_send(size: usize) -> (u64, u64, u64) {
-    // Fixed windows: an auto-tuned window grows with the arrival rate, so
-    // where the credit ends (and whether it ends on a capsule boundary)
-    // would depend on timing.
+    const SEND_BUFFER: u64 = 64 * 1024;
     let mut c = config(true);
-    c.max_stream_receive_window = Cap::Fixed(c.initial_stream_receive_window);
-    c.max_connection_receive_window = Cap::Fixed(c.initial_connection_receive_window);
-    let ((x, _), (y, _)) = duplex(1 << 20);
+    c.initial_stream_receive_window = SEND_BUFFER;
+    c.max_stream_receive_window = Cap::Fixed(SEND_BUFFER);
+    let ((x, gate), (y, _)) = duplex(1 << 20);
     let (a, b) = connect(x, y, c.clone(), c).await;
-    let (mut p, mut q) = packets(&a, &b, PacketOptions::with_policy(SendPolicy::StreamOnly)).await;
+    let ((mut send, recv), (far_send, far_recv)) = stream(&a, &b).await;
+    let credit = watchdog(30, "initial credit", send.wait_send_capacity(1))
+        .await
+        .unwrap();
+    // Occupy every byte of peer credit without returning receive credit.
+    // A big capsule has a six-byte header including Context ID.
+    let fill = capsule(0, &vec![0; usize::try_from(credit).unwrap() - 6]);
+    assert_eq!(fill.len() as u64, credit);
+    watchdog(30, "fill peer credit", send.write_all(&fill))
+        .await
+        .unwrap();
+    common::eventually(30, "all peer credit occupied", || {
+        far_recv.stats().bytes_received == credit
+    })
+    .await;
+    send.set_send_buffer(SEND_BUFFER).unwrap();
+    gate.stall(true);
+    let options = PacketOptions::with_policy(SendPolicy::StreamOnly);
+    let mut p = PacketStream::with_options(send, recv, options);
+    let mut q = PacketStream::with_options(far_send, far_recv, options);
     // A one-byte Context ID and a two-byte Length.
-    let payload = Bytes::from(vec![7u8; size - 4]);
-    let mut ok = 0u64;
-    while let Ok(r) = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        p.send(payload.clone()),
-    )
-    .await
-    {
-        assert_eq!(r, Ok(Sent::Capsule));
-        ok += 1;
+    let payload = Bytes::from(vec![7; size - 4]);
+    let ok = SEND_BUFFER / size as u64;
+    for _ in 0..ok {
+        assert_eq!(
+            watchdog(30, "send within buffer", p.send(payload.clone())).await,
+            Ok(Sent::Capsule)
+        );
     }
+    {
+        let mut pending = std::pin::pin!(p.send(payload.clone()));
+        let poll = poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx))).await;
+        assert!(poll.is_pending(), "the next capsule fills the buffer");
+    }
+    gate.stall(false);
     let reader = tokio::spawn(async move {
+        assert_eq!(next(&mut q).await.1.len() as u64, credit - 6);
         let mut n = 0u64;
         while let Some(got) = watchdog(10, "recv", q.recv()).await.unwrap() {
             assert_eq!(got.payload.len(), size - 4);
@@ -648,8 +689,8 @@ async fn queued_capsules_dropped_by_the_end(reset: bool) {
         (
             ab.datagrams_as_capsules,
             ab.datagram_bytes,
-            ab.datagrams_dropped,
-            ab.datagrams_too_large
+            ab.drops.total(),
+            ab.drops.dropped_too_large
         ),
         (0, 0, 5, 0),
         "dropped by the end, not for their size"
@@ -676,6 +717,8 @@ struct Rec {
     burst: u64,
     try_grant: AtomicU64,
     closed: AtomicBool,
+    requested: tokio::sync::Notify,
+    tried: tokio::sync::Notify,
     waiter: Mutex<Option<Waker>>,
     out: AtomicU64,
 }
@@ -695,12 +738,17 @@ impl Rec {
 }
 
 impl Limiter for Rec {
+    fn max_burst_bytes(&self) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
     fn poll_acquire(
         &self,
         cx: &mut Context<'_>,
         min: u64,
         max: u64,
     ) -> Poll<Result<u64, zmux::LimitError>> {
+        self.requested.notify_one();
         if self.closed.load(Ordering::SeqCst) {
             *self.waiter.lock().unwrap() = Some(cx.waker().clone());
             if self.closed.load(Ordering::SeqCst) {
@@ -720,11 +768,34 @@ impl Limiter for Rec {
         self.tries.lock().unwrap().push((min, max));
         let n = self.try_grant.load(Ordering::SeqCst).min(max);
         self.out.fetch_add(n, Ordering::SeqCst);
+        // Wake the test only after this call has decided its grant.
+        self.tried.notify_one();
         n
     }
     fn refund(&self, n: u64) {
         self.out.fetch_sub(n, Ordering::SeqCst);
     }
+}
+
+#[tokio::test]
+async fn packet_capsules_do_not_call_the_datagram_limiter() {
+    let limiter = Arc::new(Rec::default());
+    let mut client = config(true);
+    client.datagram_limiter.send = Some(limiter.clone());
+    let ((a, _), (b, _)) = duplex(1 << 20);
+    let (a, b) = connect(a, b, client, config(true)).await;
+    let (mut sender, mut receiver) = packets(&a, &b, PacketOptions::default()).await;
+
+    assert!(matches!(
+        sender.send(Bytes::from_static(b"denied")).await,
+        Err(PacketError::Datagram(zmux::DatagramError::Dropped(
+            zmux::DatagramDrop::Limiter
+        )))
+    ));
+    let oversized = Bytes::from(vec![0; 65535]);
+    assert_eq!(sender.send(oversized.clone()).await, Ok(Sent::Capsule));
+    assert_eq!(next(&mut receiver).await, (0, oversized));
+    assert_eq!(*limiter.tries.lock().unwrap(), [(6, 6)]);
 }
 
 fn limited(rec: &Arc<Rec>) -> SpliceOptions {
@@ -788,24 +859,24 @@ fn a_packet_relay_takes_one_whole_grant_per_capsule() {
 }
 
 #[test]
-fn a_burst_below_the_capsule_still_forwards_it_whole() {
+fn a_short_atomic_grant_refunds_and_ends_the_direction() {
     multi_thread(async {
         let rec = Arc::new(Rec {
             burst: 10,
             ..Rec::default()
         });
         let hop = Hop::with(true, 0, true, limited(&rec)).await;
-        let (mut s, r) = hop.a.open_bi().await.unwrap();
-        let c = capsule(4, &[9; 1000]);
-        s.write_all(&c).await.unwrap();
-        s.finish().unwrap();
-        let (fs, fr) = watchdog(10, "accept", hop.b.accept_bi()).await.unwrap();
-        let mut q = PacketStream::new(fs, fr);
-        assert_eq!(drain(&mut q).await, [(4, Bytes::from(vec![9; 1000]))]);
-        drop(r);
-        q.close().await.unwrap();
-        watchdog(10, "relay", hop.relay).await.unwrap();
-        let n = c.len() as u64;
+        let (mut send, recv) = hop.a.open_bi().await.unwrap();
+        let unit = capsule(4, &[9; 1000]);
+        send.write_all(&unit).await.unwrap();
+        let stopped = watchdog(30, "limiter STOP", send.stopped()).await.unwrap();
+        assert_eq!(stopped, Some(VarInt::from_u32(0x5a4d_0001)));
+        drop(recv);
+        let (result, _) = watchdog(30, "relay", hop.relay).await.unwrap();
+        assert_eq!(result.end, zmux::helpers::SpliceEnd::LimiterFailed);
+        assert_eq!(result.bytes, 0);
+        assert_eq!(rec.outstanding(), 0);
+        let n = unit.len() as u64;
         assert_eq!(*rec.acquires.lock().unwrap(), [(n, n)]);
     });
 }
@@ -823,13 +894,8 @@ fn a_packet_relay_holds_only_the_header_while_the_limiter_waits() {
         // The relay read the header and waits: nothing more is read,
         // nothing granted, nothing forwarded.
         let read = || hop.inbound.stats().bytes_read;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while read() < 3 {
-            assert!(std::time::Instant::now() < deadline, "header not read");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(read(), 3, "only Type and Length are held");
+        watchdog(30, "exact reservation requested", rec.requested.notified()).await;
+        assert_eq!(read(), 4, "only the complete capsule header is held");
         assert_eq!(rec.outstanding(), 0);
         assert!(rec.acquires.lock().unwrap().is_empty());
         rec.open();
@@ -837,8 +903,8 @@ fn a_packet_relay_holds_only_the_header_while_the_limiter_waits() {
         let (fs, fr) = watchdog(10, "accept", hop.b.accept_bi()).await.unwrap();
         let mut q = PacketStream::new(fs, fr);
         assert_eq!(drain(&mut q).await, [(4, Bytes::from(vec![9; 1000]))]);
-        drop(r);
         q.close().await.unwrap();
+        drop(r);
         watchdog(10, "relay", hop.relay).await.unwrap();
         let n = c.len() as u64;
         assert_eq!(*rec.acquires.lock().unwrap(), [(n, n)]);
@@ -856,12 +922,7 @@ fn a_reset_ends_a_packet_relay_waiting_for_a_capsule_grant() {
         let hop = Hop::with(true, 0, true, limited(&rec)).await;
         let (mut s, r) = hop.a.open_bi().await.unwrap();
         s.write_all(&capsule(4, &[9; 1000])).await.unwrap();
-        let read = || hop.inbound.stats().bytes_read;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while read() < 3 {
-            assert!(std::time::Instant::now() < deadline, "header not read");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        watchdog(30, "exact reservation requested", rec.requested.notified()).await;
         s.reset(VarInt::from_u32(9)).unwrap();
         drop(r);
         let (ab, _) = watchdog(10, "relay", hop.relay).await.unwrap();
@@ -911,11 +972,7 @@ fn a_packet_relay_polices_datagrams_and_drops_them_without_a_grant() {
             // Refused: dropped and counted. Then granted, and an empty
             // one that passes without a call.
             s.send_datagram(2, Bytes::from(vec![5; 100])).unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while rec.tries.lock().unwrap().is_empty() {
-                assert!(std::time::Instant::now() < deadline, "not policed");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            watchdog(30, "datagram policed", rec.tried.notified()).await;
             rec.try_grant.store(u64::MAX, Ordering::SeqCst);
             s.send_datagram(3, Bytes::from(vec![6; 50])).unwrap();
             s.send_datagram(4, Bytes::new()).unwrap();
@@ -936,8 +993,13 @@ fn a_packet_relay_polices_datagrams_and_drops_them_without_a_grant() {
                 .is_some()
             {}
             let (ab, _) = watchdog(10, "relay", hop.relay).await.unwrap();
-            assert_eq!((ab.datagrams_dropped, ab.datagrams_limited), (1, 1));
-            assert_eq!(*rec.tries.lock().unwrap(), [(100, 100), (50, 50)]);
+            assert_eq!((ab.drops.total(), ab.drops.dropped_limiter), (1, 1));
+            let tries = rec.tries.lock().unwrap();
+            if capsules {
+                assert_eq!(*tries, [(104, 104), (53, 53), (3, 3)]);
+            } else {
+                assert_eq!(*tries, [(100, 100), (50, 50)]);
+            }
             // Only the capsule written by the sender was acquired.
             assert_eq!(*rec.acquires.lock().unwrap(), [(4, 4)]);
             assert_eq!(ab.datagrams_as_capsules, u64::from(capsules) * 2);

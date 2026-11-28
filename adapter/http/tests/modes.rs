@@ -1,9 +1,7 @@
 //! Carrier modes through intermediaries: one unified
-//! endpoint with prefix authentication serves every kind, and a test proxy
-//! in front of it behaves as common reverse proxies and CDNs do. Auto mode
-//! picks the best kind each path passes; an explicit mode never falls back;
-//! with joins, a session established on the exchange carrier moves to a
-//! preferred kind.
+//! endpoint with an admission credential serves every kind, and a test proxy
+//! in front of it behaves as common reverse proxies and CDNs do. The controller
+//! picks the best carrier that works over each path.
 
 #![cfg(feature = "websocket")]
 
@@ -17,30 +15,58 @@ use std::time::Duration;
 use proxy::Profile;
 use tokio::net::{TcpListener, TcpStream};
 use zmux::{
-    Admission, CandidateOutcome, CarrierChoice, CarrierChoicePolicy, CarrierKind, Config, Listener,
-    ListenerConfig, PipeAuth, PrefixAuth, PrefixAuthVerifier, Session, dial_choice,
+    Admission, CandidateOutcome, CarrierKind, Config, ControllerError, ControllerOptions, Listener,
+    ListenerConfig, Session, SessionController, SessionTarget,
 };
 use zmux_http::{Endpoint, ExchangeOptions, ExchangeServer, Options};
 
 const PSK: &[u8] = b"an exchange key";
 
-fn auth() -> PrefixAuth {
-    PrefixAuth::new(b"prefix psk", Duration::from_secs(30), false).unwrap()
+#[derive(Debug)]
+struct FixtureCredential;
+
+const FIXTURE_HEADER: &str = "x-test-carrier";
+const FIXTURE_PREFIX: &[u8] = b"carrier-fixture";
+
+impl zmux::CarrierCredential for FixtureCredential {
+    fn prefix(&self, _: &zmux::CarrierInfo) -> std::io::Result<Vec<u8>> {
+        Ok(FIXTURE_PREFIX.to_vec())
+    }
+
+    fn header(&self, _: &zmux::CarrierInfo) -> std::io::Result<(String, String)> {
+        Ok((FIXTURE_HEADER.into(), "fixture".into()))
+    }
 }
 
 fn exchange_options() -> ExchangeOptions {
     ExchangeOptions::default().with_psk(PSK).with_path("/zmux")
 }
 
-/// The unified endpoint, prefix authentication on every streaming kind;
+/// The unified endpoint, with admission on every streaming kind;
 /// its address and listener.
 async fn origin(config: Config) -> (std::net::SocketAddr, Listener) {
-    let verifier = Arc::new(PrefixAuthVerifier::new(auth(), 1, 4096).unwrap());
     let mut limits = ListenerConfig::default();
-    limits.admission = Some(Admission::prefix_auth(verifier));
+    limits.admission = Some(Admission::new(FIXTURE_PREFIX.len(), |info, prefix| {
+        if info.is_head() {
+            let mut valid = false;
+            info.for_each_header(|name, value| {
+                valid |= name.eq_ignore_ascii_case(FIXTURE_HEADER) && value == b"fixture";
+            });
+            if valid {
+                zmux::AdmissionVerdict::accept(0)
+            } else {
+                zmux::AdmissionVerdict::Close
+            }
+        } else if prefix == FIXTURE_PREFIX {
+            zmux::AdmissionVerdict::accept(prefix.len())
+        } else {
+            zmux::AdmissionVerdict::Close
+        }
+    }));
     let listener = Listener::new(config, limits).expect("valid listener configuration");
     let exchange = ExchangeServer::new(&listener, exchange_options()).unwrap();
     let endpoint = Endpoint::new(listener.clone(), Options::default().with_exchange(exchange))
+        .unwrap()
         .with_websocket(zmux_websocket::Options::default());
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
@@ -81,7 +107,7 @@ fn connect(
 
 /// The candidates of every HTTP kind through `addr`, by kind.
 fn candidate(kind: CarrierKind, addr: &str) -> zmux::Candidate {
-    let credential: Arc<dyn zmux::CarrierCredential> = Arc::new(auth());
+    let credential: Arc<dyn zmux::CarrierCredential> = Arc::new(FixtureCredential);
     let http = Options::default()
         .with_carrier_credential(credential.clone())
         .with_timeout(Duration::from_secs(3));
@@ -108,8 +134,27 @@ const ORDER: [CarrierKind; 4] = [
     CarrierKind::Exchange,
 ];
 
-fn auto(order: &[CarrierKind], addr: &str) -> CarrierChoice {
-    CarrierChoice::auto(order.iter().map(|&k| candidate(k, addr)))
+async fn open_controller(
+    order: &[CarrierKind],
+    addr: &str,
+    domain: &str,
+) -> Result<Session, ControllerError> {
+    let candidates = order
+        .iter()
+        .zip(0..)
+        .map(|(&kind, tier)| {
+            candidate(kind, addr)
+                .with_tier(tier)
+                .with_identity(kind.name(), kind.name())
+        })
+        .collect();
+    let controller = SessionController::new(ControllerOptions::new(domain, candidates))?;
+    let (session, control) = controller.open(config(), SessionTarget::default()).await?;
+    if let Some(control) = control {
+        control.release().unwrap();
+        control.done().await;
+    }
+    Ok(session)
 }
 
 fn config() -> Config {
@@ -143,7 +188,6 @@ fn auto_picks_the_best_kind_each_path_passes() {
         tokio::time::timeout(Duration::from_secs(120), async {
             let (origin, _listener) = origin(config()).await;
             let direct = origin.to_string();
-            let policy = CarrierChoicePolicy::default().without_join();
             let cases: Vec<(&str, Option<Profile>, &[CarrierKind], Vec<_>)> = vec![
                 ("direct", None, &ORDER, vec![(WebSocket, Usable)]),
                 (
@@ -197,7 +241,7 @@ fn auto_picks_the_best_kind_each_path_passes() {
                     Some(p) => proxy::start(p, origin).await.0,
                     None => direct.clone(),
                 };
-                let client = dial_choice(&auto(order, &addr), config(), &policy)
+                let client = open_controller(order, &addr, name)
                     .await
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert_eq!(tries(&client), expect, "{name}");
@@ -217,69 +261,23 @@ fn explicit_never_falls_back() {
         tokio::time::timeout(Duration::from_secs(60), async {
             let (origin, listener) = origin(config()).await;
             let (addr, _p) = proxy::start(Profile::REVERSE_PROXY, origin).await;
-            let e = dial_choice(
-                &CarrierChoice::explicit(candidate(CarrierKind::WebSocket, &addr)),
-                config(),
-                &CarrierChoicePolicy::default(),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(e.results.len(), 1);
-            assert_eq!(e.results[0].outcome, CandidateOutcome::Refused);
-            let e = dial_choice(
-                &CarrierChoice::explicit(candidate(CarrierKind::Streaming, &addr)),
-                config(),
-                &CarrierChoicePolicy::default(),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(e.results.len(), 1, "{e}");
+            let Err(ControllerError::Bootstrap(first)) =
+                open_controller(&[CarrierKind::WebSocket], &addr, "single-ws").await
+            else {
+                panic!("expected bootstrap refusal");
+            };
+            assert_eq!(first.results.len(), 1);
+            assert_eq!(first.results[0].outcome, CandidateOutcome::Refused);
+            let Err(ControllerError::Bootstrap(second)) =
+                open_controller(&[CarrierKind::Streaming], &addr, "single-streaming").await
+            else {
+                panic!("expected bootstrap failure");
+            };
+            assert_eq!(second.results.len(), 1);
             assert_eq!(listener.stats().sessions, 0);
-            // The kind that passes works explicitly too.
-            let client = dial_choice(
-                &CarrierChoice::explicit(candidate(CarrierKind::Exchange, &addr)),
-                config(),
-                &CarrierChoicePolicy::default(),
-            )
-            .await
-            .unwrap();
-            works(&client).await;
-            client.close().await;
-        })
-        .await
-        .unwrap();
-    });
-}
-
-fn multipath() -> Config {
-    let mut c = config();
-    c.max_pipes = 4;
-    c.pipe_auth = PipeAuth::psk(*b"carrier-modes-psk-0123456789abcd").with_end_to_end();
-    c
-}
-
-/// With joins, the session is established on the exchange carrier and
-/// moves to the split kind (one pipe over two HTTP requests), which the half-duplex path passes;
-/// the exchange pipe is retired.
-#[test]
-fn auto_with_joins_moves_off_the_exchange() {
-    support::run(4, 90, || async {
-        tokio::time::timeout(Duration::from_secs(60), async {
-            let (origin, _listener) = origin(multipath()).await;
-            let (addr, _p) = proxy::start(Profile::HALF_DUPLEX, origin).await;
-            let mut policy = CarrierChoicePolicy::default();
-            policy.settle = Duration::from_millis(300);
-            let client = dial_choice(&auto(&ORDER, &addr), multipath(), &policy)
+            let client = open_controller(&[CarrierKind::Exchange], &addr, "single-exchange")
                 .await
                 .unwrap();
-            assert_eq!(client.stats().carrier, Some(CarrierKind::Exchange));
-            let bootstrap = client.pipe(zmux::PipeId::new(0)).unwrap();
-            let _ = bootstrap.closed().await;
-            assert_eq!(client.stats().carrier, Some(CarrierKind::Split));
-            let pipes = client.pipe_stats();
-            assert_eq!(pipes.len(), 1, "{pipes:?}");
-            assert_eq!(pipes[0].carrier, Some(CarrierKind::Split));
-            assert!(pipes[0].peer_attached);
             works(&client).await;
             client.close().await;
         })
@@ -307,8 +305,6 @@ fn an_early_websocket_upgrade_is_too_early_and_a_setup_failure() {
             let mut head = [0u8; 12];
             c.read_exact(&mut head).await.unwrap();
             assert_eq!(&head, b"HTTP/1.1 425");
-            drop(c);
-            tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(listener.stats().setup_failures, 1);
         })
         .await

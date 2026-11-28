@@ -35,11 +35,12 @@ pub(in crate::proto::session) struct Blocking {
     /// frame that carried `start`.
     pub(in crate::proto::session) start: u64,
     pub(in crate::proto::session) end: u64,
-    /// The pipe it was last sent on, the send time, and the acknowledgement
-    /// time then expected (E).
+    /// The original handoff and its frozen confirmation wait.
     pub(in crate::proto::session) pipe: u64,
     pub(in crate::proto::session) sent: Instant,
-    pub(in crate::proto::session) expect: Duration,
+    pub(in crate::proto::session) source_wait: Duration,
+    /// Record position and frame offset on the original handoff.
+    pub(in crate::proto::session) original: (u64, u64),
 }
 
 /// What one scheduled stream direction contributes.
@@ -194,8 +195,6 @@ struct PipeLoad {
 pub(in crate::proto::session) struct Held {
     /// Its place in the list.
     pub(in crate::proto::session) seq: u64,
-    /// Stream credit holds it back now.
-    pub(in crate::proto::session) blocked: bool,
     /// The data that blocks it, where and when it was last sent.
     pub(in crate::proto::session) blocking: Option<Blocking>,
 }
@@ -258,7 +257,7 @@ pub(crate) struct Ledger {
     /// Per level, the ready data of each incremental direction that has
     /// some, in order, and how many they are; and the ready data of the
     /// non-incremental ones, which the round robin serves in full (`N_u`).
-    amounts: [Amounts; 8],
+    amounts: Option<Box<[Amounts; 8]>>,
     sharers: [u64; 8],
     whole: [u64; 8],
     lost: u64,
@@ -271,9 +270,7 @@ pub(crate) struct Ledger {
     loads: Vec<PipeLoad>,
     /// The directions with new data, by how a decision treats them.
     tags: BTreeMap<Tag, BTreeSet<StreamKey>>,
-    /// The listed directions that stream credit holds back, and their
-    /// blocking data by last send time (ties in list order).
-    blocked: u64,
+    /// Blocking data of listed directions, by handoff time. Ties use list order.
     blocking: BTreeMap<(Instant, u64), Blocking>,
     /// The view generation the blocking data was found in: it depends on
     /// which pipes are live.
@@ -305,7 +302,17 @@ fn sub(set: &mut BTreeMap<Instant, u64>, t: Option<Instant>) {
     }
 }
 
+static EMPTY_AMOUNTS: [Amounts; 8] = [const { Amounts::EMPTY }; 8];
+
 impl Ledger {
+    fn amounts(&self) -> &[Amounts; 8] {
+        self.amounts.as_deref().unwrap_or(&EMPTY_AMOUNTS)
+    }
+
+    pub(super) fn amounts_heap_bytes(&self) -> usize {
+        self.amounts.as_deref().map_or(0, size_of_val)
+    }
+
     /// Brings the contributions of `key` up to date.
     pub(in crate::proto::session) fn update(&mut self, key: StreamKey, p: Parts) {
         let slot = key.slot as usize;
@@ -416,11 +423,6 @@ impl Ledger {
     }
 
     fn count_held(&mut self, h: &Held, add_it: bool) {
-        if add_it {
-            self.blocked += u64::from(h.blocked);
-        } else {
-            self.blocked -= u64::from(h.blocked);
-        }
         if let Some(b) = h.blocking {
             if add_it {
                 self.blocking.insert((b.sent, h.seq), b);
@@ -437,15 +439,9 @@ impl Ledger {
         }
     }
 
-    /// Whether a listed direction is held back by stream credit.
-    pub(in crate::proto::session) fn credit_blocked(&self) -> bool {
-        self.blocked > 0
-    }
-
-    /// The blocking data sent first among the directions held back by
-    /// stream credit.
-    pub(in crate::proto::session) fn blocking(&self) -> Option<Blocking> {
-        self.blocking.first_key_value().map(|(_, &b)| b)
+    /// Blocking ranges of the listed directions, earliest handoff first.
+    pub(in crate::proto::session) fn blocking(&self) -> impl Iterator<Item = Blocking> + '_ {
+        self.blocking.values().copied()
     }
 
     /// Replaces a contribution `old` by `new`, touching the multisets only
@@ -472,7 +468,7 @@ impl Ledger {
         if a != b {
             if let Some((level, r, incremental)) = a {
                 if incremental {
-                    self.amounts[level].remove(r);
+                    self.amounts.as_mut().expect("counted incremental amount")[level].remove(r);
                     self.sharers[level] -= 1;
                 } else {
                     self.whole[level] -= r;
@@ -480,7 +476,7 @@ impl Ledger {
             }
             if let Some((level, r, incremental)) = b {
                 if incremental {
-                    self.amounts[level].insert(r);
+                    self.amounts.get_or_insert_with(Box::default)[level].insert(r);
                     self.sharers[level] += 1;
                 } else {
                     self.whole[level] += r;
@@ -587,7 +583,7 @@ impl Ledger {
     pub(in crate::proto::session) fn ready_capped(&self, level: u8, cap: u64) -> u64 {
         let l = usize::from(level);
         let shared = self
-            .amounts
+            .amounts()
             .get(l)
             .map_or(0, |a| u64::try_from(a.capped_sum(cap)).unwrap_or(u64::MAX));
         self.whole
@@ -676,9 +672,9 @@ impl Ledger {
         debug_assert_eq!(entries(self), entries(fresh), "ledger: stale contributions");
         debug_assert_eq!(self.ready, fresh.ready, "ledger: ready data");
         debug_assert!(
-            self.amounts
+            self.amounts()
                 .iter()
-                .zip(&fresh.amounts)
+                .zip(fresh.amounts())
                 .all(|(a, b)| a.items() == b.items()),
             "ledger: ready amounts"
         );
@@ -703,7 +699,6 @@ impl Ledger {
             "ledger: pipe loads"
         );
         debug_assert!(self.tags().eq(fresh.tags()), "ledger: decision tags");
-        debug_assert_eq!(self.blocked, fresh.blocked, "ledger: blocked parts");
         debug_assert_eq!(self.blocking, fresh.blocking, "ledger: blocking data");
         debug_assert_eq!(self.holds, fresh.holds, "ledger: waiting writers");
         debug_assert_eq!(self.others, fresh.others, "ledger: other writers");
@@ -773,7 +768,7 @@ impl crate::proto::session::SessionCore {
         let mut fresh = Ledger::default();
         let mut keys: Vec<StreamKey> = Vec::new();
         for (u, q) in self.streams.queue().levels().iter().enumerate() {
-            for &key in q {
+            for key in q.iter().map(|ready| ready.key) {
                 if let Some(send) = self.streams.send(key) {
                     debug_assert_eq!(
                         send.queued.map(usize::from),
@@ -820,7 +815,6 @@ mod tests {
         };
         let held = Held {
             seq: 7,
-            blocked: true,
             blocking: None,
         };
         let mut l = Ledger::default();

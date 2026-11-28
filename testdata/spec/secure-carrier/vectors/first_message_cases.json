@@ -1,0 +1,68 @@
+{
+  "prefix": {
+    "base_unix_seconds": 1767225600,
+    "slot_seconds": 30,
+    "skew_slots": 1,
+    "default_input": "unbound",
+    "cases": [
+      {"name": "stream-prefix-only", "attempts": [{"append_hex": "04ff", "expect_remaining_hex": "04ff", "expect": "accepted"}]},
+      {"name": "binary-message", "form": "message", "attempts": [{"expect": "accepted"}]},
+      {"name": "token-must-fill-message", "form": "message", "attempts": [{"append_hex": "ff", "expect": "refused"}]},
+      {"name": "bound-head-same-connection", "form": "header", "attempts": [{"input": "bound", "expect": "accepted"}, {"input": "bound", "expect": "refused"}]},
+      {"name": "bound-over-quic", "attempts": [{"input": "bound", "outer_transport": "quic", "expect": "accepted"}]},
+      {"name": "bound-requires-tls13-or-quic", "attempts": [{"input": "bound", "outer_transport": "tls12", "expect": "refused"}, {"input": "bound", "outer_transport": "cleartext", "expect": "refused"}, {"input": "bound", "expect": "accepted"}]},
+      {"name": "header-requires-encryption", "form": "header", "accept_first_use_dos": true, "attempts": [{"outer_transport": "cleartext", "expect": "refused"}, {"outer_transport": "tls12", "expect": "accepted"}]},
+      {"name": "cleartext-binary-bearer", "attempts": [{"outer_transport": "cleartext", "expect": "refused"}, {"outer_transport": "cleartext", "accept_first_use_dos": true, "expect": "accepted"}]},
+      {"name": "wrong-exporter", "attempts": [{"input": "bound", "binding_hex": "", "expect": "refused"}, {"input": "bound", "binding_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "expect": "refused"}, {"input": "bound", "expect": "accepted"}]},
+      {"name": "truncated-prefix-at-eof", "attempts": [{"take_bytes": 63, "expect": "refused"}]},
+      {"name": "header-canonical", "form": "header", "attempts": [{"count": 0, "expect": "refused"}, {"count": 2, "expect": "refused"}, {"append_text": "==", "expect": "refused"}, {"xor_unused_bit": true, "expect": "refused"}, {"expect": "accepted"}]},
+      {"name": "alter-fields", "attempts": [{"xor_byte": 0, "expect": "refused"}, {"xor_byte": 16, "expect": "refused"}, {"xor_byte": 32, "expect": "refused"}, {"xor_byte": 48, "expect": "refused"}, {"expect": "accepted"}]},
+      {"name": "valid-a-bad-t-does-not-claim", "single_use": true, "claim_capacity": 1, "attempts": [{"xor_byte": 48, "expect": "refused"}, {"expect": "accepted"}, {"input": "fresh_nonce", "expect": "refused"}]},
+      {"name": "unknown-id", "attempts": [{"input": "other_id", "expect": "refused"}, {"expect": "accepted"}]},
+      {"name": "slot-boundaries", "attempts": [{"offset_seconds": -31, "expect": "refused"}, {"offset_seconds": -30, "expect": "accepted"}, {"input": "fresh_nonce", "offset_seconds": 59, "expect": "accepted"}, {"input": "fresh_nonce", "offset_seconds": 60, "expect": "refused"}]},
+      {"name": "upper-cutoff-unused-nonce", "attempts": [{"offset_seconds": 59, "expect": "accepted"}, {"input": "fresh_nonce", "offset_seconds": 60, "expect": "refused"}]},
+      {"name": "expire-then-rollback", "attempts": [{"expect": "accepted"}, {"expire_at_offset_seconds": 60}, {"offset_seconds": 60, "expect": "refused"}, {"offset_seconds": 0, "expect": "refused"}, {"input": "fresh_nonce", "offset_seconds": 0, "expect": "refused"}]},
+      {"name": "acceptance-floor-shared-between-entrances", "attempts": [{"input": "next_slot", "entrance": "first", "offset_seconds": 60, "expect": "accepted"}, {"entrance": "second", "offset_seconds": 0, "expect": "refused"}]},
+      {"name": "replay-capacity", "claim_capacity": 1, "attempts": [{"expect": "accepted"}, {"input": "fresh_nonce", "expect": "refused"}, {"expect": "refused"}]},
+      {"name": "cutover", "cutover_slot": 58907521, "attempts": [{"input": "rotated", "offset_seconds": 0, "expect": "accepted"}, {"input": "next_slot", "offset_seconds": 30, "expect": "refused"}, {"offset_seconds": 59, "expect": "accepted"}, {"input": "fresh_nonce", "offset_seconds": 60, "expect": "refused"}]},
+      {"name": "two-generations-match-a", "cutover_slot": 58907521, "incoming_outer_from": "unbound", "attempts": [{"expect": "refused"}, {"offset_seconds": -30, "expect": "accepted"}]},
+      {"name": "same-id-nonce-across-generations", "cutover_slot": 58907521, "attempts": [{"expect": "accepted"}, {"input": "rotated_same_nonce", "offset_seconds": 30, "expect": "refused"}, {"input": "rotated", "offset_seconds": 30, "expect": "accepted"}]},
+      {"name": "future-slot-does-not-advance-floor", "attempts": [{"input": "next_slot", "expect": "accepted"}, {"input": "previous_slot", "expect": "accepted"}]},
+      {"name": "one-use-lost-carrier", "single_use": true, "attempts": [{"xor_byte": 63, "expect": "refused"}, {"expect": "accepted", "then": "end_carrier"}, {"input": "fresh_nonce", "expect": "refused"}]},
+      {"name": "one-use-across-rotation", "cutover_slot": 58907521, "single_use": true, "attempts": [{"expect": "accepted"}, {"input": "rotated", "offset_seconds": 30, "expect": "refused"}]},
+      {"name": "one-use-two-entrances", "single_use": true, "attempts": [{"concurrent_inputs": ["unbound", "fresh_nonce"], "expect_multiset": ["accepted", "refused"]}]},
+      {"name": "reusable-replayed-at-two-entrances", "attempts": [{"concurrent_inputs": ["unbound", "unbound"], "expect_multiset": ["accepted", "refused"]}, {"input": "fresh_nonce", "expect": "accepted"}]},
+      {"name": "revoked-ticket", "attempts": [{"expect": "accepted", "then": "revoke_ticket"}, {"input": "fresh_nonce", "expect": "refused"}]},
+      {"name": "early-data", "attempts": [{"early_data": true, "expect": "refused"}, {"expect": "accepted"}]}
+    ]
+  },
+  "anonymous": {
+    "cases": [
+      {"name": "direct", "handshake": "profile4-sealed-empty", "expect_flights": ["hello", "reply", "finish"]},
+      {"name": "direct-bound", "handshake": "profile5-bound-empty", "expect_flights": ["hello", "reply", "finish"]},
+      {"name": "direct-trusted", "handshake": "profile4-trusted-empty", "expect_flights": ["hello", "reply", "finish"]},
+      {"name": "direct-profile5", "handshake": "profile5-sealed-empty", "expect_flights": ["hello", "reply", "finish"]},
+      {"name": "disabled-profile", "accept_profile": false, "expect_flights": ["hello"]},
+      {"name": "anonymous-capacity-refusal", "capacity_available": false, "expect_flights": ["hello"]},
+      {"name": "hello-plus-bytes", "framing": "stream", "append_to_hello_hex": "00", "expect_flights": ["modified_hello"]},
+      {"name": "short-anonymous-hello", "truncate_noise_msg1_to": 1215, "expect_flights": ["modified_hello"]},
+      {"name": "forbidden-msg1-data", "append_to_noise_msg1_hex": "020100", "expect_flights": ["modified_hello"]},
+      {"name": "bad-kem", "replace_first_kem_coefficient": 3329, "expect_flights": ["modified_hello"]}
+    ]
+  },
+  "responses": [
+    {"name": "plain-qmux", "fixture": "compat.qmux.plain_peer_basic", "expect": "trace"},
+    {"name": "shared-leading-parameters", "fixture": "multipath.join.leading_parameters_discarded", "expect": "trace"},
+    {"name": "authenticated-join-refusal", "fixture": "multipath.join.refusal_backoff", "expect": "trace"},
+    {"name": "protected-plain-prefix", "entry": "prefix", "fixture": "compat.qmux.plain_peer_basic", "step": 3, "eof": true, "expect_inner_output_hex": ""},
+    {"name": "admitted-bad-seal", "prefix": "unbound", "negative": "msg1-bit-flip-tag", "expect_server_flights": []},
+    {"name": "admitted-psk1", "prefix": "unbound", "handshake": "profile1-sealed-empty", "expect_server_flights": ["reply"]},
+    {"name": "admitted-psk3", "prefix": "bound", "handshake": "profile3-sealed-empty", "expect_server_flights": ["reply"]},
+    {"name": "psk-before-msg2", "negative": "msg1-bit-flip-tag", "expect_server_flights": []},
+    {"name": "psk-after-msg2", "negative": "msg3-bit-flip", "expect_server_flights": ["reply"]},
+    {"name": "unknown-locator", "fixture": "multipath.join.unknown_locator", "expect": "trace"},
+    {"name": "prefix-fallback", "invalid_prefix_hex": "ff", "eof": true, "host_output_hex": "abcd", "expect_output_hex": "abcd"},
+    {"name": "outer-early-data", "outer_http_early_data": true, "host_status": 425, "expect_host_status": 425, "expect_inner_output_hex": ""},
+    {"name": "http-upgrade", "outer_http_upgrade": true, "host_status": 101, "then": "short-anonymous-hello", "expect_host_status": 101, "expect_inner_output_hex": ""}
+  ]
+}

@@ -6,16 +6,16 @@
 //! zmux-shaping-peer client <addr>     dial and run the exchange
 //! ```
 //!
-//! The environment variable `SHAPE_DEF` names a shaping definition (JSON,
-//! `zmux-shaping`'s machine format, as in `defs/`); unset or empty, the side runs unshaped.
+//! `SHAPE_DEF` points to a JSON definition in the `zmux-shaping` machine format.
+//! With the variable unset or empty, the side runs unshaped.
 //!
 //! The exchange: the client opens eight bidirectional streams and sends
 //! `200000 + i * 7919` pseudo-random bytes on stream `i` (the generator is
 //! xorshift64 seeded with `i + 1`, so every implementation can produce and
 //! check them); the server echoes each stream back and the client compares.
 //! Each side prints `STATS wire_spent=<n> injected=<n> dropped=<n> clamped=<n>
-//! faults=<n>` from the session's shaping statistics and `OK`. A shaped side
-//! fails (exit status 1) when its session added no wire bytes or counted a
+//! faults=<n> extra_bytes=<n>` from the session's shaping statistics and `OK`.
+//! A shaped side fails (exit status 1) when its byte ledger shows no overhead or it counted a
 //! fault. A 60-second deadline ends the process.
 
 use std::sync::Arc;
@@ -53,16 +53,29 @@ fn shape(s: &Session) {
     let json = std::fs::read(&path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
     let factory = zmux_shaping::MachineFactory::from_json(&json, zmux_shaping::Options::default())
         .unwrap_or_else(|e| die(&format!("definition: {e}")));
-    s.set_shaper(Some(Arc::new(factory)), None);
+    let budget = zmux::shaping::ShapingBudget::new(|| {
+        zmux::shaping::Budget::new(
+            Some(zmux::shaping::Account::new(4096, 4096, 0, 0)),
+            None,
+            false,
+        )
+    });
+    s.set_shaper(Some(Arc::new(factory)), Some(budget))
+        .unwrap_or_else(|e| die(&e.to_string()));
 }
 
 fn report(s: &Session) {
     let st = s.shaping_stats();
     println!(
-        "STATS wire_spent={} injected={} dropped={} clamped={} faults={}",
-        st.wire_spent, st.injected, st.inject_dropped, st.clamped, st.faults
+        "STATS wire_spent={} injected={} dropped={} clamped={} faults={} extra_bytes={}",
+        st.wire_spent,
+        st.injection_accepted_requests,
+        st.injection_rejected,
+        st.clamped,
+        st.faults,
+        st.ledger.measured_bytes
     );
-    if definition().is_some() && (st.wire_spent == 0 || st.faults != 0) {
+    if definition().is_some() && (st.ledger.measured_bytes == 0 || st.faults != 0) {
         die("not shaped");
     }
 }

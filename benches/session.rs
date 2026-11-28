@@ -33,9 +33,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use zmux::Chunk;
 use zmux::proto::frame::Dir;
 use zmux::proto::record::Framing;
 use zmux::proto::session::{self as core, PipeId, Role};
@@ -162,7 +162,7 @@ fn core_bulk(zero_copy: bool) {
     let mut p = CorePair::new();
     let send = p.a.open(Dir::Uni).unwrap();
     let data = [5u8; 64 * 1024];
-    let shared = Bytes::from(vec![5u8; 1 << 20]);
+    let shared = Chunk::from(vec![5u8; 1 << 20]);
     let _keep = shared.clone();
     let mut sink = vec![0u8; 256 * 1024];
     let mut recv = None;
@@ -407,7 +407,7 @@ async fn carrier_pair(carrier: &str) -> (Session, Session) {
 fn bench_config() -> Config {
     let mut c = Config::default();
     if std::env::var("ZMUX_BENCH_MP").is_ok() {
-        c.max_pipes = 2;
+        c.session_policy.limits.steady_attachments = 2;
         c.pipe_auth = PipeAuth::psk(*b"0123456789abcdef0123456789abcdef").with_end_to_end();
     }
     if let Some(us) = std::env::var("ZMUX_BENCH_B")
@@ -441,7 +441,7 @@ async fn driver_bulk(zero_copy: bool) {
     });
     let mut s = client.open_uni().await.unwrap();
     let data = vec![1u8; 64 * 1024];
-    let chunk = Bytes::from(data.clone());
+    let chunk = Chunk::from(data.clone());
     let _keep = chunk.clone();
     // Warm up, then measure.
     let warm = 256u64 << 20;
@@ -509,7 +509,7 @@ async fn wan_bulk() {
     let cl = client.clone();
     let writer = tokio::spawn(async move {
         let mut s = cl.open_uni().await.unwrap();
-        let chunk = Bytes::from(vec![1u8; 64 * 1024]);
+        let chunk = Chunk::from(vec![1u8; 64 * 1024]);
         while !st.load(Relaxed) {
             if s.write_chunk(chunk.clone()).await.is_err() {
                 return;
@@ -646,7 +646,7 @@ async fn scale(multipath: bool) {
                 let mut opts = PipeOptions::default();
                 opts.send_standby = zmux::Change::Set(true);
                 opts.receive_standby = zmux::Change::Set(true);
-                client.begin_add_pipe(PipeIo::new(c), opts).unwrap();
+                client.test_begin_join(PipeIo::new(c), opts).unwrap();
                 (client, server)
             }
         };
@@ -861,7 +861,7 @@ async fn rr_under_bulk(secs: f64) {
             }
         });
         let mut s = client.open_uni().await.unwrap();
-        let chunk = Bytes::from(vec![1u8; 64 * 1024]);
+        let chunk = Chunk::from(vec![1u8; 64 * 1024]);
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let writer = tokio::spawn(async move {
@@ -1317,7 +1317,7 @@ async fn soak_serve(server: Session, soak: Arc<Soak>) {
 }
 
 /// One request-response of `len` bytes on a new stream.
-async fn soak_exchange(client: &Session, payload: &Bytes, len: usize) -> bool {
+async fn soak_exchange(client: &Session, payload: &Chunk, len: usize) -> bool {
     let Ok((mut send, mut recv)) = client.open_bi().await else {
         return false;
     };
@@ -1346,7 +1346,7 @@ async fn soak_slot(
     soak: Arc<Soak>,
     single: Arc<Config>,
     mp: Arc<Config>,
-    payload: Bytes,
+    payload: Chunk,
 ) {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (slot + 1).wrapping_mul(0x1234_5678_9abc_def1));
     let multipath = slot % 2 == 1;
@@ -1429,7 +1429,7 @@ async fn soak_slot(
                 tokio::spawn(
                     async move { l2.handle_pipe(PipeIo::new(d), PipeHint::default()).await },
                 );
-                match client.begin_add_pipe(PipeIo::new(c), PipeOptions::default()) {
+                match client.test_begin_join(PipeIo::new(c), PipeOptions::default()) {
                     Ok(pipe) => {
                         soak.counts.joins.fetch_add(1, Relaxed);
                         tokio::time::sleep(Duration::from_millis(500 + rng.below(3000))).await;
@@ -1510,14 +1510,14 @@ async fn soak() {
         let ratio = if l > 0 { r as f64 / l as f64 } else { 0.0 };
         let (core, held) = soak.core_bytes();
         println!(
-            "SOAK alloc={alloc} t={:.0} phase={phase} live_KiB={} rss_KiB={} rss_per_live={ratio:.2} open={} core_KiB={} held_KiB={} read_pool={} sessions={} streams={} MiB={} joins={} pipe_failures={} errors={}",
+            "SOAK alloc={alloc} t={:.0} phase={phase} live_KiB={} rss_KiB={} rss_per_live={ratio:.2} open={} core_KiB={} held_KiB={} read_pool_KiB={} sessions={} streams={} MiB={} joins={} pipe_failures={} errors={}",
             t0.elapsed().as_secs_f64(),
             l / 1024,
             r / 1024,
             soak.open.lock().unwrap().len(),
             core / 1024,
             held / 1024,
-            zmux::test_hooks::read_pool_buffers(),
+            zmux::test_hooks::read_pool_idle_bytes() / 1024,
             c.sessions.load(Relaxed),
             c.streams.load(Relaxed),
             c.bytes.load(Relaxed) >> 20,
@@ -1528,7 +1528,7 @@ async fn soak() {
         series.push((t0.elapsed().as_secs_f64(), l, r));
     };
     // The requests' bytes, shared by every stream.
-    let payload = Bytes::from(vec![0x5au8; 1 << 20]);
+    let payload = Chunk::from(vec![0x5au8; 1 << 20]);
     let mut series = Vec::new();
     sample("start", &mut series);
     let start = (live(), rss().unwrap_or(0));
@@ -1682,7 +1682,7 @@ fn policy_name(p: &Scheduler) -> &'static str {
 
 fn mp_config(policy: &Scheduler) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 8;
+    c.session_policy.limits.steady_attachments = 8;
     c.pipe_auth = PipeAuth::psk(*b"bench-multipath-psk-0123456789ab").with_end_to_end();
     c.scheduler = policy.clone();
     // Loopback pipes are trusted: a new pipe carries data at once instead
@@ -1758,7 +1758,7 @@ impl Pair {
         for _ in 0..n {
             let c = TcpStream::connect(addr).await.unwrap();
             self.client
-                .begin_add_pipe(PipeIo::from_tcp(c), PipeOptions::default())
+                .test_begin_join(PipeIo::from_tcp(c), PipeOptions::default())
                 .unwrap();
         }
         self.pipes += n;
@@ -1840,7 +1840,7 @@ async fn spawn_bulk(
         }
         done
     });
-    let chunk = Bytes::from(vec![1u8; 64 * 1024]);
+    let chunk = Chunk::from(vec![1u8; 64 * 1024]);
     let mut writers = Vec::new();
     for _ in 0..streams {
         let mut s = pair.client.open_uni().await.unwrap();

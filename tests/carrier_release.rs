@@ -166,7 +166,7 @@ async fn carriers_go_with_the_session_task() {
 async fn dropped_streams_are_released_after_pipe_0_went() {
     use zmux::{Listener, ListenerConfig, PipeAuth, PipeHint, PipeId, PipeOptions};
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"carrier-release-0123456789abcdef").with_end_to_end();
     let listener = Listener::new(c.clone(), ListenerConfig::default()).unwrap();
     let gate = Arc::new(Gate::default());
@@ -187,7 +187,7 @@ async fn dropped_streams_are_released_after_pipe_0_went() {
     let client = Session::connect(carrier(), c).await.unwrap();
     let server = listener.accept().await.unwrap();
     client
-        .add_pipe(carrier(), PipeOptions::default())
+        .test_join(carrier(), PipeOptions::default())
         .await
         .unwrap();
     client.pipe(PipeId::new(0)).unwrap().abort().unwrap();

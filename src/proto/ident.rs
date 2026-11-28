@@ -233,30 +233,32 @@ fn alias_rule() -> Option<AliasRule> {
     })
 }
 
+impl AliasRule {
+    fn rewrite<'a>(&self, configured: &'a [u8]) -> Option<[&'a [u8]; 2]> {
+        if configured == self.own {
+            return Some([self.alias, b""]);
+        }
+        if let Some(application) = configured
+            .strip_prefix(self.own)
+            .filter(|suffix| suffix.starts_with(b"."))
+        {
+            return Some([self.alias, application]);
+        }
+        configured
+            .strip_suffix(self.own_suffix)
+            .map(|stem| [stem, self.alias_suffix])
+    }
+}
+
 /// The alias of a configured ALPN identifier, for a draft whose codepoints an earlier draft
 /// shares ([`crate::proto::draft::Draft::alpn_alias`]): for QMux-02, `qmux-01` for `qmux-02`,
 /// `qmux-01.<application>` for `qmux-02.<application>`, `<name>-01` for any other `<name>-02`,
 /// and no alias otherwise. A client may offer the aliases after its configured identifiers.
 #[must_use]
 pub fn alpn_alias(configured: &[u8]) -> Option<Vec<u8>> {
-    let AliasRule {
-        own,
-        own_suffix,
-        alias,
-        alias_suffix,
-    } = alias_rule()?;
-    if configured == own {
-        return Some(alias.to_vec());
-    }
-    if let Some(app) = configured
-        .strip_prefix(own)
-        .and_then(|r| r.strip_prefix(b"."))
-    {
-        return Some([alias, b".", app].concat());
-    }
-    configured
-        .strip_suffix(own_suffix)
-        .map(|stem| [stem, alias_suffix].concat())
+    alias_rule()?
+        .rewrite(configured)
+        .map(|parts| parts.concat())
 }
 
 /// The ALPN identifiers to configure on a TLS client or server for
@@ -313,34 +315,9 @@ pub fn alpn_matches(configured: &[u8], offered: &[u8]) -> bool {
     if configured == offered {
         return true;
     }
-    let Some(AliasRule {
-        own,
-        own_suffix,
-        alias,
-        alias_suffix,
-    }) = alias_rule()
-    else {
-        return false;
-    };
-    if configured == own {
-        return offered == alias;
-    }
-    if let Some(app) = configured
-        .strip_prefix(own)
-        .and_then(|r| r.strip_prefix(b"."))
-    {
-        return offered
-            .strip_prefix(alias)
-            .and_then(|r| r.strip_prefix(b"."))
-            == Some(app);
-    }
-    match (
-        configured.strip_suffix(own_suffix),
-        offered.strip_suffix(alias_suffix),
-    ) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
+    alias_rule()
+        .and_then(|rule| rule.rewrite(configured))
+        .is_some_and(|[prefix, suffix]| offered.strip_prefix(prefix) == Some(suffix))
 }
 
 /// Server-side ALPN selection: the first identifier in the client's offer

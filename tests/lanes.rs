@@ -44,7 +44,7 @@ struct LanePair {
     lanes_a: Vec<u64>,
     lanes_b: Vec<u64>,
     reverse: bool,
-    /// The length of the first batch A wrote on each lane but lane 0.
+    /// The encoded length of the first record on each of A's extra lanes.
     first_a: std::collections::HashMap<u64, usize>,
     /// Refuse every lane the sides open (an intermediary that splits the
     /// connection).
@@ -135,6 +135,9 @@ impl LanePair {
                     shut.get_or_insert(self.now);
                 }
                 if self.out.is_empty() {
+                    if t == Transmit::Shutdown {
+                        from.write_shutdown_complete(at, self.now);
+                    }
                     break;
                 }
                 self.wire.clear();
@@ -142,10 +145,10 @@ impl LanePair {
                 let mut at_byte = 0;
                 while let Some((size, n)) = zmux::proto::varint::decode(&self.wire[at_byte..]) {
                     self.widest = self.widest.max(size as usize);
+                    if at_byte == 0 && a_to_b && lane != 0 {
+                        first_a.entry(lane).or_insert(n + size as usize);
+                    }
                     at_byte += n + size as usize;
-                }
-                if a_to_b && lane != 0 {
-                    first_a.entry(lane).or_insert(self.wire.len());
                 }
                 if a_to_b
                     && lane == 0
@@ -157,6 +160,9 @@ impl LanePair {
                 }
                 let used = to.receive_in_place(at, &self.wire, self.now);
                 assert_eq!(used, self.wire.len(), "a batch is whole records");
+                if t == Transmit::Shutdown {
+                    from.write_shutdown_complete(at, self.now);
+                }
                 moved += self.wire.len();
             }
         }
@@ -469,7 +475,7 @@ fn lanes_reserve_no_record_buffer() {
 fn urgent_data_of_a_single_pipe_tier_is_copied_on_the_copy_lane() {
     let multipath = || {
         let mut c = Config::default();
-        c.max_pipes = 2;
+        c.session_policy.limits.steady_attachments = 2;
         c.pipe_auth = zmux::PipeAuth::psk(*b"lanes-psk-------0123456789abcdef").with_end_to_end();
         c
     };
@@ -529,15 +535,53 @@ impl zmux::shaping::Shaper for DelayAll {
 /// carries the plan's PADDING.
 #[test]
 fn a_lane_first_record_is_shaped_and_held_with_its_pipe() {
+    use zmux::shaping::{Budget, ProfileLimits};
+
     let mut p = LanePair::new(Config::default(), Config::default());
-    p.a.set_shaper(Some(std::sync::Arc::new(
-        |_: &zmux::shaping::ShapedPipe| Some(Box::new(DelayAll) as Box<dyn zmux::shaping::Shaper>),
-    )));
     const STREAMS: usize = 4;
     const LEN: usize = 128 * 1024;
     let keys: Vec<StreamKey> = (0..STREAMS).map(|_| p.a.open(Dir::Uni).unwrap()).collect();
     let data: Vec<Vec<u8>> = (0..STREAMS).map(|i| pattern(i, LEN)).collect();
     let mut written = [0usize; STREAMS];
+
+    // Attach the first lane without polling its writer. This makes its opener
+    // the first shaping plan and isolates its delay from any ACK deadline.
+    written[0] = p.a.write(keys[0], &data[0][..16 * 1024]).unwrap();
+    assert!(p.send(true) > 0);
+    p.events();
+    let first_lane = P0.lane(*p.lanes_a.first().expect("the first lane opened"));
+
+    // Allow the requested padding on every lane from the shared ledger.
+    p.a.set_shaper_budgeted(
+        Some(std::sync::Arc::new(|_: &zmux::shaping::ShapedPipe| {
+            Some(Box::new(DelayAll) as Box<dyn zmux::shaping::Shaper>)
+        })),
+        Budget::new(
+            None,
+            Some(ProfileLimits::new(
+                10,
+                50_000,
+                4096,
+                Duration::from_millis(5),
+            )),
+            false,
+        ),
+    )
+    .unwrap();
+    assert!(p.a.wants_write(first_lane));
+    assert_eq!(
+        p.a.poll_transmit(first_lane, p.now, &mut p.out),
+        Transmit::Idle
+    );
+    assert!(p.out.is_empty());
+    p.now += Duration::from_millis(4);
+    p.a.handle_timeout(p.now);
+    assert!(!p.a.wants_write(first_lane));
+    p.now += Duration::from_millis(1);
+    p.a.handle_timeout(p.now);
+    assert!(p.a.wants_write(first_lane));
+    p.send(true);
+
     let mut got: Vec<Vec<u8>> = vec![Vec::new(); STREAMS];
     let mut peers: [Option<StreamKey>; STREAMS] = [None; STREAMS];
     let mut done = 0;
@@ -573,13 +617,12 @@ fn a_lane_first_record_is_shaped_and_held_with_its_pipe() {
     for i in 0..STREAMS {
         assert!(got[i] == data[i], "stream {i} arrived whole and in order");
     }
-    assert!(!p.lanes_a.is_empty(), "no lane opened");
+    assert!(
+        p.lanes_a.len() >= 2,
+        "the streams opened two additional lanes"
+    );
     for lane in &p.lanes_a {
-        let n = p.first_a[lane];
-        assert!(
-            n >= 400,
-            "lane {lane}'s first record of {n} bytes was not shaped"
-        );
+        assert_eq!(p.first_a[lane], 400, "lane {lane}'s padded first record");
     }
 }
 

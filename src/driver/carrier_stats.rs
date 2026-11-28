@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "tokio")]
 use std::{any::TypeId, collections::HashMap};
 
-use crate::{CarrierConnId, CarrierCounts, CarrierSample, CarrierSource, PipeDirection};
+use crate::{
+    CarrierConnId, CarrierCounts, CarrierLoss, CarrierLossUnit, CarrierSample, CarrierSource,
+    PipeDirection,
+};
 
 enum Query {
     Tcp(Weak<std::net::TcpStream>),
@@ -101,8 +104,8 @@ impl Source {
         let cache = self.dedicated.then(Arc::<Cache>::default)?;
 
         let mut state = cache.lock();
+        state.initialize_identity();
         state.users += 1;
-        let mut initial = None;
         let query = self.query.map(Arc::new);
         #[cfg(feature = "tokio")]
         if let Some(owner) = transport_owner {
@@ -126,23 +129,14 @@ impl Source {
         {
             state.change_provider(self.provider);
             state.sampled_at = None;
-            if let Some(query) = query {
-                state.provider = Some(query.clone());
-                state.in_flight = true;
-                initial = Some(query);
-            } else {
+            state.queried_at = None;
+            state.provider = query;
+            if state.provider.is_none() {
                 state.publish(now(), self.provider, None);
             }
         }
         // The first known source owns the cache for the connection's lifetime.
         drop(state);
-        if let Some(query) = initial {
-            let at = now();
-            let counts = query.observe();
-            let mut state = cache.lock();
-            state.publish(at, self.provider, counts);
-            state.in_flight = false;
-        }
         Some(Registration {
             cache,
             attached: AtomicBool::new(true),
@@ -233,7 +227,23 @@ impl Drop for Registration {
 #[derive(Default)]
 pub(super) struct Cache(Mutex<CacheState>);
 
+pub(super) const LOSS_VALIDITY: Duration = Duration::from_mins(1);
+
 impl Cache {
+    pub(super) fn loss(&self, now: Instant) -> Option<CarrierLoss> {
+        self.lock()
+            .loss
+            .as_deref()
+            .and_then(|tracker| tracker.interval.as_ref())
+            .filter(|loss| now.saturating_duration_since(loss.at) < LOSS_VALIDITY)
+            .cloned()
+    }
+
+    pub(super) fn identity(&self) -> Option<CarrierConnId> {
+        let id = self.lock().carrier_id;
+        (id != 0).then(|| CarrierConnId::from_sampled(id))
+    }
+
     fn lock(&self) -> MutexGuard<'_, CacheState> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -243,11 +253,14 @@ impl Cache {
         let sample = state.sample();
         let request = if state.users > 0
             && !state.in_flight
-            && sample.as_ref().is_some_and(|s| {
-                now.saturating_duration_since(s.sampled_at) >= Duration::from_secs(1)
-            })
+            && state
+                .queried_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
             && let Some(provider) = state.live_provider()
         {
+            state
+                .loss
+                .get_or_insert_with(|| Box::new(LossTracker::default()));
             state.in_flight = true;
             Some(Refresh {
                 cache: self.clone(),
@@ -299,7 +312,7 @@ impl Refresh {
         let _ = queue.send(self);
     }
 
-    fn run(&self) {
+    pub(super) fn run(&self) {
         let source = {
             let state = self.cache.lock();
             if state.epoch != self.epoch {
@@ -307,11 +320,11 @@ impl Refresh {
             }
             state.source.expect("selected provider")
         };
+        let counts = self.provider.observe();
         let at = self
             .now
             .checked_add(self.submitted.elapsed())
             .unwrap_or(self.now);
-        let counts = self.provider.observe();
         let mut state = self.cache.lock();
         if state.epoch == self.epoch {
             state.publish(at, source, counts);
@@ -334,14 +347,29 @@ struct CacheState {
     users: usize,
     epoch: u64,
     sampled_at: Option<Instant>,
+    queried_at: Option<Instant>,
     carrier_id: u64,
     generation: u64,
     source: Option<CarrierSource>,
     counts_present: bool,
     last_known: Option<CarrierCounts>,
+    loss: Option<Box<LossTracker>>,
+}
+
+#[derive(Default)]
+struct LossTracker {
+    version: u64,
+    base: Option<(Instant, CarrierCounts)>,
+    interval: Option<CarrierLoss>,
 }
 
 impl CacheState {
+    fn initialize_identity(&mut self) {
+        if self.carrier_id == 0 {
+            self.carrier_id = CarrierConnId::sampled().get();
+        }
+    }
+
     fn live_provider(&self) -> Option<Arc<Query>> {
         #[cfg(feature = "tokio")]
         if !self.transport_providers.is_empty() {
@@ -372,6 +400,10 @@ impl CacheState {
     fn change_provider(&mut self, source: CarrierSource) {
         self.source = Some(source);
         self.last_known = None;
+        if let Some(loss) = &mut self.loss {
+            loss.base = None;
+            loss.withdraw();
+        }
         self.counts_present = false;
     }
 
@@ -381,11 +413,34 @@ impl CacheState {
         source: CarrierSource,
         counts: Option<CarrierCounts>,
     ) {
-        if self.carrier_id == 0 {
-            self.carrier_id = CarrierConnId::sampled().get();
-        }
+        self.initialize_identity();
         if self.source != Some(source) {
             self.change_provider(source);
+        }
+        if self.queried_at.is_some_and(|at| sampled_at <= at) {
+            return;
+        }
+        self.queried_at = Some(sampled_at);
+        if self.sampled_at.is_some() && counts.is_none() {
+            return;
+        }
+        if let (Some(before), Some(after)) = (self.last_known, counts) {
+            let (unit, sent, lost) = count_pair(after);
+            let (previous_unit, previous_sent, previous_lost) = count_pair(before);
+            if unit == previous_unit && sent == previous_sent {
+                if matches!(after, CarrierCounts::Quic { .. }) && lost < previous_lost {
+                    // QUIC can retract its loss decision without sending another packet.
+                    self.last_known = Some(after);
+                    if let Some((_, base)) = self.loss.as_mut().and_then(|loss| loss.base.as_mut())
+                    {
+                        *base = after;
+                    }
+                    return;
+                }
+                if lost >= previous_lost {
+                    return;
+                }
+            }
         }
         self.sampled_at = Some(sampled_at);
         self.counts_present = counts.is_some();
@@ -429,8 +484,77 @@ impl CacheState {
                 _ => (raw, false),
             };
             self.generation += u64::from(reset);
+            if let Some(loss) = &mut self.loss {
+                if reset {
+                    loss.base = None;
+                    loss.withdraw();
+                }
+                loss.record(sampled_at, source, counts, self.carrier_id, self.generation);
+            }
             self.last_known = Some(counts);
         }
+    }
+}
+
+impl LossTracker {
+    fn withdraw(&mut self) {
+        if self.interval.take().is_some() {
+            self.version += 1;
+        }
+    }
+
+    fn record(
+        &mut self,
+        now: Instant,
+        source: CarrierSource,
+        counts: CarrierCounts,
+        connection: u64,
+        generation: u64,
+    ) {
+        let Some((since, before)) = self.base else {
+            self.base = Some((now, counts));
+            return;
+        };
+        let (unit, sent, lost) = count_pair(counts);
+        let (previous_unit, previous_sent, previous_lost) = count_pair(before);
+        if unit != previous_unit || (sent > previous_sent && lost < previous_lost) {
+            self.base = Some((now, counts));
+            self.withdraw();
+        } else if now > since && sent > previous_sent && lost >= previous_lost {
+            self.interval = Some(CarrierLoss {
+                version: self.version,
+                connection: CarrierConnId::from_sampled(connection),
+                generation,
+                source,
+                unit,
+                since,
+                at: now,
+                sent: sent - previous_sent,
+                lost: lost - previous_lost,
+            });
+            self.base = Some((now, counts));
+        }
+    }
+}
+
+fn count_pair(counts: CarrierCounts) -> (CarrierLossUnit, u64, u64) {
+    match counts {
+        CarrierCounts::TcpSegments {
+            data_segs_out,
+            total_retrans,
+        } => (CarrierLossUnit::TcpSegments, data_segs_out, total_retrans),
+        CarrierCounts::TcpPackets {
+            packets_sent,
+            packets_retransmitted,
+        } => (
+            CarrierLossUnit::TcpPackets,
+            packets_sent,
+            packets_retransmitted,
+        ),
+        CarrierCounts::Quic {
+            packets_sent,
+            packets_lost,
+        } => (CarrierLossUnit::QuicPackets, packets_sent, packets_lost),
     }
 }
 
@@ -463,6 +587,13 @@ mod tests {
     fn dedicated(mut source: Source) -> Registration {
         source.dedicated = true;
         source.attach(Instant::now).unwrap()
+    }
+
+    fn sample_first(cache: &Arc<Cache>) -> CarrierSample {
+        let (sample, request) = cache.read(Instant::now());
+        assert!(sample.is_none());
+        request.unwrap().run();
+        cache.read(Instant::now()).0.unwrap()
     }
 
     #[test]
@@ -503,7 +634,7 @@ mod tests {
         let end = attachment.outcome().clone();
         let weak = Arc::downgrade(&end);
         let cache = end.sample.get().unwrap();
-        let last = cache.read(Instant::now()).0.unwrap();
+        let last = sample_first(cache);
         drop(attachment);
         let (sample, refresh) = cache.read(last.sampled_at + Duration::from_secs(2));
         assert_eq!(sample, Some(last));
@@ -529,7 +660,7 @@ mod tests {
         let first_registration = attach(&first);
         let second_registration = attach(&second);
         let cache = &second_registration.cache;
-        let original = cache.read(Instant::now()).0.unwrap();
+        let original = sample_first(cache);
         drop(first_registration);
         drop(first);
         let due = original.sampled_at + Duration::from_secs(2);
@@ -554,25 +685,27 @@ mod tests {
         let (started, start) = mpsc::channel();
         let (release, gate) = mpsc::channel();
         let gate = Mutex::new(gate);
-        let seeded = Arc::new(AtomicBool::new(false));
-        let first = std::thread::scope(|scope| {
-            let seed = scope.spawn(|| {
-                attach(Source::new(CarrierSource::Quinn, move || {
-                    if !seeded.swap(true, Ordering::Relaxed) {
-                        started.send(()).unwrap();
-                        gate.lock()
-                            .unwrap()
-                            .recv_timeout(Duration::from_secs(3))
-                            .unwrap();
-                    }
-                    Some(quic(9, 3))
-                }))
-            });
-            start.recv_timeout(Duration::from_secs(3)).unwrap();
+        let seeded = AtomicBool::new(false);
+        let first = attach(Source::new(CarrierSource::Quinn, move || {
+            if !seeded.swap(true, Ordering::Relaxed) {
+                started.send(()).unwrap();
+                gate.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
+            }
+            Some(quic(9, 3))
+        }));
+        let (sample, request) = first.cache.read(Instant::now());
+        assert!(sample.is_none());
+        let request = request.unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || request.run());
+            start.recv_timeout(Duration::from_secs(30)).unwrap();
             let (absent, refresh) = initial.cache.read(Instant::now());
             release.send(()).unwrap();
             assert!(absent.is_none() && refresh.is_none());
-            seed.join().unwrap()
+            worker.join().unwrap();
         });
         let sample = first.cache.read(Instant::now()).0.unwrap();
         assert_eq!(sample.carrier_id, old.carrier_id);
@@ -594,7 +727,7 @@ mod tests {
 
     #[test]
     fn blocked_refresh_is_single_flight() {
-        let limit = Duration::from_secs(3);
+        let limit = Duration::from_secs(30);
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let (started, start) = mpsc::channel();
@@ -606,15 +739,17 @@ mod tests {
             }
             started.send(()).unwrap();
             gate.lock().unwrap().recv_timeout(limit).unwrap();
-            Some(quic(400, 8))
+            Some(quic(400, 12))
         }));
         let cache = &registration.cache;
-        let old = cache.read(Instant::now()).0.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let old = sample_first(cache);
         let due = old.sampled_at + Duration::from_secs(1);
-        cache.read(due).1.unwrap().submit();
-        start.recv_timeout(limit).unwrap();
+        let refresh = cache.read(due).1.unwrap();
         let (send, results) = mpsc::channel();
         std::thread::scope(|scope| {
+            let worker = scope.spawn(move || refresh.run());
+            start.recv_timeout(limit).unwrap();
             for _ in 0..16 {
                 let send = send.clone();
                 scope.spawn(move || {
@@ -627,33 +762,81 @@ mod tests {
             for observed in observations {
                 assert_eq!(observed.unwrap(), (Some(old.clone()), true));
             }
+            worker.join().unwrap();
         });
-        let deadline = Instant::now() + limit;
-        while cache.lock().in_flight {
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
         let updated = cache.read(due).0.unwrap();
         assert!(updated.sampled_at >= due);
         assert_eq!(
             (updated.generation, updated.counts),
-            (0, Some(quic(400, 8)))
+            (0, Some(quic(400, 12)))
         );
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn quic_loss_correction_preserves_interval_and_age() {
+        let mut state = CacheState {
+            loss: Some(Box::default()),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        for (i, (sent, lost)) in [(10, 1), (20, 3), (20, 2), (30, 2)].into_iter().enumerate() {
+            state.publish(
+                start + Duration::from_secs(i as u64),
+                CarrierSource::Quinn,
+                Some(quic(sent, lost)),
+            );
+            if i == 2 {
+                assert_eq!(
+                    state.sample().unwrap().sampled_at,
+                    start + Duration::from_secs(1)
+                );
+                let interval = state.loss.as_ref().unwrap().interval.as_ref().unwrap();
+                assert_eq!(interval.at, start + Duration::from_secs(1));
+            }
+        }
+        assert_eq!(state.generation, 0);
+        let interval = state.loss.as_ref().unwrap().interval.as_ref().unwrap();
+        assert_eq!(interval.lost, 0);
+        assert_eq!(interval.sent, 10);
+    }
+
+    #[test]
+    fn loss_replacement_after_counter_correction_has_a_new_evidence_version() {
+        let mut state = CacheState {
+            loss: Some(Box::default()),
+            ..Default::default()
+        };
+        let origin = Instant::now();
+        for (step, (sent, lost)) in [(10, 1), (20, 3), (30, 2), (40, 3)].into_iter().enumerate() {
+            state.publish(
+                origin + Duration::from_secs(step as u64),
+                CarrierSource::Quinn,
+                Some(quic(sent, lost)),
+            );
+            assert_eq!(state.generation, 0);
+            let tracker = state.loss.as_ref().unwrap();
+            assert_eq!(tracker.version, (step / 2) as u64);
+            assert_eq!(tracker.interval.is_some(), step % 2 == 1);
+        }
     }
 
     #[test]
     fn linux_wrap_and_reset() {
         const WRAP: u64 = 1 << 32;
         let mut state = CacheState::default();
-        for (sent, retrans, expected_sent, expected_retrans, generation) in [
+        let start = Instant::now();
+        for (index, (sent, retrans, expected_sent, expected_retrans, generation)) in [
             (WRAP - 10, WRAP - 2, WRAP - 10, WRAP - 2, 0),
             (5, 3, WRAP + 5, WRAP + 3, 0),
             (20, 1, 20, 1, 1),
             (18, 2, 18, 2, 2),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             state.publish(
-                Instant::now(),
+                start + Duration::from_secs(index as u64),
                 CarrierSource::LinuxTcpInfo,
                 Some(CarrierCounts::TcpSegments {
                     data_segs_out: sent,

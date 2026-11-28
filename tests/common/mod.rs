@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use zmux::test_hooks::{Resources, resources};
 use zmux::{Config, PipeIo, Session};
@@ -117,13 +118,17 @@ pub(crate) fn snapshot() -> Snapshot {
     }
 }
 
-/// Waits until everything is back at `base`, at most `secs` seconds (of the
-/// runtime's clock); fails with the difference otherwise.
+/// Waits for resources to return to their baseline, bounded by the runtime's clock.
 pub(crate) async fn settle(base: Snapshot, secs: u64, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         let now = snapshot();
-        if now == base {
+        // A process-wide descriptor counted in the baseline can close during the test.
+        if now.res == base.res
+            && now.fds <= base.fds
+            && now.carriers == base.carriers
+            && now.tasks == base.tasks
+        {
             return;
         }
         assert!(
@@ -306,7 +311,7 @@ pub(crate) async fn connect(
 /// listener of its own when `config` offers multipath (which
 /// `Session::accept` refuses: it cannot accept joins).
 pub(crate) async fn accept(pipe: PipeIo, config: Config) -> Result<Session, zmux::ConnectError> {
-    if config.max_pipes == 1 && config.resume_timeout.is_none() {
+    if config.session_policy.limits.steady_attachments == 1 && config.resume_timeout.is_none() {
         return Session::accept(pipe, config).await;
     }
     let listener = zmux::Listener::new(config, zmux::ListenerConfig::default())
@@ -340,42 +345,23 @@ pub(crate) async fn pair(
 
 /// Copies `r` to `w` until the cut, an end or an error; dropping the halves
 /// then ends the relayed connection.
-async fn pump(
-    mut r: tokio::net::tcp::OwnedReadHalf,
-    mut w: tokio::net::tcp::OwnedWriteHalf,
-    cut: Arc<AtomicBool>,
-) {
-    let mut buf = vec![0u8; 16 * 1024];
-    while !cut.load(Ordering::SeqCst) {
-        match tokio::time::timeout(Duration::from_millis(10), r.read(&mut buf)).await {
-            Ok(Ok(0) | Err(_)) => break,
-            Ok(Ok(n)) => {
-                if w.write_all(&buf[..n]).await.is_err() {
-                    break;
-                }
-            }
-            Err(_) => {}
-        }
-    }
-}
-
-/// A carrier that can be cut: a TCP relay whose cut drops both sockets.
-pub(crate) async fn relay(target: std::net::SocketAddr) -> (std::net::SocketAddr, Arc<AtomicBool>) {
+/// A TCP relay whose cut signal drops both sockets, even during a write.
+pub(crate) async fn relay(
+    target: std::net::SocketAddr,
+) -> (std::net::SocketAddr, oneshot::Sender<()>) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    let cut = Arc::new(AtomicBool::new(false));
-    let c = cut.clone();
+    let (cut, interrupted) = oneshot::channel();
     tokio::spawn(async move {
-        let Ok((a, _)) = l.accept().await else {
-            return;
+        let forward = async {
+            let (mut client, _) = l.accept().await?;
+            let mut server = TcpStream::connect(target).await?;
+            tokio::io::copy_bidirectional(&mut client, &mut server).await
         };
-        let b = TcpStream::connect(target).await.unwrap();
-        let (ar, aw) = a.into_split();
-        let (br, bw) = b.into_split();
-        let t1 = tokio::spawn(pump(ar, bw, c.clone()));
-        let t2 = tokio::spawn(pump(br, aw, c));
-        let _ = t1.await;
-        let _ = t2.await;
+        tokio::select! {
+            _ = interrupted => {}
+            _ = forward => {}
+        }
     });
     (addr, cut)
 }

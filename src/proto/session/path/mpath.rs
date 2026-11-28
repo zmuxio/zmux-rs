@@ -20,7 +20,7 @@ use crate::proto::session::pipes::{
 };
 use crate::proto::session::{
     Cap, CloseFrame, CoreEvent, Inherit, InvalidConfig, LaneId, Liveness, Period, PipeEnd,
-    PipeFailure, PipeId, SessionCore, SessionError, State, StreamKey,
+    PipeFailure, PipeHealthReason, PipeId, SessionCore, SessionError, State, StreamKey,
 };
 use crate::proto::{Error, TransportErrorCode as T, VarInt};
 
@@ -103,7 +103,7 @@ impl PipeWrite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum Multipath {
-    /// This endpoint did not offer it (`max_pipes` 1 and no resume), or the
+    /// This endpoint did not offer it (a steady attachment limit of 1 and no resume), or the
     /// session is not established yet.
     #[default]
     Off,
@@ -154,11 +154,14 @@ impl CarrierConnId {
         Self { key, owner: None }
     }
 
-    #[cfg(all(feature = "tokio", not(loom)))]
     pub(crate) fn is_live(&self) -> bool {
         self.owner
             .as_ref()
             .is_some_and(|owner| owner.strong_count() != 0)
+    }
+
+    pub(crate) const fn is_verified(&self) -> bool {
+        self.owner.is_some()
     }
 }
 
@@ -239,6 +242,78 @@ pub enum CarrierCounts {
     },
 }
 
+/// How much the sender can establish about limits during the entire ACK interval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryLoad {
+    /// A credited, queued byte remained available to this unrestricted path throughout.
+    Backlogged,
+    /// The estimator observed a limited delivery interval.
+    Limited,
+    /// At least one of credit, shaping, backlog or scheduling share was unproven.
+    Unknown,
+}
+
+/// An outbound protocol ACK interval. Only backlogged intervals supply capacity samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AckDelivery {
+    /// Original monotonic start and end of the acknowledgement interval.
+    pub start: Instant,
+    /// Monotonic time at which the ACK advanced.
+    pub end: Instant,
+    /// Newly acknowledged bytes over this interval.
+    pub delivered: u64,
+    /// Acknowledged bytes per second.
+    pub bytes_per_second: u64,
+    /// Interval-wide load classification for capacity scoring.
+    pub load: DeliveryLoad,
+    /// Maximum age from the original observation.
+    pub valid_for: Duration,
+}
+
+pub(crate) trait CapacityObserver: Send + Sync {
+    fn capacity_sample(&self, sample: AckDelivery);
+}
+
+impl AckDelivery {
+    pub(crate) fn current(self, now: Instant, health: &crate::PipeHealth) -> bool {
+        now.saturating_duration_since(self.end) < self.valid_for
+            && health.send_evidence.is_some_and(|e| self.start >= e.since)
+    }
+}
+
+/// Unit of a carrier loss interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarrierLossUnit {
+    /// TCP data segments, with retransmitted segments.
+    TcpSegments,
+    /// TCP packets, with retransmitted packets.
+    TcpPackets,
+    /// QUIC packets, with packets declared lost.
+    QuicPackets,
+}
+
+/// A paired interval from one physical connection's counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarrierLoss {
+    pub(crate) version: u64,
+    /// Physical connection to which all counts belong.
+    pub connection: CarrierConnId,
+    /// Counter epoch.
+    pub generation: u64,
+    /// Counter provider.
+    pub source: CarrierSource,
+    /// Counted unit.
+    pub unit: CarrierLossUnit,
+    /// Start of the observed interval.
+    pub since: Instant,
+    /// End of the observed interval.
+    pub at: Instant,
+    /// Units sent during this interval.
+    pub sent: u64,
+    /// Units retransmitted or declared lost during this interval.
+    pub lost: u64,
+}
+
 /// One observation of a carrier connection, shared by its pipes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarrierSample {
@@ -317,7 +392,7 @@ impl PipeLiveness {
 }
 
 /// The options of a pipe, fixed when it is added (`direction`,
-/// `record_mode`, `key_group`, `label`, `fate_group`, `return_on_reply`)
+/// `record_mode`, `key_group`, `label`, `fate_group`)
 /// or its runtime settings at the start, which [`PipeUpdate`](crate::PipeUpdate)
 /// changes later. The runtime settings are the fields of `PipeUpdate`, of
 /// the same types: here [`Change::Keep`] and [`Change::Clear`] both mean
@@ -380,15 +455,6 @@ pub struct PipeOptions {
     /// The fate group: pipes expected to fail together share one; 0 (the
     /// default) is independent.
     pub fate_group: u64,
-    /// `add_pipe` returns once the Reply has been verified instead of once
-    /// the peer attached the pipe (default false). The caller then keeps
-    /// the session's other pipes until
-    #[cfg_attr(
-        feature = "tokio",
-        doc = " [`Pipe::attached`](crate::Pipe#method.attached) resolves."
-    )]
-    #[cfg_attr(not(feature = "tokio"), doc = " `Pipe::attached` resolves.")]
-    pub return_on_reply: bool,
 }
 
 impl PipeOptions {
@@ -492,14 +558,6 @@ impl PipeOptions {
         self
     }
 
-    /// Whether `add_pipe` returns at the verified Reply rather than once
-    /// the peer attached the pipe.
-    #[must_use]
-    pub fn with_return_on_reply(mut self, on: bool) -> Self {
-        self.return_on_reply = on;
-        self
-    }
-
     /// Whether the options are valid: the liveness settings in their
     /// ranges, a fixed probation base above zero and a record mode a pipe can be joined in
     /// ([`PipeError::InvalidOptions`] otherwise, which adding a pipe with
@@ -541,7 +599,6 @@ impl Default for PipeOptions {
             quality_band: Change::Keep,
             label: None,
             fate_group: 0,
-            return_on_reply: false,
         }
     }
 }
@@ -653,6 +710,10 @@ pub struct PipeFinal {
     reason = "public statistics: each bool reports an independent pipe condition"
 )]
 pub struct PipeStats {
+    /// The committed directional health of the attachment.
+    pub health: super::super::PipeHealth,
+    /// In-service and retired-lane totals when accounting is enabled.
+    pub accounting: Option<crate::PipeAccounting>,
     /// The pipe ID.
     pub pipe: PipeId,
     /// Whether the local endpoint joined it.
@@ -673,7 +734,7 @@ pub struct PipeStats {
     pub epoch: Option<u64>,
     /// When the epoch policy wants the carrier replaced by a new join, make before break:
     /// twice the epoch period after it joined.
-    /// A `PipePool` and the redial hooks replace it then.
+    /// A controller can use this when planning rotation.
     pub replace_by: Option<Instant>,
     /// How often the outbound pipe became suspect.
     pub suspect_count: u64,
@@ -720,6 +781,14 @@ pub struct PipeStats {
     /// Where `smoothed_rtt` and `rttvar` come from;
     /// `None` before the first sample.
     pub rtt_source: Option<RttSource>,
+    /// Local outbound protocol RTT (sample time, smoothed RTT and validity).
+    pub protocol_rtt: Option<(Instant, Duration, Duration)>,
+    /// Same-source minimum RTT (sample time, minimum and validity).
+    pub protocol_min_rtt: Option<(Instant, Duration, Duration)>,
+    /// Most recent local outbound delivery interval in the current service generation.
+    pub ack_delivery: Option<AckDelivery>,
+    #[cfg_attr(not(any(feature = "tokio", feature = "blocking")), allow(dead_code))]
+    pub(crate) delivery_version: u64,
     /// Smoothed RTT of the outbound pipe (estimate); `None` before the
     /// first sample, not the 333 ms default.
     pub smoothed_rtt: Option<Duration>,
@@ -774,6 +843,8 @@ pub struct PipeStats {
     pub records_lost: Option<u64>,
     /// The cached statistics of an identified outbound connection, once available.
     pub carrier_sample: Option<CarrierSample>,
+    /// Latest usable native loss interval, shared by the connection's pipes.
+    pub carrier_loss: Option<CarrierLoss>,
     /// Duplicate stream bytes received on the inbound pipe.
     pub bytes_duplicate_received: u64,
     /// Opportunistic copies sent on the outbound pipe.
@@ -872,15 +943,21 @@ type PipeStates = (u64, Option<OutboundState>, Option<InboundState>);
 /// behind its own operations.
 #[derive(Debug)]
 pub(crate) struct Mp {
+    pub(in crate::proto::session) counters: super::super::MultipathCounters,
+    #[cfg(all(feature = "blocking", not(loom)))]
+    redial_attempts: u64,
+    pub(in crate::proto::session) replica_burst: u64,
+    pub(in crate::proto::session) replica_budget: Option<Box<super::redundancy::ReplicaBudget>>,
     /// Why the last pipe that failed did (`SessionError::PipesLost` and
     /// `ResumeTimeout` report it).
     pub(in crate::proto::session) last_failure: Option<PipeFailure>,
     /// How often an outbound pipe became suspect, a DRAINING one included
     /// (whose public state stays DRAINING): for tests.
     pub(in crate::proto::session) suspects: u64,
+    pub(in crate::proto::session) health_seq: u64,
     /// The pipe states a pass of the multipath timers started with
     /// ([`SessionCore::mp_timeout`]), kept for its next pass.
-    pass_states: Vec<PipeStates>,
+    pass_states: Option<Box<[PipeStates]>>,
     pub(in crate::proto::session) keys: JoinKeys,
     pub(in crate::proto::session) epochs: Epochs,
     pub(in crate::proto::session) peer_locator: Locator,
@@ -897,6 +974,7 @@ pub(crate) struct Mp {
     next_id: u64,
     /// The replay window over the peer's pipe IDs.
     replay: ReplayWindow,
+    pub(super) join_control: Option<Box<JoinControl>>,
     /// Our joins refused with `ZMUX_PIPE_RESOURCE_LIMIT` in a row, and until
     /// when the next join waits.
     refusals: u32,
@@ -939,6 +1017,55 @@ pub(crate) struct Mp {
     blocked: crate::proto::session::opp::CreditBlocked,
     /// The SUSPENDED state (`resume.rs`).
     suspension: crate::proto::session::resume::Suspension,
+}
+
+/// Rare Join and provenance state, shared across attachments.
+#[derive(Debug, Default)]
+pub(super) struct JoinControl {
+    pub(super) pending: super::join::PendingPeers,
+    pub(super) peer_sources: std::collections::HashMap<u64, super::super::CarrierHalfSources>,
+    physical_failures: super::super::health::PhysicalFailures,
+    members: std::collections::HashMap<PipeId, super::super::capacity::MemberBinding>,
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    rotation: std::collections::HashMap<crate::MemberId, MemberRotation>,
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(super) receive: std::collections::HashMap<PipeId, crate::PathPreference>,
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(super) receive_changed: bool,
+    /// Only accessible during the core commit that applies the report.
+    applying_failure: Option<std::sync::Arc<super::super::CarrierFailureEvent>>,
+}
+
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+#[derive(Debug, Default)]
+struct MemberRotation {
+    send_limit: Option<u64>,
+    receive_limit: Option<u64>,
+    sent: u64,
+    received: u64,
+}
+
+#[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+impl MemberRotation {
+    fn due(&self) -> bool {
+        self.send_limit.is_some_and(|limit| self.sent >= limit)
+            || self
+                .receive_limit
+                .is_some_and(|limit| self.received >= limit)
+    }
+}
+
+impl JoinControl {
+    pub(super) fn idle(&self) -> bool {
+        let idle = self.pending.is_empty()
+            && self.peer_sources.is_empty()
+            && self.physical_failures.0.is_empty()
+            && self.members.is_empty();
+        #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+        let idle =
+            idle && self.receive.is_empty() && !self.receive_changed && self.rotation.is_empty();
+        idle
+    }
 }
 
 /// The replay window over the pipe IDs of the peer's parity, counted in
@@ -1054,7 +1181,14 @@ impl Mp {
 
     /// Heap bytes the multipath state holds besides the attachments.
     pub(crate) fn heap_bytes(&self) -> usize {
-        size_of::<Self>() + self.batch.heap_bytes() + self.acks.heap_bytes()
+        size_of::<Self>()
+            + self.batch.heap_bytes()
+            + self.acks.heap_bytes()
+            + self.ledger.borrow().amounts_heap_bytes()
+            + self
+                .replica_budget
+                .as_ref()
+                .map_or(0, |b| std::mem::size_of_val(&**b))
     }
 
     /// The session is closing: no more pipe-layer state changes matter.
@@ -1208,6 +1342,15 @@ impl Mp {
         &mut self.tiers
     }
 
+    pub(super) fn batch_and_repairs(
+        &mut self,
+    ) -> (
+        &mut crate::proto::session::output::BatchLog,
+        &mut super::opp::CreditBlocked,
+    ) {
+        (&mut self.batch, &mut self.blocked)
+    }
+
     #[inline]
     pub(crate) fn blocked(&self) -> &crate::proto::session::opp::CreditBlocked {
         &self.blocked
@@ -1229,6 +1372,28 @@ impl Mp {
     }
 }
 
+fn sequenced_datagram_replica_burst(local_cap: u64, peer_cap: u64) -> u64 {
+    use crate::proto::frame::DatagramPrefix;
+    use crate::proto::params::ZMUX_MAX_RECORD_SIZE;
+    use crate::proto::payload::Flow;
+
+    let frame = if local_cap == 0 {
+        ZMUX_MAX_RECORD_SIZE
+    } else {
+        local_cap
+    };
+    let frame = if peer_cap == 0 {
+        frame
+    } else {
+        frame.min(peer_cap)
+    };
+    let prefix = DatagramPrefix::Sequenced {
+        sequence: 0,
+        flow: Flow::Session,
+    };
+    frame.saturating_sub(1 + prefix.encoded_len() as u64)
+}
+
 impl SessionCore {
     // ---- setup ------------------------------------------------------------------
 
@@ -1239,6 +1404,7 @@ impl SessionCore {
         peer: &TransportParameters,
         now: Instant,
     ) {
+        debug_assert!(self.features.same_family);
         let (Some(l), Some(p)) = (&local.zmux_multipath, &peer.zmux_multipath) else {
             return;
         };
@@ -1340,9 +1506,20 @@ impl SessionCore {
         let local_mad = Duration::from_millis(self.local_tp().max_ack_delay());
         let threshold = self.local_tp().ack_threshold();
         let mp = Mp {
-            pass_states: Vec::new(),
+            counters: super::super::MultipathCounters::default(),
+            #[cfg(all(feature = "blocking", not(loom)))]
+            redial_attempts: 0,
+            replica_burst: sequenced_datagram_replica_burst(
+                self.local_tp().max_datagram_frame_size(),
+                self.peer_tp
+                    .as_ref()
+                    .map_or(0, super::super::tp::TpValues::max_datagram_frame_size),
+            ),
+            replica_budget: None,
+            pass_states: None,
             last_failure: None,
             suspects: 0,
+            health_seq: 0,
             keys,
             epochs: Epochs::new(
                 self.local_locator(),
@@ -1362,6 +1539,7 @@ impl SessionCore {
             next_id: if initiator { 2 } else { 1 },
             // The bootstrap pair is the initiator's attachment 0.
             replay: ReplayWindow::new(self.replay_width(), !initiator),
+            join_control: None,
             refusals: 0,
             join_backoff: None,
             deferred: Vec::new(),
@@ -1403,6 +1581,13 @@ impl SessionCore {
 
     pub(in crate::proto::session) fn mp_mut(&mut self) -> &mut Mp {
         self.mp.as_deref_mut().expect("multipath in use")
+    }
+
+    #[cfg(all(feature = "blocking", not(loom)))]
+    pub(crate) fn next_redial_attempt(&mut self) -> u64 {
+        let counter = &mut self.mp_mut().redial_attempts;
+        *counter = counter.checked_add(1).expect("redial ID exhausted");
+        *counter
     }
 
     /// Sets the locator of the multipath parameter this endpoint sends
@@ -1501,15 +1686,8 @@ impl SessionCore {
 
     // ---- pipe IDs -------------------------------------------------------------------
 
-    /// W of the replay window: the setting, else max(64, 2 x (`max_pipes` +
-    /// H)), never below `max_pipes` + H.
     fn replay_width(&self) -> u64 {
-        let held = self.cap() as u64;
-        match self.config.replay_window {
-            Cap::Fixed(w) => w,
-            Cap::Auto => 64.max(held.saturating_mul(2)),
-        }
-        .max(held)
+        self.config.initial_capacity().replay_width()
     }
 
     /// Whether an ID names a retired attachment: our own parity, taken and
@@ -1552,15 +1730,22 @@ impl SessionCore {
         self.views_changed();
     }
 
-    /// The cap of unretired attachments per joiner: `max_pipes` + H.
+    /// The effective cap of unretired attachments per joiner.
     pub(in crate::proto::session) fn cap(&self) -> usize {
-        let held = u64::from(self.config.max_pipes.max(1))
-            .saturating_add(u64::from(self.config.pipe_headroom));
-        usize::try_from(held).unwrap_or(usize::MAX)
+        self.session_policy().limits.envelope()
+    }
+
+    fn join_cap(&self, local: bool) -> usize {
+        let cap = self.cap();
+        if local {
+            cap
+        } else {
+            self.config.hooks.pipe_cap.map_or(cap, |test| test.min(cap))
+        }
     }
 
     /// Unretired attachments joined by the peer (or by us).
-    fn unretired(&self, local: bool) -> usize {
+    pub(in crate::proto::session) fn unretired(&self, local: bool) -> usize {
         self.atts
             .iter()
             .filter(|a| a.joiner_local() == local && !a.unattached() && !a.deferred())
@@ -1583,11 +1768,7 @@ impl SessionCore {
         inbound: bool,
         outbound: bool,
     ) -> bool {
-        let cap = if local {
-            self.cap()
-        } else {
-            self.config.hooks.pipe_cap.unwrap_or_else(|| self.cap())
-        };
+        let cap = self.join_cap(local);
         if self.unretired(local) < cap {
             return true;
         }
@@ -1604,12 +1785,7 @@ impl SessionCore {
         outbound: bool,
         now: Instant,
     ) -> bool {
-        let cap = if local {
-            self.cap()
-        } else {
-            // The trace runner's cap for the peer's attachments.
-            self.config.hooks.pipe_cap.unwrap_or_else(|| self.cap())
-        };
+        let cap = self.join_cap(local);
         if self.unretired(local) < cap {
             return true;
         }
@@ -1626,7 +1802,7 @@ impl SessionCore {
             .atts
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.joiner_local() == local && !a.unattached() && !a.deferred())
+            .filter(|(_, a)| a.displaceable(local))
             .min_by_key(|(_, a)| {
                 displacement_rank(a.failed(), a.abandon_acked(), a.seq(), a.last_progress())
             })
@@ -1670,7 +1846,7 @@ impl SessionCore {
 
     /// Adds a pipe that the local endpoint joins: `inbound`/`outbound` name the carrier's
     /// directions, `mode` its record mode, and `binding` the carrier's Binding exactly when
-    /// Bound. Each call takes a fresh pipe ID. While the endpoint has `max_pipes` + H
+    /// Bound. Each call takes a fresh pipe ID. While the endpoint is at its cap of
     /// unretired attachments of its own, or after a refusal until the join backoff has
     /// elapsed, the join is deferred ([`SessionCore::join_deferred`]);
     /// [`SessionCore::join_hello`] writes its Hello once allowed.
@@ -1728,6 +1904,7 @@ impl SessionCore {
         if (mode == RecordMode::Bound) != binding.is_some() {
             return Err(PipeError::InvalidArgument);
         }
+        let work = self.reserve_join_work()?;
         let id = PipeId::allocate(&mut self.mp_mut().next_id)?.get();
         let seq = self.next_att_seq();
         let mut att = Attachment::new(id, true, opts.fate_group, seq);
@@ -1766,8 +1943,13 @@ impl SessionCore {
         let mp = self.mp_mut();
         mp.deferred.push(Deferred { id });
         let binding = binding.map(<[u8]>::to_vec).unwrap_or_default();
-        mp.local_joins
-            .push(LocalJoin::new(id, mode, binding, opts.key_group.own()));
+        mp.local_joins.push(LocalJoin::new(
+            id,
+            mode,
+            binding,
+            opts.key_group.own(),
+            work,
+        ));
         for half in [PipeHalf::Inbound, PipeHalf::Outbound] {
             self.pipe_event(id, half);
         }
@@ -1784,26 +1966,26 @@ impl SessionCore {
         let Some(mp) = self.mp.as_deref() else {
             return false;
         };
-        !mp.keys.pending()
+        self.state < State::Closing
+            && !mp.keys.pending()
             && mp.deferred.is_empty()
             && mp.join_backoff.is_none_or(|t| now >= t)
             && (self.unretired(true) < self.cap()
                 || self.state == State::Suspended && self.displaceable(true))
     }
 
-    /// Whether an attachment of the given joiner could be displaced to make room.
-    fn displaceable(&self, local: bool) -> bool {
-        self.atts
-            .iter()
-            .any(|a| a.joiner_local() == local && !a.unattached() && !a.deferred())
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(in crate::proto::session) fn peer_join_retry(&self) -> Option<Instant> {
+        self.mp.as_ref()?.join_backoff.filter(|&at| at > self.now)
     }
 
-    /// Whether this endpoint has room for a join of its own now: one
-    /// added would join at once ([`SessionCore::join_ready`]), and its live
-    /// attachments stay within `max_pipes`, the attachments it aims for.
-    /// A rejoin of a duplicate session's route is skipped otherwise.
-    /// Pipes that may be added now: none unless [`Self::join_ready`], else
-    /// the room under `max_pipes` beside the live attachments.
+    /// Whether an attachment of the given joiner could be displaced to make room.
+    fn displaceable(&self, local: bool) -> bool {
+        self.atts.iter().any(|a| a.displaceable(local))
+    }
+
+    /// Local Join capacity under the maintenance target and unretired cap.
+    /// During suspension one attachment may instead use reclamation.
     pub fn join_room(&self, now: Instant) -> usize {
         if !self.join_ready(now) {
             return 0;
@@ -1811,18 +1993,39 @@ impl SessionCore {
         let live = self
             .atts
             .iter()
-            .filter(|a| !a.unattached() && !a.failed())
+            .filter(|a| {
+                a.joiner_local()
+                    && !a.unattached()
+                    && !a.failed()
+                    && (a.out().is_some()
+                        || a.inp().is_some_and(|input| input.state() != InState::Ended))
+            })
             .count();
-        (self.config.max_pipes as usize).saturating_sub(live)
+        let protocol_room = self.cap().saturating_sub(self.unretired(true));
+        let available =
+            (self.session_policy().limits.steady_attachments as usize).saturating_sub(live);
+        if self.state == State::Suspended && self.displaceable(true) {
+            available.min(protocol_room.max(1))
+        } else {
+            available.min(protocol_room)
+        }
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn replacement_join_room(&self, now: Instant) -> usize {
+        if !self.join_ready(now) {
+            return 0;
+        }
+        let room = self.cap().saturating_sub(self.unretired(true));
+        if self.state == State::Suspended && self.displaceable(true) {
+            room.max(1)
+        } else {
+            room
+        }
     }
 
     pub fn join_wanted(&self, now: Instant) -> bool {
-        let live = self
-            .atts
-            .iter()
-            .filter(|a| !a.unattached() && !a.failed())
-            .count();
-        self.join_ready(now) && live < self.config.max_pipes as usize
+        self.join_room(now) != 0
     }
 
     /// Whether a local join waits to be sent (the cap of unretired
@@ -1882,9 +2085,11 @@ impl SessionCore {
     /// abandoned; its carrier halves are closed.
     pub(in crate::proto::session) fn drop_deferred(&mut self, i: usize) {
         self.keep_final_pipe(i);
+        self.cancel_pipe_lane_open(self.atts.at(i).id());
         let a = self.atts.remove(i);
         self.views_changed();
         let id = a.id();
+        self.set_pacing_deadline(id, None);
         self.recv_lane_gone(id);
         let mp = self.mp_mut();
         mp.end_deferred(id);
@@ -2100,8 +2305,114 @@ impl SessionCore {
 
     pub(in crate::proto::session) fn next_att_seq(&mut self) -> u64 {
         let mp = self.mp_mut();
-        mp.seq += 1;
+        mp.seq = mp
+            .seq
+            .checked_add(1)
+            .expect("attachment sequence exhausted");
         mp.seq
+    }
+
+    pub(in crate::proto::session) fn member_binding(
+        &self,
+        pipe: PipeId,
+    ) -> Option<&super::super::capacity::MemberBinding> {
+        self.mp.as_ref()?.join_control.as_ref()?.members.get(&pipe)
+    }
+
+    #[cfg(all(any(feature = "blocking", feature = "tokio"), not(loom)))]
+    pub(crate) fn set_member_rotation(
+        &mut self,
+        members: &[(crate::MemberId, Option<u64>, Option<u64>)],
+    ) {
+        let Some(mp) = &mut self.mp else { return };
+        if members.is_empty() && mp.join_control.is_none() {
+            return;
+        }
+        let rotation = &mut mp.join_control.get_or_insert_default().rotation;
+        rotation.retain(|id, _| members.iter().any(|&(member, _, _)| member == *id));
+        for &(id, send_limit, receive_limit) in members {
+            let entry = rotation.entry(id).or_default();
+            entry.send_limit = send_limit;
+            entry.receive_limit = receive_limit;
+        }
+    }
+
+    #[cfg(all(any(feature = "blocking", feature = "tokio"), not(loom)))]
+    pub(crate) fn member_rotation_due(&self, id: crate::MemberId) -> bool {
+        self.mp
+            .as_ref()
+            .and_then(|mp| mp.join_control.as_ref())
+            .and_then(|control| control.rotation.get(&id))
+            .is_some_and(MemberRotation::due)
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(in crate::proto::session) fn member_bytes(&mut self, pipe: PipeId, send: bool, n: u64) {
+        if self
+            .mp
+            .as_ref()
+            .and_then(|mp| mp.join_control.as_ref())
+            .is_none_or(|control| control.rotation.is_empty())
+        {
+            return;
+        }
+        let Some(id) = self.member_for_pipe(pipe) else {
+            return;
+        };
+        let Some(entry) = self
+            .mp_mut()
+            .join_control
+            .as_mut()
+            .and_then(|control| control.rotation.get_mut(&id))
+        else {
+            return;
+        };
+        let was_due = entry.due();
+        if send {
+            entry.sent = entry.sent.saturating_add(n);
+        } else {
+            entry.received = entry.received.saturating_add(n);
+        }
+        if !was_due && entry.due() {
+            self.push_event(super::super::CoreEvent::MemberRotationDue);
+        }
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn allocate_member(&mut self) -> super::super::MemberId {
+        super::super::MemberId(self.next_att_seq() + 1)
+    }
+
+    #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+    pub(crate) fn assign_member(
+        &mut self,
+        pipe: PipeId,
+        id: super::super::MemberId,
+        candidate: Option<super::super::CandidateId>,
+        expected: super::super::Directions,
+        attachments: usize,
+    ) {
+        if self.mp.is_some() {
+            let exclusion = candidate
+                .as_ref()
+                .map_or_else(super::super::DirectionExclusion::default, |candidate| {
+                    self.session_policy().exclusion(candidate)
+                });
+            self.mp_mut()
+                .join_control
+                .get_or_insert_default()
+                .members
+                .insert(
+                    pipe,
+                    super::super::capacity::MemberBinding {
+                        id,
+                        candidate,
+                        expected,
+                        attachments,
+                    },
+                );
+            self.set_pipe_topology_exclusion(pipe, exclusion, self.now);
+        }
     }
 
     /// One of our joins was confirmed: the refusal backoff resets, and a
@@ -2122,7 +2433,7 @@ impl SessionCore {
         self.join_refused(now);
         self.fail_attachment(id, PipeFailure::JoinRefused, now);
         // A verified Reply: no failed join.
-        self.stats.join_failures = 0;
+        self.mp_mut().counters.join_failures = 0;
         if let Some(i) = self.att_index(id) {
             self.atts.at_mut(i).drop_abandon();
             self.retire_at_index(i, now);
@@ -2133,7 +2444,7 @@ impl SessionCore {
     /// One of our joins was refused: the next waits 1 s, doubled per
     /// consecutive refusal, at most 60 s.
     fn join_refused(&mut self, now: Instant) {
-        self.stats.join_refusals += 1;
+        self.mp_mut().counters.join_refusals += 1;
         let mp = self.mp_mut();
         mp.refusals = mp.refusals.saturating_add(1);
         let wait = Duration::from_secs(1)
@@ -2143,10 +2454,13 @@ impl SessionCore {
     }
 
     /// Inserts `att` in identifier order; returns its index. The list grows
-    /// by one: attachments come rarely and are bounded by `max_pipes`, and a
+    /// by one: attachments come rarely and are bounded by the attachment envelope, and a
     /// quiet session holds no room for more.
     pub(in crate::proto::session) fn insert_attachment(&mut self, att: Attachment) -> usize {
         let pos = self.atts.insert(att);
+        if let Some(mp) = &mut self.mp {
+            mp.acks_mut().invalidate_backlog();
+        }
         self.views_changed();
         pos
     }
@@ -2165,6 +2479,93 @@ impl SessionCore {
 
     // ---- removal --------------------------------------------------------------------
 
+    /// Applies a carrier-reported physical failure to its session attachments.
+    /// Returns true for a new round and false for a replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reported identity does not match the named
+    /// attachment, the retry time is unrepresentable, or the session ended.
+    pub fn report_carrier_failure(
+        &mut self,
+        pipe: PipeId,
+        report: super::super::CarrierFailureReport,
+        now: Instant,
+    ) -> Result<bool, PipeError> {
+        self.tick(now);
+        if let Some(error) = self.error() {
+            return Err(PipeError::SessionLost(error.clone()));
+        }
+        if self.mp.is_none() {
+            return Err(PipeError::NotNegotiated);
+        }
+        let att = self
+            .att(pipe.0)
+            .filter(|a| !a.unattached())
+            .ok_or(PipeError::UnknownPipe)?;
+        if !report.connection.is_verified() || att.physical_connection() != Some(&report.connection)
+        {
+            return Err(PipeError::InvalidArgument);
+        }
+        let now = self.now;
+        let retry_at = report
+            .retry_after
+            .map(|delay| now.checked_add(delay).ok_or(PipeError::InvalidArgument))
+            .transpose()?;
+        let seen = &mut self
+            .mp_mut()
+            .join_control
+            .get_or_insert_default()
+            .physical_failures
+            .0;
+        seen.retain(|conn, _| conn == &report.connection || conn.is_live());
+        if seen
+            .get(&report.connection)
+            .is_some_and(|round| *round >= report.round)
+        {
+            return Ok(false);
+        }
+        seen.insert(report.connection.clone(), report.round);
+        let affected: Vec<_> = self
+            .atts
+            .iter()
+            .filter(|a| {
+                !a.failed()
+                    && !a.unattached()
+                    && a.physical_connection() == Some(&report.connection)
+            })
+            .map(Attachment::id)
+            .collect();
+        let kind = report.kind;
+        let control = self.mp_mut().join_control.as_mut().expect("recorded round");
+        control.applying_failure = Some(std::sync::Arc::new(super::super::CarrierFailureEvent {
+            report,
+            at: now,
+            retry_at,
+        }));
+        for id in affected {
+            self.fail_attachment(id, PipeFailure::Carrier(kind), now);
+        }
+        self.after_pipe_change(now);
+        self.mp_mut()
+            .join_control
+            .as_mut()
+            .expect("recorded round")
+            .applying_failure = None;
+        Ok(true)
+    }
+
+    pub(in crate::proto::session) fn applying_carrier_failure(
+        &self,
+    ) -> Option<&std::sync::Arc<super::super::CarrierFailureEvent>> {
+        self.mp
+            .as_ref()?
+            .join_control
+            .as_ref()?
+            .applying_failure
+            .as_ref()
+    }
+
     /// Removes a pipe: gracefully (drain, `PIPE_ABANDON(NO_ERROR)`) or
     /// abruptly (failure, reinjection, `PIPE_ABANDON(ZMUX_PIPE_FAILED)`).
     pub fn remove_pipe(
@@ -2173,6 +2574,9 @@ impl SessionCore {
         graceful: bool,
         now: Instant,
     ) -> Result<(), PipeError> {
+        if graceful {
+            return self.drain_attachments(&[pipe], now, |_| Ok(()));
+        }
         self.tick(now);
         if self.mp.is_none() {
             return Err(PipeError::NotNegotiated);
@@ -2183,21 +2587,113 @@ impl SessionCore {
         if a.failed() || a.unattached() {
             return Ok(());
         }
-        if graceful && a.deferred() {
-            if let Some(i) = self.att_index(pipe.0) {
-                self.drop_deferred(i);
+        self.fail_attachment(pipe.0, PipeFailure::Aborted, now);
+        self.after_pipe_change(now);
+        Ok(())
+    }
+
+    /// Starts graceful drain for an entire batch while preserving coverage.
+    ///
+    /// After validation, calls `before_drain` with the pipes that will start
+    /// draining, so the caller can reserve any resources required for retirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if multipath is unavailable, a pipe is unknown or
+    /// repeated, the batch would leave a required direction uncovered, or
+    /// `before_drain` declines the batch.
+    pub fn drain_attachments<E: From<PipeError>>(
+        &mut self,
+        pipes: &[PipeId],
+        now: Instant,
+        before_drain: impl FnOnce(&[PipeId]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.tick(now);
+        if let Some(error) = self.error() {
+            return Err(PipeError::SessionLost(error.clone()).into());
+        }
+        if self.mp.is_none() {
+            return Err(PipeError::NotNegotiated.into());
+        }
+        for (i, pipe) in pipes.iter().enumerate() {
+            if pipes[..i].contains(pipe) {
+                return Err(PipeError::InvalidArgument.into());
             }
+            if self.att(pipe.0).is_none_or(Attachment::unattached) {
+                return Err(PipeError::UnknownPipe.into());
+            }
+        }
+        if pipes.is_empty() {
             return Ok(());
         }
-        if graceful {
-            self.drain_attachment(pipe.0, now);
-            // As the last frame of the drained pipe itself.
-            self.att_mut(pipe.0).expect("present").abandon_gracefully();
-        } else {
-            self.fail_attachment(pipe.0, PipeFailure::Aborted, now);
+        if self.service_directions(pipes) != (true, true) {
+            return Err(PipeError::NoDirectionCoverage.into());
+        }
+        let active = pipes
+            .iter()
+            .copied()
+            .filter(|pipe| {
+                self.att(pipe.0)
+                    .is_some_and(|attachment| !attachment.failed() && !attachment.draining())
+            })
+            .collect::<Vec<_>>();
+        before_drain(&active)?;
+        for pipe in active {
+            self.start_attachment_drain(pipe, now);
         }
         self.after_pipe_change(now);
         Ok(())
+    }
+
+    /// A generation change revokes the peer Joins previously authorized.
+    /// Bootstrap admission has its own authority.
+    pub(in crate::proto::session) fn revoke_peer_attachments(
+        &mut self,
+        auth_changed: bool,
+        now: Instant,
+    ) {
+        let policy = self.session_policy();
+        let sources = self.mp.as_ref().and_then(|mp| mp.join_control.as_ref());
+        let pipes: Vec<_> = self
+            .atts
+            .iter()
+            .filter(|a| {
+                a.id() != 0
+                    && !a.joiner_local()
+                    && !a.unattached()
+                    && !a.failed()
+                    && (auth_changed
+                        || !policy.permits_join_sources(
+                            sources.and_then(|control| control.peer_sources.get(&a.id())),
+                            (a.inp().is_some(), a.out().is_some()),
+                        ))
+            })
+            .map(|a| PipeId(a.id()))
+            .collect();
+        if !pipes.is_empty() {
+            for pipe in pipes {
+                self.start_attachment_drain(pipe, now);
+            }
+            self.after_pipe_change(now);
+        }
+    }
+
+    fn start_attachment_drain(&mut self, pipe: PipeId, now: Instant) {
+        let Some(i) = self.att_index(pipe.0) else {
+            return;
+        };
+        let attachment = self.atts.at(i);
+        if attachment.failed() || attachment.draining() {
+            return;
+        }
+        if attachment.deferred() {
+            self.drop_deferred(i);
+            return;
+        }
+        self.drain_attachment(pipe.0, now);
+        // As the last frame of the drained pipe itself when possible.
+        self.atts.at_mut(i).abandon_gracefully();
+        self.pipe_event(pipe.0, PipeHalf::Inbound);
     }
 
     /// Removes `pipe` abruptly for a local resource limit or a carrier loop
@@ -2237,6 +2733,7 @@ impl SessionCore {
         let Some(i) = self.att_index(id) else {
             return;
         };
+        self.cancel_pipe_lane_open(id);
         if self.atts.at(i).deferred() {
             let pending = self.atts.at_mut(i);
             pending.fail();
@@ -2247,7 +2744,7 @@ impl SessionCore {
         // Decided before the failure sets a failure code.
         let draining = self.atts.at(i).outside_fate();
         if self.atts.at(i).joining_local() {
-            self.stats.join_failures += 1;
+            self.mp_mut().counters.join_failures += 1;
             // The handshake ends with the attachment: a Reply still in flight
             // can no longer confirm it, and so revive a failed attachment.
             self.mp_mut().end_local_join(id);
@@ -2257,7 +2754,7 @@ impl SessionCore {
         }
         self.atts.at_mut(i).set_failure(cause);
         self.mp_mut().last_failure = Some(cause);
-        self.stats.pipe_failures += 1;
+        self.mp_mut().counters.pipe_failures += 1;
         self.probation_failed(i, now);
         let a = self.atts.at_mut(i);
         let (local, group) = a.fate();
@@ -2265,6 +2762,7 @@ impl SessionCore {
         if a.out().is_some_and(|o| o.state() != OutState::Failed) {
             self.reinject(id, now);
             let report = self.atts.at_mut(i).out_mut().expect("present").fail();
+            self.set_pacing_deadline(id, None);
             if self.shape.is_some() {
                 self.shape_pipe_failed(id);
             }
@@ -2320,8 +2818,15 @@ impl SessionCore {
 
     /// An outbound pipe becomes suspect.
     pub(in crate::proto::session) fn suspect(&mut self, id: u64, now: Instant) {
+        self.suspect_for(id, PipeHealthReason::AckStall, now);
+    }
+
+    fn suspect_for(&mut self, id: u64, reason: PipeHealthReason, now: Instant) {
         if !self.out_mut(id).is_some_and(|o| o.suspect(now)) {
             return;
+        }
+        if let Some(health) = self.att_mut(id).and_then(Attachment::health_mut) {
+            health.fault = Some(reason);
         }
         self.mp_mut().suspects += 1;
         self.unsettle(id);
@@ -2380,13 +2885,16 @@ impl SessionCore {
             let own = a.own_abandon_done();
             if own && a.unattached() {
                 // Only a bit in the replay window remains.
+                self.cancel_pipe_lane_open(a.id());
                 let id = self.atts.remove(i).id();
+                self.set_pacing_deadline(id, None);
                 self.views_changed();
                 self.recv_lane_gone(id);
                 continue;
             }
             let unilateral = a.retire_at().is_some_and(|t| now >= t);
-            if own && unilateral && a.abandon_received().is_none() {
+            if own && unilateral && a.abandon_received().is_none() && !a.graceful_shutdown_pending()
+            {
                 // The peer never answered: close whatever is still open and
                 // retire anyway.
                 self.retire_at_index(i, now);
@@ -2413,9 +2921,23 @@ impl SessionCore {
             self.reinject(id, now);
         }
         self.keep_final_pipe(i);
+        self.cancel_pipe_lane_open(self.atts.at(i).id());
         let a = self.atts.remove(i);
         self.views_changed();
         let id = a.id();
+        self.set_pacing_deadline(id, None);
+        self.mp_mut().acks_mut().invalidate_backlog_pipe(id);
+        if let Some(control) = &mut self.mp_mut().join_control {
+            control.peer_sources.remove(&id);
+            control.members.remove(&PipeId(id));
+            #[cfg(all(any(feature = "tokio", feature = "blocking"), not(loom)))]
+            {
+                control.receive_changed |= control.receive.remove(&PipeId(id)).is_some();
+            }
+            if control.idle() {
+                self.mp_mut().join_control = None;
+            }
+        }
         self.recv_lane_gone(id);
         let peer = !a.joiner_local();
         if let Some(o) = a.out().filter(|o| o.close_unreported()) {
@@ -2610,6 +3132,8 @@ impl SessionCore {
         // PIPE_ABANDON may be on this pipe).
         self.reinject(id, now);
         self.out_mut(id).expect("present").close_drained();
+        self.cancel_pipe_lane_open(id);
+        self.set_pacing_deadline(id, None);
         self.pipe_event(id, PipeHalf::Outbound);
         self.try_retire(now);
         // It may have been the last outbound pipe.
@@ -2660,6 +3184,7 @@ impl SessionCore {
 
     /// Reports a pipe's current state.
     pub(in crate::proto::session) fn pipe_event(&mut self, id: u64, half: PipeHalf) {
+        self.sync_pipe_health(id);
         let Some(a) = self.att(id) else {
             return;
         };
@@ -2712,11 +3237,15 @@ impl SessionCore {
 
     /// The attachments and their pipes, with their quality.
     pub fn pipes(&self) -> Vec<PipeStats> {
+        self.pipes_at(self.now)
+    }
+
+    pub(crate) fn pipes_at(&self, now: Instant) -> Vec<PipeStats> {
         let gate = self.path_gate();
         self.atts
             .iter()
             .filter(|a| Self::listed(a))
-            .map(|a| self.info_of(a, gate))
+            .map(|a| self.info_of(a, gate, now))
             .collect()
     }
 
@@ -2834,9 +3363,10 @@ impl SessionCore {
                 a.failure().unwrap_or(PipeFailure::Aborted),
             )));
         }
-        let out_live = a
-            .out()
-            .is_some_and(|o| !matches!(o.state(), OutState::Failed | OutState::Closed));
+        let out_live = a.out().is_some_and(|o| {
+            !matches!(o.state(), OutState::Failed | OutState::Closed)
+                || o.graceful_shutdown_pending()
+        });
         let in_live = a.inp().is_some_and(|i| i.state() != InState::Ended);
         if !out_live && !in_live {
             return Some(Ok(()));
@@ -2877,7 +3407,7 @@ impl SessionCore {
     /// One attachment's quality, `None` when unknown.
     pub fn pipe_info(&self, pipe: PipeId) -> Option<PipeStats> {
         let a = self.att(pipe.0).filter(|a| !a.unattached())?;
-        Some(self.info_of(a, self.path_gate()))
+        Some(self.info_of(a, self.path_gate(), self.now))
     }
 
     /// The RTT estimates of an attachment's outbound pipe and their source:
@@ -2948,8 +3478,8 @@ impl SessionCore {
         &self,
         a: &Attachment,
         gate: Option<crate::proto::session::tier::Gate>,
+        now: Instant,
     ) -> PipeStats {
-        let now = self.now;
         let o = a.out();
         let i = a.inp();
         let q = o.and_then(OutPipe::quality).unwrap_or_default();
@@ -2966,7 +3496,10 @@ impl SessionCore {
             .flatten()
             .min()
             .unwrap_or(now);
+        let health = self.pipe_health(PipeId(a.id())).unwrap_or_default();
         PipeStats {
+            health,
+            accounting: a.accounting().map(|ledger| ledger.snapshot()),
             record_mode: self.pipe_record_mode(PipeId(a.id())),
             pipe: PipeId(a.id()),
             local: a.joiner_local(),
@@ -3004,6 +3537,23 @@ impl SessionCore {
                 gate.is_some_and(|g| g.admits(a))
             },
             rtt_source: rtt.source,
+            protocol_rtt: acked.and_then(|o| {
+                let est = o.est();
+                let at = est.last_sample?;
+                (now.saturating_duration_since(at) < super::estimator::RTT_EVIDENCE_WINDOW
+                    && health.send_evidence.is_some_and(|e| at >= e.since))
+                .then_some((at, est.srtt, super::estimator::RTT_EVIDENCE_WINDOW))
+            }),
+            protocol_min_rtt: acked.and_then(|o| {
+                let (at, value) = o.est().min_rtt.observation()?;
+                (now.saturating_duration_since(at) < super::filter::LOOP_SPAN
+                    && health.send_evidence.is_some_and(|e| at >= e.since))
+                .then_some((at, value, super::filter::LOOP_SPAN))
+            }),
+            ack_delivery: acked
+                .and_then(|o| o.est().ack_delivery)
+                .filter(|sample| sample.current(now, &health)),
+            delivery_version: acked.map_or(0, |o| o.est().delivery_version),
             smoothed_rtt: rtt.srtt,
             min_rtt: rtt.min,
             rttvar: rtt.rttvar,
@@ -3031,6 +3581,7 @@ impl SessionCore {
                 }
             }),
             carrier_sample: None,
+            carrier_loss: None,
             bytes_duplicate_received: i.map_or(0, InPipe::dup_bytes),
             bytes_opportunistic: q.bytes_opportunistic,
             bytes_redundant: q.bytes_redundant,
@@ -3062,6 +3613,7 @@ impl SessionCore {
             self.lane_write(pipe.0, at.lane.0, &write, now);
             return;
         }
+        self.tick(now);
         if self.mp.is_none() {
             // Outside multipath only rate samples depend on it, and only
             // with pipe acknowledgement: no scan of the scheduled streams
@@ -3072,7 +3624,6 @@ impl SessionCore {
             }
             return;
         }
-        self.tick(now);
         let has_data = self.has_ready_stream_data();
         let waits = write.refused && write.end.is_some() && self.bytes_wait_for(pipe.0);
         if let Some(o) = self.out_mut(pipe.0) {
@@ -3093,6 +3644,7 @@ impl SessionCore {
             && o.set_low_water(on)
         {
             o.unpace(now);
+            self.set_pacing_deadline(pipe.0, None);
             self.quality_sample(pipe.0, now);
         }
     }
@@ -3109,6 +3661,7 @@ impl SessionCore {
             && o.set_lane_unsent(at.lane.0, bytes, now)
         {
             o.unpace(now);
+            self.set_pacing_deadline(pipe, None);
             self.quality_sample(pipe, now);
         }
     }
@@ -3141,18 +3694,135 @@ impl SessionCore {
 
     // ---- failure detection ----------------------------------------------------------
 
-    /// `T_suspect`, `T_fail` and D of an outbound pipe.
-    pub(in crate::proto::session) fn limits(&self, o: &OutPipe) -> (Duration, Duration, Duration) {
-        let mad = self.mp().peer_mad;
-        let base = o.est().pto(mad) + o.queue_term();
-        let t_suspect = o.detection().0.max(base * 2);
-        let t_fail = Duration::from_secs(2).max(base * 8);
-        let dead = self
-            .idle_timeout()
-            .map_or(crate::proto::session::DEFAULT_MAX_IDLE_TIMEOUT / 2, |t| {
-                t / 2
-            });
-        (t_suspect, t_fail, t_fail.max(dead))
+    #[cfg(all(feature = "test-hooks", feature = "tokio", not(loom)))]
+    pub(crate) fn fixture_stall_evidence(
+        &mut self,
+        id: PipeId,
+        cost: Duration,
+        waiting: bool,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        self.tick(now);
+        if !self
+            .pipe_health(id)
+            .is_some_and(|health| health.peer_attached && health.send.settled)
+        {
+            return Err("relative stall fixture requires a settled outbound pipe");
+        }
+        let peer_mad = self
+            .mp
+            .as_deref()
+            .ok_or("multipath was not negotiated")?
+            .peer_mad();
+        self.out_mut(id.get())
+            .ok_or("fixture pipe has no writer")?
+            .fixture_stall_evidence(now, cost, peer_mad, waiting);
+        Ok(())
+    }
+
+    /// Absolute suspect and drain deadlines. Other consumers of the
+    /// absolute suspect threshold (idle copies and ACK routing) share it.
+    pub(in crate::proto::session) fn absolute_stall_limit(&self, o: &OutPipe) -> Duration {
+        Self::absolute_stall_limit_at_cost(o, o.stall_cost(self.mp().peer_mad))
+    }
+
+    fn absolute_stall_limit_at_cost(o: &OutPipe, cost: Duration) -> Duration {
+        o.detection().0.max(cost.saturating_mul(2))
+    }
+
+    fn drain_limit(&self, o: &OutPipe) -> Duration {
+        Duration::from_secs(2).max(o.stall_cost(self.mp().peer_mad).saturating_mul(8))
+    }
+
+    fn stall_fail_limit(cost: Duration, absolute: Duration) -> Duration {
+        Duration::from_secs(2)
+            .max(absolute)
+            .max(cost.saturating_mul(8))
+    }
+
+    fn ack_stall_from(&self, out: &OutPipe, inbound_live: bool) -> Option<Instant> {
+        inbound_live
+            .then(|| out.ack_stall_from(self.mp().detect_from))
+            .flatten()
+    }
+
+    /// Current delivery proof shared by stall detection and prefix repair.
+    /// Tier and writer admission for a particular range are checked by the scheduler.
+    pub(super) fn delivery_reference(
+        &self,
+        a: &Attachment,
+        inbound_live: bool,
+        now: Instant,
+    ) -> Option<(Instant, Duration)> {
+        let o = a.out()?;
+        let health = self.pipe_health(PipeId(a.id()))?;
+        if !inbound_live
+            || !health.peer_attached
+            || !health.send.settled
+            || !o.confirmed()
+            || !o.usable(false)
+            || !self.class().is_some_and(|class| class.usable(a))
+        {
+            return None;
+        }
+        let cost = o.stall_cost(self.mp().peer_mad);
+        let proof = o.delivery_proof_at(now, cost)?;
+        if self
+            .ack_stall_from(o, inbound_live)
+            .is_some_and(|at| now.saturating_duration_since(at) >= cost)
+            || self
+                .write_stall_from(a.id(), o)
+                .and_then(|at| at.checked_add(Self::absolute_stall_limit_at_cost(o, cost)))
+                .is_some_and(|due| due <= now)
+        {
+            return None;
+        }
+        Some((proof, cost))
+    }
+
+    pub(super) fn suspect_deadline(
+        &self,
+        id: u64,
+        o: &OutPipe,
+        inbound_live: bool,
+        now: Instant,
+    ) -> Option<(Instant, PipeHealthReason)> {
+        let absolute = self.absolute_stall_limit(o);
+        let write = self
+            .write_stall_from(id, o)
+            .and_then(|at| at.checked_add(absolute))
+            .map(|due| (due, PipeHealthReason::WriteStall));
+        let ack = self
+            .ack_stall_from(o, inbound_live)
+            .and_then(|at| {
+                let floor = o.detection().0;
+                let limit = if o.state() == OutState::Active
+                    && o.confirmed()
+                    && absolute > floor
+                    && self.atts.len() > 1
+                {
+                    let reference = self
+                        .atts
+                        .iter()
+                        .filter(|a| a.id() != id)
+                        .filter_map(|a| {
+                            let (proof, cost) = self.delivery_reference(a, inbound_live, now)?;
+                            (proof > at).then_some((cost, a.id()))
+                        })
+                        .min();
+                    reference.map_or(absolute, |(cost, _)| {
+                        absolute.min(cost.saturating_mul(3).max(floor))
+                    })
+                } else {
+                    absolute
+                };
+                at.checked_add(limit)
+            })
+            .map(|due| (due, PipeHealthReason::AckStall));
+        match (ack, write) {
+            (Some(a), Some(w)) if w.0 < a.0 => Some(w),
+            (a, w) => a.or(w),
+        }
     }
 
     /// The reference time of a write stall, if the pipe has one.
@@ -3228,11 +3898,7 @@ impl SessionCore {
     /// The stall reference of a pipe: the earlier of its ack and write
     /// stalls (ack stalls only while an inbound pipe is live).
     fn stall_from(&self, id: u64, o: &OutPipe, inbound_live: bool) -> Option<Instant> {
-        let ack = if inbound_live {
-            o.ack_stall_from(self.mp().detect_from)
-        } else {
-            None
-        };
+        let ack = self.ack_stall_from(o, inbound_live);
         match (ack, self.write_stall_from(id, o)) {
             (Some(a), Some(w)) => Some(a.min(w)),
             (a, w) => a.or(w),
@@ -3258,23 +3924,23 @@ impl SessionCore {
             }
         };
         if let Some(o) = a.out().filter(|o| o.is_live()) {
-            let (t_suspect, t_fail, d) = self.limits(o);
-            if let Some(from) = self.stall_from(a.id(), o, inbound_live) {
-                match o.state() {
-                    OutState::Active => at(from.checked_add(t_suspect)),
-                    OutState::Suspect if o.confirmed() => {
-                        let (fail, dead) = self.fail_limits(a.id(), o, t_fail, d);
-                        if let Some(f) = fail {
-                            at(from.checked_add(f));
-                        }
-                        at(from.checked_add(dead));
-                    }
-                    OutState::Draining if !o.suspect_mark() => at(from.checked_add(t_suspect)),
-                    _ => {}
+            match o.state() {
+                OutState::Active | OutState::Draining if !o.suspect_mark() => {
+                    at(self
+                        .suspect_deadline(a.id(), o, inbound_live, now)
+                        .map(|(due, _)| due));
                 }
+                OutState::Suspect if o.confirmed() => {
+                    if let Some(from) = self.stall_from(a.id(), o, inbound_live) {
+                        at(self
+                            .failure_limit(a.id(), o)
+                            .and_then(|limit| from.checked_add(limit)));
+                    }
+                }
+                _ => {}
             }
             if let Some(since) = o.drain_since() {
-                at(since.checked_add(t_fail));
+                at(since.checked_add(self.drain_limit(o)));
             }
             // Probes of idle pipes; an owed PIPE_PING waits only for the
             // rate limit (writing it is the transmit path's business).
@@ -3305,7 +3971,9 @@ impl SessionCore {
             }
         }
         at(a.attach_by().map(JoinDeadline::at));
-        at(a.retire_at());
+        if !a.graceful_shutdown_pending() {
+            at(a.retire_at());
+        }
         next
     }
 
@@ -3460,36 +4128,30 @@ impl SessionCore {
         }
     }
 
-    /// The `T_fail` and D limits that apply to a suspect pipe: `T_fail` only
-    /// with another ACTIVE pipe or with resume; the last usable pipe uses
-    /// `max(T_suspect`, `DeadTimeout`) when set.
-    ///
-    /// Under the floor and dead timeout in force when the pipe turned
-    /// suspect: a later change applies from its next suspicion.
-    fn fail_limits(
-        &self,
-        id: u64,
-        o: &OutPipe,
-        t_fail: Duration,
-        d: Duration,
-    ) -> (Option<Duration>, Duration) {
-        let other = self.other_active(id);
-        let (floor, dead) = o.held_detection();
-        let dead = match dead {
-            // Stall-based failure off: neither T_fail nor the dead timeout.
-            crate::DeadTimeout::Off => return (None, Duration::MAX),
-            crate::DeadTimeout::After(dt) => Some(dt),
-            crate::DeadTimeout::Auto => None,
-        };
-        if !other && let Some(dt) = dead {
-            let base = o.est().pto(self.mp().peer_mad) + o.queue_term();
-            return (None, floor.max(base * 2).max(dt));
+    /// The failure and last-direction limits use the source's own running
+    /// clocks and the detection options held on entry to SUSPECT.
+    fn failure_limit(&self, id: u64, o: &OutPipe) -> Option<Duration> {
+        let (floor, setting) = o.held_detection();
+        if setting == crate::DeadTimeout::Off {
+            return None;
         }
-        if other || self.mp().resume {
-            (Some(t_fail), d)
-        } else {
-            (None, d)
+        let cost = o.stall_cost(self.mp().peer_mad);
+        let absolute = floor.max(cost.saturating_mul(2));
+        let fail = Self::stall_fail_limit(cost, absolute);
+        if self.other_active(id) {
+            return Some(fail);
         }
+        Some(match setting {
+            crate::DeadTimeout::Off => unreachable!(),
+            crate::DeadTimeout::After(timeout) => absolute.max(timeout),
+            crate::DeadTimeout::Auto if self.mp().resume => fail,
+            crate::DeadTimeout::Auto => {
+                let idle = self
+                    .idle_timeout()
+                    .unwrap_or(crate::proto::session::DEFAULT_MAX_IDLE_TIMEOUT);
+                fail.max(idle / 2)
+            }
+        })
     }
 
     /// The inbound silence limit `L_in` of an attachment's inbound pipe, when
@@ -3579,6 +4241,12 @@ impl SessionCore {
         .flatten()
         .min();
         for a in &self.atts {
+            if let Some(t) = a
+                .health()
+                .and_then(|h| h.deadline(self.config.stability.hold_for))
+            {
+                next = Some(next.map_or(t, |n| n.min(t)));
+            }
             if let Some(t) = self.pipe_deadline(a, inbound_live, now) {
                 next = Some(next.map_or(t, |n| n.min(t)));
             }
@@ -3596,14 +4264,7 @@ impl SessionCore {
                 // Failure detection and probes go on during the close wait:
                 // a pipe that stalls fails, and what it carried is
                 // reinjected.
-                let mut next = self.atts.first().map(Attachment::id);
-                while let Some(id) = next {
-                    if !self.close_waiting() {
-                        return;
-                    }
-                    self.check_pipe(id, now);
-                    next = self.atts.next_after(id);
-                }
+                self.check_pipe_cut(now);
             }
             return;
         }
@@ -3611,25 +4272,28 @@ impl SessionCore {
             return;
         }
         self.epoch_progress(now);
+        self.probation_timers(now);
+        self.health_timeouts();
         loop {
-            // Kept from the last pass: no allocation per timer.
-            let mut before = self
-                .mp
-                .as_mut()
-                .map(|m| std::mem::take(&mut m.pass_states))
-                .unwrap_or_default();
-            before.clear();
-            before.extend(self.atts.iter().map(Self::pipe_states));
-            // Attachments are sorted by identifier; checking one may
-            // retire it.
-            let mut next = self.atts.first().map(Attachment::id);
-            while let Some(id) = next {
-                if self.state >= State::Closing {
-                    return;
-                }
-                self.check_pipe(id, now);
-                next = self.atts.next_after(id);
+            const EMPTY: PipeStates = (0, None, None);
+            let count = self.atts.len();
+            let mut small = [EMPTY; 8];
+            let mut large = None;
+            let before = if count <= small.len() {
+                &mut small[..count]
+            } else {
+                let storage = self
+                    .mp_mut()
+                    .pass_states
+                    .take()
+                    .filter(|storage| storage.len() >= count)
+                    .unwrap_or_else(|| vec![EMPTY; count].into_boxed_slice());
+                &mut large.insert(storage)[..count]
+            };
+            for (previous, attachment) in before.iter_mut().zip(self.atts.iter()) {
+                *previous = Self::pipe_states(attachment);
             }
+            self.check_pipe_cut(now);
             self.probation_timers(now);
             self.refresh_tiers();
             self.try_retire(now);
@@ -3642,10 +4306,46 @@ impl SessionCore {
             let Some(mp) = self.mp.as_mut() else {
                 return;
             };
-            mp.pass_states = before;
+            mp.pass_states = large;
             if self.state >= State::Closing || unchanged {
                 return;
             }
+        }
+    }
+
+    /// Handle non-ACTIVE paths first, then process ACTIVE paths in cost
+    /// order. A path withdrawn at this cut cannot be used by a slower path.
+    fn check_pipe_cut(&mut self, now: Instant) {
+        let mad = self.mp().peer_mad;
+        let order = |a: &Attachment| {
+            let cost = a
+                .out()
+                .filter(|o| o.state() == OutState::Active)
+                .map_or(Duration::ZERO, |o| o.stall_cost(mad));
+            (cost, a.id())
+        };
+        let mut inline = [(Duration::ZERO, 0); 8];
+        let count = self.atts.len();
+        let mut overflow;
+        let paths = if count <= inline.len() {
+            for (slot, a) in inline.iter_mut().zip(&self.atts) {
+                *slot = order(a);
+            }
+            &mut inline[..count]
+        } else {
+            overflow = self.atts.iter().map(order).collect::<Vec<_>>();
+            &mut overflow[..]
+        };
+        paths.sort_unstable();
+        let closing = self.state >= State::Closing;
+        for &(_, id) in paths.iter() {
+            if (self.state >= State::Closing && !closing)
+                || self.state == State::Closed
+                || (closing && !self.close_waiting())
+            {
+                break;
+            }
+            self.check_pipe(id, now);
         }
     }
 
@@ -3669,33 +4369,34 @@ impl SessionCore {
         };
         // Outbound.
         if let Some(o) = a.out().filter(|o| o.is_live()) {
-            let (t_suspect, t_fail, d) = self.limits(o);
-            if let Some(from) = self.stall_from(id, o, inbound_live) {
-                let stalled = now.saturating_duration_since(from);
-                match o.state() {
-                    OutState::Active if stalled >= t_suspect => {
-                        self.suspect(id, now);
+            match o.state() {
+                OutState::Active | OutState::Draining if !o.suspect_mark() => {
+                    if let Some((due, reason)) = self.suspect_deadline(id, o, inbound_live, now)
+                        && now >= due
+                    {
+                        self.suspect_for(id, reason, now);
                     }
-                    OutState::Suspect if o.confirmed() => {
-                        let (fail, dead) = self.fail_limits(id, o, t_fail, d);
-                        if fail.is_some_and(|f| stalled >= f) || stalled >= dead {
-                            self.fail_attachment(id, PipeFailure::Stalled, now);
-                            self.after_pipe_change(now);
-                            return;
-                        }
-                    }
-                    OutState::Draining if !o.suspect_mark() && stalled >= t_suspect => {
-                        self.suspect(id, now);
-                    }
-                    _ => {}
                 }
+                OutState::Suspect if o.confirmed() => {
+                    let limit = self.failure_limit(id, o);
+                    if self.stall_from(id, o, inbound_live).is_some_and(|from| {
+                        limit.is_some_and(|limit| now.saturating_duration_since(from) >= limit)
+                    }) {
+                        self.fail_attachment(id, PipeFailure::Stalled, now);
+                        self.after_pipe_change(now);
+                        return;
+                    }
+                }
+                _ => {}
             }
             let Some(o) = self.out_ref(id) else {
                 return;
             };
             if let Some(since) = o.drain_since()
                 && o.state() == OutState::Draining
-                && since.checked_add(t_fail).is_some_and(|t| now >= t)
+                && since
+                    .checked_add(self.drain_limit(o))
+                    .is_some_and(|t| now >= t)
             {
                 // The drain did not complete in time.
                 self.fail_attachment(id, PipeFailure::Stalled, now);
@@ -3795,6 +4496,35 @@ pub(in crate::proto::session) fn dead_timeout_of(
 mod tests {
     use super::displacement_rank;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn multipath_replica_burst_requires_the_sequenced_family() {
+        use crate::proto::keys::secret_flags;
+        use crate::proto::params::{
+            Features, Locator, MultipathParameter, TransportParameters, ZMUX_MAX_RECORD_SIZE,
+        };
+
+        let local = TransportParameters {
+            zmux_datagram_family: true,
+            zmux_multipath: Some(MultipathParameter {
+                secret_flags: secret_flags::PSK,
+                session_nonce: [0; 16],
+                locator: Locator::default(),
+            }),
+            ..Default::default()
+        };
+        let mut peer = local.clone();
+        peer.zmux_datagram_family = false;
+        assert!(!Features::negotiate(&local, &peer).multipath);
+        peer.zmux_datagram_family = true;
+        let features = Features::negotiate(&local, &peer);
+        assert!(features.multipath && features.same_family);
+        assert_eq!(
+            super::sequenced_datagram_replica_burst(0, 0),
+            ZMUX_MAX_RECORD_SIZE - 3
+        );
+        assert_eq!(super::sequenced_datagram_replica_burst(0, 40), 37);
+    }
 
     #[test]
     fn neither_endpoint_can_allocate_the_unassigned_pipe_id() {

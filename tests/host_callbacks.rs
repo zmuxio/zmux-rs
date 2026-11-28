@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -71,7 +71,7 @@ async fn record_policy_runs_without_the_session_lock() {
         let (s, _srv, _l) = sessions(c, config()).await;
         holder.set(s.clone()).ok();
         let (x, _y) = duplex(1 << 16);
-        let _ = s.begin_add_pipe(PipeIo::new(x), PipeOptions::default());
+        let _ = s.test_begin_join(PipeIo::new(x), PipeOptions::default());
         assert!(rx.recv_timeout(Duration::from_secs(10)).unwrap());
     })
     .await
@@ -85,7 +85,7 @@ async fn a_panicking_record_policy_leaves_sealed() {
         c.record_policy = Some(RecordPolicy::new(|_| panic!("the policy")));
         let (s, _srv, _l) = sessions(c, config()).await;
         let (x, _y) = duplex(1 << 16);
-        s.begin_add_pipe(PipeIo::new(x), PipeOptions::default())
+        s.test_begin_join(PipeIo::new(x), PipeOptions::default())
             .unwrap();
     })
     .await
@@ -96,7 +96,7 @@ async fn a_panicking_record_policy_leaves_sealed() {
 async fn join_through(s: &Session, l: &Listener) -> Result<(), HandleError> {
     let (x, y) = duplex(1 << 16);
     let _pipe = s
-        .begin_add_pipe(PipeIo::new(x), PipeOptions::default())
+        .test_begin_join(PipeIo::new(x), PipeOptions::default())
         .unwrap();
     l.handle_pipe(PipeIo::new(y), PipeHint::default()).await
 }
@@ -109,7 +109,7 @@ async fn panicking_join_policies_refuse() {
             if allow {
                 server.allow_record_mode = Some(AllowRecordMode::new(|_, _, _| panic!("a")));
             } else {
-                server.authorize_join = Some(AuthorizeJoin::new(|_| panic!("b")));
+                server.session_policy.authorize_join = Some(AuthorizeJoin::new(|_| panic!("b")));
             }
             let (s, _srv, l) = sessions(config(), server).await;
             while !s.adapter().join_ready() {
@@ -135,7 +135,7 @@ async fn a_panicking_reject_policy_closes() {
         let (s, _srv, l) = sessions_with(limits).await;
         // A Hello in Bound on a carrier with nothing to check it with.
         let (near, far) = duplex(1 << 16);
-        let _pipe = s.begin_add_pipe(bound_carrier(near), bound()).unwrap();
+        let _pipe = s.test_begin_join(bound_carrier(near), bound()).unwrap();
         assert_eq!(
             l.handle_pipe(PipeIo::new(far), PipeHint::default()).await,
             Err(HandleError::Rejected)
@@ -184,7 +184,7 @@ fn stray_join_hello() -> Vec<u8> {
         }
         let (x, mut y) = duplex(1 << 16);
         let _pipe = s
-            .begin_add_pipe(PipeIo::new(x), PipeOptions::default())
+            .test_begin_join(PipeIo::new(x), PipeOptions::default())
             .unwrap();
         let mut hello = vec![0; 4096];
         let n = y.read(&mut hello).await.unwrap();
@@ -263,7 +263,7 @@ async fn bound_without_a_binding_is_auth() {
         ];
         for acceptor in carriers {
             let (x, y) = duplex(1 << 16);
-            let _pipe = s.begin_add_pipe(bound_carrier(x), bound()).unwrap();
+            let _pipe = s.test_begin_join(bound_carrier(x), bound()).unwrap();
             let r = l.handle_pipe(acceptor(y), PipeHint::default()).await;
             assert_eq!(r, Err(HandleError::Rejected));
         }
@@ -292,7 +292,7 @@ async fn bound_on_a_split_acceptor_is_auth() {
         }
         let (x, y) = duplex(1 << 16);
         let (y_read, y_write) = tokio::io::split(y);
-        let _pipe = s.begin_add_pipe(bound_carrier(x), bound()).unwrap();
+        let _pipe = s.test_begin_join(bound_carrier(x), bound()).unwrap();
         let pair = || {
             let mut h = PipeHint::default();
             h.pair = Some(vec![5; PAIRING_TOKEN_LEN]);
@@ -326,7 +326,7 @@ struct Watched {
     /// Writes so far; the second is the confirmation.
     writes: AtomicUsize,
     reads_after_last: AtomicUsize,
-    dropped: AtomicBool,
+    dropped: tokio::sync::Notify,
 }
 
 struct LastWrite {
@@ -337,7 +337,7 @@ struct LastWrite {
 
 impl Drop for LastWrite {
     fn drop(&mut self) {
-        self.watched.dropped.store(true, Ordering::SeqCst);
+        self.watched.dropped.notify_one();
     }
 }
 
@@ -397,11 +397,9 @@ async fn a_join_finished_on_an_ended_session_starts_no_pipe_task() {
         });
         let (r, w) = tokio::io::split(carrier);
         let _pipe = s
-            .begin_add_pipe(PipeIo::from_halves(r, w), PipeOptions::default())
+            .test_begin_join(PipeIo::from_halves(r, w), PipeOptions::default())
             .unwrap();
-        while !watched.dropped.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        watched.dropped.notified().await;
         assert_eq!(watched.writes.load(Ordering::SeqCst), 2);
         assert_eq!(watched.reads_after_last.load(Ordering::SeqCst), 0);
     })
@@ -475,7 +473,7 @@ fn a_join_finished_on_an_ended_session_starts_no_pipe_thread() {
             e.fetch_add(1, Ordering::SeqCst);
         }
     });
-    let _pipe = s.begin_add_pipe(carrier, PipeOptions::default()).unwrap();
+    let _pipe = s.test_begin_join(carrier, PipeOptions::default()).unwrap();
     let end = std::time::Instant::now() + Duration::from_secs(10);
     while seen.writes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(5));
@@ -531,7 +529,7 @@ fn paired_join_on_the_std_driver() {
         })
         .with_closer(closer(closed.clone()));
     let pair = b::PipeIo::paired_join(up, down);
-    let pipe = s.begin_add_pipe(pair, PipeOptions::default()).unwrap();
+    let pipe = s.test_begin_join(pair, PipeOptions::default()).unwrap();
     let (l3, f2) = (l.clone(), up_far.try_clone().unwrap());
     let df = down_far.try_clone().unwrap();
     std::thread::spawn(move || {
@@ -580,29 +578,7 @@ fn paired_join_on_the_std_driver() {
             true
         });
     let pair = b::PipeIo::paired_join(up, b::PipeIo::reader(i));
-    assert!(s.begin_add_pipe(pair, with_mode).is_err());
-}
-
-/// An accept error other than the listener's close leaves `serve` running.
-#[cfg(unix)]
-#[test]
-fn serve_goes_on_after_an_accept_error() {
-    use std::os::fd::OwnedFd;
-    let l = b::Listener::new(config(), ListenerConfig::default(), None)
-        .expect("valid listener configuration");
-    // A socket that does not listen: every accept fails with an error of the socket.
-    let real = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let conn = std::net::TcpStream::connect(real.local_addr().unwrap()).unwrap();
-    let tcp = std::net::TcpListener::from(OwnedFd::from(conn));
-    let l2 = l.clone();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let r = l2.serve(&tcp);
-        let _ = tx.send(r.is_ok());
-    });
-    assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
-    l.close();
-    assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    assert!(s.test_begin_join(pair, with_mode).is_err());
 }
 
 #[test]
@@ -625,7 +601,7 @@ fn hook_lengths_saturate() {
             }
             let (x, y) = duplex(1 << 18);
             let pipe = s
-                .begin_add_pipe(PipeIo::new(x), PipeOptions::default())
+                .test_begin_join(PipeIo::new(x), PipeOptions::default())
                 .unwrap();
             let l2 = l.clone();
             tokio::spawn(async move {
@@ -779,36 +755,30 @@ fn the_std_listener_refuses_carriers_it_could_not_bound() {
 /// told, and a new session under pressure is refused.
 #[cfg(unix)]
 #[test]
-fn the_std_listener_keeps_the_memory_budget() {
+fn the_std_listener_refuses_at_its_memory_limit() {
     use std::os::unix::net::UnixStream;
-    let told = Arc::new(AtomicUsize::new(0));
-    let t = told.clone();
     let mut limits = ListenerConfig::default();
     limits.limits.memory_budget = Some(1);
-    limits.on_memory_pressure = Some(zmux::OnMemoryPressure::new(move |p| {
-        if p.active {
-            t.fetch_add(1, Ordering::SeqCst);
-        }
-    }));
-    let c = Arc::new(config());
-    let l = b::Listener::new(c.clone(), limits, None).expect("valid listener configuration");
-    let connect = |l: &b::Listener| {
-        let (x, y) = UnixStream::pair().unwrap();
-        let (l2, y2) = (l.clone(), y.try_clone().unwrap());
-        let h = std::thread::spawn(move || l2.handle_pipe(served(y, y2), b::PipeHint::default()));
-        let x2 = x.try_clone().unwrap();
-        let s = b::Session::connect(b::PipeIo::from_halves(x, x2), c.clone());
-        (s, h.join().unwrap())
+    let config = Arc::new(config());
+    let listener =
+        b::Listener::new(config.clone(), limits, None).expect("valid listener configuration");
+    let (client, peer) = UnixStream::pair().unwrap();
+    let peer_writer = peer.try_clone().unwrap();
+    let accepted = listener.clone();
+    let handler = std::thread::spawn(move || {
+        accepted.handle_pipe(served(peer, peer_writer), b::PipeHint::default())
+    });
+    let writer = client.try_clone().unwrap();
+    let result = b::Session::connect(b::PipeIo::from_halves(client, writer), config);
+    assert_eq!(handler.join().unwrap(), Err(HandleError::Refused));
+    let error = match result {
+        Ok(session) => session.closing().unwrap(),
+        Err(b::WaitError::Failed(zmux::ConnectError::SessionLost(error))) => error,
+        Err(error) => panic!("unexpected connect outcome: {error}"),
     };
-    // The first session's own charge exceeds the budget of one byte: it
-    // may be refused as well, once its report comes before its queueing.
-    let _first = connect(&l);
-    let end = std::time::Instant::now() + Duration::from_secs(5);
-    while told.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(told.load(Ordering::SeqCst), 1, "pressure reported");
-    let (_second, r) = connect(&l);
-    assert_eq!(r, Err(HandleError::Refused), "refused under pressure");
-    l.close();
+    assert!(
+        matches!(error, zmux::SessionError::TransportClosed { code, remote: true, .. }
+        if code == zmux::proto::TransportErrorCode::CONNECTION_REFUSED)
+    );
+    listener.close();
 }

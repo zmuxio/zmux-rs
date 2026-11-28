@@ -5,12 +5,12 @@
 //! Decoding borrows from the input: payloads (STREAM data, DATAGRAM data,
 //! reasons, locators, parameter blocks) are slices of it and nothing is
 //! copied or allocated, with one exception: a `QX_TRANSPORT_PARAMETERS`
-//! block is validated by decoding it (the wire vectors make a malformed
-//! block a frame error), once per pipe, and its receiver decodes it again
-//! to read the values. Every frame type has an exact `encoded_len` and an
+//! block is parsed and validated once, and the resulting frame owns the
+//! parsed values. Every frame type has an exact `encoded_len` and an
 //! `encode` that writes into a caller-provided buffer.
 
 pub mod channel;
+mod datagram_ack;
 mod entries;
 mod ext;
 mod pipe;
@@ -19,6 +19,9 @@ mod quic;
 
 use std::fmt;
 
+pub use datagram_ack::{
+    DatagramAck, DatagramChannelKind, MAX_DATAGRAM_ACK_RANGES, MAX_DATAGRAM_ACK_SIZE,
+};
 pub use ext::{GoAwayFrame, Priority, PriorityUpdate};
 pub use pipe::{
     EpochPhase, JoinDirection, LANE_KEY_LEN, MAX_LOCATOR_LEN, PipeAbandon, PipeAck, PipeAckEntry,
@@ -27,9 +30,9 @@ pub use pipe::{
 pub use qmux::{QxPing, QxTransportParameters};
 use quic::parse_stream_header;
 pub use quic::{
-    ConnectionClose, DataBlocked, Datagram, MAX_COUNT, MaxData, MaxStreamData, MaxStreams, Padding,
-    ResetStream, ResetStreamAt, StopSending, Stream, StreamDataBlocked, StreamHeader,
-    StreamsBlocked,
+    ConnectionClose, DataBlocked, Datagram, DatagramPrefix, MAX_COUNT, MaxData, MaxStreamData,
+    MaxStreams, Padding, ResetStream, ResetStreamAt, StopSending, Stream, StreamDataBlocked,
+    StreamHeader, StreamsBlocked,
 };
 
 use super::codec::{Cursor, Short, Writer};
@@ -83,6 +86,8 @@ impl FrameType {
     pub const DATAGRAM: Self = Self(0x30);
     /// DATAGRAM with a Length field.
     pub const DATAGRAM_LEN: Self = Self(0x31);
+    /// `DATAGRAM_ACK`.
+    pub const DATAGRAM_ACK: Self = Self(0x28bb_d99f);
     /// `QX_TRANSPORT_PARAMETERS` ([`draft`]).
     pub const QX_TRANSPORT_PARAMETERS: Self = Self(draft::CURRENT.transport_parameters);
     /// `QX_PING` request ([`draft`]).
@@ -132,6 +137,7 @@ impl FrameType {
             0x1e => "HANDSHAKE_DONE",
             0x24 => "RESET_STREAM_AT",
             0x30 | 0x31 => "DATAGRAM",
+            0x28bb_d99f => "DATAGRAM_ACK",
             QX_TP => "QX_TRANSPORT_PARAMETERS",
             QX_PING_REQ | QX_PING_RESP => "QX_PING",
             0x1911_f43e => "GOAWAY",
@@ -197,6 +203,8 @@ pub struct Gates {
     /// The receiver's `max_datagram_frame_size`: the largest DATAGRAM frame
     /// it accepts, 0 if none.
     pub max_datagram_frame_size: u64,
+    /// Same-family peer advertised a positive DATAGRAM size.
+    pub datagram_ack: bool,
     /// GOAWAY is in use.
     pub goaway: bool,
     /// `PRIORITY_UPDATE` is in use.
@@ -214,6 +222,7 @@ impl Gates {
     pub const NONE: Self = Self {
         reset_stream_at: false,
         max_datagram_frame_size: 0,
+        datagram_ack: false,
         goaway: false,
         priority: false,
         multipath: false,
@@ -225,6 +234,7 @@ impl Gates {
     pub const ALL: Self = Self {
         reset_stream_at: true,
         max_datagram_frame_size: u64::MAX,
+        datagram_ack: true,
         goaway: true,
         priority: true,
         multipath: true,
@@ -234,7 +244,7 @@ impl Gates {
 }
 
 /// A decoded frame, borrowing its payload from the input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Frame<'a> {
     /// A run of PADDING frames.
@@ -263,6 +273,8 @@ pub enum Frame<'a> {
     ResetStreamAt(ResetStreamAt),
     /// DATAGRAM.
     Datagram(Datagram<'a>),
+    /// `DATAGRAM_ACK`.
+    DatagramAck(DatagramAck<'a>),
     /// `QX_TRANSPORT_PARAMETERS`.
     TransportParameters(QxTransportParameters<'a>),
     /// `QX_PING`.
@@ -347,6 +359,7 @@ impl<'a> Frame<'a> {
             Self::ResetStreamAt(_) => FrameType::RESET_STREAM_AT.0,
             Self::Datagram(f) if f.explicit_len => FrameType::DATAGRAM_LEN.0,
             Self::Datagram(_) => FrameType::DATAGRAM.0,
+            Self::DatagramAck(_) => FrameType::DATAGRAM_ACK.0,
             Self::TransportParameters(_) => FrameType::QX_TRANSPORT_PARAMETERS.0,
             Self::QxPing(f) if f.response => FrameType::QX_PING_RESPONSE.0,
             Self::QxPing(_) => FrameType::QX_PING_REQUEST.0,
@@ -367,7 +380,7 @@ impl<'a> Frame<'a> {
     pub const fn is_ack_eliciting(&self) -> bool {
         !matches!(
             self,
-            Self::Padding(_) | Self::PipeAck(_) | Self::ConnectionClose(_)
+            Self::Padding(_) | Self::PipeAck(_) | Self::DatagramAck(_) | Self::ConnectionClose(_)
         )
     }
 
@@ -388,6 +401,7 @@ impl<'a> Frame<'a> {
             Self::ConnectionClose(f) => f.encoded_len(),
             Self::ResetStreamAt(f) => f.encoded_len(),
             Self::Datagram(f) => f.encoded_len(),
+            Self::DatagramAck(f) => f.encoded_len(),
             Self::TransportParameters(f) => f.encoded_len(),
             Self::QxPing(f) => f.encoded_len(),
             Self::GoAway(f) => f.encoded_len(),
@@ -425,6 +439,7 @@ impl<'a> Frame<'a> {
             Self::ConnectionClose(f) => f.write(w),
             Self::ResetStreamAt(f) => f.write(w),
             Self::Datagram(f) => f.write(w),
+            Self::DatagramAck(f) => f.write(w),
             Self::TransportParameters(f) => f.write(w),
             Self::QxPing(f) => f.write(w),
             Self::GoAway(f) => f.write(w),
@@ -533,6 +548,7 @@ fn decode<'a>(buf: &'a [u8], gates: &Gates) -> Result<(Frame<'a>, usize), Fail> 
         0x01..=0x03 | 0x06 | 0x07 | 0x18..=0x1b | 0x1e => {
             return Err(Error::frame_encoding(ty, "prohibited frame type").into());
         }
+        0x28bb_d99f => Frame::DatagramAck(DatagramAck::read(&mut c)?),
         QX_TP => Frame::TransportParameters(QxTransportParameters::read(&mut c)?),
         QX_PING_REQ | QX_PING_RESP => Frame::QxPing(QxPing::read(&mut c, ty)?),
         0x1911_f43e => Frame::GoAway(GoAwayFrame::read(&mut c, ty)?),
@@ -577,6 +593,7 @@ fn check_gate(frame: &Frame<'_>, ty: u64, len: usize, gates: &Gates) -> Result<(
             }
             return Ok(());
         }
+        Frame::DatagramAck(_) => (gates.datagram_ack, "DATAGRAM_ACK not in use"),
         Frame::GoAway(_) => (gates.goaway, "GOAWAY not in use"),
         Frame::PriorityUpdate(_) => (gates.priority, "PRIORITY_UPDATE not in use"),
         Frame::PipeAck(_) => (

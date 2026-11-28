@@ -15,12 +15,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use tokio::time::Instant;
 
+use super::deadline::timeout;
 use super::tokio::PipeIo;
+use crate::ClockDomain;
 use crate::proto::admission::{AdmittedValue, CarrierInfo};
 use crate::proto::record::Framing;
 
@@ -30,7 +31,8 @@ pub(crate) async fn read_more<R>(
     mut prefix: Vec<u8>,
     need: usize,
     r: &mut R,
-    deadline: Instant,
+    clock: &ClockDomain,
+    deadline: Option<Instant>,
 ) -> (Vec<u8>, bool)
 where
     R: AsyncRead + Unpin + ?Sized,
@@ -45,7 +47,7 @@ where
             }
         }
     };
-    let late = tokio::time::timeout_at(deadline, fill).await.is_err();
+    let late = timeout(clock, deadline, fill).await.is_none();
     prefix.truncate(got);
     (prefix, late)
 }
@@ -55,8 +57,8 @@ where
 pub(crate) enum FirstMessage {
     /// The message, whole.
     Message(Vec<u8>),
-    /// Longer than the bound.
-    TooLarge,
+    /// Longer than the bound, with the entire message if it was retained.
+    TooLarge(Option<Vec<u8>>),
     /// No message to decide on: the carrier ended or failed, or sent an
     /// empty or a non-binary message.
     Failed,
@@ -68,47 +70,51 @@ pub(crate) enum FirstMessage {
 /// which is one message (a [`message_too_large`](crate::adapter::message_too_large)
 /// error for one longer than the read's room), at most `max` bytes, by
 /// `deadline`.
-pub(crate) async fn read_message<R>(r: &mut R, max: usize, deadline: Instant) -> FirstMessage
+pub(crate) async fn read_message<R>(
+    r: &mut R,
+    max: usize,
+    clock: &ClockDomain,
+    deadline: Option<Instant>,
+) -> FirstMessage
 where
     R: AsyncRead + Unpin + ?Sized,
 {
     // One byte more than the bound: a longer message is told apart from
     // one of the bound's length either way.
     let mut buf = vec![0u8; max.saturating_add(1)];
-    let read = tokio::time::timeout_at(deadline, r.read(&mut buf)).await;
+    let read = timeout(clock, deadline, r.read(&mut buf)).await;
     match read {
-        Err(_) => FirstMessage::Late,
-        Ok(Ok(n)) if n > max => FirstMessage::TooLarge,
-        Ok(Ok(0)) => FirstMessage::Failed,
-        Ok(Ok(n)) => {
+        None => FirstMessage::Late,
+        Some(Ok(n)) if n > max => {
+            buf.truncate(n);
+            FirstMessage::TooLarge(Some(buf))
+        }
+        Some(Ok(0)) => FirstMessage::Failed,
+        Some(Ok(n)) => {
             buf.truncate(n);
             FirstMessage::Message(buf)
         }
-        Ok(Err(e)) if super::is_message_too_large(&e) => FirstMessage::TooLarge,
-        Ok(Err(_)) => FirstMessage::Failed,
+        Some(Err(e)) if super::is_message_too_large(&e) => FirstMessage::TooLarge(None),
+        Some(Err(_)) => FirstMessage::Failed,
     }
 }
 
 /// Reads and discards what arrives on `r`, `chunk` bytes at a time (a
 /// message at a time on a message-framed carrier, `records`, one too long
-/// for the chunk dropped by the reader), until it ends, fails, or
-/// `duration` has passed.
-pub(crate) async fn discard<R>(r: &mut R, chunk: usize, duration: Duration, records: bool)
+/// for the chunk dropped by the reader), until it ends or fails.
+pub(crate) async fn discard<R>(r: &mut R, chunk: usize, records: bool)
 where
     R: AsyncRead + Unpin + ?Sized,
 {
     let mut buf = vec![0u8; chunk.max(1)];
-    let discard = async {
-        loop {
-            match r.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) if records && super::is_message_too_large(&e) => {}
-                Err(_) => break,
-            }
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if records && super::is_message_too_large(&e) => {}
+            Err(_) => break,
         }
-    };
-    let _ = tokio::time::timeout(duration, discard).await;
+    }
 }
 
 /// The source of a TCP connection that arrived from `peer`, which `trusted`
@@ -1043,6 +1049,7 @@ impl Drop for Returned {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
@@ -1060,13 +1067,14 @@ mod tests {
     async fn prefix_is_bounded() {
         let (mut a, mut b) = tokio::io::duplex(64);
         a.write_all(b"0123456789").await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let (p, late) = read_more(Vec::new(), 4, &mut b, deadline).await;
+        let clock = ClockDomain::default();
+        let deadline = clock.now().checked_add(Duration::from_secs(5));
+        let (p, late) = read_more(Vec::new(), 4, &mut b, &clock, deadline).await;
         assert_eq!((&p[..], late), (&b"0123"[..], false));
         let mut rest = [0u8; 6];
         b.read_exact(&mut rest).await.unwrap();
-        let deadline = Instant::now() + Duration::from_millis(20);
-        let (p, late) = read_more(Vec::new(), 4, &mut b, deadline).await;
+        let deadline = clock.now().checked_add(Duration::from_millis(20));
+        let (p, late) = read_more(Vec::new(), 4, &mut b, &clock, deadline).await;
         assert!(p.is_empty() && late, "timed out with nothing read");
     }
 
@@ -1095,27 +1103,46 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn first_message_is_bounded() {
-        let at = || Instant::now() + Duration::from_secs(1);
+        let clock = ClockDomain::default();
+        let at = || clock.now().checked_add(Duration::from_secs(1));
         let msgs = |m: Vec<io::Result<Vec<u8>>>| Messages(m.into());
         let mut r = msgs(vec![Ok(vec![1; 8])]);
         assert_eq!(
-            read_message(&mut r, 8, at()).await,
+            read_message(&mut r, 8, &clock, at()).await,
             FirstMessage::Message(vec![1; 8])
         );
         // One byte over, whether the reader has the room or not.
         let mut r = msgs(vec![Ok(vec![1; 9])]);
-        assert_eq!(read_message(&mut r, 8, at()).await, FirstMessage::TooLarge);
+        assert_eq!(
+            read_message(&mut r, 8, &clock, at()).await,
+            FirstMessage::TooLarge(Some(vec![1; 9]))
+        );
         let mut r = msgs(vec![Ok(vec![1; 10])]);
-        assert_eq!(read_message(&mut r, 8, at()).await, FirstMessage::TooLarge);
+        assert_eq!(
+            read_message(&mut r, 8, &clock, at()).await,
+            FirstMessage::TooLarge(None)
+        );
         // Ended, failed, an empty message: nothing to decide on.
         let mut r = tokio::io::empty();
-        assert_eq!(read_message(&mut r, 8, at()).await, FirstMessage::Failed);
+        assert_eq!(
+            read_message(&mut r, 8, &clock, at()).await,
+            FirstMessage::Failed
+        );
         let mut r = msgs(vec![Err(io::ErrorKind::InvalidData.into())]);
-        assert_eq!(read_message(&mut r, 8, at()).await, FirstMessage::Failed);
+        assert_eq!(
+            read_message(&mut r, 8, &clock, at()).await,
+            FirstMessage::Failed
+        );
         let mut r = msgs(vec![Err(crate::adapter::empty_message())]);
-        assert_eq!(read_message(&mut r, 8, at()).await, FirstMessage::Failed);
+        assert_eq!(
+            read_message(&mut r, 8, &clock, at()).await,
+            FirstMessage::Failed
+        );
         let mut r = msgs(vec![]);
-        assert_eq!(read_message(&mut r, 8, at()).await, FirstMessage::Late);
+        assert_eq!(
+            read_message(&mut r, 8, &clock, at()).await,
+            FirstMessage::Late
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1129,13 +1156,11 @@ mod tests {
             ]
             .into(),
         );
-        let started = Instant::now();
-        discard(&mut r, 16, Duration::from_secs(5), true).await;
+        discard(&mut r, 16, true).await;
         assert!(r.0.is_empty(), "read on past the long ones to the error");
-        assert_eq!(started, Instant::now());
         // A byte stream's error ends it.
         let mut r = Messages(vec![Err(crate::adapter::message_too_large()), Ok(vec![1])].into());
-        discard(&mut r, 16, Duration::from_secs(5), false).await;
+        discard(&mut r, 16, false).await;
         assert_eq!(r.0.len(), 1);
     }
 
@@ -1152,7 +1177,16 @@ mod tests {
             .with_variant("v")
             .with_terminated_tls(|| Some(crate::TlsState::new(Some(b"h2".to_vec()), None)))
             .with_unsent(|| Some(1))
-            .with_handshake_padding(3)
+            .with_establish_receipts([
+                Some(crate::shaping::EstablishReceipt {
+                    at: std::time::Instant::now(),
+                    baseline: 20,
+                    allowance: 3,
+                    extra: 3,
+                    delay: Duration::ZERO,
+                }),
+                None,
+            ])
             .with_write_overhead(4)
             .with_max_record(16_384)
             .unwrap()
@@ -1192,14 +1226,14 @@ mod tests {
             // A TCP socket's: part of the moved carrier.
             socket: _,
             unsent,
-            handshake_padding,
+            establish_receipts,
             write_overhead,
             max_record,
             secure,
             // A paired split carrier's, which is never taken over.
             split: _,
             first_mode,
-            admitted,
+            admission_evidence,
             low_water,
             partial_reads,
             // A stream carrier's outer session: part of the moved carrier.
@@ -1225,11 +1259,15 @@ mod tests {
         assert_eq!(variant.as_deref(), Some("v"));
         assert_eq!(prefix, replay);
         assert!(unsent.is_some());
-        assert_eq!((handshake_padding, write_overhead), (3, 4));
+        assert_eq!(
+            (establish_receipts[0].unwrap().extra, write_overhead),
+            (3, 4)
+        );
         assert_eq!(max_record, Some(16_384));
         assert!(secure && low_water && partial_reads && reports_failure);
         assert_eq!(first_mode, Some(crate::proto::seal::RecordMode::Bound));
-        assert!(admitted.is_some());
+        let evidence = admission_evidence.unwrap();
+        assert!(evidence.value.is_some() && evidence.bound_prefix.is_none());
         let lanes = lanes.expect("lane capabilities");
         assert!(lanes.conn.is_some() && lanes.on == Some(true));
         assert_eq!(conn_memory, 6);

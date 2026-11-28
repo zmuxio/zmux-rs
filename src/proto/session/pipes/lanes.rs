@@ -30,8 +30,8 @@ pub(crate) enum LaneState {
     /// wait for the carrier's stream credit).
     Requested,
     /// Attached: its first record holds `PIPE_LANE` alone, and nothing else
-    /// goes on it until it is confirmed; since when.
-    Opening(Instant),
+    /// goes on it until it is confirmed.
+    Opening,
     /// A `PIPE_ACK` acknowledged a position above 0 on it.
     Confirmed,
     /// Ended, reset or failed before it was confirmed, or not confirmed
@@ -368,19 +368,16 @@ impl OutLanes {
     pub(crate) fn unconfirmed(&self) -> Option<u64> {
         self.lanes
             .iter()
-            .position(|l| matches!(l.state, LaneState::Requested | LaneState::Opening(_)))
+            .position(|l| matches!(l.state, LaneState::Requested | LaneState::Opening))
             .map(|i| i as u64 + 1)
     }
 
-    /// The handshake deadline reference of the opening lane.
-    pub(crate) fn opening_since(&self) -> Option<(u64, Instant)> {
+    /// Only the newest lane can be opening.
+    pub(crate) fn opening(&self) -> Option<u64> {
         self.lanes
-            .iter()
-            .enumerate()
-            .find_map(|(i, l)| match l.state {
-                LaneState::Opening(t) => Some((i as u64 + 1, t)),
-                _ => None,
-            })
+            .last()
+            .filter(|lane| lane.state == LaneState::Opening)?;
+        Some(self.lanes.len() as u64)
     }
 
     /// Lane `n` (not 0).
@@ -448,10 +445,10 @@ impl OutLanes {
 
     /// The driver attached the stream of requested lane `n`: its first
     /// record is owed. `false` when `n` is not a requested lane.
-    pub(crate) fn attach(&mut self, n: u64, framing: Framing, now: Instant) -> bool {
+    pub(crate) fn attach(&mut self, n: u64, framing: Framing) -> bool {
         match self.get_mut(n) {
             Some(l) if l.state == LaneState::Requested => {
-                l.state = LaneState::Opening(now);
+                l.state = LaneState::Opening;
                 l.framing = framing;
                 l.first_owed = true;
                 true
@@ -466,7 +463,7 @@ impl OutLanes {
         let Some(l) = self.get_mut(n) else {
             return false;
         };
-        if !matches!(l.state, LaneState::Requested | LaneState::Opening(_)) {
+        if !matches!(l.state, LaneState::Requested | LaneState::Opening) {
             return false;
         }
         l.state = LaneState::Refused;
@@ -518,7 +515,7 @@ impl OutLanes {
         if let Some(l) = self.get_mut(n) {
             match l.state {
                 LaneState::Refused => return false,
-                LaneState::Opening(_) if pos > 0 => {
+                LaneState::Opening if pos > 0 => {
                     l.state = LaneState::Confirmed;
                     if std::mem::take(&mut self.copy_wanted) && self.copy_lane.is_none() {
                         self.copy_lane = Some(n);
@@ -676,6 +673,13 @@ impl OutLanes {
             l.out_closed = true;
             l.writing = 0;
         }
+    }
+
+    /// Every attached lane has finished its carrier's sending half.
+    pub(crate) fn shutdown_complete(&self) -> bool {
+        self.lanes
+            .iter()
+            .all(|lane| !lane.attached() || lane.out_closed)
     }
 
     /// Lane `n`'s last batch, with the shutdown, was written.
@@ -861,7 +865,7 @@ impl OutLane {
     /// Attached and still written: opening or confirmed.
     #[inline]
     pub(crate) fn attached(&self) -> bool {
-        matches!(self.state, LaneState::Opening(_) | LaneState::Confirmed)
+        matches!(self.state, LaneState::Opening | LaneState::Confirmed)
     }
 }
 

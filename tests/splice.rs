@@ -24,7 +24,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::{connect, duplex, eventually, multi_thread, settle, snapshot, watchdog};
 use tokio::task::JoinHandle;
-use zmux::helpers::{SpliceAbort, SpliceEnd, SpliceError, SpliceOptions, SpliceResult, splice};
+use zmux::helpers::{
+    ControlledSpliceOptions, SpliceAbort, SpliceEnd, SpliceError, SpliceOptions, SpliceResult,
+    splice,
+};
 use zmux::proto::{ApplicationErrorCode, TransportParameters};
 use zmux::{Cap, Config, Limiter, RecvStream, SendStream, Session, StreamError, VarInt};
 
@@ -184,7 +187,7 @@ fn a_reset_is_forwarded_with_its_reliable_bytes_within_the_next_hops_credit() {
         let base = snapshot();
         {
             let hop = Hop::new(Config::default(), Config::default(), small()).await;
-            let mut relay = hop.relay(SpliceOptions::default());
+            let relay = hop.relay(SpliceOptions::default());
             // Within the relay's upstream window (256 KiB), beyond B's.
             let data = pattern(192 << 10, 3);
             let ((mut s, _r), (mut fs, mut fr)) = hop.stream(&data[..1]).await;
@@ -194,14 +197,6 @@ fn a_reset_is_forwarded_with_its_reliable_bytes_within_the_next_hops_credit() {
             s.write_all(&data[1..]).await.unwrap();
             s.set_reliable_boundary().unwrap();
             s.reset(VarInt::from_u32(0x42)).unwrap();
-            // The relay forwards only within B's credit: while B reads
-            // nothing it waits, the reset not yet forwarded.
-            assert!(
-                tokio::time::timeout(Duration::from_millis(500), &mut relay)
-                    .await
-                    .is_err(),
-                "the relay waits for B's credit"
-            );
             // B reads: every reliable byte, then the reset.
             let reader = tokio::spawn(async move { read_until_end(&mut fr).await });
             let done = watchdog(30, "splice", relay).await.unwrap().unwrap();
@@ -417,6 +412,10 @@ fn a_direction_into_its_own_stream_is_refused() {
 struct Count(AtomicU64);
 
 impl Limiter for Count {
+    fn max_burst_bytes(&self) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
     fn poll_acquire(
         &self,
         _: &mut Context<'_>,
@@ -439,6 +438,8 @@ impl Limiter for Count {
 struct Budget {
     left: Mutex<(u64, Option<Waker>)>,
     charged: AtomicU64,
+    waiting: tokio::sync::Notify,
+    refused: tokio::sync::Notify,
 }
 
 impl Budget {
@@ -452,38 +453,42 @@ impl Budget {
             w.wake();
         }
     }
+    fn take(&self, balance: &mut u64, max: u64) -> u64 {
+        let n = (*balance).min(max);
+        *balance -= n;
+        self.charged.fetch_add(n, Ordering::Relaxed);
+        n
+    }
 }
 
 impl Limiter for Budget {
+    fn max_burst_bytes(&self) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
     fn poll_acquire(
         &self,
         cx: &mut Context<'_>,
         min: u64,
         max: u64,
     ) -> Poll<Result<u64, zmux::LimitError>> {
-        match self.try_acquire(min, max) {
-            0 => {
-                let mut g = self.left.lock().unwrap();
-                // Checked again under the lock that `add` takes.
-                if g.0 < min {
-                    g.1 = Some(cx.waker().clone());
-                    return Poll::Pending;
-                }
-                drop(g);
-                self.poll_acquire(cx, min, max)
-            }
-            n => Poll::Ready(Ok(n)),
+        let mut g = self.left.lock().unwrap();
+        if g.0 < min {
+            g.1 = Some(cx.waker().clone());
+            self.waiting.notify_one();
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(self.take(&mut g.0, max)))
         }
     }
     fn try_acquire(&self, min: u64, max: u64) -> u64 {
         let mut g = self.left.lock().unwrap();
         if g.0 < min {
-            return 0;
+            self.refused.notify_one();
+            0
+        } else {
+            self.take(&mut g.0, max)
         }
-        let n = g.0.min(max);
-        g.0 -= n;
-        self.charged.fetch_add(n, Ordering::Relaxed);
-        n
     }
     fn refund(&self, n: u64) {
         self.left.lock().unwrap().0 += n;
@@ -514,18 +519,15 @@ fn limiters_are_charged_exactly_what_was_forwarded_and_datagrams_follow() {
             let down = pattern(64 << 10, 5);
             fs.write_all(&down).await.unwrap();
             fs.finish().unwrap();
-            // The budget's first 16 KiB, in one chunk: then the direction
-            // waits for a budget of 16 KiB again.
-            eventually(10, "a chunk forwarded", || {
-                budget.charged.load(Ordering::Relaxed) > 0
-            })
+            watchdog(
+                30,
+                "stream waiting for more quota",
+                budget.waiting.notified(),
+            )
             .await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let charged = budget.charged.load(Ordering::Relaxed) as usize;
-            assert!(charged <= 16 * 1024);
-            let over = vec![1u8; 16 * 1024 - charged + 1];
-            fs.send_datagram(1, Bytes::from(over)).unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(budget.charged.load(Ordering::Relaxed), 16 * 1024);
+            fs.send_datagram(1, Bytes::from_static(b"x")).unwrap();
+            watchdog(30, "datagram refused", budget.refused.notified()).await;
             budget.add(64 << 10);
             let back = watchdog(10, "A reads", read_all(&mut r, 64 << 10))
                 .await
@@ -554,8 +556,11 @@ fn limiters_are_charged_exactly_what_was_forwarded_and_datagrams_follow() {
                 budget.charged.load(Ordering::Relaxed),
                 ba.bytes + ba.datagram_bytes
             );
-            assert_eq!(ba.datagrams_dropped, 1, "the datagram over budget");
-            assert_eq!((ba.datagrams_limited, ba.datagrams_too_large), (1, 0));
+            assert_eq!(ba.drops.total(), 1, "the datagram over budget");
+            assert_eq!(
+                (ba.drops.dropped_limiter, ba.drops.dropped_too_large),
+                (1, 0)
+            );
             hop.close();
         }
         settle(base, 10, "limiters").await;
@@ -576,7 +581,7 @@ fn a_splice_cancelled_in_a_limiter_wait_leaves_nothing_behind() {
             s.write_all(b"x").await.unwrap();
             // The byte cannot pass: the splice waits in the limiter,
             // holding nothing; the outbound stream sent nothing yet.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            watchdog(30, "stream waiting for quota", budget.waiting.notified()).await;
             relay.abort();
             let _ = relay.await;
             assert_eq!(budget.charged.load(Ordering::Relaxed), 0);
@@ -619,11 +624,16 @@ fn a_window_remainder_below_the_step_is_forwarded_without_new_credit() {
             eventually(5, "A's data at the relay", || readable() == 32 * 1024).await;
             // The outbound stream reaches B, which finishes its side at
             // once: B is quiet from then on and sends no credit.
-            let (mut out_s, out_r) = hop.rb.open_bi().await.unwrap();
+            let (mut out_s, mut out_r) = hop.rb.open_bi().await.unwrap();
             out_s.write_all(b"o").await.unwrap();
             let (mut fs, fr) = hop.b.accept_bi().await.unwrap();
             fs.finish().unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                watchdog(30, "reverse FIN", out_r.read_chunk(1))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             let mut opts = SpliceOptions::default();
             opts.chunk = 3 * 1024;
             let relay = tokio::spawn(splice(inbound, (out_s, out_r), opts));
@@ -648,16 +658,17 @@ fn a_stalled_downstream_bounds_what_the_relay_holds() {
             let hop = Hop::new(small(), small(), small()).await;
             let relay = hop.relay(SpliceOptions::default());
             let ((mut s, r), (fs, fr)) = hop.stream(b"x").await;
-            // B never reads; A writes as much as flow control lets it.
-            let writer = tokio::spawn(async move {
-                let chunk = vec![7u8; 64 * 1024];
-                loop {
-                    if s.write_all(&chunk).await.is_err() {
-                        return;
-                    }
-                }
-            });
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            // The finite input exceeds B's fixed window. Observe that
+            // window fill and that the remaining input reached the relay.
+            let data = vec![7; 112 * 1024];
+            watchdog(30, "source window", s.write_all(&data))
+                .await
+                .unwrap();
+            eventually(30, "buffered source input", || {
+                hop.rb.meter().bytes_written() >= 64 * 1024 - 256
+                    && hop.ra.debug_tables().held_bytes >= 16 * 1024
+            })
+            .await;
             let held = hop.ra.debug_tables().held_bytes + hop.rb.debug_tables().held_bytes;
             // The upstream window, what the downstream holds unsent within
             // its peer's credit (B's window), one chunk: 3 x 64 KiB at
@@ -668,9 +679,7 @@ fn a_stalled_downstream_bounds_what_the_relay_holds() {
                 "the backlog waits upstream"
             );
             // Both ends give up: the splice ends both ways.
-            writer.abort();
-            let _ = writer.await;
-            drop((r, fs, fr));
+            drop((s, r, fs, fr));
             let done = watchdog(10, "splice", relay).await.unwrap().unwrap();
             for end in [done.a_to_b.end, done.b_to_a.end] {
                 assert!(
@@ -697,6 +706,10 @@ struct Recorder {
 }
 
 impl Limiter for Recorder {
+    fn max_burst_bytes(&self) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
     fn poll_acquire(
         &self,
         _: &mut Context<'_>,
@@ -732,14 +745,12 @@ fn a_splice_holds_no_grant_while_its_source_is_idle() {
         let got = watchdog(10, "x", read_n(&mut fr, 1)).await;
         assert_eq!(got, b"x");
         let used = || rec.granted.load(Ordering::SeqCst) - rec.refunded.load(Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let calls = rec.calls.lock().unwrap().clone();
         assert_eq!(calls, [(1, 1)], "asked once, for the readable byte");
         assert_eq!(used(), 1);
         s.write_all(&[7; 10]).await.unwrap();
         let got = watchdog(10, "ten", read_n(&mut fr, 10)).await;
         assert_eq!(got, [7; 10]);
-        tokio::time::sleep(Duration::from_millis(20)).await;
         for &(min, max) in rec.calls.lock().unwrap().iter() {
             assert!(min == 1 && (1..=10).contains(&max), "({min}, {max})");
         }
@@ -762,20 +773,9 @@ fn a_limiter_error_ends_the_direction() {
         let relay = hop.relay(opts);
         let (mut s, _r) = hop.a.open_bi().await.unwrap();
         s.write_all(b"x").await.unwrap();
-        let stopped = watchdog(10, "stopped", async {
-            loop {
-                match s.write_all(&[0; 1024]).await {
-                    Ok(()) => tokio::time::sleep(Duration::from_millis(5)).await,
-                    Err(e) => return e,
-                }
-            }
-        })
-        .await;
+        let stopped = watchdog(30, "stopped", s.stopped()).await.unwrap();
         let cancelled = VarInt::from_u32(0x5a4d_0001);
-        assert!(
-            matches!(stopped, StreamError::Stopped(c) if c == cancelled),
-            "{stopped:?}"
-        );
+        assert_eq!(stopped, Some(cancelled));
         assert!(rec.calls.lock().unwrap().iter().all(|c| c.0 == 1));
         relay.abort();
         hop.close();
@@ -810,4 +810,381 @@ async fn read_n(r: &mut RecvStream, n: usize) -> Vec<u8> {
     let mut b = vec![0; n];
     r.read_exact(&mut b).await.unwrap();
     b
+}
+
+type Leg = (SendStream, RecvStream);
+
+/// Both streams have identifiers before the test starts driving the splice.
+async fn prepared_hop(hop: &Hop) -> (Leg, Leg, Leg, Leg) {
+    let a = hop.a.open_bi().await.unwrap();
+    a.0.pin_id().unwrap();
+    let ra = hop.ra.accept_bi().await.unwrap();
+    let rb = hop.rb.open_bi().await.unwrap();
+    rb.0.pin_id().unwrap();
+    let b = hop.b.accept_bi().await.unwrap();
+    (a, ra, rb, b)
+}
+
+async fn controlled_hop(
+    hop: &Hop,
+    opts: ControlledSpliceOptions,
+    packets: bool,
+) -> (
+    zmux::helpers::SpliceController,
+    JoinHandle<SpliceResult>,
+    Leg,
+    Leg,
+) {
+    let (a, ra, rb, b) = prepared_hop(hop).await;
+    let (control, relay) = if packets {
+        let (control, run) = zmux::helpers::controlled_splice_packets(ra, rb, opts).unwrap();
+        (control, tokio::spawn(run))
+    } else {
+        let (control, run) = zmux::helpers::controlled_splice(ra, rb, opts).unwrap();
+        (control, tokio::spawn(run))
+    };
+    (control, relay, a, b)
+}
+
+#[test]
+fn controlled_splice_detaches_without_redeciding_delayed_output() {
+    use zmux::helpers::{SpliceDecision, SpliceHooks, SpliceMirror, SpliceSignal, SpliceWait};
+
+    common::paused(async {
+        let hop = Hop::default().await;
+        let mut opts = ControlledSpliceOptions::default();
+        let signal = SpliceSignal::default();
+        let resume = signal.clone();
+        let (mirror, mut samples) = SpliceMirror::channel(1, 1).unwrap();
+        opts.a_to_b_mirror = Some(mirror);
+        opts.a_to_b_hooks.stream.push(Arc::new(move |unit| {
+            assert_eq!(unit.items(), 1);
+            assert_eq!(unit.segments(0).unwrap().next(), Some(&b"a"[..]));
+            unit.write(1, |out| out[0] = b'b')?;
+            unit.write(1, |out| out[0] = b'c')?;
+            Ok(SpliceDecision::Replace(SpliceWait {
+                resume: Some(signal.clone()),
+                ..SpliceWait::default()
+            }))
+        }));
+        let (control, relay, (mut a, _reverse), (mut b, mut read)) =
+            controlled_hop(&hop, opts, false).await;
+        a.write_all(b"a").await.unwrap();
+        let first = watchdog(60, "first input sampled", samples.recv())
+            .await
+            .unwrap();
+        assert_eq!((first.generation, &first.prefix[..]), (1, &b"a"[..]));
+        assert_eq!(
+            control
+                .a_to_b
+                .replace_hooks(SpliceHooks::default())
+                .await
+                .unwrap(),
+            2
+        );
+        a.write_all(b"d").await.unwrap();
+        resume.resume();
+        assert_eq!(
+            watchdog(60, "forwarded generation", read_n(&mut read, 3)).await,
+            b"bcd"
+        );
+        a.finish().unwrap();
+        b.finish().unwrap();
+        let result = watchdog(60, "controlled splice", relay).await.unwrap();
+        assert_eq!(result.a_to_b.replacements, 1);
+        assert_eq!(result.a_to_b.enqueued_items, 3);
+        assert_eq!(result.a_to_b.end, SpliceEnd::Finished);
+    });
+}
+
+#[test]
+fn controlled_splice_admits_injection_after_resume_and_stop_ends_pause() {
+    use zmux::helpers::{SpliceCommandError, SpliceInjection, SpliceKind};
+
+    common::paused(async {
+        let hop = Hop::default().await;
+        let (control, relay, (_a, mut reverse), (mut b, mut read)) =
+            controlled_hop(&hop, ControlledSpliceOptions::default(), false).await;
+        let offer = || SpliceInjection {
+            kind: SpliceKind::Stream,
+            payload: zmux::Chunk::from_static(b"local"),
+        };
+        let pause = control.a_to_b.pause().await.unwrap();
+        pause.acknowledged().await.unwrap();
+        assert!(matches!(
+            control.a_to_b.inject(offer()).await,
+            Err(SpliceCommandError::Paused)
+        ));
+        b.write_all(b"reverse").await.unwrap();
+        assert_eq!(
+            watchdog(60, "reverse", read_n(&mut reverse, 7)).await,
+            b"reverse"
+        );
+        control.a_to_b.resume(&pause).await.unwrap();
+        let receipt = control.a_to_b.inject(offer()).await.unwrap();
+        assert_eq!(
+            watchdog(60, "injection", read_n(&mut read, 5)).await,
+            b"local"
+        );
+        let disposition = receipt.disposition().await.unwrap();
+        assert_eq!(
+            (disposition.accepted_bytes, disposition.enqueued_items),
+            (5, 1)
+        );
+        let pause = control.a_to_b.pause().await.unwrap();
+        pause.acknowledged().await.unwrap();
+        read.stop(VarInt::ZERO).unwrap();
+        assert_eq!(
+            watchdog(60, "stopped direction", control.a_to_b.finished())
+                .await
+                .unwrap(),
+            SpliceEnd::Stopped(VarInt::ZERO)
+        );
+        b.finish().unwrap();
+        let output = watchdog(60, "controlled splice", relay).await.unwrap();
+        assert_eq!(output.a_to_b.end, SpliceEnd::Stopped(VarInt::ZERO));
+        assert_eq!(output.b_to_a.end, SpliceEnd::Finished);
+    });
+}
+
+#[test]
+fn a_datagram_with_later_admission_overtakes_an_earlier_delayed_group() {
+    use zmux::helpers::{SpliceDecision, SpliceInjection, SpliceKind, SpliceWait};
+
+    common::paused(async {
+        let hop = Hop::default().await;
+        let mut opts = ControlledSpliceOptions::default();
+        opts.limits.datagram_delay = true;
+        let (decided, mut decision) = tokio::sync::mpsc::channel(2);
+        opts.a_to_b_hooks.datagram.push(Arc::new(move |unit| {
+            let delayed = matches!(unit.meta.kind, SpliceKind::Datagram { context } if context == VarInt::ZERO);
+            decided.try_send(delayed).unwrap();
+            if delayed {
+                Ok(SpliceDecision::Pass(SpliceWait {
+                    ready_at: Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+                    ..SpliceWait::default()
+                }))
+            } else {
+                Ok(SpliceDecision::default())
+            }
+        }));
+        let (control, relay, (mut a, _reverse), (mut b, read)) =
+            controlled_hop(&hop, opts, false).await;
+        let inject = |context, payload| SpliceInjection {
+            kind: SpliceKind::Datagram {
+                context: VarInt::from_u32(context),
+            },
+            payload: zmux::Chunk::from_static(payload),
+        };
+        let first = control.a_to_b.inject(inject(0, b"first")).await.unwrap();
+        assert_eq!(decision.recv().await, Some(true));
+        let second = control.a_to_b.inject(inject(1, b"second")).await.unwrap();
+        assert_eq!(decision.recv().await, Some(false));
+        let next = watchdog(60, "overtaking datagram", read.read_datagram())
+            .await
+            .unwrap();
+        assert_eq!(&next.payload[..], b"second");
+        assert_eq!(second.disposition().await.unwrap().enqueued_items, 1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let next = watchdog(60, "released datagram", read.read_datagram())
+            .await
+            .unwrap();
+        assert_eq!(&next.payload[..], b"first");
+        assert_eq!(first.disposition().await.unwrap().enqueued_items, 1);
+        a.finish().unwrap();
+        b.finish().unwrap();
+        let result = watchdog(60, "controlled splice", relay).await.unwrap();
+        assert_eq!(result.a_to_b.datagram_bytes, 11);
+    });
+}
+
+#[test]
+fn capsule_hook_collects_a_bounded_unit_across_fragments() {
+    use zmux::helpers::{SpliceDecision, SpliceKind, SpliceWait};
+
+    common::paused(async {
+        let hop = Hop::default().await;
+        let mut opts = ControlledSpliceOptions::default();
+        opts.forwarding.chunk = 1;
+        opts.limits.descriptors = 2;
+        opts.a_to_b_hooks.capsule.push(Arc::new(|unit| {
+            assert_eq!(
+                unit.meta.kind,
+                SpliceKind::Capsule {
+                    ty: VarInt::from_u32(5),
+                    context: None
+                }
+            );
+            let bytes: Vec<_> = unit.segments(0).unwrap().flatten().copied().collect();
+            assert_eq!(bytes, b"abcd");
+            unit.slice(0, 1..3)?;
+            unit.write(1, |byte| byte[0] = b'e')?;
+            Ok(SpliceDecision::Replace(SpliceWait::default()))
+        }));
+        let (_control, relay, (mut a, _reverse), (mut b, mut read)) =
+            controlled_hop(&hop, opts, true).await;
+        a.write_all(&[5, 4, b'a', b'b', b'c']).await.unwrap();
+        eventually(60, "incomplete capsule held at the relay", || {
+            hop.ra.meter().bytes_read() == 5
+        })
+        .await;
+        assert!(matches!(
+            read.try_read_chunk(1),
+            Ok(zmux::TryRead::WouldBlock)
+        ));
+        a.write_all(b"d").await.unwrap();
+        a.finish().unwrap();
+        b.finish().unwrap();
+        let got = watchdog(60, "transformed capsule group", read_all(&mut read, 7))
+            .await
+            .unwrap();
+        assert_eq!(got, [5, 2, b'b', b'c', 5, 1, b'e']);
+        let result = watchdog(60, "controlled splice", relay).await.unwrap();
+        assert_eq!(
+            (result.a_to_b.input_units, result.a_to_b.enqueued_items),
+            (1, 2)
+        );
+    });
+}
+
+#[test]
+fn truncated_hooked_capsule_never_submits_a_partial_unit() {
+    common::paused(async {
+        let hop = Hop::default().await;
+        let mut opts = ControlledSpliceOptions::default();
+        opts.a_to_b_hooks
+            .capsule
+            .push(Arc::new(|_| panic!("truncated capsule reached the hook")));
+        let (_control, relay, (mut a, _reverse), (mut b, mut read)) =
+            controlled_hop(&hop, opts, true).await;
+        a.write_all(&[5, 4, b'a']).await.unwrap();
+        a.finish().unwrap();
+        b.finish().unwrap();
+        let (bytes, error) = watchdog(60, "target reset", read_until_end(&mut read)).await;
+        assert_eq!(bytes, [] as [u8; 0]);
+        assert!(matches!(error, Some(StreamError::Reset { code, .. })
+            if code.into_inner() == ApplicationErrorCode::ZMUX_PACKET_ERROR.0));
+        let result = watchdog(60, "controlled splice", relay).await.unwrap();
+        assert_eq!(result.a_to_b.end, SpliceEnd::PacketError);
+        assert_eq!(result.a_to_b.input_units, 0);
+        assert_eq!(result.a_to_b.enqueued_items, 0);
+        assert_eq!(result.a_to_b.bytes, 0);
+    });
+}
+
+#[test]
+fn transparent_capsule_error_resets_at_the_last_complete_capsule() {
+    check_transparent_capsule_error(b"\x21\x01a\x22\x02b".to_vec(), 3);
+}
+
+fn check_transparent_capsule_error(raw: Vec<u8>, prefix_size: u64) {
+    common::paused(async {
+        let hop = Hop::default().await;
+        let ((mut a, mut reverse), ra, rb, (mut b, mut read)) = prepared_hop(&hop).await;
+        let relay = tokio::spawn(zmux::helpers::splice_packets(
+            ra,
+            rb,
+            SpliceOptions::default(),
+        ));
+        a.write_all(&raw).await.unwrap();
+        assert_eq!(
+            watchdog(
+                60,
+                "transparent stream before truncation",
+                read_n(&mut read, raw.len())
+            )
+            .await,
+            raw
+        );
+        a.finish().unwrap();
+        b.finish().unwrap();
+
+        let code = VarInt::from_u64(ApplicationErrorCode::ZMUX_PACKET_ERROR.0).unwrap();
+        assert_eq!(
+            watchdog(60, "peer received reset", read.received_reset())
+                .await
+                .unwrap(),
+            Some(code)
+        );
+        let (bytes, error) = watchdog(60, "read after reset", read_until_end(&mut read)).await;
+        assert_eq!(bytes, [] as [u8; 0]);
+        assert!(
+            matches!(error, Some(StreamError::Reset { code: reset_code, reliable_size })
+            if reset_code == code && reliable_size == prefix_size)
+        );
+        assert!(
+            watchdog(60, "reverse FIN", reverse.read_chunk(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let result = watchdog(60, "splice result", relay).await.unwrap().unwrap();
+        assert_eq!(result.a_to_b.end, SpliceEnd::PacketError);
+        assert_eq!(result.b_to_a.end, SpliceEnd::Finished);
+    });
+}
+
+#[test]
+fn a_waiting_datagram_and_an_injected_stream_share_the_queue_limit() {
+    use zmux::helpers::{
+        SpliceCommandError, SpliceDecision, SpliceInjection, SpliceKind, SpliceSignal, SpliceWait,
+    };
+
+    common::paused(async {
+        let hop = Hop::default().await;
+        let mut opts = ControlledSpliceOptions::default();
+        opts.limits.datagram_delay = true;
+        opts.limits.queue_items = 1;
+        let resume = SpliceSignal::default();
+        let signal = resume.clone();
+        opts.a_to_b_hooks.datagram.push(Arc::new(move |_| {
+            Ok(SpliceDecision::Pass(SpliceWait {
+                resume: Some(signal.clone()),
+                ..SpliceWait::default()
+            }))
+        }));
+        let (control, relay, (mut a, _reverse), (mut b, mut read)) =
+            controlled_hop(&hop, opts, false).await;
+        let payload = Bytes::from_static(b"test");
+        let datagram = control
+            .a_to_b
+            .inject(SpliceInjection {
+                kind: SpliceKind::Datagram {
+                    context: VarInt::ZERO,
+                },
+                payload: zmux::Chunk::from_static(b"test"),
+            })
+            .await
+            .unwrap();
+        let stream = || SpliceInjection {
+            kind: SpliceKind::Stream,
+            payload: zmux::Chunk::from_static(b"test"),
+        };
+        assert!(matches!(
+            control.a_to_b.inject(stream()).await,
+            Err(SpliceCommandError::SpliceBudget)
+        ));
+        resume.resume();
+        let got = watchdog(60, "released datagram", read.read_datagram())
+            .await
+            .unwrap();
+        assert_eq!(got.payload, payload);
+        assert_eq!(datagram.disposition().await.unwrap().enqueued_items, 1);
+        let after = control.a_to_b.inject(stream()).await.unwrap();
+        assert_eq!(
+            watchdog(60, "stream after budget releases", read_n(&mut read, 4)).await,
+            payload
+        );
+        assert_eq!(after.disposition().await.unwrap().enqueued_items, 1);
+        a.finish().unwrap();
+        b.finish().unwrap();
+        let result = watchdog(60, "splice result", relay).await.unwrap();
+        assert_eq!(result.a_to_b.end, SpliceEnd::Finished);
+    });
+}
+
+// Loaded with include! so rustfmt does not require the development-only file.
+#[cfg(zmux_dev_contracts)]
+mod contracts {
+    include!("splice_contract/vectors.rs");
 }

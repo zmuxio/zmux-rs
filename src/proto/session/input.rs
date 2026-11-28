@@ -5,6 +5,7 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use super::pipes::{Attachment, Classified, InPipe};
+use super::recv_store::{InputSpan, Source};
 use super::stream::{self, Offer, RecvPart, RecvState, SendOutcome, SendState, Stream, StreamKey};
 use super::{
     BIDI, CloseFrame, CoreEvent, InState, LaneId, SessionCore, SessionError, State, UNI, di,
@@ -14,7 +15,6 @@ use crate::proto::frame::{
     ConnectionClose, Dir, Frame, GoAwayFrame, PriorityUpdate, QxPing, ResetStreamAt, StopSending,
 };
 use crate::proto::ident::Classifier;
-use crate::proto::params::TransportParameters;
 use crate::proto::payload::{Flow, WirePreamble};
 use crate::proto::record::{Event as RecordEvent, Framing};
 use crate::proto::{DetailKey, Error, Gates, TransportErrorCode as T};
@@ -45,7 +45,7 @@ impl SessionCore {
     /// anywhere. A record that is incomplete in `data` is kept by the core
     /// and applied later.
     pub fn receive(&mut self, at: impl Into<LaneId>, data: &[u8], now: Instant) {
-        self.receive_inner(at.into(), data, now, false);
+        self.receive_inner(at.into(), data, now, false, None);
     }
 
     /// Applies the complete records at the start of `data` without
@@ -53,23 +53,48 @@ impl SessionCore {
     /// rest (an incomplete record) and passes it again with more bytes
     /// appended; its buffer must hold `max_record_size + 4` bytes.
     pub fn receive_in_place(&mut self, at: impl Into<LaneId>, data: &[u8], now: Instant) -> usize {
-        self.receive_inner(at.into(), data, now, true)
+        self.receive_inner(at.into(), data, now, true, None)
     }
 
-    /// [`SessionCore::receive_in_place`] for bytes the driver read into a
-    /// shared buffer `backing`: STREAM data of 4 KiB or more is kept as a
-    /// reference to `data` instead of a copy.
-    /// Backing identifiers grow with every new buffer: the received data
-    /// that references older ones is copied out when it keeps more than
-    /// twice its size alive.
+    /// [`SessionCore::receive_in_place`] for a chunk whose backing is known.
+    /// Complete STREAM ranges within `data` can retain its allocation.
     pub fn receive_shared(
+        &mut self,
+        at: impl Into<LaneId>,
+        data: &super::Chunk,
+        now: Instant,
+    ) -> usize {
+        self.receive_backed(at.into(), &data.bytes, data.backing, now, true)
+    }
+
+    /// Receives bytes from a driver buffer whose backing the driver allocated.
+    #[cfg(any(test, all(feature = "tokio", not(loom))))]
+    pub(crate) fn receive_buffer(
         &mut self,
         at: impl Into<LaneId>,
         data: &Bytes,
         backing: super::Backing,
         now: Instant,
     ) -> usize {
-        let at = at.into();
+        self.receive_backed(at.into(), data, backing, now, true)
+    }
+
+    /// Receives a range handed over by an outer stream. An incomplete
+    /// record stays in the record reader, while complete records borrow
+    /// their stream payloads from the original allocation.
+    #[cfg(any(test, all(feature = "tokio", not(loom))))]
+    pub(crate) fn receive_segment(&mut self, at: LaneId, segment: &super::Segment, now: Instant) {
+        self.receive_backed(at, &segment.bytes, segment.backing, now, false);
+    }
+
+    fn receive_backed(
+        &mut self,
+        at: LaneId,
+        data: &Bytes,
+        backing: super::Backing,
+        now: Instant,
+        retain: bool,
+    ) -> usize {
         let refs = &mut self.recv_refs;
         let mut moved = false;
         match refs.current.iter_mut().find(|(lane, _)| *lane == at) {
@@ -81,9 +106,9 @@ impl SessionCore {
             }
             None => refs.current.push((at, backing)),
         }
-        self.rx_src = Some((data.clone(), backing));
-        let used = self.receive_inner(at, data, now, true);
-        self.rx_src = None;
+        let input = InputSpan::new(data, backing);
+        let used = self.receive_inner(at, data, now, retain, Some(&input));
+        input.finish(&mut self.receive);
         // Checked with the new buffer's data referenced.
         let refs = &self.recv_refs;
         if moved && refs.retired_at_most > 2 * refs.referenced_at_least {
@@ -119,83 +144,74 @@ impl SessionCore {
                 .is_some_and(|p| p.state() != InState::Ended && p.lane_reads(lane.lane.0))
         });
         let refs = &mut self.recv_refs;
-        if refs.holders.is_empty() {
-            refs.retired_at_most = 0;
-            refs.referenced_at_least = 0;
-            return;
-        }
-        let tally = &mut refs.tally;
-        tally.clear();
-        for &k in &refs.holders {
-            if let Some(r) = self.streams.recv(k) {
-                r.tally(&mut |b, n| tally.push((b.id, b.size, n)));
-            }
-        }
-        tally.sort_unstable_by_key(|&(id, _, _)| id);
-        tally.dedup_by(|b, a| {
-            let same = a.0 == b.0;
-            if same {
-                a.2 += b.2;
-            }
-            same
-        });
+        let tally = refs.tally.get_mut();
+        self.receive.tally(tally);
         let referenced: usize = tally.iter().map(|&(_, _, n)| n).sum();
         let current = &refs.current;
-        tally.retain(|&(id, _, _)| !current.iter().any(|&(_, c)| c.id == id));
-        let mut retired: usize = tally.iter().map(|&(_, size, _)| size).sum();
-        let mut kept = referenced;
-        let streams = &mut self.streams;
-        if retired <= 2 * kept {
-            refs.retired_at_most = retired;
-            refs.referenced_at_least = kept;
-            refs.holders
-                .retain(|&k| streams.recv_mut(k).is_some_and(RecvPart::keep_listed));
-            return;
-        }
-        // The least used first: each copied buffer frees its size for the
-        // bytes it held.
-        let used = |&(_, size, held): &(u64, usize, usize)| (held as u128, size as u128);
-        tally.sort_unstable_by(|a, b| {
-            let ((ha, sa), (hb, sb)) = (used(a), used(b));
-            (ha * sb).cmp(&(hb * sa))
+        let packing = self.receive.copying_backing();
+        tally.retain(|&(id, _, _)| {
+            packing.is_none_or(|packing| packing.id != id)
+                && !current.iter().any(|&(_, c)| c.id == id)
         });
-        let mut n = 0;
-        while retired > 2 * kept && n < tally.len() {
-            let (_, size, held) = tally[n];
-            retired -= size;
-            kept -= held;
-            n += 1;
+        let mut retired: usize = tally.iter().map(|&(_, size, _)| size).sum();
+        if retired > 2 * referenced {
+            // Pack the sparsest retired roots first, preserving every node's
+            // offset and queue links. A compacted range retains its exact size.
+            let used = |&(_, size, held): &(u64, usize, usize)| (held as u128, size as u128);
+            tally.sort_unstable_by(|a, b| {
+                let ((ha, sa), (hb, sb)) = (used(a), used(b));
+                (ha * sb).cmp(&(hb * sa))
+            });
+            let selected = tally
+                .iter()
+                .take_while(|&&(_, size, held)| {
+                    if retired <= 2 * referenced {
+                        return false;
+                    }
+                    retired -= size.saturating_sub(held);
+                    true
+                })
+                .count();
+            tally.truncate(selected);
+            tally.sort_unstable_by_key(|&(id, _, _)| id);
+            self.receive.compact(tally);
         }
         refs.retired_at_most = retired;
-        refs.referenced_at_least = kept;
-        tally.truncate(n);
-        tally.sort_unstable_by_key(|&(id, _, _)| id);
-        let out = |id: u64| tally.binary_search_by_key(&id, |&(id, _, _)| id).is_ok();
-        refs.holders
-            .retain(|&k| streams.recv_mut(k).is_some_and(|r| r.copy_out(&out)));
+        refs.referenced_at_least = referenced;
+    }
+
+    /// The physical capacity of roots kept alive by unread STREAM data.
+    pub(super) fn receive_root_capacity(&self) -> usize {
+        let mut tally = self.recv_refs.tally.borrow_mut();
+        self.receive.tally(&mut tally);
+        tally.iter().map(|&(_, capacity, _)| capacity).sum()
     }
 
     /// The bytes of the retired read buffers that received data keeps
     /// alive, and the bytes it references in all read buffers.
     #[cfg(test)]
     pub(super) fn recv_bound(&self) -> (usize, usize) {
-        let mut t = Vec::new();
-        for &k in &self.recv_refs.holders {
-            if let Some(r) = self.streams.recv(k) {
-                r.tally(&mut |b, n| t.push((b.id, b.size, n)));
-            }
-        }
+        let mut t = self.recv_refs.tally.borrow_mut();
+        self.receive.tally(&mut t);
         let referenced = t.iter().map(|&(_, _, n)| n).sum();
         let current = &self.recv_refs.current;
-        t.retain(|&(id, _, _)| !current.iter().any(|&(_, c)| c.id == id));
-        t.sort_unstable_by_key(|&(id, _, _)| id);
-        t.dedup_by_key(|&mut (id, _, _)| id);
+        let packing = self.receive.copying_backing();
+        t.retain(|&(id, _, _)| {
+            packing.is_none_or(|packing| packing.id != id)
+                && !current.iter().any(|&(_, c)| c.id == id)
+        });
         (t.iter().map(|&(_, size, _)| size).sum(), referenced)
     }
 
     /// One complete message from a message-framed pipe, or lane of one.
-    pub fn receive_message(&mut self, at: impl Into<LaneId>, message: &[u8], now: Instant) {
+    pub fn receive_message(
+        &mut self,
+        at: impl Into<LaneId>,
+        message: crate::proto::ReceivedRecord,
+        now: Instant,
+    ) {
         let at = at.into();
+        let len = message.as_ref().len();
         let pipe = at.pipe.0;
         self.tick(now);
         self.pick_input();
@@ -212,14 +228,14 @@ impl SessionCore {
         if p.framing() != Framing::Records || p.state() == InState::Ended {
             return;
         }
-        if li == 0 && !p.classify_message(message) {
+        if li == 0 && !p.classify_message(message.as_ref()) {
             self.protocol_error(Classifier::rejection_error(), now);
             return;
         }
         let Some(mut reader) = p.take_reader(li) else {
             return;
         };
-        let result = reader.begin_message(message.len());
+        let result = reader.begin_message(len);
         if let Err(e) = result {
             if let Some(p) = self.inp_mut(pipe) {
                 p.return_reader(li, reader);
@@ -229,15 +245,33 @@ impl SessionCore {
         }
         self.rx = pipe;
         self.rx_lane = li;
-        let mut input = message;
-        self.drain_reader(&mut reader, &mut input, now, false);
+        let backing = super::Backing::new(message.capacity());
+        let message = message.into_bytes();
+        let mut input = message.as_ref();
+        let source = InputSpan::new(&message, backing);
+        self.drain_reader(&mut reader, &mut input, now, false, Some(&source));
+        source.finish(&mut self.receive);
         if let Some(p) = self.inp_mut(pipe) {
             p.return_reader(li, reader);
         }
-        self.stats.bytes_received += message.len() as u64;
+        self.stats.bytes_received += len as u64;
+        self.account_copied_input();
+        // This carrier handed over a complete root. No driver will fill
+        // any remaining capacity on a later call.
+        self.recv_refs.retired_at_most += backing.size;
+        if self.recv_refs.retired_at_most > 2 * self.recv_refs.referenced_at_least {
+            self.settle_recv_refs();
+        }
     }
 
-    fn receive_inner(&mut self, at: LaneId, data: &[u8], now: Instant, retain: bool) -> usize {
+    fn receive_inner(
+        &mut self,
+        at: LaneId,
+        data: &[u8],
+        now: Instant,
+        retain: bool,
+        source: Source<'_>,
+    ) -> usize {
         let pipe = at.pipe.0;
         self.tick(now);
         self.pick_input();
@@ -276,7 +310,7 @@ impl SessionCore {
         self.rx = pipe;
         self.rx_lane = li;
         let mut input = data;
-        self.drain_reader(&mut reader, &mut input, now, retain);
+        self.drain_reader(&mut reader, &mut input, now, retain, source);
         let ended = self
             .inp_mut(pipe)
             .is_none_or(|p| p.return_reader(li, reader));
@@ -285,6 +319,7 @@ impl SessionCore {
         } else {
             data.len() - input.len()
         };
+        self.account_copied_input();
         if retain && let Some(p) = self.inp_mut(pipe) {
             // The driver holds an incomplete record (for `pipe_ended`).
             p.set_partial(li, used < data.len());
@@ -293,17 +328,61 @@ impl SessionCore {
         used
     }
 
+    fn account_copied_input(&mut self) {
+        self.recv_refs.retired_at_most += self.receive.take_copied_capacity();
+        if self.recv_refs.retired_at_most > 2 * self.recv_refs.referenced_at_least {
+            self.settle_recv_refs();
+        }
+    }
+
     fn drain_reader(
         &mut self,
         reader: &mut crate::proto::RecordReader,
         input: &mut &[u8],
         now: Instant,
         retain: bool,
+        source: Source<'_>,
+    ) {
+        let account = if self.config.accounting.enabled {
+            self.att(self.rx).and_then(|attachment| {
+                let ledger = attachment.accounting()?.clone();
+                let lane = attachment.inp()?.lane_number(self.rx_lane);
+                Some((ledger, lane))
+            })
+        } else {
+            None
+        };
+        self.read_record_events(reader, input, now, retain, account.as_ref(), source);
+        if let Some((ledger, lane)) = account {
+            if self.discarding()
+                && let Some(len) = reader.complete_record_len()
+            {
+                // A close can end scanning before the parser yields RecordEnd.
+                ledger.receive_complete(lane, len, reader.framing());
+                return;
+            }
+            let retained = if retain && !self.discarding() {
+                input.len() as u64
+            } else {
+                0
+            };
+            ledger.pending_read(lane, reader.pending_record_bytes().saturating_add(retained));
+        }
+    }
+
+    fn read_record_events(
+        &mut self,
+        reader: &mut crate::proto::RecordReader,
+        input: &mut &[u8],
+        now: Instant,
+        retain: bool,
+        account: Option<&(std::sync::Arc<super::accounting::Ledger>, u64)>,
+        source: Source<'_>,
     ) {
         self.budget.refill(now);
         let (pipe, lane) = (self.rx, self.rx_lane);
+        let framing = reader.framing();
         // A frame other than PADDING in the record being read (shaping).
-        let mut framed = false;
         loop {
             let gates = self.receive_gates();
             let event = if retain {
@@ -323,7 +402,12 @@ impl SessionCore {
                     Ok(Some(RecordEvent::Frame(Frame::ConnectionClose(_)))) => {
                         self.peer_close_read(pipe, now);
                     }
-                    Ok(Some(_)) => {}
+                    Ok(Some(RecordEvent::RecordEnd { len })) => {
+                        if let Some((ledger, lane)) = account {
+                            ledger.receive_complete(*lane, len, framing);
+                        }
+                    }
+                    Ok(Some(RecordEvent::Frame(_))) => {}
                     Ok(None) => return,
                     Err(_) => {
                         if let Some(p) = self.inp_mut(pipe) {
@@ -337,17 +421,12 @@ impl SessionCore {
                 continue;
             }
             let result = match event {
-                Ok(Some(RecordEvent::Frame(f))) => {
-                    framed |= !matches!(f, Frame::Padding(_));
-                    self.on_frame(f, now)
-                }
+                Ok(Some(RecordEvent::Frame(f))) => self.on_frame(f, now, source),
                 Ok(Some(RecordEvent::RecordEnd { len })) => {
-                    let r = self.on_record_end(len, now);
-                    if self.shape.is_some() {
-                        self.shape_record_in(pipe, lane as u64, usize_sat(len), !framed);
+                    if let Some((ledger, lane)) = account {
+                        ledger.receive_complete(*lane, len, framing);
                     }
-                    framed = false;
-                    r
+                    self.on_record_end(len, now)
                 }
                 Ok(None) => return,
                 Err(e) => Err(e),
@@ -384,11 +463,13 @@ impl SessionCore {
 
     /// The frames the local endpoint accepts now.
     pub(super) fn receive_gates(&self) -> Gates {
-        if self.peer_tp.is_some() {
-            self.features.receive_gates(
+        if let Some(peer) = &self.peer_tp {
+            let mut gates = self.features.receive_gates(
                 self.local_tp().reset_stream_at,
                 self.local_tp().max_datagram_frame_size(),
-            )
+            );
+            gates.datagram_ack = self.features.same_family && peer.max_datagram_frame_size() != 0;
+            gates
         } else {
             Gates {
                 reset_stream_at: self.local_tp().reset_stream_at,
@@ -420,7 +501,12 @@ impl SessionCore {
         self.charge()
     }
 
-    fn on_frame(&mut self, frame: Frame<'_>, now: Instant) -> Result<(), Error> {
+    fn on_frame(
+        &mut self,
+        frame: Frame<'_>,
+        now: Instant,
+        source: Source<'_>,
+    ) -> Result<(), Error> {
         let (id, li) = (self.rx, self.rx_lane);
         if li > 0 && self.inp_mut(id).is_some_and(|p| p.in_first_record(li)) {
             return self.on_lane_first_frame(&frame);
@@ -429,6 +515,7 @@ impl SessionCore {
             frame,
             Frame::Padding(_)
                 | Frame::PipeAck(_)
+                | Frame::DatagramAck(_)
                 | Frame::MaxData(_)
                 | Frame::MaxStreamData(_)
                 | Frame::MaxStreams(_)
@@ -444,10 +531,7 @@ impl SessionCore {
             let Some(p) = self.inp_mut(id) else {
                 return Ok(());
             };
-            let eliciting = !matches!(
-                frame,
-                Frame::Padding(_) | Frame::PipeAck(_) | Frame::ConnectionClose(_)
-            );
+            let eliciting = frame.is_ack_eliciting();
             let activity = matches!(
                 frame,
                 Frame::Stream(_)
@@ -479,6 +563,23 @@ impl SessionCore {
                 "first frame is not QX_TRANSPORT_PARAMETERS",
             ));
         }
+        if self.carrier_early_in()
+            && matches!(
+                frame,
+                Frame::Stream(_)
+                    | Frame::ResetStream(_)
+                    | Frame::ResetStreamAt(_)
+                    | Frame::StopSending(_)
+                    | Frame::Datagram(_)
+            )
+            && (self.features.same_family || !matches!(frame, Frame::Stream(_)))
+        {
+            return Err(violation(
+                T::PROTOCOL_VIOLATION,
+                ty,
+                "application frame in carrier early data",
+            ));
+        }
         match frame {
             Frame::Padding(_) => Ok(()),
             Frame::TransportParameters(f) => {
@@ -489,11 +590,9 @@ impl SessionCore {
                         "QX_TRANSPORT_PARAMETERS not first",
                     ));
                 }
-                let tp = TransportParameters::decode(f.block)
-                    .map_err(|e| Error::new(e.code(), ty, e.reason()))?;
-                self.on_peer_parameters(&tp, now)
+                self.on_peer_parameters(f.parameters()?.as_ref(), now)
             }
-            Frame::Stream(s) => self.on_stream(s, ty, now),
+            Frame::Stream(s) => self.on_stream(s, ty, now, source),
             Frame::ResetStream(f) => {
                 self.on_reset(f.stream_id, f.error_code, f.final_size, None, ty, now)
             }
@@ -569,7 +668,11 @@ impl SessionCore {
                 self.on_connection_close(f, now);
                 Ok(())
             }
-            Frame::Datagram(d) => self.on_datagram(d, ty),
+            Frame::Datagram(d) => self.on_datagram(d, ty, id),
+            Frame::DatagramAck(ack) => {
+                self.on_datagram_ack(ack);
+                Ok(())
+            }
             Frame::QxPing(p) => self.on_qx_ping(p, ty, now),
             Frame::GoAway(g) => self.on_goaway(g, now),
             Frame::PriorityUpdate(p) => self.on_priority_update(p, ty),
@@ -705,20 +808,24 @@ impl SessionCore {
             Dir::Bidi => {
                 let send_max = peer.map_or(0, |p| p.window_bidi_local);
                 s.send = Some(self.streams.new_send_part(send_max));
-                s.recv = Some(
-                    self.streams
-                        .new_recv_part(local.window_bidi_remote, max_window),
-                );
+                s.recv = Some(RecvPart::new(local.window_bidi_remote, max_window));
             }
             Dir::Uni => {
-                s.recv = Some(self.streams.new_recv_part(local.window_uni, max_window));
+                s.recv = Some(RecvPart::new(local.window_uni, max_window));
             }
         }
         self.stats.streams_opened_remote += 1;
         if self.shape.is_some() || self.shape_pending.is_some() {
             self.shape_stream(super::shaping::EventKind::StreamOpen, id);
         }
-        self.streams.insert_peer(id, di(dir), s)
+        let key = self.streams.insert_peer(id, di(dir), s);
+        if let Some(goaway) = &mut self.goaway
+            && goaway.shutdown.is_some()
+        {
+            // The first GOAWAY still lets the peer use already granted IDs.
+            goaway.draining.insert(key);
+        }
+        key
     }
 
     /// Offers peer stream `key` if it is ready.
@@ -736,6 +843,7 @@ impl SessionCore {
         f: crate::proto::frame::Stream<'_>,
         ty: u64,
         now: Instant,
+        source: Source<'_>,
     ) -> Result<(), Error> {
         let (key, opened) = match self.lookup(f.stream_id, Part::Recv, ty)? {
             Lookup::Stream { key, opened } => (key, opened),
@@ -824,13 +932,7 @@ impl SessionCore {
             }
         }
         self.streams.count_received(increase);
-        // Keys of streams gone since they were listed go, amortised: the
-        // list follows the live streams, not the history.
-        if self.recv_refs.holders.len() >= 2 * self.streams.len() + 64 {
-            let streams = &self.streams;
-            self.recv_refs.holders.retain(|&k| streams.get(k).is_some());
-        }
-        let (s, spare) = self.streams.stream_and_spare(key).expect("present");
+        let s = self.streams.get_mut(key).expect("present");
         let r = s.recv.as_mut().expect("present");
         r.received = r.received.max(end);
         if f.fin {
@@ -846,7 +948,7 @@ impl SessionCore {
         let mut parsed = false;
         if preamble_in_use
             && peer_opened
-            && r.preamble_size.is_none()
+            && r.preamble_size().is_none()
             && offset == 0
             && r.cold().stopped.is_none()
             && (len > 0 || f.fin)
@@ -869,7 +971,7 @@ impl SessionCore {
                     "Reliable Size below the preamble",
                 ));
             }
-            r.preamble_size = Some(size as u64);
+            r.set_preamble_size(size);
             r.read_offset = size as u64;
             if r.contig < size as u64 {
                 // Data held beyond the preamble becomes readable from its
@@ -898,9 +1000,9 @@ impl SessionCore {
             data = &f.data[size..];
             data_offset = size as u64;
             parsed = true;
-        } else if preamble_in_use && peer_opened && r.preamble_size.is_none() && mp {
+        } else if preamble_in_use && peer_opened && r.preamble_size().is_none() && mp {
             // Data before its preamble (multipath): held from offset 0.
-        } else if let Some(size) = r.preamble_size
+        } else if let Some(size) = r.preamble_size()
             && data_offset < size
         {
             // A repeated frame at offset 0 (multipath): its preamble part is
@@ -920,31 +1022,16 @@ impl SessionCore {
             None => data.len(),
         };
         let mut buffered = 0u64;
-        let mut settle = false;
         let contig = r.contig;
         // Held bytes below the preamble's end (copies of preamble bytes that
         // arrived before it) leave the buffers once it is parsed.
         let mut trimmed = 0u64;
         if !discard && keep > 0 {
             if parsed {
-                trimmed = r.pull_held();
+                trimmed = r.pull_held(&mut self.receive);
             }
-            if r.buf.storage_capacity() == 0
-                && let Some(b) = spare.take_drained()
-            {
-                r.buf.give_storage(b);
-            }
-            let src = self.rx_src.as_ref().map(|(b, k)| (b, *k));
-            let before = r.referenced();
-            buffered = r.store(data_offset, &data[..keep], src);
-            // What it now references counts towards the bound's estimate
-            // (held data moved to the flat store references less).
-            let after = r.referenced();
-            self.recv_refs.referenced(after.saturating_sub(before));
-            settle |= self.recv_refs.consumed(before.saturating_sub(after) as u64);
-            if r.needs_listing() {
-                self.recv_refs.holders.push(key);
-            }
+            buffered = r.store(&mut self.receive, data_offset, &data[..keep], source);
+            self.recv_refs.referenced(usize_sat(buffered));
             let dup = keep as u64 - buffered;
             self.stats.bytes_duplicate_received += dup;
             if dup > 0
@@ -953,16 +1040,13 @@ impl SessionCore {
                 p.duplicate(dup);
             }
         } else if parsed {
-            trimmed = r.pull_held();
+            trimmed = r.pull_held(&mut self.receive);
         }
-        // Session credit: each byte once, when it arrives, below the bytes a reset released. Bytes
-        // beyond a gap release nothing before they arrive; a part that discards its data
-        // counts every byte below the frame's end as arrived.
-        let fresh = if discard {
-            r.arrive(0, end)
-        } else {
-            r.arrive(offset, end)
-        };
+        // Release credit for the offsets in this frame, including when the
+        // application has stopped reading and their payload is discarded.
+        let previous_history = r.protected_history();
+        let fresh = r.arrive(offset, end);
+        let protected_history = r.protected_history();
         // Every byte stored is new; the others (preamble bytes, discarded
         // data) are consumed on arrival.
         let fresh_buffered = buffered.min(fresh);
@@ -987,6 +1071,8 @@ impl SessionCore {
         // nobody until the gap fills.
         let readable = r.contig > contig || new_final || complete;
         let received = r.received;
+        self.streams
+            .replace_protected_history(previous_history, protected_history);
         self.credit_received(buffered, fresh_buffered, fresh_consumed);
         if trimmed > 0 {
             self.credit_consumed(trimmed);
@@ -1002,9 +1088,6 @@ impl SessionCore {
         }
         if readable {
             self.notify_readable(key);
-        }
-        if settle {
-            self.settle_recv_refs();
         }
         self.try_discard(key);
         Ok(())
@@ -1096,7 +1179,7 @@ impl SessionCore {
                     "reset does not keep the preamble",
                 ));
             }
-            if let Some(p) = r.preamble_size
+            if let Some(p) = r.preamble_size()
                 && reliable_size < p
             {
                 return Err(violation(
@@ -1128,14 +1211,18 @@ impl SessionCore {
             r.state = RecvState::ResetRecvd;
         }
         // Unread data at or beyond the Reliable Size is never delivered.
-        let dropped = r.drop_from(reliable_size.max(r.read_offset));
+        let dropped = r.drop_from(&mut self.receive, reliable_size.max(r.read_offset));
         if r.end_read || r.cold().stopped.is_some() {
             r.state = RecvState::ResetRead;
         }
         // Bytes at or above the Reliable Size that have not arrived never
         // will: their credit is released once, now, and data arriving later
         // releases none.
+        let previous_history = r.protected_history();
         let lost = r.credit_reset(reliable_size, final_size);
+        let protected_history = r.protected_history();
+        self.streams
+            .replace_protected_history(previous_history, protected_history);
         self.credit_received(0, 0, lost);
         self.credit_consumed(dropped);
         self.notify_readable(key);
@@ -1477,80 +1564,94 @@ impl SessionCore {
         Ok(())
     }
 
-    /// A received datagram's payload: a reference into the shared read
-    /// buffer of [`SessionCore::receive_shared`] from
-    /// [`super::recv_buf::REFERENCE_MIN`] bytes on, as STREAM data is kept,
-    /// otherwise a copy.
-    fn datagram_bytes(&self, payload: &[u8]) -> Bytes {
-        match &self.rx_src {
-            Some((src, _))
-                if payload.len() >= super::recv_buf::REFERENCE_MIN && {
-                    let (r, p) = (src.as_ptr_range(), payload.as_ptr_range());
-                    r.start <= p.start && p.end <= r.end
-                } =>
-            {
-                src.slice_ref(payload)
-            }
-            _ => Bytes::copy_from_slice(payload),
-        }
-    }
-
     pub(super) fn on_datagram(
         &mut self,
         d: crate::proto::frame::Datagram<'_>,
         ty: u64,
+        pipe: u64,
     ) -> Result<(), Error> {
-        self.stats.datagrams_received += 1;
-        if !self.features.datagram_flows {
-            let data = self.datagram_bytes(d.data);
-            self.datagram_arrived(None, data);
+        if !self.features.same_family {
+            self.dgram_mut().counters.received += 1;
+            let data = super::Chunk::copy_from_slice(d.data);
+            self.datagram_arrived(None, None, data);
             return Ok(());
         }
-        let (flow, payload) =
-            Flow::parse(d.data).map_err(|e| Error::new(e.code(), ty, e.reason()))?;
-        match flow {
+        let (sequence, encoded_flow) = d.sequence_data()?;
+        self.expire_waiting(self.now);
+        let fresh = self.datagram_sequence_fresh(sequence);
+        let checked = d
+            .flow_data(encoded_flow)
+            .and_then(|(flow, data)| Ok((flow, data, self.datagram_waits_for_open(flow, ty)?)));
+        if !fresh && checked.is_err() {
+            return Ok(());
+        }
+        let (flow, payload, waiting) = checked?;
+        let channel = if self.rx_channel {
+            crate::proto::frame::DatagramChannelKind::Native
+        } else {
+            crate::proto::frame::DatagramChannelKind::Record
+        };
+        self.note_datagram_arrival(pipe, channel, sequence, payload.len());
+        if !fresh {
+            return Ok(());
+        }
+        self.advance_datagram_sequence(sequence);
+        let sequence = Some(sequence);
+        let data = super::Chunk::copy_from_slice(payload);
+        let accepted = match flow {
             Flow::Session => {
-                let data = self.datagram_bytes(payload);
-                self.datagram_arrived(None, data);
-                Ok(())
+                self.dgram_mut().counters.received += 1;
+                self.datagram_arrived(None, sequence, data)
+            }
+            Flow::Stream { stream_id, context } if waiting => {
+                self.hold_datagram(stream_id, context, sequence, data)
             }
             Flow::Stream { stream_id, context } => {
-                let client = stream::client_initiated(stream_id);
-                let local = client == matches!(self.role, crate::proto::params::Role::Client);
-                let index = stream::index(stream_id);
-                if local {
-                    if index >= self.streams.local_dir(BIDI).next_index {
-                        return Err(violation(
-                            T::PROTOCOL_VIOLATION,
-                            ty,
-                            "datagram for an unopened local stream",
-                        ));
-                    }
-                } else if index >= self.streams.remote_dir(BIDI).limit_sent {
-                    return Err(violation(
-                        T::PROTOCOL_VIOLATION,
-                        ty,
-                        "datagram for a stream beyond the limit",
-                    ));
-                } else if index >= self.streams.remote_dir(BIDI).opened {
-                    // It overtook the stream's opening frame: held for at most one smoothed
-                    // RTT.
-                    // Counted as received once delivered.
-                    self.stats.datagrams_received -= 1;
-                    let data = self.datagram_bytes(payload);
-                    self.hold_datagram(stream_id, context, data);
-                    return Ok(());
-                }
-                let data = self.datagram_bytes(payload);
-                self.stream_datagram_arrived(stream_id, context, data);
-                Ok(())
+                self.dgram_mut().counters.received += 1;
+                self.stream_datagram_arrived(stream_id, context, sequence, data)
             }
+        };
+        self.occupy_datagram(sequence, accepted);
+        Ok(())
+    }
+
+    fn datagram_waits_for_open(&self, flow: Flow, ty: u64) -> Result<bool, Error> {
+        let Flow::Stream { stream_id, .. } = flow else {
+            return Ok(false);
+        };
+        let index = stream::index(stream_id);
+        let local = stream::client_initiated(stream_id)
+            == matches!(self.role, crate::proto::params::Role::Client);
+        if local {
+            if index >= self.streams.local_dir(BIDI).next_index {
+                return Err(violation(
+                    T::PROTOCOL_VIOLATION,
+                    ty,
+                    "datagram for an unopened local stream",
+                ));
+            }
+            return Ok(false);
         }
+        let remote = self.streams.remote_dir(BIDI);
+        if index >= remote.limit_sent {
+            return Err(violation(
+                T::PROTOCOL_VIOLATION,
+                ty,
+                "datagram for a stream beyond the limit",
+            ));
+        }
+        Ok(index >= remote.opened)
     }
 
     /// A datagram for the opened stream `stream_id`: to its queue when the
     /// stream is usable, else dropped and counted.
-    fn stream_datagram_arrived(&mut self, stream_id: u64, context: u64, data: Bytes) {
+    fn stream_datagram_arrived(
+        &mut self,
+        stream_id: u64,
+        context: u64,
+        sequence: Option<u64>,
+        data: super::Chunk,
+    ) -> bool {
         let key = self.streams.key_of(stream_id);
         let usable = key
             .and_then(|k| self.streams.get(k))
@@ -1560,9 +1661,12 @@ impl SessionCore {
                 if let Some(s) = self.streams.get_mut(k) {
                     s.datagrams_mut().counts.received += 1;
                 }
-                self.datagram_arrived(Some((k, context)), data);
+                self.datagram_arrived(Some((k, context)), sequence, data)
             }
-            _ => self.drop_received_datagram(key.map(|k| (k, context))),
+            _ => {
+                self.drop_received_datagram(key.map(|k| (k, context)));
+                false
+            }
         }
     }
 
@@ -1577,13 +1681,19 @@ impl SessionCore {
             return;
         };
         let n = q.queue.len() as u64;
-        let bytes = std::mem::take(&mut q.bytes);
+        let capacity = q
+            .queue
+            .iter()
+            .map(|packet| packet.data.backing_capacity())
+            .sum();
         q.queue.clear();
+        q.bytes = 0;
         q.codel.idle();
         q.counts.dropped_recv += n;
         if n > 0 {
-            super::debit(&mut self.dgram_mut().stream_bytes, bytes);
+            super::debit(&mut self.dgram_mut().stream_bytes, capacity);
             self.count_dropped(n);
+            self.refresh_stream_datagram_expiry(key);
         }
     }
 
@@ -1591,31 +1701,53 @@ impl SessionCore {
     /// and not opened yet, until it opens or one smoothed RTT passed; it
     /// counts in the session's datagram bytes, where the oldest held ones
     /// make room first.
-    fn hold_datagram(&mut self, stream_id: u64, context: u64, data: Bytes) {
+    fn hold_datagram(
+        &mut self,
+        stream_id: u64,
+        context: u64,
+        sequence: Option<u64>,
+        data: super::Chunk,
+    ) -> bool {
         let recv_bytes_cap = self.config.datagram_receive_bytes;
+        let hold_packets = self.config.datagram_config().hold_packets;
+        if hold_packets.is_some_and(|limit| self.dgram().waiting.len() >= limit) {
+            self.count_dropped(1);
+            return false;
+        }
         let cost = data.len() + super::WAITING_COST;
         self.trim_waiting(cost);
         let d = self.dgram_mut();
         if d.recv_bytes + d.held_bytes + cost > recv_bytes_cap {
             self.count_dropped(1);
-            return;
+            return false;
         }
         let channel = self.rx_channel;
-        let mut until = self.now + self.rtt_or_default();
+        let Some(until) = self
+            .now
+            .checked_add(
+                self.config
+                    .datagram_config()
+                    .hold_time
+                    .unwrap_or_else(|| self.rtt_or_default()),
+            )
+            .filter(|&until| until > self.now)
+        else {
+            self.count_dropped(1);
+            return false;
+        };
         let d = self.dgram_mut();
         d.recv_bytes += cost;
-        // Not past the one held before it: they expire in arrival order,
-        // so that the deadline and the expiry take the oldest only.
-        if let Some(last) = d.waiting.back() {
-            until = until.max(last.until);
-        }
-        d.waiting.push_back(super::WaitingDatagram {
-            stream_id,
-            context,
-            data,
+        d.waiting.push(
+            super::WaitingDatagram {
+                sequence,
+                stream_id,
+                context,
+                data,
+                channel,
+            },
             until,
-            channel,
-        });
+        );
+        true
     }
 
     /// Drops the oldest datagrams held for streams not opened yet until
@@ -1627,7 +1759,7 @@ impl SessionCore {
         while d.recv_bytes + d.held_bytes + len > recv_bytes_cap
             && let Some(old) = d.waiting.pop_front()
         {
-            super::debit(&mut d.recv_bytes, old.cost());
+            d.release_waiting_slot(&old);
             dropped += 1;
         }
         if dropped > 0 {
@@ -1638,39 +1770,30 @@ impl SessionCore {
     /// Delivers the datagrams held for peer streams that opened, in
     /// arrival order.
     fn release_waiting(&mut self) {
+        self.expire_waiting(self.now);
         let opened = self.streams.remote_dir(BIDI).opened;
         let Some(d) = self.dgram.as_deref_mut() else {
             return;
         };
-        if !d
+        let ready: Vec<_> = d
             .waiting
-            .iter()
-            .any(|w| stream::index(w.stream_id) < opened)
-        {
-            return;
-        }
-        let all = std::mem::take(&mut d.waiting);
-        let mut ready = Vec::new();
-        for w in all {
-            if stream::index(w.stream_id) < opened {
-                super::debit(&mut d.recv_bytes, w.cost());
-                ready.push(w);
-            } else {
-                d.waiting.push_back(w);
-            }
-        }
+            .take_opened(opened)
+            .inspect(|w| super::debit(&mut d.recv_bytes, w.cost()))
+            .collect();
         for w in ready {
-            self.stats.datagrams_received += 1;
+            self.dgram_mut().counters.received += 1;
             if w.channel {
-                self.stats.datagrams_received_channel += 1;
+                self.dgram_mut().counters.received_channel += 1;
             }
-            self.stream_datagram_arrived(w.stream_id, w.context, w.data);
+            if !self.stream_datagram_arrived(w.stream_id, w.context, w.sequence, w.data) {
+                self.occupy_datagram(w.sequence, false);
+            }
         }
     }
 
     /// When the first datagram held for a stream not opened yet expires.
     pub(super) fn waiting_deadline(&self) -> Option<Instant> {
-        self.dgram().waiting.front().map(|w| w.until)
+        self.dgram().waiting.deadline()
     }
 
     /// Drops the held datagrams whose stream did not open within one
@@ -1678,11 +1801,8 @@ impl SessionCore {
     pub(super) fn expire_waiting(&mut self, now: Instant) {
         let mut dropped = 0;
         if let Some(d) = self.dgram.as_deref_mut() {
-            while let Some(w) = d.waiting.front()
-                && w.until <= now
-            {
-                super::debit(&mut d.recv_bytes, w.cost());
-                d.waiting.pop_front();
+            while let Some(entry) = d.waiting.take_due(now) {
+                d.release_waiting_slot(&entry);
                 dropped += 1;
             }
         }
@@ -1698,14 +1818,18 @@ impl SessionCore {
     /// datagram held, whether waiting for the limiter
     /// or queued, counts in the session's datagram bytes: the oldest waiting ones make room, and
     /// one that still does not fit is dropped.
-    fn datagram_arrived(&mut self, stream: Option<(StreamKey, u64)>, data: Bytes) {
+    fn datagram_arrived(
+        &mut self,
+        stream: Option<(StreamKey, u64)>,
+        sequence: Option<u64>,
+        data: super::Chunk,
+    ) -> bool {
         let recv_bytes_cap = self.config.datagram_receive_bytes;
         if self.config.datagram_limiter.receive.is_none() {
             if stream.is_none() {
                 self.trim_waiting(data.len());
             }
-            let _ = self.queue_received_datagram(stream, data);
-            return;
+            return self.queue_received_datagram(stream, data);
         }
         self.trim_waiting(data.len());
         let len = data.len();
@@ -1716,6 +1840,7 @@ impl SessionCore {
                 && let Some(old) = d.held.pop_front()
             {
                 super::debit(&mut d.held_bytes, old.data.len());
+                super::datagram::occupy_window(&mut d.window, old.sequence, false);
                 dropped.push(old.stream);
             }
         }
@@ -1725,14 +1850,16 @@ impl SessionCore {
         let d = self.dgram_mut();
         if d.held_bytes + d.recv_bytes + len > recv_bytes_cap {
             self.drop_received_datagram(stream);
-            return;
+            return false;
         }
-        self.dgram_mut().held_bytes += data.len();
-        self.dgram_mut().held.push_back(super::ReceivedDatagram {
+        d.held_bytes += data.len();
+        d.held.push_back(super::ReceivedDatagram {
+            sequence,
             stream,
             data,
             granted: None,
         });
+        true
     }
 
     /// Queues a received datagram for the application; `false` when the
@@ -1740,11 +1867,18 @@ impl SessionCore {
     pub(super) fn queue_received_datagram(
         &mut self,
         stream: Option<(StreamKey, u64)>,
-        data: Bytes,
+        data: super::Chunk,
     ) -> bool {
         match stream {
-            None => self.queue_session_datagram(data),
-            Some((key, context)) => self.queue_stream_datagram(key, context, data),
+            None => self.queue_session_datagram(data.into_bytes()),
+            Some((key, context)) => {
+                let expires = self
+                    .config
+                    .datagram_config()
+                    .receive_lifetime
+                    .and_then(|lifetime| self.now.checked_add(lifetime));
+                self.queue_stream_datagram(key, context, data, expires)
+            }
         }
     }
 
@@ -1791,13 +1925,19 @@ impl SessionCore {
 
     /// Queues a stream datagram within the stream's own two bounds, the
     /// count ([`Config::datagram_stream_queue`]) and the bytes
-    /// ([`Config::datagram_stream_bytes`]): the stream's oldest datagrams
+    /// ([`super::DatagramConfig::stream_receive_bytes`]): the stream's oldest datagrams
     /// make room until both hold, each counted as dropped; one larger than
     /// the bytes alone is kept alone. Stream queues do not count in the
     /// session's datagram bytes. `false` when the stream is gone.
-    fn queue_stream_datagram(&mut self, key: StreamKey, context: u64, data: Bytes) -> bool {
+    pub(super) fn queue_stream_datagram(
+        &mut self,
+        key: StreamKey,
+        context: u64,
+        data: super::Chunk,
+        expires: Option<Instant>,
+    ) -> bool {
         let stream_queue = self.config.datagram_stream_queue;
-        let stream_bytes = self.config.datagram_stream_bytes;
+        let stream_bytes = self.config.datagram_config().stream_receive_bytes;
         let now = self.now;
         let mut dropped = 0;
         let len = data.len();
@@ -1806,20 +1946,30 @@ impl SessionCore {
         };
         let s = s.datagrams_mut();
         let dgram = self.dgram.get_or_insert_with(Box::default);
+        let mut refresh_expiry = expires.is_some();
         while (s.queue.len() >= stream_queue || stream_bytes.is_some_and(|cap| s.bytes + len > cap))
-            && let Some((_, old, _)) = s.queue.pop_front()
+            && let Some(old) = s.queue.pop_front()
         {
-            super::debit(&mut s.bytes, old.len());
-            super::debit(&mut dgram.stream_bytes, old.len());
+            super::debit(&mut s.bytes, old.data.len());
+            super::debit(&mut dgram.stream_bytes, old.data.backing_capacity());
+            refresh_expiry |= old.expires.is_some();
             dropped += 1;
         }
         s.counts.dropped_recv += dropped;
         let was_empty = s.queue.is_empty();
-        s.queue.push_back((context, data, now));
+        dgram.stream_bytes += data.backing_capacity();
+        s.queue.push_back(stream::QueuedStreamDatagram {
+            context,
+            data,
+            at: now,
+            expires,
+        });
         s.bytes += len;
-        dgram.stream_bytes += len;
         if dropped > 0 {
             self.count_dropped(dropped);
+        }
+        if refresh_expiry {
+            self.refresh_stream_datagram_expiry(key);
         }
         if was_empty {
             self.events.push_back(CoreEvent::StreamDatagram(key));
@@ -1827,8 +1977,60 @@ impl SessionCore {
         true
     }
 
+    pub(super) fn refresh_stream_datagram_expiry(&mut self, key: StreamKey) {
+        let Some(queue) = self.streams.get_mut(key).and_then(|s| s.datagrams.as_mut()) else {
+            return;
+        };
+        let next = queue.queue.iter().filter_map(|packet| packet.expires).min();
+        let previous = std::mem::replace(&mut queue.expiry, next);
+        if previous == next {
+            return;
+        }
+        let index = &mut self.dgram_mut().stream_expiry;
+        if let Some(at) = previous {
+            index.remove(&(at, key));
+        }
+        if let Some(at) = next {
+            index.insert((at, key));
+        }
+    }
+
+    pub(super) fn expire_stream_datagrams(&mut self, now: Instant) {
+        while let Some(&(at, key)) = self
+            .dgram()
+            .stream_expiry
+            .first()
+            .filter(|(at, _)| *at <= now)
+        {
+            self.dgram_mut().stream_expiry.remove(&(at, key));
+            let Some(queue) = self.streams.get_mut(key).and_then(|s| s.datagrams.as_mut()) else {
+                continue;
+            };
+            queue.expiry = None;
+            let mut capacity = 0;
+            let before = queue.queue.len();
+            queue.queue.retain(|packet| {
+                if packet.expires.is_some_and(|at| at <= now) {
+                    queue.bytes -= packet.data.len();
+                    capacity += packet.data.backing_capacity();
+                    return false;
+                }
+                true
+            });
+            let expired = (before - queue.queue.len()) as u64;
+            queue.counts.dropped_recv += expired;
+            queue.counts.expired_recv += expired;
+            if queue.queue.is_empty() {
+                queue.codel.idle();
+            }
+            super::debit(&mut self.dgram_mut().stream_bytes, capacity);
+            self.count_dropped(expired);
+            self.refresh_stream_datagram_expiry(key);
+        }
+    }
+
     pub(super) fn count_dropped(&mut self, n: u64) {
-        self.stats.datagrams_dropped_recv += n;
+        self.dgram_mut().counters.dropped_recv += n;
         if let Some(CoreEvent::DatagramsDropped { count }) = self
             .events
             .iter_mut()

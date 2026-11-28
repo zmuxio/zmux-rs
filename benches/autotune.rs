@@ -225,7 +225,7 @@ async fn run(sc: &Scenario) {
     // Writers: the first byte names the stream.
     for s in 0..sc.streams {
         let (mut w, r) = client.open_bi().await.unwrap();
-        let chunk = bytes::Bytes::from(vec![s as u8; 64 * 1024]);
+        let chunk = zmux::Chunk::from(vec![s as u8; 64 * 1024]);
         tokio::spawn(async move {
             let _keep = r;
             while w.write_chunk(chunk.clone()).await.is_ok() {}

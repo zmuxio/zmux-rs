@@ -73,7 +73,7 @@ impl Recording {
 
 fn config(shaper: Option<Arc<Recording>>) -> Config {
     let mut c = Config::default();
-    c.max_pipes = 4;
+    c.session_policy.limits.steady_attachments = 4;
     c.pipe_auth = PipeAuth::psk(*b"carrier-kind-psk-0123456789abcde").with_end_to_end();
     c.shaper = shaper.map(|s| s as Arc<dyn Factory>);
     c
@@ -158,7 +158,7 @@ async fn kinds_reach_the_factories_of_both_ends() {
     );
 
     let joined = client
-        .begin_add_pipe(
+        .test_begin_join(
             PipeIo::from_tcp(TcpStream::connect(quic).await.unwrap())
                 .with_carrier(CarrierKind::Quic),
             PipeOptions::new(),

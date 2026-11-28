@@ -262,7 +262,10 @@ impl quic::RecvStream for RecvStream {
 }
 
 /// The sending half of a request, also used by a host fallback.
-pub struct SendStream<B: Buf>(Sender<B>);
+pub struct SendStream<B: Buf> {
+    sender: Sender<B>,
+    ended: bool,
+}
 
 enum Sender<B: Buf> {
     H3(h3_quinn::SendStream<B>),
@@ -271,7 +274,14 @@ enum Sender<B: Buf> {
 
 impl<B: Buf> SendStream<B> {
     fn h3(s: h3_quinn::SendStream<B>) -> Self {
-        Self(Sender::H3(s))
+        Self::new(Sender::H3(s))
+    }
+
+    fn new(sender: Sender<B>) -> Self {
+        Self {
+            sender,
+            ended: false,
+        }
     }
 }
 
@@ -299,7 +309,7 @@ fn poll_bytes(
 
 impl<B: Buf> quic::SendStream<B> for SendStream<B> {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-        match &mut self.0 {
+        match &mut self.sender {
             Sender::H3(s) => s.poll_ready(cx),
             Sender::Request(s, pending) => {
                 if let Some(buf) = pending {
@@ -313,7 +323,7 @@ impl<B: Buf> quic::SendStream<B> for SendStream<B> {
         }
     }
     fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
-        match &mut self.0 {
+        match &mut self.sender {
             Sender::H3(s) => s.send_data(data),
             Sender::Request(_, slot @ None) => {
                 *slot = Some(data.into());
@@ -327,16 +337,24 @@ impl<B: Buf> quic::SendStream<B> for SendStream<B> {
         }
     }
     fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
-        match &mut self.0 {
+        std::task::ready!(self.poll_ready(cx))?;
+        let result = match &mut self.sender {
             Sender::H3(s) => s.poll_finish(cx),
             Sender::Request(s, _) => Poll::Ready(
                 s.finish()
                     .map_err(|e| StreamErrorIncoming::Unknown(Box::new(e))),
             ),
+        };
+        if matches!(result, Poll::Ready(Ok(()))) {
+            self.ended = true;
         }
+        result
     }
     fn reset(&mut self, code: u64) {
-        match &mut self.0 {
+        if std::mem::replace(&mut self.ended, true) {
+            return;
+        }
+        match &mut self.sender {
             Sender::H3(s) => s.reset(code),
             Sender::Request(s, _) => {
                 let _ = s.reset(quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::MAX));
@@ -344,10 +362,16 @@ impl<B: Buf> quic::SendStream<B> for SendStream<B> {
         }
     }
     fn send_id(&self) -> StreamId {
-        match &self.0 {
+        match &self.sender {
             Sender::H3(s) => s.send_id(),
             Sender::Request(s, _) => u64::from(s.id()).try_into().expect("QUIC stream ID"),
         }
+    }
+}
+
+impl<B: Buf> Drop for SendStream<B> {
+    fn drop(&mut self) {
+        quic::SendStream::<B>::reset(self, super::carrier_failed().value());
     }
 }
 
@@ -357,7 +381,7 @@ impl<B: Buf> quic::SendStreamUnframed<B> for SendStream<B> {
         cx: &mut Context<'_>,
         buf: &mut D,
     ) -> Poll<Result<usize, StreamErrorIncoming>> {
-        match &mut self.0 {
+        match &mut self.sender {
             Sender::H3(s) => s.poll_send(cx, buf),
             Sender::Request(s, _) => poll_bytes(s, cx, buf),
         }
@@ -441,7 +465,10 @@ impl<B: Buf> quic::SendStreamUnframed<B> for BidiStream<B> {
 }
 
 /// h3-quinn's connection with bounded receiving halves.
-pub(crate) struct Connection(h3_quinn::Connection, Option<Incoming>);
+pub(crate) struct Connection {
+    streams: BoundedOpen<h3_quinn::Connection>,
+    incoming: Option<Incoming>,
+}
 
 pub(crate) type Stopped = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
 
@@ -481,18 +508,27 @@ struct Incoming {
 
 impl Connection {
     pub(crate) fn serving(conn: quinn::Connection, stop: RequestStop) -> Self {
-        Self(
-            h3_quinn::Connection::new(conn.clone()),
-            Some(Incoming {
+        Self {
+            streams: BoundedOpen {
+                inner: h3_quinn::Connection::new(conn.clone()),
+                owns_close: true,
+            },
+            incoming: Some(Incoming {
                 conn,
                 accept: None,
                 stop,
             }),
-        )
+        }
     }
 
-    pub(crate) fn new(conn: quinn::Connection) -> Self {
-        Self(h3_quinn::Connection::new(conn), None)
+    pub(crate) fn new(conn: quinn::Connection, owns_close: bool) -> Self {
+        Self {
+            streams: BoundedOpen {
+                inner: h3_quinn::Connection::new(conn),
+                owns_close,
+            },
+            incoming: None,
+        }
     }
 }
 
@@ -504,15 +540,16 @@ impl<B: Buf> quic::Connection<B> for Connection {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
-        quic::Connection::<B>::poll_accept_recv(&mut self.0, cx).map_ok(RecvStream::unidirectional)
+        quic::Connection::<B>::poll_accept_recv(&mut self.streams.inner, cx)
+            .map_ok(RecvStream::unidirectional)
     }
 
     fn poll_accept_bidi(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
-        let Some(incoming) = &mut self.1 else {
-            return quic::Connection::<B>::poll_accept_bidi(&mut self.0, cx)
+        let Some(incoming) = &mut self.incoming else {
+            return quic::Connection::<B>::poll_accept_bidi(&mut self.streams.inner, cx)
                 .map_ok(BidiStream::new);
         };
         let accept = incoming.accept.get_or_insert_with(|| {
@@ -554,7 +591,7 @@ impl<B: Buf> quic::Connection<B> for Connection {
             .unwrap_or_else(PoisonError::into_inner) =
             Some((Box::pin(cancel), fallback_stop.clone()));
         Poll::Ready(Ok(BidiStream {
-            send: SendStream(Sender::Request(send, None)),
+            send: SendStream::new(Sender::Request(send, None)),
             recv: RecvStream {
                 inner: Receiver::Request(body, id),
                 scan: Scan::varint(Part::FrameType),
@@ -565,7 +602,10 @@ impl<B: Buf> quic::Connection<B> for Connection {
     }
 
     fn opener(&self) -> Self::OpenStreams {
-        OpenStreams(quic::Connection::<B>::opener(&self.0))
+        BoundedOpen {
+            inner: quic::Connection::<B>::opener(&self.streams.inner),
+            owns_close: self.streams.owns_close,
+        }
     }
 }
 
@@ -577,32 +617,45 @@ impl<B: Buf> quic::OpenStreams<B> for Connection {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-        quic::OpenStreams::<B>::poll_open_bidi(&mut self.0, cx).map_ok(BidiStream::new)
+        self.streams.poll_open_bidi(cx)
     }
 
     fn poll_open_send(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
-        quic::OpenStreams::<B>::poll_open_send(&mut self.0, cx)
+        self.streams.poll_open_send(cx)
     }
 
     fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
-        quic::OpenStreams::<B>::close(&mut self.0, code, reason);
+        quic::OpenStreams::<B>::close(&mut self.streams, code, reason);
     }
 }
 
 /// h3-quinn's stream opener with bounded receiving halves.
 #[derive(Clone)]
-pub(crate) struct OpenStreams(h3_quinn::OpenStreams);
+pub(crate) struct BoundedOpen<T> {
+    inner: T,
+    owns_close: bool,
+}
 
-impl std::fmt::Debug for OpenStreams {
+pub(crate) type OpenStreams = BoundedOpen<h3_quinn::OpenStreams>;
+
+impl<T> std::fmt::Debug for BoundedOpen<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenStreams").finish_non_exhaustive()
     }
 }
 
-impl<B: Buf> quic::OpenStreams<B> for OpenStreams {
+impl<B, T> quic::OpenStreams<B> for BoundedOpen<T>
+where
+    B: Buf,
+    T: quic::OpenStreams<
+            B,
+            BidiStream = h3_quinn::BidiStream<B>,
+            SendStream = h3_quinn::SendStream<B>,
+        >,
+{
     type BidiStream = BidiStream<B>;
     type SendStream = h3_quinn::SendStream<B>;
 
@@ -610,18 +663,20 @@ impl<B: Buf> quic::OpenStreams<B> for OpenStreams {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-        quic::OpenStreams::<B>::poll_open_bidi(&mut self.0, cx).map_ok(BidiStream::new)
+        quic::OpenStreams::<B>::poll_open_bidi(&mut self.inner, cx).map_ok(BidiStream::new)
     }
 
     fn poll_open_send(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
-        quic::OpenStreams::<B>::poll_open_send(&mut self.0, cx)
+        quic::OpenStreams::<B>::poll_open_send(&mut self.inner, cx)
     }
 
     fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
-        quic::OpenStreams::<B>::close(&mut self.0, code, reason);
+        if self.owns_close {
+            quic::OpenStreams::<B>::close(&mut self.inner, code, reason);
+        }
     }
 }
 

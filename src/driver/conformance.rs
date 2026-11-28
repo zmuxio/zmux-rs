@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
+use crate::Chunk;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::tokio::{PipeIo, Reader, Writer};
@@ -65,7 +65,7 @@ impl Halves {
 
 /// One write call of what is left of `chunk`: its bytes taken, as a
 /// [`ChunkWrite`](super::tokio::ChunkWrite) or an `AsyncWrite` takes them.
-fn poll_write(w: &mut Writer, cx: &mut Context<'_>, chunk: &mut Bytes) -> Poll<io::Result<usize>> {
+fn poll_write(w: &mut Writer, cx: &mut Context<'_>, chunk: &mut Chunk) -> Poll<io::Result<usize>> {
     match w {
         Writer::Chunks(w) => w
             .as_mut()
@@ -79,7 +79,7 @@ fn poll_write(w: &mut Writer, cx: &mut Context<'_>, chunk: &mut Bytes) -> Poll<i
 fn poll_slice(
     w: Pin<&mut (impl AsyncWrite + ?Sized)>,
     cx: &mut Context<'_>,
-    chunk: &mut Bytes,
+    chunk: &mut Chunk,
 ) -> Poll<io::Result<usize>> {
     let r = w.poll_write(cx, chunk);
     if let Poll::Ready(Ok(n)) = r {
@@ -94,13 +94,13 @@ fn pattern(at: usize) -> u8 {
     (at % 251) as u8
 }
 
-fn chunk_at(at: usize) -> Bytes {
+fn chunk_at(at: usize) -> Chunk {
     (at..at + CHUNK).map(pattern).collect::<Vec<_>>().into()
 }
 
 /// Writes `chunk` to its end, retrying each `Pending` with the same chunk;
 /// `Err` or `Ok(0)` ends it with the error.
-async fn write_all(w: &mut Writer, mut chunk: Bytes) -> io::Result<()> {
+async fn write_all(w: &mut Writer, mut chunk: Chunk) -> io::Result<()> {
     while !chunk.is_empty() {
         let n = poll_fn(|cx| poll_write(w, cx, &mut chunk)).await?;
         if n == 0 {

@@ -44,6 +44,9 @@ body cancels it with the transport's STOP_SENDING(0). A request or
 connection that fails under a pipe is a failure of the pipe. At most one
 body write is in flight at a time.
 
+When using `Carrier::new` or `serve_connection`, pass the established QUIC
+connection's configured receive window with `LaneWindows::with_established_receive_window`.
+
 ```rust,no_run
 # async fn example(endpoint: quinn::Endpoint) -> Result<(), Box<dyn std::error::Error>> {
 let uri: http::Uri = "https://example.com/zmux".parse()?;

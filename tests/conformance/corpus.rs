@@ -6,7 +6,9 @@
     reason = "test and bench values are small and bounded; checked conversions would only add noise"
 )]
 
-use serde_json::Value;
+use serde_json::{Value, json};
+use zmux::proto::frame::{Datagram, channel};
+use zmux::proto::payload::Flow;
 use zmux::proto::record::{Event, Framing, RecordReader};
 use zmux::proto::{Error, Frame, Gates};
 
@@ -17,10 +19,14 @@ use crate::wire::{self, json_subset, no_placeholders, normalise};
 /// The gates of a corpus entry (the `gates` list of parameter names).
 pub fn gates_of(entry: &Value) -> Gates {
     let mut g = Gates::NONE;
+    let mut same_family = false;
     for name in entry["gates"].as_array().expect("gates") {
         match name.as_str().expect("gate name") {
             "reset_stream_at" => g.reset_stream_at = true,
             "max_datagram_frame_size" => g.max_datagram_frame_size = u64::MAX,
+            "zmux_datagram_family" => same_family = true,
+            // The channel codec handles these independently of record gates.
+            "zmux_carrier_datagrams" | "zmux_carrier_datagram_padding" => (),
             "zmux_goaway" => g.goaway = true,
             "zmux_priority" => g.priority = true,
             "zmux_multipath" => g.multipath = true,
@@ -36,6 +42,7 @@ pub fn gates_of(entry: &Value) -> Gates {
     {
         g.max_datagram_frame_size = m.as_u64().expect("limit");
     }
+    g.datagram_ack = same_family && g.max_datagram_frame_size > 0;
     g
 }
 
@@ -118,10 +125,49 @@ fn check_record_lists(id: &str, expected: &[Value], got: &[Vec<Value>]) {
     }
 }
 
+fn channel_input(entry: &Value) -> Vec<u8> {
+    let mut input = hex(entry["hex"].as_str().unwrap());
+    if let Some(fill) = entry.get("zero_fill") {
+        let offset = usize::try_from(fill["offset"].as_u64().unwrap()).unwrap();
+        let count = usize::try_from(fill["count"].as_u64().unwrap()).unwrap();
+        input.splice(offset..offset, std::iter::repeat_n(0, count));
+    }
+    input
+}
+
+fn decode_channel<'a>(
+    entry: &Value,
+    input: &'a [u8],
+    gates: Gates,
+) -> Result<(Datagram<'a>, usize, Value), Error> {
+    let id = entry["id"].as_str().unwrap();
+    let frame = if let Some(expected) = entry["pipe_stream_id"].as_u64() {
+        let (observed, frame) = channel::split(input).unwrap();
+        assert_eq!(observed, expected, "{id}: routing prefix");
+        frame
+    } else {
+        input
+    };
+    let padding = entry["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|gate| gate == "zmux_carrier_datagram_padding");
+    let datagram = channel::decode_frame(frame, &gates, padding)?;
+    let (sequence, flow, data) = datagram.sequenced()?;
+    let mut decoded = json!({"sequence": sequence, "data": to_hex(data)});
+    if let Flow::Stream { stream_id, context } = flow {
+        decoded["stream"] = json!(stream_id);
+        decoded["context"] = json!(context);
+    }
+    let padding_bytes = frame.len() - channel::datagram_len(None, datagram.data.len());
+    Ok((datagram, padding_bytes, decoded))
+}
+
 #[test]
 fn valid_cases_round_trip() {
     let entries = read_ndjson("wire/valid.ndjson");
-    let mut counts = [0usize; 3];
+    let mut counts = [0usize; 4];
     for e in &entries {
         let id = e["id"].as_str().unwrap();
         let gates = gates_of(e);
@@ -213,15 +259,30 @@ fn valid_cases_round_trip() {
                 }
                 counts[2] += 1;
             }
+            "channel_datagram" => {
+                let input = channel_input(e);
+                let (datagram, padding, data) = decode_channel(e, &input, gates)
+                    .unwrap_or_else(|error| panic!("{id}: rejected: {error}"));
+                assert_eq!(json!(padding), e["padding"], "{id}: padding");
+                json_subset(
+                    &e["frame"],
+                    &wire::frame_json(&Frame::Datagram(datagram)),
+                    id,
+                )
+                .unwrap();
+                assert_eq!(data, e["datagram_data"], "{id}: datagram data");
+                counts[3] += 1;
+            }
             other => panic!("{id}: unknown kind {other}"),
         }
     }
     eprintln!(
-        "valid corpus: {} cases ({} frames, {} records, {} message sets)",
+        "valid corpus: {} cases ({} frames, {} records, {} message sets, {} channel datagrams)",
         entries.len(),
         counts[0],
         counts[1],
-        counts[2]
+        counts[2],
+        counts[3]
     );
     assert_eq!(counts.iter().sum::<usize>(), entries.len());
 }
@@ -255,6 +316,10 @@ fn invalid_cases_fail_with_their_error() {
                     .map(|m| hex(m.as_str().unwrap()))
                     .collect();
                 vec![read_messages(&messages, max_record_size(e), gates).expect_err(id)]
+            }
+            "channel_datagram" => {
+                let input = channel_input(e);
+                vec![decode_channel(e, &input, gates).expect_err(id)]
             }
             other => panic!("{id}: unknown kind {other}"),
         };

@@ -234,6 +234,20 @@ pub(crate) async fn ask(predicate: &WindowIncrease, delta: u64, logger: Option<&
         })
 }
 
+fn wait_for_decision<T>(
+    decision: crate::proto::Decision<T>,
+    stop: impl Future<Output = ()>,
+) -> Result<T, impl Future<Output = Option<T>>> {
+    match decision {
+        crate::proto::Decision::Now(value) => Ok(value),
+        crate::proto::Decision::Later(future) => Err(async move {
+            first(stop, crate::proto::decision::host_future(|| future))
+                .await
+                .flatten()
+        }),
+    }
+}
+
 /// A host decision, awaited until `deadline` (`None`: unbounded) or until
 /// `stop` (its caller ended: the listener closed, the carrier was evicted,
 /// the session ended), whichever comes first; `None` when it panicked,
@@ -242,40 +256,29 @@ pub(crate) async fn ask(predicate: &WindowIncrease, delta: u64, logger: Option<&
 #[cfg(feature = "tokio")]
 pub(crate) async fn settle_by<T>(
     decision: crate::proto::Decision<T>,
+    clock: &crate::ClockDomain,
     deadline: Option<std::time::Instant>,
     stop: impl Future<Output = ()>,
 ) -> Option<T> {
-    match decision {
-        crate::proto::Decision::Now(v) => Some(v),
-        later @ crate::proto::Decision::Later(_) => {
-            let settled = first(stop, later.settle());
-            match deadline {
-                Some(at) => tokio::time::timeout_at(at.into(), settled)
-                    .await
-                    .ok()
-                    .flatten()
-                    .flatten(),
-                None => settled.await.flatten(),
-            }
-        }
+    match wait_for_decision(decision, stop) {
+        Ok(value) => Some(value),
+        Err(settled) => super::deadline::timeout(clock, deadline, settled)
+            .await
+            .flatten(),
     }
 }
 
-/// [`settle_by`] on a thread of the std driver: the thread parks while it
-/// waits.
+/// Settles a host decision on a thread of the std driver, parking it while it waits.
 #[cfg(feature = "blocking")]
 pub(crate) fn settle_blocking<T>(
     decision: crate::proto::Decision<T>,
+    clock: &crate::ClockDomain,
     deadline: Option<std::time::Instant>,
     stop: impl Future<Output = ()>,
 ) -> Option<T> {
-    match decision {
-        crate::proto::Decision::Now(v) => Some(v),
-        later @ crate::proto::Decision::Later(_) => {
-            super::blocking::run(first(stop, later.settle()), deadline)
-                .flatten()
-                .flatten()
-        }
+    match wait_for_decision(decision, stop) {
+        Ok(value) => Some(value),
+        Err(settled) => super::blocking::wait_in_domain(clock, deadline, settled).flatten(),
     }
 }
 

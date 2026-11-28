@@ -325,21 +325,44 @@ pub enum ShareOverride {
     InPayload,
 }
 
-/// Appends the key share item of `group` and `share`: its type is above every other type a
-/// Hello or a Reply knows.
-fn push_key_share(payload: &[u8], group: u64, share: &[u8]) -> Vec<u8> {
-    let mut value = Vec::with_capacity(share.len() + 8);
-    put_varint(&mut value, group);
-    value.extend_from_slice(share);
-    push_item(payload, &value)
-}
-
-fn push_item(payload: &[u8], value: &[u8]) -> Vec<u8> {
-    let mut out = payload.to_vec();
-    put_varint(&mut out, KEY_SHARE_ITEM);
-    put_varint(&mut out, value.len() as u64);
-    out.extend_from_slice(value);
-    out
+/// Builds and validates the payload for either outgoing Join message.
+fn outgoing_payload(
+    given: &[u8],
+    group: u64,
+    share: &[u8],
+    #[cfg(feature = "test-hooks")] override_share: Option<ShareOverride>,
+    known: &[u64],
+    required: u64,
+) -> Result<Payload, Error> {
+    let append_share = || {
+        let value_len = crate::proto::varint::len(group) + share.len();
+        let mut out = Vec::with_capacity(given.len() + 8 + value_len);
+        out.extend_from_slice(given);
+        put_varint(&mut out, KEY_SHARE_ITEM);
+        put_varint(&mut out, value_len as u64);
+        put_varint(&mut out, group);
+        out.extend_from_slice(share);
+        out
+    };
+    #[cfg(feature = "test-hooks")]
+    let bytes = match override_share {
+        None => append_share(),
+        Some(ShareOverride::Missing | ShareOverride::InPayload) => given.to_vec(),
+        Some(ShareOverride::Value(value)) => {
+            let mut out = given.to_vec();
+            put_varint(&mut out, KEY_SHARE_ITEM);
+            put_varint(&mut out, value.len() as u64);
+            out.extend_from_slice(&value);
+            out
+        }
+    };
+    #[cfg(not(feature = "test-hooks"))]
+    let bytes = append_share();
+    let parsed = Payload::validate(bytes, known)?;
+    if !parsed.has(required) {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(parsed)
 }
 
 /// The key share of a received payload: `missing_field` when absent; `bad_field` when its
@@ -465,7 +488,11 @@ impl Joiner {
     /// which must hold the join pipe.
     pub fn write_hello(self, payload: &[u8]) -> Result<(Vec<u8>, HelloSent), Error> {
         Payload::check_outgoing(payload, JOIN_HELLO_KNOWN)?;
-        self.write_hello_payload(payload, None)
+        self.write_hello_payload(
+            payload,
+            #[cfg(feature = "test-hooks")]
+            None,
+        )
     }
 
     /// As [`Joiner::write_hello`], also with items of types a sender does
@@ -493,40 +520,22 @@ impl Joiner {
         self.group.initiate()
     }
 
-    #[cfg_attr(
-        not(feature = "test-hooks"),
-        allow(
-            clippy::needless_pass_by_value,
-            reason = "`share` is used only with the test hooks"
-        )
-    )]
     fn write_hello_payload(
         self,
         payload: &[u8],
-        #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] share: Option<
-            ShareOverride,
-        >,
+        #[cfg(feature = "test-hooks")] share: Option<ShareOverride>,
     ) -> Result<(Vec<u8>, HelloSent), Error> {
         let (own_share, kex) = self.initiate()?;
-        #[cfg(feature = "test-hooks")]
-        let given = payload;
-        let payload = push_key_share(payload, self.group.value(), &own_share);
-        #[cfg(feature = "test-hooks")]
-        let payload = match share {
-            None => payload,
-            Some(ShareOverride::InPayload) => given.to_vec(),
-            Some(ShareOverride::Missing) => {
-                payload[..payload.len() - item_len(&own_share, self.group)].to_vec()
-            }
-            Some(ShareOverride::Value(v)) => {
-                let head = &payload[..payload.len() - item_len(&own_share, self.group)];
-                push_item(head, &v)
-            }
-        };
-        let parsed = Payload::validate(payload.clone(), JOIN_HELLO_KNOWN)?;
-        if !parsed.has(JOIN_HELLO_REQUIRED) {
-            return Err(Error::InvalidConfig);
-        }
+        let payload = outgoing_payload(
+            payload,
+            self.group.value(),
+            &own_share,
+            #[cfg(feature = "test-hooks")]
+            share,
+            JOIN_HELLO_KNOWN,
+            JOIN_HELLO_REQUIRED,
+        )?;
+        let payload = payload.as_bytes();
         let suite = self.suite;
         let (attempt, random) = match self.fixed_random {
             Some(fixed) => fixed,
@@ -541,11 +550,11 @@ impl Joiner {
         )]
         wire.push(self.locator.len() as u8);
         wire.extend_from_slice(&self.locator);
-        let r = join_r(suite, &self.psk, attempt, &random, &wire, &payload);
+        let r = join_r(suite, &self.psk, attempt, &random, &wire, payload);
         wire.extend_from_slice(&r);
         let th = transcript_start(suite, &wire, &self.binding);
         let k0 = expand_labeled(suite, &self.psk, b"hello", &th, suite.cipher.key_len());
-        let ciphertext = suite.cipher.seal(&k0, 0, b"", &payload)?;
+        let ciphertext = suite.cipher.seal(&k0, 0, b"", payload)?;
         frame(self.framing, &mut wire, &ciphertext)?;
         let next = HelloSent {
             suite,
@@ -560,18 +569,6 @@ impl Joiner {
         };
         Ok((wire, next))
     }
-}
-
-/// The encoded length of a key share item.
-#[cfg(feature = "test-hooks")]
-fn item_len(share: &[u8], group: &Group) -> usize {
-    let mut value = Vec::new();
-    put_varint(&mut value, group.value());
-    let len = value.len() + share.len();
-    let mut head = Vec::new();
-    put_varint(&mut head, KEY_SHARE_ITEM);
-    put_varint(&mut head, len as u64);
-    head.len() + len
 }
 
 /// The encoded length of the key share item of `group` for a role: what a message of that
@@ -995,7 +992,13 @@ impl Unconfirmed {
     pub fn write_reply(self, payload: &[u8]) -> Result<(Vec<u8>, AwaitConfirm), Error> {
         Payload::check_outgoing(payload, JOIN_REPLY_KNOWN)?;
         let (attempt, random) = fresh_random(self.suite)?;
-        self.reply_with(payload, attempt, &random, None)
+        self.reply_with(
+            payload,
+            attempt,
+            &random,
+            #[cfg(feature = "test-hooks")]
+            None,
+        )
     }
 
     /// As [`Unconfirmed::write_reply`] with a fixed attempt and random bytes, for the
@@ -1026,47 +1029,29 @@ impl Unconfirmed {
         self.group.respond(&self.share)
     }
 
-    #[cfg_attr(
-        not(feature = "test-hooks"),
-        allow(
-            clippy::needless_pass_by_value,
-            reason = "`share` is used only with the test hooks"
-        )
-    )]
     fn reply_with(
         self,
         payload: &[u8],
         attempt: u64,
         random: &[u8],
-        #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] share: Option<
-            ShareOverride,
-        >,
+        #[cfg(feature = "test-hooks")] share: Option<ShareOverride>,
     ) -> Result<(Vec<u8>, AwaitConfirm), Error> {
         let (own_share, secrets) = self.respond()?;
-        #[cfg(feature = "test-hooks")]
-        let given = payload;
-        let payload = push_key_share(payload, self.group.value(), &own_share);
-        #[cfg(feature = "test-hooks")]
-        let payload = match share {
-            None => payload,
-            Some(ShareOverride::InPayload) => given.to_vec(),
-            Some(ShareOverride::Missing) => {
-                payload[..payload.len() - item_len(&own_share, self.group)].to_vec()
-            }
-            Some(ShareOverride::Value(v)) => {
-                let head = &payload[..payload.len() - item_len(&own_share, self.group)];
-                push_item(head, &v)
-            }
-        };
-        let parsed = Payload::validate(payload.clone(), JOIN_REPLY_KNOWN)?;
-        if !parsed.has(JOIN_REPLY_REQUIRED) {
-            return Err(Error::InvalidConfig);
-        }
+        let payload = outgoing_payload(
+            payload,
+            self.group.value(),
+            &own_share,
+            #[cfg(feature = "test-hooks")]
+            share,
+            JOIN_REPLY_KNOWN,
+            JOIN_REPLY_REQUIRED,
+        )?;
+        let payload = payload.as_bytes();
         let suite = self.suite;
-        let r = join_r(suite, &self.psk, attempt, random, &[REPLY_TYPE], &payload);
+        let r = join_r(suite, &self.psk, attempt, random, &[REPLY_TYPE], payload);
         let th2 = suite.hash.hash(&[&self.th, &self.hello_ct, &r]);
         let k1 = expand_labeled(suite, &self.psk, b"reply", &th2, suite.cipher.key_len());
-        let ciphertext = suite.cipher.seal(&k1, 0, b"", &payload)?;
+        let ciphertext = suite.cipher.seal(&k1, 0, b"", payload)?;
         let mut wire = vec![REPLY_TYPE];
         wire.extend_from_slice(&r);
         frame(self.framing, &mut wire, &ciphertext)?;

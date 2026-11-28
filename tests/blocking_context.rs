@@ -97,7 +97,7 @@ fn blocking_calls_on_a_reader_thread_fail_at_once() {
                 Ok(_) | Err(zmux::blocking::WaitError::TimedOut)
             ),
             c.try_open_bi().is_ok(),
-            c.begin_add_pipe(
+            c.test_begin_join(
                 PipeIo::from_halves(io::empty(), io::sink()),
                 zmux::PipeOptions::default(),
             )

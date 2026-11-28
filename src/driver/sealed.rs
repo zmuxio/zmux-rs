@@ -3,16 +3,22 @@
 //! AEAD message. The carrier's lanes, datagram channel and exporter are hidden, since
 //! they would pass the protection; what is asked of its socket stays.
 
+use std::future::poll_fn;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::tokio::{PipeIo, Reader, Writer};
+use super::accept::JoinWrite;
+use super::attachment::Attachment;
+use super::sealed_failure as failure;
+use super::tokio::{ChunkWrite, PipeIo, Reader, Tokio, Writer};
+use crate::proto::ReceivedRecord;
 use crate::proto::record::Framing;
 use crate::proto::seal::{
-    Opener, SealedFailure, SealedRead as SealedRecordRead, SealedReader, SealedWriter, Sealer,
+    Opener, SealedRead as SealedRecordRead, SealedReader, SealedWriter, Sealer,
 };
 
 /// The length prefix of a byte-stream Sealed record carrying `sealed`.
@@ -36,13 +42,15 @@ pub(crate) fn seal_carrier(mut p: PipeIo, sealer: Sealer, opener: Opener) -> Pip
     p.reader = p.reader.take().map(|r| {
         Reader::Sealed(Box::pin(SealedRead {
             lower: r,
-            records: SealedReader::new(lower, opener, prefix),
+            records: SealedReader::new(lower, opener, prefix, p.max_record),
+            remainder: None,
         }))
     });
     p.writer = p.writer.take().map(|w| {
         Writer::Sealed(Box::pin(SealedWrite {
             lower: w,
             records: SealedWriter::new(lower, sealer),
+            memory_wait: None,
             error: None,
         }))
     });
@@ -56,7 +64,31 @@ pub(crate) fn seal_carrier(mut p: PipeIo, sealer: Sealer, opener: Opener) -> Pip
 
 /// A Sealed reading half, for allocation tests.
 #[cfg(feature = "test-hooks")]
-pub type SealedReadHalf = Pin<Box<dyn AsyncRead + Send>>;
+#[doc(hidden)]
+pub struct SealedReadHalf(Pin<Box<SealedRead>>);
+
+#[cfg(feature = "test-hooks")]
+impl std::fmt::Debug for SealedReadHalf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedReadHalf").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl SealedReadHalf {
+    /// Polls for the next authenticated record.
+    ///
+    /// # Errors
+    ///
+    /// The record or carrier failed.
+    pub fn poll_record(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<ReceivedRecord>>> {
+        self.0.as_mut().get_mut().poll_record(cx)
+    }
+}
+
 /// A Sealed writing half, for allocation tests.
 #[cfg(feature = "test-hooks")]
 pub type SealedWriteHalf = Pin<Box<dyn AsyncWrite + Send>>;
@@ -71,34 +103,61 @@ where
     let (Some(Reader::Sealed(r)), Some(Writer::Sealed(w))) = (p.reader, p.writer) else {
         unreachable!("Sealed halves are boxed")
     };
-    (r, w)
+    (SealedReadHalf(r), w)
 }
 
 /// The reading half: an I/O shell of [`SealedReader`].
 pub(crate) struct SealedRead {
     lower: Reader,
     records: SealedReader,
+    /// A short byte read during setup may leave a plaintext suffix.
+    remainder: Option<ReceivedRecord>,
 }
 
 impl SealedRead {
-    /// Whether the buffer is held with no record bytes in it.
+    /// Whether the reader can free resources.
     pub(crate) fn idle_buffer(&self) -> bool {
-        self.records.idle_buffer()
+        self.remainder.is_none() && self.records.idle_buffer()
     }
 
-    /// Frees the buffer of an idle pipe: the next read allocates it again.
+    /// Frees resources held by an idle reader.
     pub(crate) fn release_idle(&mut self) {
-        self.records.release_idle();
+        if self.remainder.is_none() {
+            self.records.release_idle();
+        }
+    }
+
+    pub(crate) fn poll_record(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<ReceivedRecord>>> {
+        if let Some(record) = self.remainder.take() {
+            return Poll::Ready(Ok(Some(record)));
+        }
+        loop {
+            match self.records.read().map_err(failure)? {
+                SealedRecordRead::Record(record) => return Poll::Ready(Ok(Some(record))),
+                SealedRecordRead::End => return Poll::Ready(Ok(None)),
+                SealedRecordRead::More => {
+                    let mut rb = ReadBuf::new(self.records.space());
+                    let result = ready!(Pin::new(&mut self.lower).poll_read(cx, &mut rb));
+                    let n = rb.filled().len();
+                    match result {
+                        Ok(()) if n == 0 => self.records.eof(),
+                        Ok(()) => self.records.filled(n).map_err(failure)?,
+                        Err(e) if super::is_empty_message(&e) => {
+                            self.records.filled(0).map_err(failure)?;
+                        }
+                        Err(e) => return Poll::Ready(Err(e)),
+                    }
+                }
+            }
+        }
     }
 }
 
-fn failure(f: SealedFailure) -> io::Error {
-    match f {
-        SealedFailure::Invalid => io::ErrorKind::InvalidData.into(),
-        SealedFailure::Cut => io::ErrorKind::UnexpectedEof.into(),
-    }
-}
-
+// The setup APIs still read into a caller-owned destination. The session driver
+// hands the authenticated record directly to the core.
 impl AsyncRead for SealedRead {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -106,26 +165,21 @@ impl AsyncRead for SealedRead {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if out.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
-            match this
-                .records
-                .read(out.initialize_unfilled())
-                .map_err(failure)?
-            {
-                // The end at a record's boundary reads as the carrier's end, which
-                // closes no stream and which the session judges by its frames.
-                SealedRecordRead::End => return Poll::Ready(Ok(())),
-                SealedRecordRead::Data(n) => {
-                    out.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                SealedRecordRead::More => {
-                    let mut rb = ReadBuf::new(this.records.space());
-                    ready!(Pin::new(&mut this.lower).poll_read(cx, &mut rb))?;
-                    let n = rb.filled().len();
-                    this.records.filled(n);
-                }
+            let Some(mut record) = ready!(this.poll_record(cx))? else {
+                return Poll::Ready(Ok(()));
+            };
+            let n = record.copy_prefix(out.remaining(), |data| out.put_slice(data));
+            if n == 0 {
+                continue;
             }
+            if !record.as_ref().is_empty() {
+                this.remainder = Some(record);
+            }
+            return Poll::Ready(Ok(()));
         }
     }
 }
@@ -137,11 +191,41 @@ impl AsyncRead for SealedRead {
 pub(crate) struct SealedWrite {
     lower: Writer,
     records: SealedWriter,
+    memory_wait: Option<std::sync::Arc<crate::proto::memory::BudgetWait>>,
     /// The error that failed the direction after its write was reported.
     error: Option<io::ErrorKind>,
 }
 
 impl SealedWrite {
+    pub(super) fn set_workspace(
+        &mut self,
+        workspace: Option<std::sync::Arc<crate::proto::memory::WriteWorkspace>>,
+    ) {
+        self.records.set_workspace(workspace);
+    }
+
+    fn poll_memory(&mut self, cx: &Context<'_>, len: usize) -> Poll<()> {
+        loop {
+            let epoch = self
+                .records
+                .workspace()
+                .map(|space| space.domain().release_epoch());
+            if self.records.prepare(len) {
+                self.memory_wait = None;
+                return Poll::Ready(());
+            }
+            let space = self
+                .records
+                .workspace()
+                .expect("only managed writer space can be denied");
+            if !space
+                .domain()
+                .watch(epoch.unwrap(), &mut self.memory_wait, cx.waker())
+            {
+                return Poll::Pending;
+            }
+        }
+    }
     /// Whether an idle pipe would free something.
     pub(crate) fn idle_held(&self) -> bool {
         self.records.idle_held()
@@ -204,7 +288,8 @@ impl AsyncWrite for SealedWrite {
             // Nothing to write is no record.
             return Poll::Ready(Ok(0));
         }
-        this.records.seal(buf).map_err(io::Error::other)?;
+        ready!(this.poll_memory(cx, buf.len()));
+        this.records.seal_prepared(buf).map_err(io::Error::other)?;
         // Taken: the record is committed (its nonce spent) and goes out
         // here as far as the carrier takes it, the rest at the next call.
         match this.poll_pending(cx) {
@@ -228,6 +313,15 @@ impl AsyncWrite for SealedWrite {
 
 /// Writes one handshake unit in one write.
 pub(crate) async fn write_unit(p: &mut PipeIo, unit: &[u8]) -> io::Result<()> {
+    write_unit_progress(p, unit, &mut 0, &mut false).await
+}
+
+async fn write_unit_progress(
+    p: &mut PipeIo,
+    unit: &[u8],
+    accepted: &mut usize,
+    attempted: &mut bool,
+) -> io::Result<()> {
     if unit.is_empty() {
         return Ok(());
     }
@@ -235,26 +329,136 @@ pub(crate) async fn write_unit(p: &mut PipeIo, unit: &[u8]) -> io::Result<()> {
         .writer
         .as_mut()
         .ok_or(io::Error::from(io::ErrorKind::BrokenPipe))?;
-    let mut rest = bytes::Bytes::copy_from_slice(unit);
+    let atomic = p.framing == Framing::Records;
+    let mut rest = crate::Chunk::copy_from_slice(unit);
     std::future::poll_fn(|cx| {
         while !rest.is_empty() {
-            let n = match &mut *w {
-                Writer::Io(w) => ready!(w.as_mut().poll_write(cx, &rest))?,
-                Writer::Sealed(w) => ready!(w.as_mut().poll_write(cx, &rest))?,
+            *attempted = true;
+            let progress = match &mut *w {
+                Writer::Io(w) => w.as_mut().poll_write(cx, &rest),
+                Writer::Sealed(w) => w.as_mut().poll_write(cx, &rest),
                 Writer::Chunks(w) => {
-                    let mut c = [rest.clone()];
-                    ready!(w.as_mut().poll_write_chunks(cx, &mut c))?
+                    let mut chunks = [rest.clone()];
+                    w.as_mut().poll_write_chunks(cx, &mut chunks)
                 }
-                Writer::Stream(w) => ready!(Pin::new(w).poll_write(cx, &rest))?,
+                Writer::Stream(w) => Pin::new(w).poll_write(cx, &rest),
             };
-            if n == 0 {
+            let Poll::Ready(result) = progress else {
+                // Plain AsyncWrite and our sealed and stream writers take
+                // no bytes on Pending. Join chunks use the separate path.
+                *attempted = false;
+                return Poll::Pending;
+            };
+            let n = result?;
+            if n == 0 || atomic && n != rest.len() {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
+            *accepted += n;
             let _ = rest.split_to(n);
         }
+        *attempted = false;
         w.poll_flush(cx)
     })
     .await
+}
+
+/// Writes a Join and preserves a submitted chunk call across cancellation.
+pub(crate) async fn write_join_unit(
+    pipe: &mut PipeIo,
+    mut write: JoinWrite<Tokio>,
+) -> io::Result<()> {
+    if write.unit.is_empty() {
+        write.settle(false);
+        return Ok(());
+    }
+    if !matches!(pipe.writer, Some(Writer::Chunks(_))) {
+        let result =
+            write_unit_progress(pipe, &write.unit, &mut write.accepted, &mut write.attempted).await;
+        write.settle(result.is_err());
+        return result;
+    }
+    let Some(Writer::Chunks(writer)) = pipe.writer.take() else {
+        unreachable!("chunk writer");
+    };
+    let mut submission = JoinChunkDrain(Some(JoinChunkOutput {
+        rest: crate::Chunk::copy_from_slice(&write.unit),
+        writer,
+        write,
+        atomic: pipe.framing == Framing::Records,
+        submitted: false,
+        _attachment: pipe.attachment().clone(),
+    }));
+    let output = submission.0.as_mut().expect("Join output");
+    let result = poll_fn(|cx| {
+        while !output.rest.is_empty() {
+            ready!(output.poll_chunk(cx))?;
+        }
+        output.writer.as_mut().poll_flush(cx)
+    })
+    .await;
+    let mut output = submission.0.take().expect("finished Join output");
+    output.write.settle(result.is_err());
+    pipe.writer = Some(Writer::Chunks(output.writer));
+    result
+}
+
+struct JoinChunkOutput {
+    writer: Pin<Box<dyn ChunkWrite>>,
+    write: JoinWrite<Tokio>,
+    rest: crate::Chunk,
+    atomic: bool,
+    submitted: bool,
+    _attachment: Arc<Attachment>,
+}
+
+impl JoinChunkOutput {
+    fn poll_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.submitted = false;
+        self.write.attempted = true;
+        let before = self.rest.len();
+        match self
+            .writer
+            .as_mut()
+            .poll_write_chunks(cx, std::slice::from_mut(&mut self.rest))
+        {
+            Poll::Pending => {
+                self.submitted = self.writer.has_submitted_write();
+                self.write.attempted = self.submitted;
+                Poll::Pending
+            }
+            Poll::Ready(Ok(n))
+                if n != 0
+                    && before.checked_sub(self.rest.len()) == Some(n)
+                    && (!self.atomic || n == before) =>
+            {
+                self.write.accepted += n;
+                self.write.attempted = false;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(_)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
+struct JoinChunkDrain(Option<JoinChunkOutput>);
+
+impl Drop for JoinChunkDrain {
+    fn drop(&mut self) {
+        if let Some(mut output) = self.0.take()
+            && output.submitted
+        {
+            // Keep the same writer and buffers. Finish the one submitted
+            // call, leaving any unsubmitted suffix withdrawn.
+            super::tokio::spawn_drain(
+                async move {
+                    let result = poll_fn(|cx| output.poll_chunk(cx)).await;
+                    output.write.settle(result.is_err());
+                },
+                super::DRAIN_LIMIT,
+            );
+        }
+    }
 }
 
 /// Reads once from the carrier, its bytes read ahead first; appends to `into`. On a

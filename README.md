@@ -12,7 +12,6 @@
 [![zmux-http](https://img.shields.io/crates/v/zmux-http.svg?label=zmux-http)](https://crates.io/crates/zmux-http)
 [![zmux-h3](https://img.shields.io/crates/v/zmux-h3.svg?label=zmux-h3)](https://crates.io/crates/zmux-h3)
 [![zmux-webtransport](https://img.shields.io/crates/v/zmux-webtransport.svg?label=zmux-webtransport)](https://crates.io/crates/zmux-webtransport)
-[![zmux-shaping](https://img.shields.io/crates/v/zmux-shaping.svg?label=zmux-shaping)](https://crates.io/crates/zmux-shaping)
 
 Rust implementation of zmux: multiplexed, flow-controlled streams and
 datagrams over one or many reliable byte pipes.
@@ -81,7 +80,11 @@ async fn report(session: &zmux::Session) {
 
 ## Multipath
 
-A session can run on several pipes at once (`Config::max_pipes` above 1).
+A session can run on several pipes at once when
+`config.session_policy.limits.steady_attachments` is above 1.
+Use `Session::capacity` to inspect protocol occupancy, carrier occupancy, and
+direction coverage. Commit a newer policy with `Session::set_session_policy`.
+Increase its authorization generation when changing Join authorization.
 Joins need a secret source, given in `Config::pipe_auth`: a pre-shared key
 (`PipeAuth::psk`, or `PipeAuth::deferred_psk` given later with
 `set_join_secret`), the TLS exporter of the first pipe (`PipeAuth::exporter`),
@@ -92,8 +95,10 @@ keys only once the host states that it proved the pipe end to end:
 `with_end_to_end` in the configuration, or `declare_end_to_end` later.
 
 ```rust,no_run
+use std::time::Duration;
 use tokio::net::TcpStream;
-use zmux::{Config, Listener, ListenerConfig, PipeAuth, PipeIo, PipeOptions, Session};
+use zmux::{AttachmentSpec, AttemptReason, CarrierOpener, ChangeRequest, Config, Directions,
+    Listener, ListenerConfig, MemberSpec, PathPreference, PipeAuth, PipeIo, PipeOptions, Session};
 
 async fn two_pipes(first: TcpStream, second: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
     let auth = PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end();
@@ -102,21 +107,31 @@ async fn two_pipes(first: TcpStream, second: TcpStream) -> Result<(), Box<dyn st
     let _listener = Listener::new(config.clone(), ListenerConfig::default())?;
     // Client: a second TCP connection becomes a second pipe.
     let session = Session::connect(PipeIo::from_tcp(first), config).await?;
-    let pipe = session.add_pipe(PipeIo::from_tcp(second), PipeOptions::default()).await?;
-    // Make it a fallback for both directions.
-    pipe.update(&zmux::PipeUpdate {
-        send_priority: zmux::Change::Set(10),
-        receive_priority: zmux::Change::Set(10),
-        ..Default::default()
-    })?;
+    let mut request = ChangeRequest::new(session.capacity(), Duration::from_secs(10));
+    request.add.push(MemberSpec {
+        candidate: None,
+        attachments: vec![AttachmentSpec::new(Directions::BOTH,
+            PipeOptions::default().with_send_priority(10))],
+    });
+    let change = session.begin_change(request)?;
+    let opener = CarrierOpener::prepared(vec![PipeIo::from_tcp(second)]);
+    let result = change.start_member(0, opener)?.wait().await;
+    if result.reason != AttemptReason::Confirmed {
+        return Err(format!("Join ended with {:?}", result.reason).into());
+    }
+    change.commit()?;
+    session.set_local_receive_preference(result.pipes[0], Some(PathPreference {
+        tier: 10,
+        ..PathPreference::default()
+    }))?;
     Ok(())
 }
 ```
 
-`add_pipe` waits at most `Config::join_timeout` (10 s) for the peer to
-attach the pipe; it fails with `PipeError::Failed(PipeFailure::JoinRefused)`
-when the peer refused the join. `helpers::maintain_pipes` keeps a pool of pipes up per
-path, redialling with backoff.
+`Session::begin_change` reserves a member's exact carrier layout.
+`CapacityChange::start_member` returns an `Attempt` that can be inspected
+or cancelled independently of a wait. A `SessionController` uses the
+same capacity transaction to manage a declarative target.
 
 A pipe whose acknowledgements stall turns suspect, traffic moves away from
 it, and it fails after `Liveness::dead_timeout` (a `DeadTimeout`: `Auto`,
@@ -134,26 +149,26 @@ included) overrides both.
 ## Resume
 
 With `Config::resume_timeout` set, a session whose pipes are all lost is
-suspended for that long instead of ending, and resumes when a pipe joins
-again. Something has to dial: the `redial` hook (a session on one pipe at a
-time), a pipe pool, or the application's own `add_pipe`. A suspension with
-none of them is reported as `SessionEvent::ResumeUnattended` and logged.
+suspended for that long and resumes when a pipe joins again. A
+`SessionController` opens carriers to recover missing directions. Its domain
+defaults to 64 pending owners, 4 concurrent carrier openers and 8 attachment
+cleanup reservations. Set `ControllerOptions::limits` to change these bounds.
+Applications may also submit explicit capacity changes. A suspension
+without an active recovery source is reported as
+`SessionEvent::ResumeUnattended`.
 
 ```rust,no_run
 use std::time::Duration;
-use zmux::{Config, PipeAuth, PipeIo, Redial, Session};
+use zmux::{Candidate, Config, ControllerError, ControllerOptions, PipeAuth, Session,
+    SessionControl, SessionController, SessionTarget};
 
-async fn resumable(first: tokio::net::TcpStream) -> Result<Session, zmux::ConnectError> {
+async fn resumable(candidate: Candidate) -> Result<(Session, Option<SessionControl>), ControllerError> {
     let mut config = Config::default();
     config.pipe_auth = PipeAuth::psk(*b"a pre-shared key of 32 bytes....").with_end_to_end();
     config.resume_timeout = Some(Duration::from_secs(60));
-    // Replaces the lost pipe, with `config.redial_backoff` (from 1 s
-    // doubling up to 60 s).
-    config.redial = Some(Redial::new(|_req| async {
-        Ok(PipeIo::from_tcp(tokio::net::TcpStream::connect("192.0.2.1:4433").await?))
-    }));
-    config.logger = Some(zmux::Logger::new(|level, msg| eprintln!("{level:?}: {msg}")));
-    Session::connect(PipeIo::from_tcp(first), config).await
+    let candidate = candidate.with_identity("primary", "primary");
+    let controller = SessionController::new(ControllerOptions::new("application", vec![candidate]))?;
+    controller.open(config, SessionTarget::default()).await
 }
 ```
 
@@ -189,7 +204,7 @@ close; "delivered or given up after `d`" is
 session. Over QUIC, the adapter closes the QUIC connection only after
 that, with the same application error code.
 
-## Servers, carrier choice and shaping
+## Servers and carrier choice
 
 - **Carrier handoff.** Calling `Listener::handle_pipe` moves the carrier into
   setup, even if the future is dropped before its first poll. Await it to
@@ -226,17 +241,12 @@ that, with the same application error code.
   carriers and late decision callbacks still close on timeout. Quinn sends
   its first bidirectional stream to `ListenerConfig::fallback` from either
   serving entry point.
-- **Pipe removal.** `PipeError::is_gone()` and `JoinError::is_gone()` include a local
-  abort. Its specific reason remains `PipeFailure::Aborted` or `JoinError::PipeAborted`.
-- **Join outcomes.** Set `Config::join_outcome` to observe every authorized inbound
-  join and every outbound carrier given to a join. The callback receives the
-  session, pipe ID and an optional `JoinError`. Failures before ID allocation
-  report `PipeId::UNASSIGNED` (`1 << 62`). Successful joins
-  release their queued pipe events after the callback completes. An outbound
-  callback waits for peer attachment even with `return_on_reply`.
+- **Join progress.** Use the `Attempt` returned by a capacity change to
+  inspect the verified Replies, confirmed attachments and terminal result.
+  A local pipe abort is included in `PipeError::is_gone()`.
 - **Draining a listener.** `drain(reason)` refuses subsequent bootstrap handshakes
   with transport `CONNECTION_REFUSED` and the reason bytes. A later drain
-  replaces the reason. `undrain()` resumes accepting new sessions. Joins,
+  sets a new reason. `undrain()` resumes accepting new sessions. Joins,
   resumptions and lanes remain available. Graceful shutdown drains permanently.
 
 - **Takeover.** The fallback's future runs on a task of its own and owns
@@ -263,11 +273,25 @@ let fallback = Fallback::new(|t: Takeover| async move {
 });
 # let _ = fallback;
 ```
-  `PrefixAuth` is a ready-made credential check, bound to the
-  TLS connection where the carrier has an exporter; a client presents it
-  as a `CarrierCredential`. `TrustedProxies` names the intermediaries whose report
-  of the client address (PROXY protocol, a forwarding header field) is
-  believed.
+  Use `PrefixAuth` to present a 64-byte ticket at a protected entry and
+  `Admission::prefix_auth` to redeem it with a shared `PrefixStore`. The
+  bound form uses the completed TLS 1.3 or QUIC connection's exporter and
+  makes the bootstrap ticket ID available through
+  `Session::bound_prefix_principal` after session acceptance. Head-stage
+  tickets require an encrypted connection. Configure a PSK and a separate
+  envelope-only listener for exchange at a ticket-protected HTTP endpoint.
+
+  Share one `MemoryPrefixStore` across the entry points of an admission
+  domain. Use a durable store if the domain's tickets survive a restart.
+  An in-memory authority's ID capacity is a process-lifetime quota. Expired,
+  spent and revoked IDs continue to occupy it.
+  A single-use ticket may have been consumed without admitting the carrier.
+  When a commit receipt is missing, the verifier queries the original
+  operation with an independent one-second deadline. Issue a fresh ticket
+  ID when the single-use ticket must be replaced.
+
+  `TrustedProxies` configures the intermediaries trusted for client
+  addresses reported through PROXY protocol or forwarding fields.
 - **Carriers before a session.** `ListenerConfig::limits` holds the bounds
   that `Listener::set_limits` changes while the listener runs
   (`Listener::limits` reads them). Every carrier holds a slot of its source
@@ -284,16 +308,13 @@ let fallback = Fallback::new(|t: Takeover| async move {
   closed at once (`rejected`) when none is stalled. Stalls hold at most
   half of the listener's slots and one fewer than a source's; a Stall
   beyond them is closed at once (`stall_overflow`).
-- **Choosing a carrier.** `dial_choice` takes a `CarrierChoice`: `CarrierChoice::explicit` uses
-  one `Candidate`, `CarrierChoice::auto` tries several in order of preference and,
-  with `Config::max_pipes` above 1, moves the session to preferred kinds by
-  joining them as further pipes. A `CarrierCache` in the `CarrierChoicePolicy`
-  remembers which kinds worked per server and network; `snapshot` and
-  `restore` carry it across restarts.
-- **Shaping.** `zmux::shaping` holds the hooks for record sizes and timing
-  (`Config::shaper`, `Session::set_shaper`, `Pipe::set_shaper`,
-  `shaping::Limits`); the
-  `zmux-shaping` crate offers a factory for them.
+- **Managing carriers.** Register candidates with an identity and cache key
+  using `Candidate::with_identity`, then construct a `SessionController`.
+  `open` establishes the first carrier and `manage` binds an existing
+  multipath session. Submit `SessionTarget` revisions to grow or replace
+  members. The controller protects direction coverage and shares retry
+  admission across its sessions. `CarrierCache::export` and `import`
+  persist v2 history across restarts.
 
 ## Memory and allocators
 
@@ -315,9 +336,9 @@ of in a record; `SessionEvent::DatagramPathChanged` reports changes. A
 packet forwarder uses it as its MTU.
 
 zmux gives memory back as load goes away: idle pipes return their read and
-write buffers after a second, a process-wide pool keeps a bounded number of
-read buffers, and closed streams and sessions free their state. Whether the
-freed memory also leaves the process is up to the global allocator, which
+write buffers after a second. The process-wide receive pool keeps up to
+8 MiB of idle backing capacity. Closed streams and sessions free their state.
+Whether the freed memory also leaves the process is up to the global allocator, which
 the crate never sets: the choice belongs to the application.
 
 After a burst of many sessions and large transfers on several runtime
@@ -344,9 +365,8 @@ the resident set, under any allocator given by `LD_PRELOAD`.
 | `zmux::proto` (hidden) | the sans-IO layer: wire format and the session state machine, which the drivers, carrier crates and bindings build on; no stable API, and the crate root re-exports what applications use | always |
 | crate root | `Session`, `SendStream`, `RecvStream`, `PipeIo`, `Listener`: one tokio task per session | `tokio` (default) |
 | `zmux::blocking` | the same handles for threads: the calls that wait block instead of returning a future; streams implement `std::io::Read` / `Write` | `blocking` |
-| `zmux::helpers` | helpers above the public API: `maintain_pipes` (keeping pipes up), `splice` (relaying a stream into another), `resolve_duplicate` (two sessions between the same endpoints) | `tokio`; `resolve_duplicate` either driver |
+| `zmux::helpers` | helpers above the public API: `splice` (relaying a stream into another), `resolve_duplicate` (two sessions between the same endpoints) | `tokio`; `resolve_duplicate` either driver |
 | `zmux::sched` | the scheduler: `Scheduler` and the custom policy's interface (`Pick`) | always |
-| `zmux::shaping` | traffic shaping: shapers, definitions and budgets | always |
 | `zmux::adapter` | what carrier adapters and own accept loops use: `Listener::adapter()` and `Session::adapter()` views, carrier admission at an entrance, connection identities, lanes, datagram channels, memory charges | `tokio` |
 
 The session core has no I/O and no clock: drivers feed it bytes, timer
@@ -363,7 +383,7 @@ The carrier crates of the workspace turn connections into pipes, each with
 | `zmux-websocket` (`adapter/websocket`) | WebSocket (tokio-tungstenite), `ws` and `wss` | no |
 | `zmux-http` (`adapter/http`) | HTTP/1.1 and HTTP/2 exchanges (hyper), over TCP or TLS | HTTP/2, off by default |
 | `zmux-h3` (`adapter/h3`) | HTTP/3 requests (h3 over quinn) | further requests |
-| `zmux-webtransport` (`adapter/webtransport`) | WebTransport sessions (web-transport-quinn) | further streams |
+| `zmux-webtransport` (`adapter/webtransport`) | WebTransport sessions (Quinn, HTTP/3) | further streams |
 
 `zmux-http` also serves every HTTP carrier kind on one request target:
 streamed bidirectional requests, split uplink and downlink requests, and

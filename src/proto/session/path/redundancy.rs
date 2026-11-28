@@ -16,6 +16,126 @@ use crate::proto::session::{Redundancy, Scheduler, SessionCore, StreamKey};
 
 /// An idle period lasts at least max(this, `T_suspect`).
 const IDLE: Duration = Duration::from_secs(1);
+const REPLICA_WINDOW: usize = 10;
+const REPLICA_BUCKETS: usize = REPLICA_WINDOW + 1;
+
+#[derive(Debug, Default)]
+pub(in crate::proto::session) struct ReplicaBudget {
+    buckets: [ReplicaBucket; REPLICA_BUCKETS],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReplicaBucket {
+    second: u64,
+    original: u64,
+    extra: u64,
+}
+
+impl ReplicaBudget {
+    fn record(&mut self, second: u64, bytes: u64, extra: bool) {
+        let index = usize::try_from(second % REPLICA_BUCKETS as u64).expect("bucket index");
+        let slot = &mut self.buckets[index];
+        if slot.second != second {
+            *slot = ReplicaBucket {
+                second,
+                ..ReplicaBucket::default()
+            };
+        }
+        let counter = if extra {
+            &mut slot.extra
+        } else {
+            &mut slot.original
+        };
+        *counter = counter.saturating_add(bytes);
+    }
+
+    fn room(&self, second: u64, percent: u8, burst: u64) -> u64 {
+        let (mut original, mut extra) = (0u128, 0u128);
+        for slot in &self.buckets {
+            let age = second.saturating_sub(slot.second);
+            if age < REPLICA_WINDOW as u64 {
+                original += u128::from(slot.original);
+            }
+            if age <= REPLICA_WINDOW as u64 {
+                extra += u128::from(slot.extra);
+            }
+        }
+        let allowance = original * u128::from(percent) / 100 + u128::from(burst);
+        u64::try_from(allowance.saturating_sub(extra)).unwrap_or(u64::MAX)
+    }
+}
+
+impl SessionCore {
+    fn replicas_enabled(&self) -> bool {
+        self.config.datagram_config().replica_percent != 0
+    }
+
+    pub(in crate::proto::session) fn replica_bytes(&mut self, bytes: u64, extra: bool) {
+        if bytes == 0 || self.mp.is_none() {
+            return;
+        }
+        let second = self.now.saturating_duration_since(self.started).as_secs();
+        self.mp_mut()
+            .replica_budget
+            .get_or_insert_with(Box::default)
+            .record(second, bytes, extra);
+    }
+
+    pub(in crate::proto::session) fn replica_room(&self) -> u64 {
+        let Some(mp) = self.mp.as_deref() else {
+            return 0;
+        };
+        if !self.replicas_enabled() {
+            return 0;
+        }
+        let percent = self.config.datagram_config().replica_percent;
+        let second = self.now.saturating_duration_since(self.started).as_secs();
+        mp.replica_budget
+            .as_ref()
+            .map_or(mp.replica_burst, |budget| {
+                budget.room(second, percent, mp.replica_burst)
+            })
+    }
+
+    pub(in crate::proto::session) fn next_replica_tier(&self, first: u64) -> Option<u64> {
+        self.atts
+            .iter()
+            .filter(|a| {
+                !a.standby() && a.send_tier() > first && a.out().is_some_and(|o| o.usable(false))
+            })
+            .map(Attachment::send_tier)
+            .min()
+    }
+
+    pub(in crate::proto::session) fn replica_eligible(
+        &self,
+        original: &Attachment,
+        candidate: &Attachment,
+        next_tier: Option<u64>,
+    ) -> bool {
+        let tier = candidate.send_tier();
+        candidate.id() != original.id()
+            && candidate.out().is_some_and(|o| o.usable(false))
+            && if candidate.standby() {
+                self.config.datagram_config().replica_standby
+            } else {
+                tier == original.send_tier() || next_tier == Some(tier)
+            }
+    }
+}
+
+pub(in crate::proto::session) fn independent_fates(a: &Attachment, b: &Attachment) -> bool {
+    let fate = a.fate();
+    if fate.1 != 0 && fate == b.fate() {
+        return false;
+    }
+    if a.physical_connection()
+        .is_some_and(|id| Some(id) == b.physical_connection())
+    {
+        return false;
+    }
+    matches!((a.replica_domain(), b.replica_domain()), (Some(x), Some(y)) if x != y)
+}
 
 /// The policy that schedules a direction.
 fn policy_of<'a>(send: &'a SendPart, session: &'a Scheduler) -> &'a Scheduler {
@@ -109,19 +229,24 @@ impl SessionCore {
         }
     }
 
-    /// The pipe for a copy of `len` bytes written on `writer`: the eligible
-    /// pipe of its tier with the smallest ETA other than the writer.
+    /// The eligible target with the smallest ETA for a copy.
     fn copy_target(&self, gate: &Gate, writer: u64, len: u64) -> Option<u64> {
-        let tier = self.att(writer)?.send_tier();
-        if tier > gate.last() {
+        let original = self.att(writer)?;
+        if !gate.admits(original) {
             return None;
         }
-        self.earliest_two(gate, tier, len, Some(writer))[0]
+        let next = self.next_replica_tier(original.send_tier());
+        self.atts
+            .iter()
+            .filter(|a| self.replica_eligible(original, a, next))
+            .filter_map(|a| a.out().map(|o| (self.eta(a, o, len), a.id())))
+            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            .map(|(_, id)| id)
     }
 
     /// The bound on the copy bytes outstanding: `max(spread_chunk`,
     /// retransmit budget / 64).
-    fn copy_bound(&self) -> u64 {
+    pub(super) fn copy_bound(&self) -> u64 {
         (self.config.spread_chunk as u64).max(self.retransmit_budget() / 64)
     }
 
@@ -130,7 +255,9 @@ impl SessionCore {
     /// it became usable if it never had any.
     fn idle(&self, o: &OutPipe) -> bool {
         let quiet = self.now.saturating_duration_since(o.last_advance());
-        quiet >= IDLE && o.oldest_unacked_eliciting().is_none() && quiet >= self.limits(o).0
+        quiet >= IDLE
+            && o.oldest_unacked_eliciting().is_none()
+            && quiet >= self.absolute_stall_limit(o)
     }
 
     /// A frame of new data, stream bytes `off..off + n` and maybe the FIN,
@@ -145,6 +272,9 @@ impl SessionCore {
         (off, n, fin): (u64, u64, bool),
         gate: Option<&Gate>,
     ) {
+        if !self.replicas_enabled() {
+            return;
+        }
         let chunk = self.config.spread_chunk as u64;
         // The first new data of the batch on a pipe idle until it: the
         // frames before it in the batch are not in flight yet. Copies and
@@ -183,7 +313,7 @@ impl SessionCore {
             None => return,
         };
         let outstanding = self.ledger().map_or(0, |l| l.copies());
-        if outstanding + (end - off) > self.copy_bound() {
+        if outstanding + (end - off) > self.copy_bound() || end - off > self.replica_room() {
             return;
         }
         if let Some(send) = self.streams.send_mut(key) {
@@ -196,7 +326,7 @@ impl SessionCore {
         {
             self.out_mut(target).expect("present").pop_copy(lane);
         }
-        let c = QueuedCopy::new(key, off, end, fin);
+        let c = QueuedCopy::new(pipe, key, off, end, fin);
         let o = self.out_mut(target).expect("present");
         // Finished copies behind an unfinished one leave the queue too,
         // whenever it doubles: amortized constant work per copy, and a
@@ -266,16 +396,30 @@ impl SessionCore {
         if !self.copies_queued(id, lane) {
             return true;
         }
-        let eligible = self
-            .att(id)
-            .is_some_and(|a| self.gate().is_some_and(|g| g.admits(a)));
-        if !eligible {
+        if !self.replicas_enabled() {
             self.drop_copies(id);
             return true;
         }
         while let Some(c) = self.out_ref(id).and_then(|o| o.next_copy(lane)) {
             if self.copy_done(&c) {
                 self.out_mut(id).expect("present").pop_copy(lane);
+                continue;
+            }
+            let eligible = match (self.att(c.source()), self.att(id)) {
+                (Some(_), Some(target)) if c.source() == id => {
+                    self.gate().is_some_and(|g| g.admits(target))
+                }
+                (Some(source), Some(target)) => {
+                    let next = self.next_replica_tier(source.send_tier());
+                    self.replica_eligible(source, target, next)
+                }
+                _ => false,
+            };
+            if !eligible {
+                self.out_mut(id).expect("present").pop_copy(lane);
+                if let Some(send) = self.streams.send_mut(c.key()) {
+                    send.mp_mut().uncopy(c.off(), c.end());
+                }
                 continue;
             }
             let send = self
@@ -290,10 +434,18 @@ impl SessionCore {
             };
             let fin = c.fin() && !send.mp().fin_acked && send.cold().reset.is_none();
             let end = c.end().min(send.owed_end());
-            let Ok((n, _)) = self.write_copy(c.key(), start, end, fin, w) else {
+            let budget_end = start.saturating_add(self.replica_room()).min(end);
+            if budget_end == start && start < end {
+                self.drop_copies(id);
+                return true;
+            }
+            let Ok((n, _)) =
+                self.write_copy(c.key(), start, budget_end, fin && budget_end == end, w)
+            else {
                 return false;
             };
-            self.stats.bytes_redundant += n;
+            self.replica_bytes(n, true);
+            self.mp_mut().counters.bytes_redundant += n;
             let o = self.out_mut(id).expect("present");
             o.redundant(n);
             if n == 0 || start + n >= end {
@@ -345,6 +497,29 @@ mod tests {
     use super::*;
     use crate::proto::frame::Priority;
     use crate::proto::session::stream::SendBuf;
+
+    #[test]
+    fn copy_budget_expires_originals_before_charges() {
+        let rate = crate::proto::session::Config::default()
+            .datagram_config()
+            .replica_percent;
+        assert_eq!(rate, 20);
+        let mut budget = ReplicaBudget::default();
+        let burst = 100;
+        budget.record(0, 500, false);
+        for _ in 0..2 {
+            budget.record(0, 100, false);
+            assert!(budget.room(0, rate, burst) >= 100);
+            budget.record(0, 100, true);
+        }
+        assert_eq!(budget.room(9, rate, burst), 40);
+        budget.record(10, 100, false);
+        assert_eq!(budget.room(10, rate, burst), 0);
+        budget.record(11, 104, false);
+        assert_eq!(budget.room(11, rate, burst), 140);
+        budget.record(11, 1, false);
+        assert_eq!(budget.room(11, rate, burst), 141);
+    }
 
     #[test]
     fn clearing_the_stream_setting_follows_the_session_again() {

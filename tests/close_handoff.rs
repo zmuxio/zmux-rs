@@ -1,7 +1,6 @@
 //! `Session::close` returns once `CONNECTION_CLOSE` is handed to the
 //! carriers and their input drained, within its bound, and
-//! `Session::add_pipe` returns once the
-//! peer attached the pipe unless `return_on_reply`.
+//! Join progress distinguishes a verified Reply from peer attachment.
 
 #![allow(
     clippy::many_single_char_names,
@@ -12,14 +11,20 @@
     reason = "scenario code: buffers and futures stay on the stack on purpose, long scripted scenarios read top to bottom"
 )]
 
+#[path = "common/pending.rs"]
+mod pending;
+
 use std::io;
 use std::pin::Pin;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
 use tokio::io::AsyncWriteExt as _;
 
+use pending::is_pending;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use zmux::{
     Config, Listener, ListenerConfig, OutboundState, PipeAuth, PipeError, PipeHint, PipeIo,
@@ -28,7 +33,7 @@ use zmux::{
 
 fn config() -> Config {
     let mut c = Config::default();
-    c.max_pipes = 6;
+    c.session_policy.limits.steady_attachments = 6;
     c.pipe_auth = PipeAuth::psk(*b"close-handoff---0123456789abcdef").with_end_to_end();
     c
 }
@@ -52,14 +57,13 @@ fn hint() -> PipeHint {
     PipeHint::from_peer(([127, 0, 0, 1], 0).into())
 }
 
-/// A carrier whose writes wait while it is stalled, or, with `hold`, its
-/// writes after the first until `hold` passed (a joiner's Confirm arrives
-/// late, after the joiner is ACTIVE).
+/// A carrier whose writes can be stalled. A held Join lets its first write
+/// (Init) pass, then stalls Confirm until the test releases it.
 struct Held {
     io: DuplexStream,
     stall: Arc<Stall>,
     first: bool,
-    hold: Option<Pin<Box<tokio::time::Sleep>>>,
+    hold_after_first: bool,
     /// The shutdown under way, while `Stall::slow_shutdown` delays it.
     shutting: Option<Pin<Box<tokio::time::Sleep>>>,
 }
@@ -68,10 +72,12 @@ struct Held {
 struct Stall {
     on: AtomicBool,
     writer: Mutex<Option<Waker>>,
+    write_blocked: tokio::sync::Notify,
     /// The write side's shutdown takes 50 ms (a TLS `close_notify`, say).
     slow_shutdown: AtomicBool,
     hold_shutdown: AtomicBool,
     shutdown_entered: tokio::sync::Notify,
+    shutdown_finished: tokio::sync::Notify,
     /// The write side was shut.
     shut: AtomicBool,
     /// Nothing arrives any more, the end of input included: the peer keeps its write side
@@ -121,24 +127,24 @@ impl AsyncWrite for Held {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.stall.on.load(Ordering::SeqCst) {
+        let blocked = || {
+            self.stall.on.load(Ordering::SeqCst)
+                || (self.hold_after_first
+                    && !self.first
+                    && !self.stall.released.load(Ordering::SeqCst))
+        };
+        if blocked() {
             *self.stall.writer.lock().unwrap() = Some(cx.waker().clone());
-            if self.stall.on.load(Ordering::SeqCst) {
+            if blocked() {
+                self.stall.write_blocked.notify_one();
                 return Poll::Pending;
             }
         }
-        let first = std::mem::replace(&mut self.first, false);
-        if !first
-            && !self.stall.released.load(Ordering::SeqCst)
-            && let Some(h) = self.hold.as_mut()
-            && h.as_mut().poll(cx).is_pending()
-        {
-            *self.stall.writer.lock().unwrap() = Some(cx.waker().clone());
-            if !self.stall.released.load(Ordering::SeqCst) {
-                return Poll::Pending;
-            }
+        let written = Pin::new(&mut self.io).poll_write(cx, buf);
+        if written.is_ready() {
+            self.first = false;
         }
-        Pin::new(&mut self.io).poll_write(cx, buf)
+        written
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -164,13 +170,14 @@ impl AsyncWrite for Held {
         let r = Pin::new(&mut self.io).poll_shutdown(cx);
         if r.is_ready() {
             self.stall.shut.store(true, Ordering::SeqCst);
+            self.stall.shutdown_finished.notify_one();
         }
         r
     }
 }
 
 /// A carrier to `listener`, its writes held as [`Held`] says.
-fn carrier(listener: &Listener, stall: &Arc<Stall>, hold: Option<Duration>) -> PipeIo {
+fn carrier(listener: &Listener, stall: &Arc<Stall>, hold_after_first: bool) -> PipeIo {
     let (a, b) = tokio::io::duplex(256 * 1024);
     let l = listener.clone();
     tokio::spawn(async move {
@@ -180,7 +187,7 @@ fn carrier(listener: &Listener, stall: &Arc<Stall>, hold: Option<Duration>) -> P
         io: a,
         stall: stall.clone(),
         first: true,
-        hold: hold.map(|d| Box::pin(tokio::time::sleep(d))),
+        hold_after_first,
         shutting: None,
     })
 }
@@ -194,7 +201,7 @@ async fn setup_client(server: Config, client: Config) -> (Session, Session, List
     let listener =
         Listener::new(server, ListenerConfig::default()).expect("valid listener configuration");
     let stall = Arc::new(Stall::default());
-    let client = Session::connect(carrier(&listener, &stall, None), client)
+    let client = Session::connect(carrier(&listener, &stall, false), client)
         .await
         .unwrap();
     let server = listener.accept().await.unwrap();
@@ -212,7 +219,11 @@ fn closed_by_peer(e: &SessionError, want: u32) -> bool {
 fn close_hands_off_before_the_process_ends() {
     let mut c = config();
     c.resume_timeout = Some(Duration::from_secs(60));
-    let server_rt = tokio::runtime::Runtime::new().unwrap();
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     let (addr, listener) = server_rt.block_on(async {
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
@@ -272,7 +283,7 @@ fn close_hands_off_before_the_process_ends() {
 /// A carrier that takes nothing holds a close at most its bound; repeated
 /// and concurrent calls return no later than the first, and a call on an
 /// ended session at once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn close_is_bounded_when_a_carrier_takes_nothing() {
     for limit in [Some(Duration::from_millis(200)), None] {
         let mut c = config();
@@ -280,30 +291,17 @@ async fn close_is_bounded_when_a_carrier_takes_nothing() {
         let bound = limit.unwrap_or(Duration::from_secs(1));
         let (client, _server, listener, stall) = setup(c).await;
         stall.set(true);
-        let start = Instant::now();
-        let first = {
-            let s = client.clone();
-            tokio::spawn(async move {
-                s.close().await;
-                Instant::now()
-            })
-        };
-        tokio::time::sleep(bound / 2).await;
+        let mut first = pin!(client.close());
+        assert!(is_pending(first.as_mut()).await);
+        write_is_blocked(&stall).await;
+        tokio::time::advance(bound / 2).await;
         client.abort(VarInt::from_u32(4), b"again");
-        let second = Instant::now();
-        let first = first.await.unwrap();
-        assert!(
-            first - start >= bound.checked_sub(Duration::from_millis(20)).unwrap(),
-            "{:?}",
-            first - start
-        );
-        // A guard against a hang only, not the time the bound may take.
-        assert!(
-            first - start < bound * 3 + Duration::from_secs(1),
-            "{:?}",
-            first - start
-        );
-        assert!(second <= first + Duration::from_millis(50));
+        tokio::time::advance((bound / 2).checked_sub(Duration::from_millis(1)).unwrap()).await;
+        assert!(is_pending(first.as_mut()).await);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::timeout(GUARD, first)
+            .await
+            .expect("the hand-off deadline ended the close");
         // The session ended locally, with the first call's error.
         tokio::time::timeout(Duration::from_secs(2), client.closing())
             .await
@@ -341,7 +339,7 @@ async fn close_returns_once_the_carrier_took_it() {
 /// `close` returns once `CONNECTION_CLOSE` was handed to the carrier, without
 /// waiting for the peer; the write side is then shut in the background, and
 /// `wait` returns once that and the drain are done.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn close_hands_over_and_shuts_in_the_background() {
     for slow in [false, true] {
         let (client, server, listener, stall) = setup(config()).await;
@@ -369,25 +367,24 @@ async fn close_hands_over_and_shuts_in_the_background() {
     }
 }
 
-/// While the peer keeps its write side open, the drain lasts until the
-/// linger timeout (at least 250 ms) in the background: `close` returns at
-/// the hand-off, and `wait` once the drain ended.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// A silent peer leaves the read drain active until the linger deadline.
+#[tokio::test(start_paused = true)]
 async fn the_drain_goes_on_after_close_returned() {
-    let (client, _server, listener, stall) = setup(config()).await;
+    let linger = Duration::from_millis(250);
+    let mut c = config();
+    c.test_hooks().linger_timeout = Some(linger);
+    let (client, _server, listener, stall) = setup(c).await;
     stall.mute.store(true, Ordering::SeqCst);
-    let start = Instant::now();
     tokio::time::timeout(GUARD, client.close())
         .await
-        .expect("close waited for a timer");
-    tokio::time::timeout(Duration::from_secs(5), client.closed())
+        .expect("the carrier accepted the close");
+    let mut closed = pin!(client.closed());
+    assert!(is_pending(closed.as_mut()).await);
+    tokio::time::advance(linger).await;
+    tokio::time::timeout(GUARD, closed)
         .await
-        .expect("the session ended");
-    let took = start.elapsed();
+        .expect("the linger deadline ended the drain");
     assert!(stall.shut.load(Ordering::SeqCst));
-    assert!(took >= Duration::from_millis(240), "{took:?}");
-    // A guard against a hang only: three linger periods and a second.
-    assert!(took < Duration::from_millis(1750), "{took:?}");
     listener.close();
 }
 
@@ -399,12 +396,10 @@ async fn a_cancelled_shutdown_closes() {
     // An open stream holds the shutdown.
     let (mut w, _r) = client.open_bi().await.unwrap();
     w.write_all(b"x").await.unwrap();
-    let r = tokio::time::timeout(
-        Duration::from_millis(100),
-        client.shutdown(VarInt::from_u32(2), b"later"),
-    )
-    .await;
-    assert!(r.is_err());
+    {
+        let mut shutdown = pin!(client.shutdown(VarInt::from_u32(2), b"later"));
+        assert!(is_pending(shutdown.as_mut()).await);
+    }
     client.abort(VarInt::from_u32(2), b"later");
     let e = tokio::time::timeout(Duration::from_secs(2), server.closing())
         .await
@@ -418,7 +413,7 @@ async fn shutdown_waits_for_connection_close_on_each_joined_carrier() {
     let (client, server, listener, first) = setup(untimed_close(config())).await;
     let second = Arc::new(Stall::default());
     let joined = client
-        .add_pipe(carrier(&listener, &second, None), PipeOptions::new())
+        .test_join(carrier(&listener, &second, false), PipeOptions::new())
         .await
         .unwrap();
     joined.attached().await.unwrap();
@@ -426,21 +421,20 @@ async fn shutdown_waits_for_connection_close_on_each_joined_carrier() {
         stall.hold_shutdown.store(true, Ordering::SeqCst);
     }
     let mut shutdown = std::pin::pin!(client.shutdown(VarInt::ZERO, b"done"));
-    assert!(std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await);
+    assert!(is_pending(shutdown.as_mut()).await);
     tokio::time::timeout(GUARD, async {
         first.shutdown_entered.notified().await;
         second.shutdown_entered.notified().await;
     })
     .await
     .unwrap();
-    assert!(std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await);
+    assert!(is_pending(shutdown.as_mut()).await);
     first.hold_shutdown.store(false, Ordering::SeqCst);
     first.release();
-    until("bootstrap carrier shutdown", 5, || {
-        first.shut.load(Ordering::SeqCst)
-    })
-    .await;
-    assert!(std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_pending())).await);
+    tokio::time::timeout(GUARD, first.shutdown_finished.notified())
+        .await
+        .unwrap();
+    assert!(is_pending(shutdown.as_mut()).await);
     second.hold_shutdown.store(false, Ordering::SeqCst);
     second.release();
     let result = tokio::time::timeout(Duration::from_secs(5), shutdown).await;
@@ -461,6 +455,33 @@ async fn shutdown_waits_for_connection_close_on_each_joined_carrier() {
 }
 
 /// The joiner's pipes other than pipe 0 that are still live.
+#[tokio::test]
+async fn a_graceful_pipe_keeps_its_writer_until_the_carrier_accepts_shutdown() {
+    tokio::time::timeout(GUARD, async {
+        let (client, server, listener, _) = setup(config()).await;
+        let stalled = Arc::new(Stall::default());
+        let local = client
+            .test_join(carrier(&listener, &stalled, false), PipeOptions::new())
+            .await
+            .unwrap();
+        let remote = server.pipe(local.id()).expect("attached on the peer");
+
+        stalled.hold_shutdown.store(true, Ordering::SeqCst);
+        local.close().unwrap();
+        stalled.shutdown_entered.notified().await;
+        assert!(client.pipe(local.id()).is_some());
+        let mut closed = std::pin::pin!(remote.closed());
+        assert!(is_pending(closed.as_mut()).await);
+        stalled.hold_shutdown.store(false, Ordering::SeqCst);
+        stalled.release();
+        stalled.shutdown_finished.notified().await;
+        closed.await.unwrap();
+        local.closed().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 fn live_joins(s: &Session) -> usize {
     s.pipe_stats()
         .iter()
@@ -475,53 +496,47 @@ fn live_joins(s: &Session) -> usize {
 }
 
 async fn until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !f() {
-        assert!(
-            start.elapsed() < Duration::from_secs(secs),
-            "timed out: {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        while !f() {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out: {what}"));
 }
 
-/// By default `add_pipe` returns once the acceptor attached the pipe, which
-/// a late Confirm delays past the verified Reply; with `return_on_reply`
-/// it returns at the Reply.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn add_pipe_waits_for_the_attachment() {
-    let (client, _server, listener, stall) = setup(config()).await;
-    let hold = Duration::from_millis(400);
-    let start = Instant::now();
-    let pipe = client
-        .add_pipe(carrier(&listener, &stall, Some(hold)), PipeOptions::new())
+async fn write_is_blocked(stall: &Stall) {
+    tokio::time::timeout(GUARD, stall.write_blocked.notified())
         .await
-        .unwrap();
-    assert!(start.elapsed() >= hold.checked_sub(Duration::from_millis(20)).unwrap());
-    assert!(
-        tokio::time::timeout(Duration::ZERO, pipe.attached())
-            .await
-            .is_ok_and(|r| r.is_ok())
-    );
+        .expect("the carrier write reached its gate");
+}
 
-    // The Confirm is held until released: a call that returns did not wait
-    // for the attachment.
-    let opts = PipeOptions::new().with_return_on_reply(true);
-    let pipe = tokio::time::timeout(
-        GUARD,
-        client.add_pipe(carrier(&listener, &stall, Some(HOUR)), opts),
-    )
-    .await
-    .expect("add_pipe waited for the attachment")
-    .unwrap();
-    assert!(pipe.options().return_on_reply);
-    assert!(
-        tokio::time::timeout(Duration::ZERO, pipe.attached())
-            .await
-            .is_err()
-    );
+/// A late Confirm separates the verified Reply from peer attachment.
+#[tokio::test]
+async fn add_pipe_waits_for_the_attachment() {
+    let (client, _server, listener, _) = setup(config()).await;
+    let stall = Arc::new(Stall::default());
+    let mut joining = pin!(client.test_join(carrier(&listener, &stall, true), PipeOptions::new(),));
+    assert!(is_pending(joining.as_mut()).await);
+    write_is_blocked(&stall).await;
+    assert!(is_pending(joining.as_mut()).await);
     stall.release();
-    tokio::time::timeout(Duration::from_secs(5), pipe.attached())
+    let pipe = tokio::time::timeout(GUARD, joining).await.unwrap().unwrap();
+    assert!(!is_pending(pin!(pipe.attached())).await);
+
+    let stall = Arc::new(Stall::default());
+    let pipe = client
+        .test_begin_join(carrier(&listener, &stall, true), PipeOptions::new())
+        .unwrap();
+    tokio::time::timeout(GUARD, pipe.joined())
+        .await
+        .unwrap()
+        .unwrap();
+    write_is_blocked(&stall).await;
+    assert!(is_pending(pin!(pipe.attached())).await);
+    stall.release();
+    tokio::time::timeout(GUARD, pipe.attached())
         .await
         .unwrap()
         .unwrap();
@@ -531,27 +546,25 @@ async fn add_pipe_waits_for_the_attachment() {
 
 /// The handshake timeout bounds the whole call: a pipe not attached by
 /// then is aborted and the call times out, leaving no pipe.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn add_pipe_times_out_and_leaves_no_pipe() {
     let mut c = config();
     c.handshake_timeout = None;
     c.join_timeout = Duration::from_millis(600);
-    let (client, server, listener, stall) = setup(c).await;
-    let start = Instant::now();
-    let r = client
-        .add_pipe(
-            carrier(&listener, &stall, Some(Duration::from_secs(30))),
-            PipeOptions::new(),
-        )
-        .await;
+    let limit = c.join_timeout;
+    let (client, server, listener, _) = setup(c).await;
+    let stall = Arc::new(Stall::default());
+    let mut joining = pin!(client.test_join(carrier(&listener, &stall, true), PipeOptions::new()));
+    assert!(is_pending(joining.as_mut()).await);
+    write_is_blocked(&stall).await;
+    tokio::time::advance(limit.checked_sub(Duration::from_millis(1)).unwrap()).await;
+    assert!(is_pending(joining.as_mut()).await);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let r = tokio::time::timeout(GUARD, joining).await.unwrap();
     assert!(matches!(
         r.err(),
         Some(PipeError::Failed(zmux::PipeFailure::JoinTimedOut))
     ));
-    let took = start.elapsed();
-    assert!(took >= Duration::from_millis(580), "{took:?}");
-    // A guard against a hang only: three join timeouts and a second.
-    assert!(took < Duration::from_millis(2800), "{took:?}");
     assert_eq!(live_joins(&client), 0);
     // The session goes on over pipe 0.
     let (mut w, _r) = client.open_bi().await.unwrap();
@@ -564,18 +577,17 @@ async fn add_pipe_times_out_and_leaves_no_pipe() {
 }
 
 /// A cancelled call (its future dropped) aborts the pipe it started.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn a_cancelled_add_pipe_aborts_the_pipe() {
-    let (client, _server, listener, stall) = setup(config()).await;
-    let r = tokio::time::timeout(
-        Duration::from_millis(200),
-        client.add_pipe(
-            carrier(&listener, &stall, Some(Duration::from_secs(30))),
-            PipeOptions::new(),
-        ),
-    )
-    .await;
-    assert!(r.is_err());
+    let (client, _server, listener, _) = setup(config()).await;
+    let stall = Arc::new(Stall::default());
+    {
+        let mut joining =
+            pin!(client.test_join(carrier(&listener, &stall, true), PipeOptions::new()));
+        assert!(is_pending(joining.as_mut()).await);
+        write_is_blocked(&stall).await;
+        assert!(is_pending(joining.as_mut()).await);
+    }
     assert_eq!(live_joins(&client), 0);
     client.close().await;
     listener.close();
@@ -583,23 +595,21 @@ async fn a_cancelled_add_pipe_aborts_the_pipe() {
 
 /// A pipe removed before the peer attached it fails the call with the
 /// pipe-gone error, the session's end with the session's error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn add_pipe_fails_when_the_pipe_or_the_session_goes() {
-    let (client, _server, listener, stall) = setup(config()).await;
-    let s = client.clone();
-    let io = carrier(&listener, &stall, Some(Duration::from_secs(30)));
-    let call = tokio::spawn(async move { s.add_pipe(io, PipeOptions::new()).await });
-    until("the join", 5, || live_joins(&client) == 1).await;
+    let (client, _server, listener, _) = setup(config()).await;
+    let stall = Arc::new(Stall::default());
+    let mut joining = pin!(client.test_join(carrier(&listener, &stall, true), PipeOptions::new()));
+    assert!(is_pending(joining.as_mut()).await);
+    write_is_blocked(&stall).await;
     let pipe = client
         .pipes()
         .into_iter()
         .find(|p| p.id().get() != 0)
         .unwrap();
-    pipe.joined().await.unwrap();
     pipe.close().unwrap();
-    let e = tokio::time::timeout(Duration::from_secs(5), call)
+    let e = tokio::time::timeout(GUARD, joining)
         .await
-        .unwrap()
         .unwrap()
         .unwrap_err();
     assert!(
@@ -607,14 +617,13 @@ async fn add_pipe_fails_when_the_pipe_or_the_session_goes() {
         "{e:?}"
     );
 
-    let s = client.clone();
-    let io = carrier(&listener, &stall, Some(Duration::from_secs(30)));
-    let call = tokio::spawn(async move { s.add_pipe(io, PipeOptions::new()).await });
-    until("the second join", 5, || live_joins(&client) == 1).await;
+    let stall = Arc::new(Stall::default());
+    let mut joining = pin!(client.test_join(carrier(&listener, &stall, true), PipeOptions::new()));
+    assert!(is_pending(joining.as_mut()).await);
+    write_is_blocked(&stall).await;
     client.abort(VarInt::from_u32(1), b"");
-    let e = tokio::time::timeout(Duration::from_secs(5), call)
+    let e = tokio::time::timeout(GUARD, joining)
         .await
-        .unwrap()
         .unwrap()
         .unwrap_err();
     assert!(matches!(e, PipeError::SessionLost(_)), "{e:?}");
@@ -623,7 +632,7 @@ async fn add_pipe_fails_when_the_pipe_or_the_session_goes() {
 
 /// Shutdown and a concurrent close both finish within the hand-off bound
 /// when a carrier takes nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn close_after_a_shutdown_is_bounded() {
     let mut c = untimed_close(config());
     c.test_hooks().close_handoff_limit = Some(Duration::from_millis(200));
@@ -682,18 +691,17 @@ async fn an_abort_ends_a_coded_close_s_flush_and_the_close_decides() {
     // data (within the peer's window, more than a batch) holds the flush.
     stall.set(true);
     w.write_all(&[7; 128 * 1024]).await.unwrap();
-    let s = client.clone();
-    let closing =
-        tokio::spawn(async move { s.close_with_error(VarInt::from_u32(0x2a), b"bye").await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!closing.is_finished(), "the flush waits for the carrier");
+    let mut closing = pin!(client.close_with_error(VarInt::from_u32(0x2a), b"bye"));
+    assert!(
+        is_pending(closing.as_mut()).await,
+        "the flush waits for the carrier"
+    );
     client.abort(VarInt::from_u32(7), b"other");
     // The close's hand-off limit is an hour and the carrier still takes
     // nothing: only the abort can have ended it.
     tokio::time::timeout(GUARD, closing)
         .await
-        .expect("the abort ended the flush")
-        .unwrap();
+        .expect("the abort ended the flush");
     assert!(!stall.shut.load(Ordering::SeqCst));
     assert!(matches!(
         client.close_reason(),
@@ -764,7 +772,7 @@ async fn a_coded_close_gives_up_unsent_data_at_one_second() {
 /// was, within the linger timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn data_before_a_peer_close_stays_readable_until_read() {
-    let (client, server, listener, _stall) = setup(config()).await;
+    let (client, server, listener, _stall) = setup_client(long_linger(config()), config()).await;
     let (mut w, _r) = client.open_bi().await.unwrap();
     w.write_all(&[3; 100_000]).await.unwrap();
     let (_sw, mut r) = server.accept_bi().await.unwrap();
@@ -773,8 +781,7 @@ async fn data_before_a_peer_close_stays_readable_until_read() {
         .await;
     let e = tokio::time::timeout(GUARD, server.closing()).await.unwrap();
     assert!(closed_with(&e, 0x2a, b"bye"), "{e:?}");
-    // The reader starts after the close arrived.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The peer close arrived before the application starts reading.
     let mut got = 0;
     let end = loop {
         match r.read_chunk(1 << 20).await {
@@ -834,7 +841,7 @@ async fn dropping_unread_data_after_a_peer_close_ends_the_session() {
 /// The close-code hook is told every end: the session's code after a coded
 /// close (at both ends), 0 for a pipe removed while its session goes on, and
 /// 0 for a carrier dropped unused.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn the_close_code_hook_hears_every_end() {
     let told = |slot: &Arc<Mutex<Vec<u64>>>| {
         let slot = slot.clone();
@@ -866,7 +873,7 @@ async fn the_close_code_hook_hears_every_end() {
     let l = listener.clone();
     tokio::spawn(async move { l.handle_pipe(PipeIo::new(b), hint()).await });
     let pipe = client
-        .add_pipe(
+        .test_join(
             PipeIo::new(a).with_close_code(told(&removed)),
             PipeOptions::default(),
         )
@@ -926,7 +933,7 @@ impl AsyncWrite for Dropped {
 
 /// The close-code hook is called once the carrier is released: for a
 /// pipe removed while its session goes on and for the session's end.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn the_close_code_hook_follows_the_carriers_release() {
     let listener =
         Listener::new(config(), ListenerConfig::default()).expect("valid listener configuration");
@@ -956,7 +963,7 @@ async fn the_close_code_hook_follows_the_carriers_release() {
         Arc::new(Mutex::new(Vec::new())),
     );
     let pipe = client
-        .add_pipe(
+        .test_join(
             PipeIo::new(Dropped(a, gone.clone())).with_close_code(hooked(&gone, &removed)),
             PipeOptions::default(),
         )
@@ -986,7 +993,7 @@ async fn the_close_code_hook_follows_the_carriers_release() {
 /// A local close still flushing when the peer's close arrives: once its
 /// hand-off limit passed, what the peer sent before its close stays
 /// readable until the linger deadline, not discarded with the hand-off.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn a_peer_close_during_a_flush_keeps_the_read_drain() {
     let mut c = config();
     c.test_hooks().linger_timeout = Some(Duration::from_secs(5));
@@ -998,18 +1005,16 @@ async fn a_peer_close_during_a_flush_keeps_the_read_drain() {
     // The client's close flushes behind a carrier that takes nothing.
     stall.set(true);
     w.write_all(&[7; 128 * 1024]).await.unwrap();
-    let s = client.clone();
-    let closing =
-        tokio::spawn(async move { s.close_with_error(VarInt::from_u32(1), b"mine").await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut closing = pin!(client.close_with_error(VarInt::from_u32(1), b"mine"));
+    assert!(is_pending(closing.as_mut()).await);
     server
         .close_with_error(VarInt::from_u32(0x2a), b"bye")
         .await;
     let e = tokio::time::timeout(GUARD, client.closing()).await.unwrap();
     assert!(closed_with(&e, 0x2a, b"bye"), "{e:?}");
-    tokio::time::timeout(GUARD, closing).await.unwrap().unwrap();
+    tokio::time::timeout(GUARD, closing).await.unwrap();
     // Past the hand-off limit of the stalled close.
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    tokio::time::advance(Duration::from_millis(1300)).await;
     let mut got = 0;
     while let Ok(Some(b)) = r.read_chunk(1 << 20).await {
         got += b.len();
@@ -1021,7 +1026,7 @@ async fn a_peer_close_during_a_flush_keeps_the_read_drain() {
 /// A carrier whose writes never complete, a stream write queued ahead of
 /// the close: an abort and an idle timeout's close each end the session
 /// within the close bounds, though `CONNECTION_CLOSE` never leaves.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn a_close_behind_a_stuck_write_still_ends() {
     for idle in [false, true] {
         let mut c = config();
@@ -1032,20 +1037,14 @@ async fn a_close_behind_a_stuck_write_still_ends() {
         let (client, _server, listener, stall) = setup(c).await;
         stall.set(true);
         let (mut w, _r) = client.open_bi().await.unwrap();
-        let _ = tokio::time::timeout(Duration::from_millis(50), w.write_all(&[1; 1000])).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let start = Instant::now();
+        w.write_all(&[1; 1000]).await.unwrap();
+        write_is_blocked(&stall).await;
         if !idle {
             client.abort(VarInt::from_u32(3), b"gone");
         }
-        tokio::time::timeout(Duration::from_secs(8), client.closed())
+        tokio::time::timeout(GUARD, client.closed())
             .await
             .unwrap_or_else(|_| panic!("idle {idle}: the session never ended"));
-        assert!(
-            start.elapsed() < Duration::from_secs(4),
-            "idle {idle}: {:?}",
-            start.elapsed()
-        );
         listener.close();
     }
 }

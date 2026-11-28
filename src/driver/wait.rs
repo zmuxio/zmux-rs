@@ -228,6 +228,8 @@ pub(crate) enum List<K> {
     Events,
     /// Pipe state changes (`Pipe::joined`).
     Pipes,
+    /// Driver-owned carrier handshakes while waiting for join state.
+    Join,
     /// `close` calls waiting for the carriers to take `CONNECTION_CLOSE`.
     Close,
     /// `ping` calls (a `QX_PING` response arrived).
@@ -252,7 +254,10 @@ impl<K> List<K> {
     /// The other session lists serve loops (accept, datagrams, events,
     /// hooks, channels) and stay for their next wait.
     fn transient(&self) -> bool {
-        matches!(self, Self::State | Self::Pipes | Self::Close | Self::Ping)
+        matches!(
+            self,
+            Self::State | Self::Pipes | Self::Join | Self::Close | Self::Ping
+        )
     }
 
     /// A list of one stream, kept until its handle is gone.
@@ -390,6 +395,9 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
     }
 
     pub(crate) fn wake_list(&mut self, list: List<K>, wakes: &mut WakeList) {
+        if matches!(list, List::State | List::Pipes) {
+            self.wake_list(List::Join, wakes);
+        }
         if let Some(l) = self.existing(list) {
             l.wake_all(wakes);
         }
@@ -426,7 +434,7 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
             + self
                 .session
                 .iter()
-                .filter(|(l, _)| !matches!(l, List::Hook | List::Channel))
+                .filter(|(l, _)| !matches!(l, List::Hook | List::Channel | List::Join))
                 .map(|(_, w)| w.waiters.len())
                 .sum::<usize>()
             + self
@@ -434,6 +442,14 @@ impl<K: Copy + Eq + Hash> Waiters<K> {
                 .iter()
                 .map(|q| q.list.waiters.len())
                 .sum::<usize>()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn join_waits(&self) -> usize {
+        self.session
+            .iter()
+            .find(|(list, _)| *list == List::Join)
+            .map_or(0, |(_, waits)| waits.waiters.len())
     }
 
     /// Nothing is registered (openers aside, which leave by themselves).
@@ -573,6 +589,11 @@ struct DoneState {
 }
 
 impl PipeDone {
+    #[cfg(all(any(test, feature = "test-hooks"), feature = "tokio", not(loom)))]
+    pub(crate) fn is_done(&self) -> bool {
+        lock(&self.state).done
+    }
+
     /// Marks the pipe closed; the waits are woken with `wakes` (after the
     /// caller's lock).
     pub(crate) fn finish_into(&self, wakes: &mut WakeList) {
