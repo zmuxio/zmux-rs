@@ -1074,10 +1074,10 @@ fn truncated_hooked_capsule_never_submits_a_partial_unit() {
 
 #[test]
 fn transparent_capsule_error_resets_at_the_last_complete_capsule() {
-    check_transparent_capsule_error(b"\x21\x01a\x22\x02b".to_vec(), 3);
+    check_transparent_capsule_error(b"\x21\x01a\x22\x02b", 3);
 }
 
-fn check_transparent_capsule_error(raw: Vec<u8>, prefix_size: u64) {
+fn check_transparent_capsule_error(raw: &[u8], prefix_size: u64) {
     common::paused(async {
         let hop = Hop::default().await;
         let ((mut a, mut reverse), ra, rb, (mut b, mut read)) = prepared_hop(&hop).await;
@@ -1086,7 +1086,7 @@ fn check_transparent_capsule_error(raw: Vec<u8>, prefix_size: u64) {
             rb,
             SpliceOptions::default(),
         ));
-        a.write_all(&raw).await.unwrap();
+        a.write_all(raw).await.unwrap();
         assert_eq!(
             watchdog(
                 60,

@@ -8,12 +8,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::task::{Context, Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use zmux::proto::frame::{ConnectionClose, Frame, Frames, Gates};
-use zmux::{Config, VarInt};
+use zmux::{ClockDomain, Config, MonotonicClock, VarInt};
 
 const WATCHDOG: Duration = Duration::from_secs(30);
 const LOCAL_CLOSE: (VarInt, &[u8]) = (VarInt::from_u32(7), b"client");
@@ -42,11 +42,27 @@ fn is_close(record: &[u8], (code, reason): (VarInt, &[u8])) -> bool {
     })
 }
 
+struct StoppedClock(Instant);
+
+impl MonotonicClock for StoppedClock {
+    fn now(&self) -> Instant {
+        self.0
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        if deadline <= self.0 {
+            Box::pin(std::future::ready(()))
+        } else {
+            Box::pin(std::future::pending())
+        }
+    }
+}
+
 fn config() -> Config {
+    // Keep handshake, handoff and linger deadlines out of the scenario.
+    // The real-time watchdog only detects a stalled test.
     let mut config = Config::default();
-    // Only the test watchdog can end a stalled scenario. The driver's
-    // close timer must not advance the sequence under test.
-    config.test_hooks().close_handoff_limit = Some(WATCHDOG * 2);
+    config.clock_domain = ClockDomain::with_source(StoppedClock(Instant::now()));
     config.test_hooks().no_first_ping = true;
     config
 }
@@ -274,14 +290,15 @@ impl Scenario {
 async fn the_peer_close_and_the_carrier_end_do_not_abort_the_local_close() {
     tokio::time::timeout(WATCHDOG, async {
         let (scenario, (client_read, client_write), (server_read, server_write)) = Scenario::new();
+        let config = config();
         let (client, server) = tokio::try_join!(
             zmux::Session::connect(
                 zmux::PipeIo::from_halves(client_read, client_write).records(),
-                config()
+                config.clone()
             ),
             zmux::Session::accept(
                 zmux::PipeIo::from_halves(server_read, server_write).records(),
-                config()
+                config
             ),
         )
         .unwrap();
@@ -311,15 +328,19 @@ async fn blocking_peer_close_and_carrier_end_do_not_abort_the_local_close() {
 
         let (scenario, (client_read, client_write), (server_read, server_write)) = Scenario::new();
         let shutdown = scenario.shutdown.clone();
+        let peer_config = config();
+        let client_config = peer_config.clone();
+        let (peer_ready, peer_established) = oneshot::channel();
         let (close, should_close) = oneshot::channel();
         let (done, closed) = oneshot::channel();
         let (peer_done, peer_closed) = oneshot::channel();
         let peer = std::thread::spawn(move || {
             let server = Session::accept(
                 PipeIo::from_halves(server_read, server_write).records(),
-                config(),
+                peer_config,
             )
-            .unwrap();
+            .expect("the peer established its session");
+            peer_ready.send(()).unwrap();
             should_close.blocking_recv().unwrap();
             server.close_with_error(PEER_CLOSE.0, PEER_CLOSE.1);
             let _ = peer_done.send(());
@@ -332,7 +353,12 @@ async fn blocking_peer_close_and_carrier_end_do_not_abort_the_local_close() {
                         shutdown.store(true, Relaxed);
                     }
                 });
-            let client = Session::connect(pipe, config()).unwrap();
+            let client = Session::connect(pipe, client_config)
+                .expect("the local endpoint established its session");
+            // Receiving the peer's parameters can establish the client before its
+            // writer builds the first record. Wait until the peer has consumed
+            // our parameters so the close gate cannot hold up its handshake.
+            peer_established.blocking_recv().unwrap();
             client.close_with_error(LOCAL_CLOSE.0, LOCAL_CLOSE.1);
             client.closed().unwrap();
             let _ = done.send(());

@@ -95,9 +95,8 @@
 //! TLS 1.3 early data is not used as carrier early data: tokio-rustls
 //! sends rejected early data again by itself, before zmux could wait for
 //! the server's new parameters, so a client never offers it and a server
-//! never accepts it. Early data under the zmux floor
-//! ([`zmux::EarlyData::zmux_peer`]) goes after the handshake and needs
-//! none.
+//! never accepts it. Early data under the zmux floor goes after the
+//! handshake and needs none.
 #![forbid(unsafe_code)]
 
 use std::io;
