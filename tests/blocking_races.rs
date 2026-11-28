@@ -322,8 +322,17 @@ fn multipath_pipe_loss_during_traffic() {
         for _ in &jobs {
             streams_ready.recv().unwrap();
         }
-        left.shutdown(Shutdown::Both).unwrap();
-        right.shutdown(Shutdown::Both).unwrap();
+        // Cutting either side lets the relay shut down both sockets itself, so
+        // the second shutdown can find the socket already disconnected
+        // (macOS reports ENOTCONN there; Linux reports success).
+        for side in [&left, &right] {
+            match side.shutdown(Shutdown::Both) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotConnected => {
+                    panic!("relay shutdown: {error}")
+                }
+                _ => {}
+            }
+        }
         relay_task.join().unwrap();
         let _ = pipe.abort();
         for (resume, _) in &jobs {

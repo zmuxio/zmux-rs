@@ -27,6 +27,7 @@ fn gates_from(bits: u8) -> Gates {
         priority: bits & 4 != 0,
         multipath: bits & 8 != 0,
         pipe_ack: bits & 16 != 0,
+        datagram_ack: bits & 0x20 != 0,
         lanes: bits & 0x18 != 0 && bits & 1 != 0,
     }
 }
