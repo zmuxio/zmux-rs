@@ -1521,7 +1521,10 @@ impl OutPipe {
         // 4 x min_rtt. A FIFO path held its bytes that long and was busy all the
         // while, so the sample is the path's rate: a bottleneck sample, in a bubble
         // too, and taken also from bytes sent before the pipe became SUSPECT (its
-        // RTT sample stays out).
+        // RTT sample stays out). Only a batch sent behind unacknowledged bytes
+        // of the pipe can be queue-proven: a lone batch has no backlog to wait
+        // behind, a rise of the propagation delay alone delays it as much, and
+        // its interval spans the idle time before it.
         // A zero RTT (which the filter keeps as 1 ns) proves nothing.
         let min_rtt = self
             .est
@@ -1529,12 +1532,13 @@ impl OutPipe {
             .get()
             .filter(|&m| m > Duration::from_nanos(1));
         let proven = |b: &Batch| {
-            min_rtt.is_some_and(|m| {
-                now.saturating_duration_since(b.time)
-                    .saturating_sub(ack_delay.min(peer_mad))
-                    .saturating_sub(m)
-                    >= m * 4
-            })
+            b.delivered < b.start
+                && min_rtt.is_some_and(|m| {
+                    now.saturating_duration_since(b.time)
+                        .saturating_sub(ack_delay.min(peer_mad))
+                        .saturating_sub(m)
+                        >= m * 4
+                })
         };
         if let Some(b) = self
             .batches
@@ -2983,6 +2987,36 @@ mod tests {
     fn a_suspect_pipe_does_not_keep_its_old_rate() {
         let r = deep_buffer_rate(true);
         assert!((10_000..=40_000).contains(&r), "R_p {r}");
+    }
+
+    /// A rise of the propagation delay delays a lone batch as much as a queue
+    /// would: with nothing of the pipe unacknowledged ahead it proves no
+    /// queue, so its few bytes over the idle time before it do not replace
+    /// `R_p`.
+    #[test]
+    fn a_lone_batch_after_a_delay_rise_is_not_queue_proven() {
+        let t0 = Instant::now();
+        let mut o = pipe(t0);
+        let mut pos = 0;
+        let mut at = t0;
+        for _ in 0..4 {
+            batch(&mut o, 0, 3000, at);
+            pos += 3000;
+            ack(&mut o, 0, pos, at + MS * 50);
+            at += MS * 100;
+        }
+        let before = o.est().rate;
+        for _ in 0..20 {
+            batch(&mut o, 0, 36, at);
+            pos += 36;
+            ack(&mut o, 0, pos, at + MS * 400);
+            at += MS * 1000;
+        }
+        assert!(
+            o.est().rate >= before,
+            "R_p {} fell from {before}",
+            o.est().rate
+        );
     }
 
     /// `Q_p` and `unsent_ahead` on a slow carrier that reports no unsent
